@@ -790,25 +790,40 @@ open class CALayer: CAMediaTiming, Hashable {
     private func applyKeyframeAnimation(_ animation: CAKeyframeAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
         guard let values = animation.values, values.count > 1 else { return }
 
+        // For paced modes, remap progress based on arc length
+        let effectiveProgress: CFTimeInterval
+        var effectiveKeyTimes: [Float]
+
+        switch animation.calculationMode {
+        case .paced, .cubicPaced:
+            // Calculate arc-length parameterized progress
+            let (remappedProgress, pacedKeyTimes) = calculatePacedProgress(progress: Float(progress), values: values, cubic: animation.calculationMode == .cubicPaced)
+            effectiveProgress = CFTimeInterval(remappedProgress)
+            effectiveKeyTimes = pacedKeyTimes
+        default:
+            effectiveProgress = progress
+            effectiveKeyTimes = animation.keyTimes ?? defaultKeyTimes(for: values.count)
+        }
+
         // Determine which keyframe segment we're in
-        let keyTimes = animation.keyTimes ?? defaultKeyTimes(for: values.count)
-        let segmentIndex = findSegmentIndex(for: Float(progress), in: keyTimes)
+        let segmentIndex = findSegmentIndex(for: Float(effectiveProgress), in: effectiveKeyTimes)
         let startIndex = segmentIndex
         let endIndex = min(segmentIndex + 1, values.count - 1)
 
         // Get local progress within the segment
-        let startTime = keyTimes[startIndex]
-        let endTime = keyTimes[endIndex]
+        let startTime = effectiveKeyTimes[startIndex]
+        let endTime = effectiveKeyTimes[endIndex]
         let segmentProgress: Float
         if endTime > startTime {
-            segmentProgress = (Float(progress) - startTime) / (endTime - startTime)
+            segmentProgress = (Float(effectiveProgress) - startTime) / (endTime - startTime)
         } else {
             segmentProgress = 1.0
         }
 
-        // Apply timing function for this segment if available
+        // Apply timing function for this segment if available (not used for paced modes)
         let adjustedProgress: Float
-        if let timingFunctions = animation.timingFunctions,
+        if animation.calculationMode != .paced && animation.calculationMode != .cubicPaced,
+           let timingFunctions = animation.timingFunctions,
            startIndex < timingFunctions.count {
             adjustedProgress = timingFunctions[startIndex].evaluate(at: segmentProgress)
         } else {
@@ -841,6 +856,135 @@ open class CALayer: CAMediaTiming, Hashable {
         default:
             interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
         }
+    }
+
+    /// Calculates arc-length parameterized progress for paced animation modes.
+    ///
+    /// Returns the remapped progress and the paced key times array.
+    private func calculatePacedProgress(progress: Float, values: [Any], cubic: Bool) -> (Float, [Float]) {
+        guard values.count > 1 else { return (progress, [0]) }
+
+        // Calculate distances between consecutive keyframes
+        var distances: [CGFloat] = []
+        for i in 0..<(values.count - 1) {
+            let distance: CGFloat
+            if cubic {
+                // For cubic paced, estimate arc length of Catmull-Rom spline segment
+                let p0Index = max(0, i - 1)
+                let p3Index = min(values.count - 1, i + 2)
+                distance = estimateCubicArcLength(
+                    p0: values[p0Index],
+                    p1: values[i],
+                    p2: values[i + 1],
+                    p3: values[p3Index]
+                )
+            } else {
+                distance = calculateDistance(from: values[i], to: values[i + 1])
+            }
+            distances.append(max(distance, 0.0001)) // Avoid zero distance
+        }
+
+        // Calculate cumulative distances
+        var cumulativeDistances: [CGFloat] = [0]
+        for distance in distances {
+            cumulativeDistances.append(cumulativeDistances.last! + distance)
+        }
+        let totalDistance = cumulativeDistances.last!
+
+        // Calculate paced key times (normalized by total distance)
+        var pacedKeyTimes: [Float] = []
+        for cumDist in cumulativeDistances {
+            pacedKeyTimes.append(Float(cumDist / totalDistance))
+        }
+
+        return (progress, pacedKeyTimes)
+    }
+
+    /// Calculates the distance between two animation values.
+    private func calculateDistance(from: Any, to: Any) -> CGFloat {
+        // CGPoint distance (Euclidean)
+        if let fromPoint = from as? CGPoint, let toPoint = to as? CGPoint {
+            let dx = toPoint.x - fromPoint.x
+            let dy = toPoint.y - fromPoint.y
+            return sqrt(dx * dx + dy * dy)
+        }
+
+        // CGFloat distance (absolute)
+        if let fromFloat = from as? CGFloat, let toFloat = to as? CGFloat {
+            return abs(toFloat - fromFloat)
+        }
+
+        // Float distance (absolute)
+        if let fromFloat = from as? Float, let toFloat = to as? Float {
+            return CGFloat(abs(toFloat - fromFloat))
+        }
+
+        // CGRect distance (sum of component distances)
+        if let fromRect = from as? CGRect, let toRect = to as? CGRect {
+            return abs(toRect.origin.x - fromRect.origin.x) +
+                   abs(toRect.origin.y - fromRect.origin.y) +
+                   abs(toRect.size.width - fromRect.size.width) +
+                   abs(toRect.size.height - fromRect.size.height)
+        }
+
+        // CGColor distance (RGBA Euclidean)
+        if let fromColor = extractColor(from), let toColor = extractColor(to) {
+            let fromComponents = fromColor.components ?? [0, 0, 0, 1]
+            let toComponents = toColor.components ?? [0, 0, 0, 1]
+            var sum: CGFloat = 0
+            for i in 0..<min(fromComponents.count, toComponents.count) {
+                let diff = toComponents[i] - fromComponents[i]
+                sum += diff * diff
+            }
+            return sqrt(sum)
+        }
+
+        // Default: return 1 for equal spacing
+        return 1.0
+    }
+
+    /// Estimates the arc length of a Catmull-Rom spline segment using numerical integration.
+    private func estimateCubicArcLength(p0: Any, p1: Any, p2: Any, p3: Any) -> CGFloat {
+        // Use numerical integration with Simpson's rule
+        // Sample the curve at multiple points and sum segment lengths
+        let numSamples = 10
+        var arcLength: CGFloat = 0
+
+        guard let prev = interpolateForDistance(p0: p0, p1: p1, p2: p2, p3: p3, t: 0) else {
+            // Fallback to linear distance
+            return calculateDistance(from: p1, to: p2)
+        }
+
+        var previousPoint = prev
+
+        for i in 1...numSamples {
+            let t = CGFloat(i) / CGFloat(numSamples)
+            guard let currentPoint = interpolateForDistance(p0: p0, p1: p1, p2: p2, p3: p3, t: t) else {
+                return calculateDistance(from: p1, to: p2)
+            }
+            arcLength += calculatePointDistance(from: previousPoint, to: currentPoint)
+            previousPoint = currentPoint
+        }
+
+        return arcLength
+    }
+
+    /// Interpolates a point on the Catmull-Rom spline for distance calculation.
+    private func interpolateForDistance(p0: Any, p1: Any, p2: Any, p3: Any, t: CGFloat) -> (x: CGFloat, y: CGFloat)? {
+        // Only support CGPoint for now
+        if let v0 = p0 as? CGPoint, let v1 = p1 as? CGPoint, let v2 = p2 as? CGPoint, let v3 = p3 as? CGPoint {
+            let x = catmullRom(v0.x, v1.x, v2.x, v3.x, t)
+            let y = catmullRom(v0.y, v1.y, v2.y, v3.y, t)
+            return (x, y)
+        }
+        return nil
+    }
+
+    /// Calculates Euclidean distance between two 2D points.
+    private func calculatePointDistance(from: (x: CGFloat, y: CGFloat), to: (x: CGFloat, y: CGFloat)) -> CGFloat {
+        let dx = to.x - from.x
+        let dy = to.y - from.y
+        return sqrt(dx * dx + dy * dy)
     }
 
     /// Generates default key times evenly distributed.

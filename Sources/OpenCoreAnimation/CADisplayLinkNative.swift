@@ -36,7 +36,14 @@ open class CADisplayLink: @unchecked Sendable {
     }
 
     /// The preferred frame rate for the display link callback.
-    open var preferredFrameRateRange: CAFrameRateRange = CAFrameRateRange()
+    open var preferredFrameRateRange: CAFrameRateRange = CAFrameRateRange() {
+        didSet {
+            // Restart timer with new frame rate if running
+            if isRunning && !isPaused {
+                startTimer()
+            }
+        }
+    }
 
     /// The preferred frame rate in frames per second.
     open var preferredFramesPerSecond: Int = 0 {

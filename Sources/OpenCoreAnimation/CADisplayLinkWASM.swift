@@ -92,6 +92,21 @@ open class CADisplayLink: @unchecked Sendable {
     private var animationFrameCallback: JSClosure?
     private var animationFrameId: Int32 = 0
 
+    /// The timestamp of the last frame that was dispatched to the delegate.
+    private var lastDispatchedTimestamp: CFTimeInterval = 0
+
+    /// The minimum time interval between frame dispatches based on preferred frame rate.
+    private var minimumFrameInterval: CFTimeInterval {
+        if preferredFrameRateRange.maximum > 0 {
+            return 1.0 / CFTimeInterval(preferredFrameRateRange.maximum)
+        } else if preferredFrameRateRange.preferred > 0 {
+            return 1.0 / CFTimeInterval(preferredFrameRateRange.preferred)
+        } else if preferredFramesPerSecond > 0 {
+            return 1.0 / CFTimeInterval(preferredFramesPerSecond)
+        }
+        return 0 // No throttling
+    }
+
     // MARK: - Initialization
 
     /// Creates a display link with the target and selector you specify.
@@ -155,15 +170,33 @@ open class CADisplayLink: @unchecked Sendable {
 
             // Update timestamps (convert from milliseconds to seconds)
             let timestampMs = arguments[0].number ?? 0
-            self.timestamp = timestampMs / 1000.0
-            self.targetTimestamp = self.timestamp + self.duration
+            let currentTimestamp = timestampMs / 1000.0
+            self.timestamp = currentTimestamp
+            self.targetTimestamp = currentTimestamp + self.duration
 
-            // Call the delegate method
-            if let delegate = self.target as? CADisplayLinkDelegate {
-                delegate.displayLinkDidFire(self)
+            // Check if we should dispatch this frame based on frame rate throttling
+            let minInterval = self.minimumFrameInterval
+            let shouldDispatch: Bool
+
+            if minInterval > 0 {
+                // Frame rate throttling is enabled
+                let timeSinceLastDispatch = currentTimestamp - self.lastDispatchedTimestamp
+                shouldDispatch = timeSinceLastDispatch >= minInterval
+            } else {
+                // No throttling, dispatch every frame
+                shouldDispatch = true
             }
 
-            // Request next frame if still running
+            if shouldDispatch {
+                self.lastDispatchedTimestamp = currentTimestamp
+
+                // Call the delegate method
+                if let delegate = self.target as? CADisplayLinkDelegate {
+                    delegate.displayLinkDidFire(self)
+                }
+            }
+
+            // Request next frame if still running (always request to maintain accurate timing)
             if self.isRunning && !self.isPaused {
                 self.requestNextFrame()
             }
