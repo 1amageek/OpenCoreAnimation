@@ -1600,91 +1600,91 @@ public final class CAWebGPURenderer: CARenderer {
             offscreenCanvas.width = .number(Double(width))
             offscreenCanvas.height = .number(Double(height))
 
-        guard let ctx = offscreenCanvas.getContext("2d").object else { return }
+            guard let ctx = offscreenCanvas.getContext("2d").object else { return }
 
-        // Clear canvas with background color if set
-        if let bgColor = textLayer.backgroundColor {
-            let components = bgColor.components ?? [0, 0, 0, 1]
-            let r = Int((components.count > 0 ? components[0] : 0) * 255)
-            let g = Int((components.count > 1 ? components[1] : 0) * 255)
-            let b = Int((components.count > 2 ? components[2] : 0) * 255)
-            let a = components.count > 3 ? components[3] : 1.0
-            ctx.fillStyle = .string("rgba(\(r),\(g),\(b),\(a))")
-            _ = ctx.fillRect!(0, 0, width, height)
-        } else {
-            _ = ctx.clearRect!(0, 0, width, height)
-        }
+            // Clear canvas with background color if set
+            if let bgColor = textLayer.backgroundColor {
+                let components = bgColor.components ?? [0, 0, 0, 1]
+                let r = Int((components.count > 0 ? components[0] : 0) * 255)
+                let g = Int((components.count > 1 ? components[1] : 0) * 255)
+                let b = Int((components.count > 2 ? components[2] : 0) * 255)
+                let a = components.count > 3 ? components[3] : 1.0
+                ctx.fillStyle = .string("rgba(\(r),\(g),\(b),\(a))")
+                _ = ctx.fillRect!(0, 0, width, height)
+            } else {
+                _ = ctx.clearRect!(0, 0, width, height)
+            }
 
-        // Set font
-        let fontName: String
-        if let font = textLayer.font as? String {
-            fontName = font
-        } else {
-            fontName = "sans-serif"
-        }
-        ctx.font = .string("\(Int(textLayer.fontSize))px \(fontName)")
+            // Set font
+            let fontName: String
+            if let font = textLayer.font as? String {
+                fontName = font
+            } else {
+                fontName = "sans-serif"
+            }
+            ctx.font = .string("\(Int(textLayer.fontSize))px \(fontName)")
 
-        // Set text color
-        if let fgColor = textLayer.foregroundColor {
-            let components = fgColor.components ?? [0, 0, 0, 1]
-            let r = Int((components.count > 0 ? components[0] : 0) * 255)
-            let g = Int((components.count > 1 ? components[1] : 0) * 255)
-            let b = Int((components.count > 2 ? components[2] : 0) * 255)
-            let a = components.count > 3 ? components[3] : 1.0
-            ctx.fillStyle = .string("rgba(\(r),\(g),\(b),\(a))")
-        } else {
-            ctx.fillStyle = .string("rgba(255,255,255,1)")
-        }
+            // Set text color
+            if let fgColor = textLayer.foregroundColor {
+                let components = fgColor.components ?? [0, 0, 0, 1]
+                let r = Int((components.count > 0 ? components[0] : 0) * 255)
+                let g = Int((components.count > 1 ? components[1] : 0) * 255)
+                let b = Int((components.count > 2 ? components[2] : 0) * 255)
+                let a = components.count > 3 ? components[3] : 1.0
+                ctx.fillStyle = .string("rgba(\(r),\(g),\(b),\(a))")
+            } else {
+                ctx.fillStyle = .string("rgba(255,255,255,1)")
+            }
 
-        // Set text alignment
-        switch textLayer.alignmentMode {
-        case .left:
-            ctx.textAlign = .string("left")
-        case .right:
-            ctx.textAlign = .string("right")
-        case .center:
-            ctx.textAlign = .string("center")
-        case .justified, .natural:
-            ctx.textAlign = .string("start")
-        default:
-            ctx.textAlign = .string("start")
-        }
+            // Set text alignment
+            switch textLayer.alignmentMode {
+            case .left:
+                ctx.textAlign = .string("left")
+            case .right:
+                ctx.textAlign = .string("right")
+            case .center:
+                ctx.textAlign = .string("center")
+            case .justified, .natural:
+                ctx.textAlign = .string("start")
+            default:
+                ctx.textAlign = .string("start")
+            }
 
-        ctx.textBaseline = .string("top")
+            ctx.textBaseline = .string("top")
 
-        // Calculate text position based on alignment
-        let x: Double
-        switch textLayer.alignmentMode {
-        case .center:
-            x = Double(width) / 2
-        case .right:
-            x = Double(width)
-        default:
-            x = 0
-        }
+            // Calculate text position based on alignment
+            let x: Double
+            switch textLayer.alignmentMode {
+            case .center:
+                x = Double(width) / 2
+            case .right:
+                x = Double(width)
+            default:
+                x = 0
+            }
 
-        // Draw text (simple single-line for now)
-        // For wrapped text, we would need to implement line breaking
-        if textLayer.isWrapped {
-            // Simple word wrapping
-            drawWrappedText(ctx: ctx, text: text, x: x, y: 0,
-                           maxWidth: Double(width), lineHeight: textLayer.fontSize * 1.2)
-        } else {
-            _ = ctx.fillText!(text, x, Double(textLayer.fontSize * 0.1))
-        }
+            // Draw text (simple single-line for now)
+            // For wrapped text, we would need to implement line breaking
+            if textLayer.isWrapped {
+                // Simple word wrapping
+                drawWrappedText(ctx: ctx, text: text, x: x, y: 0,
+                               maxWidth: Double(width), lineHeight: textLayer.fontSize * 1.2)
+            } else {
+                _ = ctx.fillText!(text, x, Double(textLayer.fontSize * 0.1))
+            }
 
-        // Get image data from canvas
-        guard let imageData = ctx.getImageData!(0, 0, width, height).object else { return }
-        guard let dataArray = imageData.data.object else { return }
+            // Get image data from canvas
+            guard let imageData = ctx.getImageData!(0, 0, width, height).object else { return }
+            guard let dataArray = imageData.data.object else { return }
 
-        // Create WebGPU texture
-        let textureDescriptor = GPUTextureDescriptor(
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
-            format: .rgba8unorm,
-            usage: [.textureBinding, .copyDst, .renderAttachment]
-        )
+            // Create WebGPU texture
+            let textureDescriptor = GPUTextureDescriptor(
+                size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+                format: .rgba8unorm,
+                usage: [.textureBinding, .copyDst, .renderAttachment]
+            )
 
-        let texture = device.createTexture(descriptor: textureDescriptor)
+            let texture = device.createTexture(descriptor: textureDescriptor)
 
             // Copy image data to texture
             device.queue.writeTexture(
