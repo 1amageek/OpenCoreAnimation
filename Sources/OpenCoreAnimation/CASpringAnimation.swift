@@ -54,4 +54,68 @@ open class CASpringAnimation: CABasicAnimation {
         // If duration is explicitly set, use it; otherwise use settlingDuration
         return duration > 0 ? duration : settlingDuration
     }
+
+    // MARK: - Spring Physics
+
+    /// Calculates the spring interpolation value at a given time.
+    ///
+    /// This implements the damped harmonic oscillator equation:
+    /// - Underdamped (ζ < 1): Oscillates with decreasing amplitude
+    /// - Critically damped (ζ = 1): Returns to rest without oscillation, fastest
+    /// - Overdamped (ζ > 1): Returns to rest without oscillation, slower
+    ///
+    /// - Parameter time: The elapsed time in seconds since animation start.
+    /// - Returns: The interpolated value from 0 to 1, may overshoot for underdamped springs.
+    internal func springValue(at time: CFTimeInterval) -> CGFloat {
+        let safeMass = max(0.001, mass)
+        let safeStiffness = max(0.001, stiffness)
+        let safeDamping = max(0.001, damping)
+
+        // Natural frequency: ω_n = sqrt(k / m)
+        let omega_n = sqrt(safeStiffness / safeMass)
+
+        // Damping ratio: ζ = c / (2 * sqrt(k * m))
+        let zeta = safeDamping / (2 * sqrt(safeStiffness * safeMass))
+
+        // Initial conditions: starting at 0, moving towards 1
+        // x(0) = 0 (start position)
+        // x(∞) = 1 (target position)
+        // v(0) = initialVelocity
+
+        let t = CGFloat(time)
+
+        if zeta < 1 {
+            // Underdamped: oscillates
+            // x(t) = 1 - e^(-ζω_n*t) * (cos(ω_d*t) + ((ζω_n - v0) / ω_d) * sin(ω_d*t))
+            let omega_d = omega_n * sqrt(1 - zeta * zeta)  // Damped frequency
+            let decay = exp(-zeta * omega_n * t)
+            let cosComponent = cos(omega_d * t)
+            let sinCoefficient = (zeta * omega_n - initialVelocity) / omega_d
+            let sinComponent = sinCoefficient * sin(omega_d * t)
+
+            return 1 - decay * (cosComponent + sinComponent)
+        } else if zeta == 1 {
+            // Critically damped: fastest return without oscillation
+            // x(t) = 1 - e^(-ω_n*t) * (1 + (ω_n - v0) * t)
+            let decay = exp(-omega_n * t)
+            return 1 - decay * (1 + (omega_n - initialVelocity) * t)
+        } else {
+            // Overdamped: slow return without oscillation
+            // x(t) = 1 - A*e^(r1*t) - B*e^(r2*t)
+            // where r1, r2 = -ω_n * (ζ ± sqrt(ζ² - 1))
+            let sqrtTerm = sqrt(zeta * zeta - 1)
+            let r1 = -omega_n * (zeta - sqrtTerm)
+            let r2 = -omega_n * (zeta + sqrtTerm)
+
+            // Solve for A and B using initial conditions:
+            // x(0) = 0 → 1 - A - B = 0 → A + B = 1
+            // v(0) = v0 → -A*r1 - B*r2 = v0
+            // A = (r2 + v0) / (r2 - r1)
+            // B = 1 - A
+            let A = (r2 + initialVelocity) / (r2 - r1)
+            let B = 1 - A
+
+            return 1 - A * exp(r1 * t) - B * exp(r2 * t)
+        }
+    }
 }

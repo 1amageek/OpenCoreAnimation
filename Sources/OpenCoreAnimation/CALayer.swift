@@ -259,12 +259,20 @@ open class CALayer: CAMediaTiming, Hashable {
             }
         }
 
-        // Apply timing function
-        if let timingFunction = animation.timingFunction {
+        // Apply spring physics or timing function
+        if let springAnimation = animation as? CASpringAnimation {
+            // For spring animations, use physics-based interpolation
+            // Calculate the actual elapsed time for spring physics
+            let springTime = progress * singleCycleDuration
+            progress = CFTimeInterval(springAnimation.springValue(at: springTime))
+            // Spring animations can overshoot, so don't clamp to 0-1
+        } else if let timingFunction = animation.timingFunction {
+            // Apply timing function for non-spring animations
             progress = CFTimeInterval(timingFunction.evaluate(at: Float(progress)))
+            progress = max(0, min(1, progress))
+        } else {
+            progress = max(0, min(1, progress))
         }
-
-        progress = max(0, min(1, progress))
 
         // Interpolate and apply value based on animation type
         applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: progress)
@@ -275,16 +283,78 @@ open class CALayer: CAMediaTiming, Hashable {
         guard let animations = group.animations else { return }
 
         for animation in animations {
-            // Child animations inherit timing properties from the group if not set
-            if animation.duration == 0 {
-                animation.duration = group.duration
-            }
-            if animation.addedTime == 0 {
-                animation.addedTime = group.addedTime
-            }
-            // Apply each child animation
-            applyAnimation(animation, to: layer, at: time)
+            // Create a context with inherited timing properties
+            // Note: We don't modify the animation object directly to avoid side effects
+            let effectiveDuration = animation.duration > 0 ? animation.duration : group.duration
+            let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : group.addedTime
+
+            // Apply each child animation with effective timing
+            applyAnimationWithContext(animation, to: layer, at: time,
+                                      effectiveDuration: effectiveDuration,
+                                      effectiveAddedTime: effectiveAddedTime)
         }
+    }
+
+    /// Applies an animation with explicit timing context (used by animation groups).
+    private func applyAnimationWithContext(_ animation: CAAnimation, to layer: CALayer, at time: CFTimeInterval,
+                                           effectiveDuration: CFTimeInterval, effectiveAddedTime: CFTimeInterval) {
+        // Handle nested animation groups
+        if let animationGroup = animation as? CAAnimationGroup {
+            applyAnimationGroup(animationGroup, to: layer, at: time)
+            return
+        }
+
+        guard let propertyAnimation = animation as? CAPropertyAnimation,
+              let keyPath = propertyAnimation.keyPath else { return }
+
+        // Calculate animation progress with effective timing
+        let elapsed = time - effectiveAddedTime - animation.beginTime
+
+        // Get the effective duration for a single cycle
+        let singleCycleDuration: CFTimeInterval
+        if let springAnimation = animation as? CASpringAnimation {
+            singleCycleDuration = effectiveDuration > 0 ? effectiveDuration : springAnimation.settlingDuration
+        } else {
+            singleCycleDuration = effectiveDuration > 0 ? effectiveDuration : CATransaction.animationDuration()
+        }
+
+        guard singleCycleDuration > 0 else { return }
+
+        // Handle fillMode for animations that haven't started yet
+        if elapsed < 0 {
+            switch animation.fillMode {
+            case .backwards, .both:
+                applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: 0)
+            default:
+                return
+            }
+            return
+        }
+
+        var progress = elapsed / singleCycleDuration
+
+        // Handle repeat count and autoreverses (simplified for group context)
+        if progress >= 1 {
+            switch animation.fillMode {
+            case .forwards, .both:
+                progress = 1
+            default:
+                return
+            }
+        }
+
+        // Apply spring physics or timing function
+        if let springAnimation = animation as? CASpringAnimation {
+            let springTime = progress * singleCycleDuration
+            progress = CFTimeInterval(springAnimation.springValue(at: springTime))
+        } else if let timingFunction = animation.timingFunction {
+            progress = CFTimeInterval(timingFunction.evaluate(at: Float(progress)))
+            progress = max(0, min(1, progress))
+        } else {
+            progress = max(0, min(1, progress))
+        }
+
+        applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: progress)
     }
 
     /// Applies an animation value to a layer property.
@@ -396,37 +466,99 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func applyTransformAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        // Get the model layer's base transform (self is the model layer)
+        let baseTransform = _transform
+
         switch keyPath {
         case "transform":
+            // Full transform animation: interpolate between from and to values
             guard let from = (animation.fromValue as? CATransform3D) ?? _transform as CATransform3D?,
                   let to = (animation.toValue as? CATransform3D) ?? _transform as CATransform3D? else { return }
             layer._transform = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
+
         case "transform.scale":
+            // Scale animation: apply scale to the base transform
             let from = (animation.fromValue as? CGFloat) ?? 1.0
             let to = (animation.toValue as? CGFloat) ?? 1.0
             let scale = from + CGFloat(progress) * (to - from)
-            layer._transform = CATransform3DMakeScale(scale, scale, scale)
+            // Apply scale to base transform instead of replacing it
+            layer._transform = CATransform3DScale(baseTransform, scale, scale, scale)
+
         case "transform.scale.x":
+            // Scale X: modify only the X scale component
             let from = (animation.fromValue as? CGFloat) ?? 1.0
             let to = (animation.toValue as? CGFloat) ?? 1.0
-            layer._transform.m11 = from + CGFloat(progress) * (to - from)
+            let scaleX = from + CGFloat(progress) * (to - from)
+            // Apply X scale to base transform
+            layer._transform = CATransform3DScale(baseTransform, scaleX, 1, 1)
+
         case "transform.scale.y":
+            // Scale Y: modify only the Y scale component
             let from = (animation.fromValue as? CGFloat) ?? 1.0
             let to = (animation.toValue as? CGFloat) ?? 1.0
-            layer._transform.m22 = from + CGFloat(progress) * (to - from)
-        case "transform.rotation.z":
+            let scaleY = from + CGFloat(progress) * (to - from)
+            // Apply Y scale to base transform
+            layer._transform = CATransform3DScale(baseTransform, 1, scaleY, 1)
+
+        case "transform.scale.z":
+            // Scale Z: modify only the Z scale component
+            let from = (animation.fromValue as? CGFloat) ?? 1.0
+            let to = (animation.toValue as? CGFloat) ?? 1.0
+            let scaleZ = from + CGFloat(progress) * (to - from)
+            // Apply Z scale to base transform
+            layer._transform = CATransform3DScale(baseTransform, 1, 1, scaleZ)
+
+        case "transform.rotation", "transform.rotation.z":
+            // Rotation around Z axis: apply rotation to base transform
             let from = (animation.fromValue as? CGFloat) ?? 0
             let to = (animation.toValue as? CGFloat) ?? 0
             let angle = from + CGFloat(progress) * (to - from)
-            layer._transform = CATransform3DMakeRotation(angle, 0, 0, 1)
+            // Apply rotation to base transform instead of replacing it
+            layer._transform = CATransform3DRotate(baseTransform, angle, 0, 0, 1)
+
+        case "transform.rotation.x":
+            // Rotation around X axis
+            let from = (animation.fromValue as? CGFloat) ?? 0
+            let to = (animation.toValue as? CGFloat) ?? 0
+            let angle = from + CGFloat(progress) * (to - from)
+            layer._transform = CATransform3DRotate(baseTransform, angle, 1, 0, 0)
+
+        case "transform.rotation.y":
+            // Rotation around Y axis
+            let from = (animation.fromValue as? CGFloat) ?? 0
+            let to = (animation.toValue as? CGFloat) ?? 0
+            let angle = from + CGFloat(progress) * (to - from)
+            layer._transform = CATransform3DRotate(baseTransform, angle, 0, 1, 0)
+
+        case "transform.translation":
+            // Translation animation: apply translation to base transform
+            guard let from = (animation.fromValue as? CGSize) ?? CGSize.zero as CGSize?,
+                  let to = (animation.toValue as? CGSize) ?? CGSize.zero as CGSize? else { return }
+            let tx = from.width + CGFloat(progress) * (to.width - from.width)
+            let ty = from.height + CGFloat(progress) * (to.height - from.height)
+            layer._transform = CATransform3DTranslate(baseTransform, tx, ty, 0)
+
         case "transform.translation.x":
+            // Translation X: apply X translation to base transform
             let from = (animation.fromValue as? CGFloat) ?? 0
             let to = (animation.toValue as? CGFloat) ?? 0
-            layer._transform.m41 = from + CGFloat(progress) * (to - from)
+            let tx = from + CGFloat(progress) * (to - from)
+            layer._transform = CATransform3DTranslate(baseTransform, tx, 0, 0)
+
         case "transform.translation.y":
+            // Translation Y: apply Y translation to base transform
             let from = (animation.fromValue as? CGFloat) ?? 0
             let to = (animation.toValue as? CGFloat) ?? 0
-            layer._transform.m42 = from + CGFloat(progress) * (to - from)
+            let ty = from + CGFloat(progress) * (to - from)
+            layer._transform = CATransform3DTranslate(baseTransform, 0, ty, 0)
+
+        case "transform.translation.z":
+            // Translation Z: apply Z translation to base transform
+            let from = (animation.fromValue as? CGFloat) ?? 0
+            let to = (animation.toValue as? CGFloat) ?? 0
+            let tz = from + CGFloat(progress) * (to - from)
+            layer._transform = CATransform3DTranslate(baseTransform, 0, 0, tz)
+
         default:
             break
         }
@@ -491,9 +623,21 @@ open class CALayer: CAMediaTiming, Hashable {
         case .discrete:
             // No interpolation, use the from value
             applyKeyframeValue(fromValue, layer: layer, keyPath: keyPath)
-        case .linear, .cubic, .paced, .cubicPaced:
+        case .linear, .paced:
             // Linear interpolation between values
             interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
+        case .cubic, .cubicPaced:
+            // Catmull-Rom spline interpolation
+            // Get the 4 control points: P0, P1, P2, P3
+            let p0Index = max(0, startIndex - 1)
+            let p3Index = min(values.count - 1, endIndex + 1)
+
+            let p0 = values[p0Index]
+            let p1 = values[startIndex]
+            let p2 = values[endIndex]
+            let p3 = values[p3Index]
+
+            interpolateCubicKeyframeValue(p0: p0, p1: p1, p2: p2, p3: p3, t: CGFloat(adjustedProgress), layer: layer, keyPath: keyPath)
         default:
             interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
         }
@@ -580,6 +724,106 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
+    /// Catmull-Rom spline interpolation between 4 control points.
+    ///
+    /// The Catmull-Rom spline passes through P1 and P2, using P0 and P3 to determine
+    /// the tangent at those points. The parameter `t` goes from 0 (at P1) to 1 (at P2).
+    ///
+    /// Formula:
+    /// ```
+    /// p(t) = 0.5 * ((2*P1) + (-P0 + P2)*t + (2*P0 - 5*P1 + 4*P2 - P3)*t² + (-P0 + 3*P1 - 3*P2 + P3)*t³)
+    /// ```
+    private func interpolateCubicKeyframeValue(p0: Any, p1: Any, p2: Any, p3: Any, t: CGFloat, layer: CALayer, keyPath: String) {
+        switch keyPath {
+        case "opacity":
+            if let v0 = p0 as? Float, let v1 = p1 as? Float, let v2 = p2 as? Float, let v3 = p3 as? Float {
+                layer._opacity = catmullRom(v0, v1, v2, v3, Float(t))
+            }
+        case "position":
+            if let v0 = p0 as? CGPoint, let v1 = p1 as? CGPoint, let v2 = p2 as? CGPoint, let v3 = p3 as? CGPoint {
+                layer._position = CGPoint(
+                    x: catmullRom(v0.x, v1.x, v2.x, v3.x, t),
+                    y: catmullRom(v0.y, v1.y, v2.y, v3.y, t)
+                )
+            }
+        case "bounds":
+            if let v0 = p0 as? CGRect, let v1 = p1 as? CGRect, let v2 = p2 as? CGRect, let v3 = p3 as? CGRect {
+                layer._bounds = CGRect(
+                    x: catmullRom(v0.origin.x, v1.origin.x, v2.origin.x, v3.origin.x, t),
+                    y: catmullRom(v0.origin.y, v1.origin.y, v2.origin.y, v3.origin.y, t),
+                    width: catmullRom(v0.size.width, v1.size.width, v2.size.width, v3.size.width, t),
+                    height: catmullRom(v0.size.height, v1.size.height, v2.size.height, v3.size.height, t)
+                )
+            }
+        case "cornerRadius", "borderWidth", "shadowRadius", "zPosition":
+            if let v0 = p0 as? CGFloat, let v1 = p1 as? CGFloat, let v2 = p2 as? CGFloat, let v3 = p3 as? CGFloat {
+                let value = catmullRom(v0, v1, v2, v3, t)
+                switch keyPath {
+                case "cornerRadius": layer._cornerRadius = value
+                case "borderWidth": layer._borderWidth = value
+                case "shadowRadius": layer._shadowRadius = value
+                case "zPosition": layer._zPosition = value
+                default: break
+                }
+            }
+        case "transform":
+            if let v0 = p0 as? CATransform3D, let v1 = p1 as? CATransform3D, let v2 = p2 as? CATransform3D, let v3 = p3 as? CATransform3D {
+                layer._transform = catmullRomTransform(v0, v1, v2, v3, t)
+            }
+        default:
+            // Fallback to linear interpolation for unsupported types
+            interpolateKeyframeValue(from: p1, to: p2, progress: CFTimeInterval(t), layer: layer, keyPath: keyPath)
+        }
+    }
+
+    /// Catmull-Rom spline interpolation for a single CGFloat value.
+    private func catmullRom(_ p0: CGFloat, _ p1: CGFloat, _ p2: CGFloat, _ p3: CGFloat, _ t: CGFloat) -> CGFloat {
+        let t2 = t * t
+        let t3 = t2 * t
+
+        return 0.5 * (
+            (2 * p1) +
+            (-p0 + p2) * t +
+            (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+            (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+        )
+    }
+
+    /// Catmull-Rom spline interpolation for a single Float value.
+    private func catmullRom(_ p0: Float, _ p1: Float, _ p2: Float, _ p3: Float, _ t: Float) -> Float {
+        let t2 = t * t
+        let t3 = t2 * t
+
+        return 0.5 * (
+            (2 * p1) +
+            (-p0 + p2) * t +
+            (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+            (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+        )
+    }
+
+    /// Catmull-Rom spline interpolation for CATransform3D.
+    private func catmullRomTransform(_ p0: CATransform3D, _ p1: CATransform3D, _ p2: CATransform3D, _ p3: CATransform3D, _ t: CGFloat) -> CATransform3D {
+        return CATransform3D(
+            m11: catmullRom(p0.m11, p1.m11, p2.m11, p3.m11, t),
+            m12: catmullRom(p0.m12, p1.m12, p2.m12, p3.m12, t),
+            m13: catmullRom(p0.m13, p1.m13, p2.m13, p3.m13, t),
+            m14: catmullRom(p0.m14, p1.m14, p2.m14, p3.m14, t),
+            m21: catmullRom(p0.m21, p1.m21, p2.m21, p3.m21, t),
+            m22: catmullRom(p0.m22, p1.m22, p2.m22, p3.m22, t),
+            m23: catmullRom(p0.m23, p1.m23, p2.m23, p3.m23, t),
+            m24: catmullRom(p0.m24, p1.m24, p2.m24, p3.m24, t),
+            m31: catmullRom(p0.m31, p1.m31, p2.m31, p3.m31, t),
+            m32: catmullRom(p0.m32, p1.m32, p2.m32, p3.m32, t),
+            m33: catmullRom(p0.m33, p1.m33, p2.m33, p3.m33, t),
+            m34: catmullRom(p0.m34, p1.m34, p2.m34, p3.m34, t),
+            m41: catmullRom(p0.m41, p1.m41, p2.m41, p3.m41, t),
+            m42: catmullRom(p0.m42, p1.m42, p2.m42, p3.m42, t),
+            m43: catmullRom(p0.m43, p1.m43, p2.m43, p3.m43, t),
+            m44: catmullRom(p0.m44, p1.m44, p2.m44, p3.m44, t)
+        )
+    }
+
     /// Returns the model layer object associated with the receiver, if any.
     ///
     /// - Returns: The model layer if this is a presentation layer, otherwise `self`.
@@ -627,21 +871,34 @@ open class CALayer: CAMediaTiming, Hashable {
     /// The opacity of the receiver. Animatable.
     open var opacity: Float {
         get { return _opacity }
-        set { _opacity = max(0, min(1, newValue)) }
+        set {
+            let oldValue = _opacity
+            let clampedValue = max(0, min(1, newValue))
+            _opacity = clampedValue
+            CATransaction.registerChange(layer: self, keyPath: "opacity", oldValue: oldValue, newValue: clampedValue)
+        }
     }
 
     private var _isHidden: Bool = false
     /// A Boolean indicating whether the layer is displayed. Animatable.
     open var isHidden: Bool {
         get { return _isHidden }
-        set { _isHidden = newValue }
+        set {
+            let oldValue = _isHidden
+            _isHidden = newValue
+            CATransaction.registerChange(layer: self, keyPath: "isHidden", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _masksToBounds: Bool = false
     /// A Boolean indicating whether sublayers are clipped to the layer's bounds. Animatable.
     open var masksToBounds: Bool {
         get { return _masksToBounds }
-        set { _masksToBounds = newValue }
+        set {
+            let oldValue = _masksToBounds
+            _masksToBounds = newValue
+            CATransaction.registerChange(layer: self, keyPath: "masksToBounds", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     /// An optional layer whose alpha channel is used to mask the layer's content.
@@ -651,14 +908,23 @@ open class CALayer: CAMediaTiming, Hashable {
     /// A Boolean indicating whether the layer displays its content when facing away from the viewer. Animatable.
     open var isDoubleSided: Bool {
         get { return _isDoubleSided }
-        set { _isDoubleSided = newValue }
+        set {
+            let oldValue = _isDoubleSided
+            _isDoubleSided = newValue
+            CATransaction.registerChange(layer: self, keyPath: "isDoubleSided", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _cornerRadius: CGFloat = 0
     /// The radius to use when drawing rounded corners for the layer's background. Animatable.
     open var cornerRadius: CGFloat {
         get { return _cornerRadius }
-        set { _cornerRadius = max(0, newValue) }
+        set {
+            let oldValue = _cornerRadius
+            let clampedValue = max(0, newValue)
+            _cornerRadius = clampedValue
+            CATransaction.registerChange(layer: self, keyPath: "cornerRadius", oldValue: oldValue, newValue: clampedValue)
+        }
     }
 
     /// A bitmask defining which of the four corners receives the masking.
@@ -671,56 +937,91 @@ open class CALayer: CAMediaTiming, Hashable {
     /// The width of the layer's border. Animatable.
     open var borderWidth: CGFloat {
         get { return _borderWidth }
-        set { _borderWidth = max(0, newValue) }
+        set {
+            let oldValue = _borderWidth
+            let clampedValue = max(0, newValue)
+            _borderWidth = clampedValue
+            CATransaction.registerChange(layer: self, keyPath: "borderWidth", oldValue: oldValue, newValue: clampedValue)
+        }
     }
 
     private var _borderColor: CGColor?
     /// The color of the layer's border. Animatable.
     open var borderColor: CGColor? {
         get { return _borderColor }
-        set { _borderColor = newValue }
+        set {
+            let oldValue = _borderColor
+            _borderColor = newValue
+            CATransaction.registerChange(layer: self, keyPath: "borderColor", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _backgroundColor: CGColor?
     /// The background color of the receiver. Animatable.
     open var backgroundColor: CGColor? {
         get { return _backgroundColor }
-        set { _backgroundColor = newValue }
+        set {
+            let oldValue = _backgroundColor
+            _backgroundColor = newValue
+            CATransaction.registerChange(layer: self, keyPath: "backgroundColor", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _shadowOpacity: Float = 0
     /// The opacity of the layer's shadow. Animatable.
     open var shadowOpacity: Float {
         get { return _shadowOpacity }
-        set { _shadowOpacity = max(0, min(1, newValue)) }
+        set {
+            let oldValue = _shadowOpacity
+            let clampedValue = max(0, min(1, newValue))
+            _shadowOpacity = clampedValue
+            CATransaction.registerChange(layer: self, keyPath: "shadowOpacity", oldValue: oldValue, newValue: clampedValue)
+        }
     }
 
     private var _shadowRadius: CGFloat = 3
     /// The blur radius (in points) used to render the layer's shadow. Animatable.
     open var shadowRadius: CGFloat {
         get { return _shadowRadius }
-        set { _shadowRadius = max(0, newValue) }
+        set {
+            let oldValue = _shadowRadius
+            let clampedValue = max(0, newValue)
+            _shadowRadius = clampedValue
+            CATransaction.registerChange(layer: self, keyPath: "shadowRadius", oldValue: oldValue, newValue: clampedValue)
+        }
     }
 
     private var _shadowOffset: CGSize = CGSize(width: 0, height: -3)
     /// The offset (in points) of the layer's shadow. Animatable.
     open var shadowOffset: CGSize {
         get { return _shadowOffset }
-        set { _shadowOffset = newValue }
+        set {
+            let oldValue = _shadowOffset
+            _shadowOffset = newValue
+            CATransaction.registerChange(layer: self, keyPath: "shadowOffset", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _shadowColor: CGColor?
     /// The color of the layer's shadow. Animatable.
     open var shadowColor: CGColor? {
         get { return _shadowColor }
-        set { _shadowColor = newValue }
+        set {
+            let oldValue = _shadowColor
+            _shadowColor = newValue
+            CATransaction.registerChange(layer: self, keyPath: "shadowColor", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _shadowPath: CGPath?
     /// The shape of the layer's shadow. Animatable.
     open var shadowPath: CGPath? {
         get { return _shadowPath }
-        set { _shadowPath = newValue }
+        set {
+            let oldValue = _shadowPath
+            _shadowPath = newValue
+            CATransaction.registerChange(layer: self, keyPath: "shadowPath", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     /// An optional dictionary used to store property values that aren't explicitly defined by the layer.
@@ -1004,42 +1305,67 @@ open class CALayer: CAMediaTiming, Hashable {
     /// The layer's bounds rectangle. Animatable.
     open var bounds: CGRect {
         get { return _bounds }
-        set { _bounds = newValue }
+        set {
+            let oldValue = _bounds
+            _bounds = newValue
+            CATransaction.registerChange(layer: self, keyPath: "bounds", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _position: CGPoint = .zero
     /// The layer's position in its superlayer's coordinate space. Animatable.
     open var position: CGPoint {
         get { return _position }
-        set { _position = newValue }
+        set {
+            let oldValue = _position
+            _position = newValue
+            CATransaction.registerChange(layer: self, keyPath: "position", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _zPosition: CGFloat = 0
     /// The layer's position on the z axis. Animatable.
     open var zPosition: CGFloat {
         get { return _zPosition }
-        set { _zPosition = newValue }
+        set {
+            let oldValue = _zPosition
+            _zPosition = newValue
+            CATransaction.registerChange(layer: self, keyPath: "zPosition", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _anchorPointZ: CGFloat = 0
     /// The anchor point for the layer's position along the z axis. Animatable.
     open var anchorPointZ: CGFloat {
         get { return _anchorPointZ }
-        set { _anchorPointZ = newValue }
+        set {
+            let oldValue = _anchorPointZ
+            _anchorPointZ = newValue
+            CATransaction.registerChange(layer: self, keyPath: "anchorPointZ", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _anchorPoint: CGPoint = CGPoint(x: 0.5, y: 0.5)
     /// Defines the anchor point of the layer's bounds rectangle. Animatable.
     open var anchorPoint: CGPoint {
         get { return _anchorPoint }
-        set { _anchorPoint = newValue }
+        set {
+            let oldValue = _anchorPoint
+            _anchorPoint = newValue
+            CATransaction.registerChange(layer: self, keyPath: "anchorPoint", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _contentsScale: CGFloat = 1.0
-    /// The scale factor applied to the layer.
+    /// The scale factor applied to the layer. Animatable.
     open var contentsScale: CGFloat {
         get { return _contentsScale }
-        set { _contentsScale = max(0, newValue) }
+        set {
+            let oldValue = _contentsScale
+            let clampedValue = max(0, newValue)
+            _contentsScale = clampedValue
+            CATransaction.registerChange(layer: self, keyPath: "contentsScale", oldValue: oldValue, newValue: clampedValue)
+        }
     }
 
     // MARK: - Managing the Layer's Transform
@@ -1048,14 +1374,22 @@ open class CALayer: CAMediaTiming, Hashable {
     /// The transform applied to the layer's contents. Animatable.
     open var transform: CATransform3D {
         get { return _transform }
-        set { _transform = newValue }
+        set {
+            let oldValue = _transform
+            _transform = newValue
+            CATransaction.registerChange(layer: self, keyPath: "transform", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     private var _sublayerTransform: CATransform3D = CATransform3DIdentity
     /// Specifies the transform to apply to sublayers when rendering. Animatable.
     open var sublayerTransform: CATransform3D {
         get { return _sublayerTransform }
-        set { _sublayerTransform = newValue }
+        set {
+            let oldValue = _sublayerTransform
+            _sublayerTransform = newValue
+            CATransaction.registerChange(layer: self, keyPath: "sublayerTransform", oldValue: oldValue, newValue: newValue)
+        }
     }
 
     /// Returns an affine version of the layer's transform.
@@ -1376,9 +1710,67 @@ open class CALayer: CAMediaTiming, Hashable {
     /// A dictionary containing layer actions.
     open var actions: [String: any CAAction]?
 
+    /// The list of animatable property keys.
+    ///
+    /// These properties support implicit animations when changed outside of a
+    /// `CATransaction.setDisableActions(true)` block.
+    private static let animatableKeys: Set<String> = [
+        "opacity",
+        "bounds",
+        "bounds.origin",
+        "bounds.size",
+        "position",
+        "position.x",
+        "position.y",
+        "zPosition",
+        "anchorPoint",
+        "anchorPointZ",
+        "transform",
+        "transform.scale",
+        "transform.scale.x",
+        "transform.scale.y",
+        "transform.scale.z",
+        "transform.rotation",
+        "transform.rotation.x",
+        "transform.rotation.y",
+        "transform.rotation.z",
+        "transform.translation",
+        "transform.translation.x",
+        "transform.translation.y",
+        "transform.translation.z",
+        "sublayerTransform",
+        "cornerRadius",
+        "borderWidth",
+        "borderColor",
+        "backgroundColor",
+        "shadowOpacity",
+        "shadowRadius",
+        "shadowOffset",
+        "shadowColor",
+        "shadowPath",
+        "contentsRect",
+        "contentsCenter",
+        "contentsScale",
+        "isHidden",
+        "masksToBounds",
+        "isDoubleSided",
+        "shouldRasterize",
+        "rasterizationScale"
+    ]
+
     /// Returns the default action for the current class.
+    ///
+    /// For animatable properties, this returns a `CABasicAnimation` configured
+    /// with the current transaction's duration and timing function.
     open class func defaultAction(forKey event: String) -> (any CAAction)? {
-        return nil
+        guard animatableKeys.contains(event) else { return nil }
+
+        let animation = CABasicAnimation(keyPath: event)
+        animation.duration = CATransaction.animationDuration()
+        if let timingFunction = CATransaction.animationTimingFunction() {
+            animation.timingFunction = timingFunction
+        }
+        return animation
     }
 
     // MARK: - Mapping Between Coordinate and Time Spaces
@@ -1596,15 +1988,21 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Returns the farthest descendant of the receiver in the layer hierarchy (including itself)
     /// that contains the specified point.
+    ///
+    /// - Parameter p: A point in the coordinate system of the receiver's superlayer.
+    /// - Returns: The layer that contains the point, or nil if the point lies outside the receiver's bounds.
     open func hitTest(_ p: CGPoint) -> CALayer? {
         guard !isHidden && opacity > 0 else { return nil }
-        guard contains(p) else { return nil }
+
+        // Convert from superlayer coordinates to local coordinates
+        let localPoint = convertPointFromSuperlayer(p)
+        guard contains(localPoint) else { return nil }
 
         // Check sublayers in reverse order (front to back)
+        // localPoint is in self's coordinate system, which is the sublayer's superlayer coordinate system
         if let sublayers = sublayers?.reversed() {
             for sublayer in sublayers {
-                let convertedPoint = sublayer.convert(p, from: self)
-                if let hit = sublayer.hitTest(convertedPoint) {
+                if let hit = sublayer.hitTest(localPoint) {
                     return hit
                 }
             }

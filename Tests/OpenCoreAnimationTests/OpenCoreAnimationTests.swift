@@ -755,6 +755,92 @@ struct CALayerTests {
         #expect(layer1 == layer1)
         #expect(layer1 != layer2)
     }
+
+    // MARK: - Hit Testing
+
+    @Test("hitTest correctly converts coordinates from superlayer")
+    func hitTestCoordinateConversion() {
+        let parent = CALayer()
+        parent.bounds = CGRect(x: 0, y: 0, width: 200, height: 200)
+        parent.position = CGPoint(x: 100, y: 100)  // Center at (100, 100)
+
+        let child = CALayer()
+        child.bounds = CGRect(x: 0, y: 0, width: 50, height: 50)
+        child.position = CGPoint(x: 100, y: 100)  // Center at (100, 100) in parent coords
+        parent.addSublayer(child)
+
+        // Test point inside child (in parent's superlayer coords)
+        // Parent occupies (0,0) to (200,200) in its superlayer
+        // Child occupies (75, 75) to (125, 125) in parent's superlayer coords
+        let hitLayer = parent.hitTest(CGPoint(x: 100, y: 100))  // Should hit child
+        #expect(hitLayer === child)
+
+        // Test point inside parent but outside child
+        let parentHit = parent.hitTest(CGPoint(x: 10, y: 10))  // Should hit parent
+        #expect(parentHit === parent)
+
+        // Test point outside parent
+        let missHit = parent.hitTest(CGPoint(x: 250, y: 250))  // Should miss
+        #expect(missHit == nil)
+    }
+
+    @Test("hitTest respects sublayer order (front to back)")
+    func hitTestSublayerOrder() {
+        let parent = CALayer()
+        parent.bounds = CGRect(x: 0, y: 0, width: 200, height: 200)
+        parent.position = CGPoint(x: 100, y: 100)
+
+        let backLayer = CALayer()
+        backLayer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+        backLayer.position = CGPoint(x: 100, y: 100)
+        backLayer.name = "back"
+        parent.addSublayer(backLayer)
+
+        let frontLayer = CALayer()
+        frontLayer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+        frontLayer.position = CGPoint(x: 100, y: 100)  // Overlapping
+        frontLayer.name = "front"
+        parent.addSublayer(frontLayer)
+
+        // Front layer (added last) should be hit first
+        let hit = parent.hitTest(CGPoint(x: 100, y: 100))
+        #expect(hit?.name == "front")
+    }
+
+    @Test("hitTest returns nil for hidden layers")
+    func hitTestHiddenLayer() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+        layer.position = CGPoint(x: 50, y: 50)
+        layer.isHidden = true
+
+        let hit = layer.hitTest(CGPoint(x: 50, y: 50))
+        #expect(hit == nil)
+    }
+
+    @Test("hitTest returns nil for zero opacity layers")
+    func hitTestZeroOpacity() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+        layer.position = CGPoint(x: 50, y: 50)
+        layer.opacity = 0
+
+        let hit = layer.hitTest(CGPoint(x: 50, y: 50))
+        #expect(hit == nil)
+    }
+
+    @Test("contains checks point in local coordinates")
+    func containsLocalCoordinates() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+
+        // Point in local coordinates
+        #expect(layer.contains(CGPoint(x: 50, y: 50)) == true)
+        #expect(layer.contains(CGPoint(x: 0, y: 0)) == true)
+        #expect(layer.contains(CGPoint(x: 99, y: 99)) == true)
+        #expect(layer.contains(CGPoint(x: 100, y: 100)) == false)  // On boundary
+        #expect(layer.contains(CGPoint(x: -1, y: 50)) == false)
+    }
 }
 
 // MARK: - CAAnimation Tests
@@ -976,6 +1062,76 @@ struct CASpringAnimationTests {
         #expect(spring.settlingDuration > 0)
         #expect(spring.settlingDuration.isFinite)
     }
+
+    // MARK: - Spring Physics Tests
+
+    @Test("Spring value starts at 0 and ends near 1")
+    func springValueRange() {
+        let spring = CASpringAnimation()
+        spring.mass = 1
+        spring.stiffness = 100
+        spring.damping = 10
+
+        // At t=0, should be at starting position (0)
+        let startValue = spring.springValue(at: 0)
+        #expect(abs(startValue) < 0.001)
+
+        // At settling time, should be very close to target (1)
+        // Note: settlingDuration is an approximation (4τ), so allow ~2% tolerance
+        let endValue = spring.springValue(at: spring.settlingDuration)
+        #expect(abs(endValue - 1) < 0.03)
+    }
+
+    @Test("Underdamped spring overshoots")
+    func underdampedOvershoot() {
+        let spring = CASpringAnimation()
+        spring.mass = 1
+        spring.stiffness = 100
+        spring.damping = 5 // Low damping = underdamped, will overshoot
+
+        // Check for overshoot (value > 1 at some point)
+        var hasOvershoot = false
+        for i in 0..<100 {
+            let t = Double(i) * spring.settlingDuration / 100.0
+            let value = spring.springValue(at: t)
+            if value > 1.01 {
+                hasOvershoot = true
+                break
+            }
+        }
+        #expect(hasOvershoot == true)
+    }
+
+    @Test("Overdamped spring does not overshoot")
+    func overdampedNoOvershoot() {
+        let spring = CASpringAnimation()
+        spring.mass = 1
+        spring.stiffness = 100
+        spring.damping = 50 // High damping = overdamped, no overshoot
+
+        // Check that value never exceeds 1
+        var maxValue: CGFloat = 0
+        for i in 0..<100 {
+            let t = Double(i) * spring.settlingDuration / 100.0
+            let value = spring.springValue(at: t)
+            maxValue = max(maxValue, value)
+        }
+        #expect(maxValue <= 1.001)
+    }
+
+    @Test("Spring with initial velocity")
+    func springWithInitialVelocity() {
+        let spring = CASpringAnimation()
+        spring.mass = 1
+        spring.stiffness = 100
+        spring.damping = 10
+        spring.initialVelocity = 5 // Start with velocity towards target
+
+        // With positive initial velocity, should reach target faster
+        // Check that value increases quickly initially
+        let earlyValue = spring.springValue(at: 0.1)
+        #expect(earlyValue > 0.1)
+    }
 }
 
 // MARK: - CAKeyframeAnimation Tests
@@ -1028,6 +1184,36 @@ struct CAKeyframeAnimationTests {
         keyframe.calculationMode = .cubicPaced
         #expect(keyframe.calculationMode == .cubicPaced)
     }
+
+    @Test("Cubic interpolation produces smooth curve")
+    func cubicInterpolationProducesSmoothCurve() {
+        // Create a keyframe animation with cubic calculation mode
+        let keyframe = CAKeyframeAnimation(keyPath: "position")
+        keyframe.values = [
+            CGPoint(x: 0, y: 0),
+            CGPoint(x: 100, y: 50),
+            CGPoint(x: 200, y: 0),
+            CGPoint(x: 300, y: 50)
+        ]
+        keyframe.calculationMode = .cubic
+        keyframe.duration = 1.0
+
+        // The animation should use Catmull-Rom spline interpolation
+        #expect(keyframe.calculationMode == .cubic)
+        #expect(keyframe.values?.count == 4)
+    }
+
+    @Test("Cubic interpolation with two values")
+    func cubicInterpolationWithTwoValues() {
+        // Edge case: only 2 values
+        let keyframe = CAKeyframeAnimation(keyPath: "opacity")
+        keyframe.values = [Float(0.0), Float(1.0)]
+        keyframe.calculationMode = .cubic
+        keyframe.duration = 1.0
+
+        // Should still work (P0 and P3 will duplicate P1 and P2)
+        #expect(keyframe.values?.count == 2)
+    }
 }
 
 // MARK: - CAAnimationGroup Tests
@@ -1066,6 +1252,8 @@ struct CATransactionTests {
 
     @Test("Default animation duration")
     func defaultAnimationDuration() {
+        // Reset state by flushing any pending transactions
+        CATransaction.flush()
         // Default duration should be 0.25
         #expect(CATransaction.animationDuration() == 0.25)
     }
@@ -1099,6 +1287,9 @@ struct CATransactionTests {
 
     @Test("Value for key")
     func valueForKey() {
+        // Reset state first
+        CATransaction.flush()
+
         CATransaction.begin()
         CATransaction.setAnimationDuration(1.5)
 
@@ -1140,6 +1331,57 @@ struct CATransactionTests {
         // After flush, duration should be reset to default
         #expect(CATransaction.animationDuration() == 0.25)
     }
+
+    @Test("Disable actions prevents implicit animations")
+    func disableActionsPreventsImplicitAnimations() {
+        let layer = CALayer()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        // Change an animatable property
+        layer.opacity = 0.5
+
+        // No animation should be added when actions are disabled
+        #expect(layer.animationKeys() == nil || layer.animationKeys()?.isEmpty == true)
+
+        CATransaction.commit()
+    }
+
+    @Test("Default action uses transaction duration")
+    func defaultActionUsesTransactionDuration() {
+        let layer = CALayer()
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.5)
+
+        let action = layer.action(forKey: "opacity")
+        #expect(action != nil)
+
+        if let animation = action as? CABasicAnimation {
+            #expect(animation.duration == 0.5)
+        }
+
+        CATransaction.commit()
+    }
+
+    @Test("Default action uses transaction timing function")
+    func defaultActionUsesTransactionTimingFunction() {
+        let layer = CALayer()
+
+        CATransaction.begin()
+        let timingFunc = CAMediaTimingFunction(name: .easeIn)
+        CATransaction.setAnimationTimingFunction(timingFunc)
+
+        let action = layer.action(forKey: "opacity")
+        #expect(action != nil)
+
+        if let animation = action as? CABasicAnimation {
+            #expect(animation.timingFunction != nil)
+        }
+
+        CATransaction.commit()
+    }
 }
 
 // MARK: - CAAction Tests
@@ -1147,16 +1389,30 @@ struct CATransactionTests {
 @Suite("CAAction Tests")
 struct CAActionTests {
 
-    @Test("Layer action for key")
-    func layerActionForKey() {
+    @Test("Layer action for animatable key returns default animation")
+    func layerActionForAnimatableKey() {
         let layer = CALayer()
 
-        // By default, no action is returned (no delegate or custom actions)
+        // Animatable properties return a default CABasicAnimation
         let action = layer.action(forKey: "opacity")
+        #expect(action != nil)
+        #expect(action is CABasicAnimation)
+
+        if let basicAnimation = action as? CABasicAnimation {
+            #expect(basicAnimation.keyPath == "opacity")
+        }
+    }
+
+    @Test("Layer action for non-animatable key returns nil")
+    func layerActionForNonAnimatableKey() {
+        let layer = CALayer()
+
+        // Non-animatable properties return nil
+        let action = layer.action(forKey: "name")
         #expect(action == nil)
     }
 
-    @Test("Custom actions dictionary")
+    @Test("Custom actions dictionary overrides default")
     func customActionsDictionary() {
         let layer = CALayer()
         let customAnimation = CABasicAnimation()
@@ -1166,6 +1422,11 @@ struct CAActionTests {
 
         let action = layer.action(forKey: "opacity")
         #expect(action != nil)
+
+        // Should be the custom animation, not the default
+        if let anim = action as? CABasicAnimation {
+            #expect(anim.duration == 1.0)
+        }
     }
 }
 

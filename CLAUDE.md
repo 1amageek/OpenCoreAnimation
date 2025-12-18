@@ -40,15 +40,54 @@ swift test --filter <TestName>  # Run a specific test
 swift build --triple wasm32-unknown-wasi  # Build for WASM
 ```
 
-## WASM-Only Implementation
+## Platform Strategy
 
-**OpenCoreAnimation is a WASM-only library.** All source files directly import `OpenCoreGraphics` without conditional compilation:
+**OpenCoreAnimation primarily targets WASM/Web environments**, but includes native implementations for testing purposes.
+
+### Production Use
+
+- **WASM**: Uses WebGPU via swift-webgpu, JavaScriptKit for browser APIs
+- **Native platforms (iOS, macOS)**: Users should import Apple's QuartzCore directly
+
+### Native Test Support
+
+To enable `swift test` on macOS/Linux, the library includes fallback implementations:
+
+| Component | WASM Implementation | Native (Test) Implementation |
+|-----------|---------------------|------------------------------|
+| Timing | `performance.now()` | `ProcessInfo.systemUptime` |
+| Display Link | `requestAnimationFrame` | `Timer` |
+| Transactions | `setTimeout` | `DispatchQueue.main.async` |
+| Renderer | `CAWebGPURenderer` | `CAMetalRenderer` |
+| Graphics | `OpenCoreGraphics` | `CoreGraphics` (re-exported) |
+
+These native implementations are **for testing only** and should not be used in production.
+
+### Conditional Compilation
+
+Use `#if arch(wasm32)` to distinguish between WASM and native platforms:
 
 ```swift
-import OpenCoreGraphics
+#if arch(wasm32)
+import JavaScriptKit
+// WASM-specific implementation
+#else
+import Foundation
+// Native fallback for testing
+#endif
 ```
 
-Do NOT use `#if canImport(CoreGraphics)` in source files. This library is never built for native platforms - on iOS/macOS, users import Apple's QuartzCore directly.
+For graphics types, `OpenCoreAnimation.swift` re-exports the appropriate module:
+
+```swift
+#if canImport(CoreGraphics)
+@_exported import CoreGraphics      // Native: use Apple's CoreGraphics
+#else
+@_exported import OpenCoreGraphics  // WASM: use OpenCoreGraphics
+#endif
+```
+
+### WASM-Specific Features
 
 For WASM-specific features like timing and display links, use JavaScriptKit directly:
 
@@ -85,9 +124,9 @@ import OpenCoreGraphics
 
 ### Overview
 
-OpenCoreAnimation is a **WASM/Web-only library** that uses **WebGPU** as its GPU rendering backend via [swift-webgpu](https://github.com/1amageek/swift-webgpu). This provides hardware-accelerated layer rendering comparable to Metal on Apple platforms.
+OpenCoreAnimation **primarily targets WASM/Web environments** and uses **WebGPU** as its GPU rendering backend via [swift-webgpu](https://github.com/1amageek/swift-webgpu). This provides hardware-accelerated layer rendering comparable to Metal on Apple platforms.
 
-**Key point**: This library does NOT run on native platforms (iOS, macOS). On native platforms, users import Apple's QuartzCore directly. OpenCoreAnimation exists solely to provide CoreAnimation API compatibility in WASM environments.
+**Key point**: On native platforms (iOS, macOS), users should import Apple's QuartzCore directly for production use. OpenCoreAnimation includes native fallback implementations (Metal renderer, Foundation-based timing) for **testing purposes only**.
 
 ### Dependency: swift-webgpu
 
@@ -423,8 +462,11 @@ Use `#if arch(wasm32)` to distinguish between WASM and native platforms:
 ┌──────────────────────────────────────────────────────────────────┐
 │                      OpenCoreAnimation                           │
 ├──────────────────────────────────────────────────────────────────┤
-│  共通 (常にimport)                                                │
-│  └── OpenCoreGraphics                                            │
+│  Graphics Types (OpenCoreAnimation.swift)                        │
+│  ├── #if canImport(CoreGraphics)                                 │
+│  │   └── @_exported import CoreGraphics  (Native)                │
+│  └── #else                                                       │
+│      └── @_exported import OpenCoreGraphics  (WASM)              │
 ├──────────────────────────────────────────────────────────────────┤
 │  #if arch(wasm32)                                                │
 │  │   import JavaScriptKit                                        │
@@ -447,8 +489,10 @@ Use `#if arch(wasm32)` to distinguish between WASM and native platforms:
 
 | Condition | Purpose |
 |-----------|---------|
+| `#if canImport(CoreGraphics)` | Graphics types re-export (Native vs OpenCoreGraphics) |
 | `#if arch(wasm32)` | WASM platform (WebGPU, JavaScriptKit) |
-| `#if canImport(Metal)` | Metal renderer (Apple platforms) |
+| `#if canImport(Metal)` | Metal renderer (Apple platforms for testing) |
+| `#if canImport(simd)` | SIMD helper types (Apple platforms) |
 
 #### Example: CAMediaTiming.swift
 
@@ -531,9 +575,9 @@ public final class CAMetalRenderer: CARenderer {
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Platform Strategy
+### User-Facing Platform Strategy
 
-OpenCoreAnimation is **exclusively for WASM/Web environments**. Within this library, WebGPU is always used - no conditional compilation needed for rendering backend.
+OpenCoreAnimation **primarily targets WASM/Web environments**. Native implementations exist only for testing.
 
 Users select between QuartzCore and OpenCoreAnimation at the import level:
 
@@ -556,13 +600,45 @@ layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
 - Always refer to Apple's official CoreAnimation documentation to ensure API signatures match exactly
 - Focus on APIs meaningful for WASM environments
 
+### API Compatibility Notes
+
+#### CADisplayLink
+
+While CADisplayLink maintains API signature compatibility, the callback mechanism differs on WASM:
+
+**CoreAnimation (Native):**
+```swift
+let displayLink = CADisplayLink(target: self, selector: #selector(update))
+displayLink.add(to: .main, forMode: .common)
+
+@objc func update(_ displayLink: CADisplayLink) {
+    // Called via Objective-C runtime
+}
+```
+
+**OpenCoreAnimation (WASM):**
+```swift
+// Selector is a placeholder type (no Objective-C runtime on WASM)
+let displayLink = CADisplayLink(target: self, selector: Selector(""))
+displayLink.add(to: AnyObject.self, forMode: AnyObject.self)
+
+// Target must conform to CADisplayLinkDelegate
+extension MyClass: CADisplayLinkDelegate {
+    func displayLinkDidFire(_ displayLink: CADisplayLink) {
+        // Called via protocol method
+    }
+}
+```
+
+**Migration:** When porting code to WASM, replace `@objc` selector-based callbacks with `CADisplayLinkDelegate` conformance.
+
 ## Future Work (TODO)
 
 ### Android / Vulkan Support
 
 Currently, OpenCoreAnimation supports:
-- **WASM**: WebGPU via swift-webgpu
-- **Apple platforms**: Metal (for testing only)
+- **WASM** (Production): WebGPU via swift-webgpu
+- **Apple platforms** (Testing only): Metal renderer, Foundation-based timing
 
 Future support could include:
 - **Android**: Vulkan renderer (CAVulkanRenderer)
