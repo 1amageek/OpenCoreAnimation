@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenCoreAnimation Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #1a1a2e;
+            color: #eee;
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        h1 {
+            color: #4fc3f7;
+            margin-bottom: 10px;
+        }
+        h2 {
+            color: #81d4fa;
+            font-weight: normal;
+            margin-top: 20px;
+        }
+        p {
+            color: #b0bec5;
+        }
+        #animation-canvas {
+            display: block;
+            margin: 20px auto;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        #info {
+            text-align: center;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .feature-list {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-top: 20px;
+        }
+        .feature {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        #loading {
+            text-align: center;
+            padding: 40px;
+            color: #81d4fa;
+        }
+        .error {
+            color: #ff6b6b !important;
+            background: rgba(255, 107, 107, 0.1);
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px auto;
+            max-width: 600px;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <h1>OpenCoreAnimation</h1>
+        <p>Loading WASM module...</p>
+    </div>
+
+    <script type="module">
+        // Import the PackageToJS generated module
+        import { init } from './Bundle/main.js';
+
+        async function run() {
+            try {
+                const loadingDiv = document.getElementById('loading');
+
+                // Check for WebGPU support
+                if (!navigator.gpu) {
+                    loadingDiv.innerHTML = `
+                        <h1>OpenCoreAnimation</h1>
+                        <div class="error">
+                            <strong>WebGPU Not Supported</strong>
+                            <p>Your browser does not support WebGPU.</p>
+                            <p>Please use Chrome 113+, Edge 113+, or another WebGPU-enabled browser.</p>
+                        </div>
+                    `;
+                    return;
+                }
+
+                loadingDiv.innerHTML = '<h1>OpenCoreAnimation</h1><p>Initializing WebGPU...</p>';
+
+                // Initialize the Swift WASM module
+                await init();
+
+                // Remove loading indicator (Swift code will add the canvas)
+                loadingDiv.remove();
+
+            } catch (error) {
+                console.error('Failed to initialize:', error);
+                document.getElementById('loading').innerHTML = `
+                    <h1>OpenCoreAnimation</h1>
+                    <div class="error">
+                        <strong>Initialization Error</strong>
+                        <p>${error.message}</p>
+                    </div>
+                `;
+            }
+        }
+
+        run();
+    </script>
+</body>
+</html>

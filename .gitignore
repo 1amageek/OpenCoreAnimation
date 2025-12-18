@@ -1,0 +1,96 @@
+# =========================
+# macOS
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# =========================
+# Swift Package Manager
+# =========================
+.build/
+.swiftpm/
+Package.resolved
+Packages/
+
+# =========================
+# Xcode
+# =========================
+xcuserdata/
+DerivedData/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+*.playground/playground.xcworkspace/
+
+# Build products
+build/
+*.app
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# =========================
+# Swift
+# =========================
+*.swp
+*~.nib
+*.hmap
+*.ipa
+*.xcuserstate
+*.moved-aside
+
+# =========================
+# WASM / JavaScript / Node.js
+# =========================
+node_modules/
+dist/
+*.wasm
+*.wasm.map
+
+# npm/pnpm/yarn
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.npm/
+.pnpm-store/
+
+# Carton (Swift WASM tooling)
+.carton/
+
+# =========================
+# Editor / IDE
+# =========================
+# VSCode
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+
+# =========================
+# Secrets / Credentials
+# =========================
+.netrc
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+credentials.json
+
+# =========================
+# Misc
+# =========================
+*.log
+*.tmp
+*.temp
+Thumbs.db

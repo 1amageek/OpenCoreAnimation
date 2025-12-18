@@ -1,0 +1,1708 @@
+
+/// An object that manages image-based content and allows you to perform animations on that content.
+///
+/// Layers are often used to provide the backing store for views but can also be used without a view
+/// to display content. A layer's main job is to manage the visual content that you provide but the
+/// layer itself has visual attributes that can be set, such as a background color, border, and shadow.
+open class CALayer: CAMediaTiming, Hashable {
+
+    // MARK: - Initialization
+
+    /// Returns an initialized CALayer object.
+    public required init() {}
+
+    /// Override to copy or initialize custom fields of the specified layer.
+    ///
+    /// - Parameter layer: The layer from which custom fields should be copied.
+    public required init(layer: Any) {
+        if let otherLayer = layer as? CALayer {
+            // Copy geometry properties
+            self._bounds = otherLayer._bounds
+            self._position = otherLayer._position
+            self._anchorPoint = otherLayer._anchorPoint
+            self._zPosition = otherLayer._zPosition
+            self._anchorPointZ = otherLayer._anchorPointZ
+            self._transform = otherLayer._transform
+            self._sublayerTransform = otherLayer._sublayerTransform
+            self._contentsScale = otherLayer._contentsScale
+
+            // Copy appearance properties
+            self._opacity = otherLayer._opacity
+            self._isHidden = otherLayer._isHidden
+            self._masksToBounds = otherLayer._masksToBounds
+            self._isDoubleSided = otherLayer._isDoubleSided
+            self._cornerRadius = otherLayer._cornerRadius
+            self.maskedCorners = otherLayer.maskedCorners
+            self.cornerCurve = otherLayer.cornerCurve
+            self._borderWidth = otherLayer._borderWidth
+            self._borderColor = otherLayer._borderColor
+            self._backgroundColor = otherLayer._backgroundColor
+            self._shadowOpacity = otherLayer._shadowOpacity
+            self._shadowRadius = otherLayer._shadowRadius
+            self._shadowOffset = otherLayer._shadowOffset
+            self._shadowColor = otherLayer._shadowColor
+            self._shadowPath = otherLayer._shadowPath
+
+            // Copy content properties
+            self.contents = otherLayer.contents
+            self.contentsRect = otherLayer.contentsRect
+            self.contentsCenter = otherLayer.contentsCenter
+            self.contentsGravity = otherLayer.contentsGravity
+            self.contentsFormat = otherLayer.contentsFormat
+
+            // Copy rendering properties
+            self.isOpaque = otherLayer.isOpaque
+            self.isGeometryFlipped = otherLayer.isGeometryFlipped
+            self.drawsAsynchronously = otherLayer.drawsAsynchronously
+            self.shouldRasterize = otherLayer.shouldRasterize
+            self.rasterizationScale = otherLayer.rasterizationScale
+            self.allowsEdgeAntialiasing = otherLayer.allowsEdgeAntialiasing
+            self.allowsGroupOpacity = otherLayer.allowsGroupOpacity
+            self.edgeAntialiasingMask = otherLayer.edgeAntialiasingMask
+
+            // Copy filter properties
+            self.filters = otherLayer.filters
+            self.compositingFilter = otherLayer.compositingFilter
+            self.backgroundFilters = otherLayer.backgroundFilters
+            self.minificationFilter = otherLayer.minificationFilter
+            self.minificationFilterBias = otherLayer.minificationFilterBias
+            self.magnificationFilter = otherLayer.magnificationFilter
+
+            // Copy layout properties
+            self.autoresizingMask = otherLayer.autoresizingMask
+            self.needsDisplayOnBoundsChange = otherLayer.needsDisplayOnBoundsChange
+            self.constraints = otherLayer.constraints
+
+            // Copy timing properties
+            self.beginTime = otherLayer.beginTime
+            self.timeOffset = otherLayer.timeOffset
+            self.repeatCount = otherLayer.repeatCount
+            self.repeatDuration = otherLayer.repeatDuration
+            self.duration = otherLayer.duration
+            self.speed = otherLayer.speed
+            self.autoreverses = otherLayer.autoreverses
+            self.fillMode = otherLayer.fillMode
+
+            // Copy identification
+            self._name = otherLayer._name
+            self.style = otherLayer.style
+
+            // Note: We intentionally do NOT copy:
+            // - delegate (weak reference, not owned)
+            // - sublayers (hierarchy is not copied)
+            // - superlayer (hierarchy relationship)
+            // - mask (would create ownership issues)
+            // - layoutManager (typically shared)
+            // - actions (typically defined at class level)
+            // - animations (presentation layer specific)
+        }
+    }
+
+    // MARK: - Accessing Related Layer Objects
+
+    /// The presentation layer associated with this layer during animations.
+    private var _presentationLayer: CALayer?
+
+    /// Whether this layer is a presentation layer.
+    private var _isPresentation: Bool = false
+
+    /// The model layer if this is a presentation layer.
+    private weak var _modelLayer: CALayer?
+
+    /// Returns a copy of the presentation layer object that represents the state of the layer
+    /// as it currently appears onscreen.
+    ///
+    /// The presentation layer reflects the current state of any active animations. If there are
+    /// no animations running, the presentation layer's values match the model layer's values.
+    ///
+    /// - Returns: A copy of the presentation layer, or `nil` if this layer hasn't been committed
+    ///   to the render tree.
+    open func presentation() -> Self? {
+        // If we're already a presentation layer, return self
+        if _isPresentation {
+            return self
+        }
+
+        // Create or update presentation layer
+        if _presentationLayer == nil {
+            _presentationLayer = createPresentationLayer()
+        }
+
+        // Update presentation layer with current animated values
+        updatePresentationLayer()
+
+        return _presentationLayer as? Self
+    }
+
+    /// Creates a new presentation layer as a copy of this layer.
+    private func createPresentationLayer() -> CALayer {
+        let presentationClass = type(of: self)
+        let presentation = presentationClass.init(layer: self)
+        presentation._isPresentation = true
+        presentation._modelLayer = self
+        return presentation
+    }
+
+    /// Updates the presentation layer with current animated values.
+    private func updatePresentationLayer() {
+        guard let presentation = _presentationLayer else { return }
+
+        let currentTime = CACurrentMediaTime()
+
+        // Copy current property values
+        presentation._bounds = _bounds
+        presentation._position = _position
+        presentation._anchorPoint = _anchorPoint
+        presentation._zPosition = _zPosition
+        presentation._transform = _transform
+        presentation._opacity = _opacity
+        presentation._isHidden = _isHidden
+        presentation._backgroundColor = _backgroundColor
+        presentation._borderColor = _borderColor
+        presentation._borderWidth = _borderWidth
+        presentation._cornerRadius = _cornerRadius
+        presentation._shadowColor = _shadowColor
+        presentation._shadowOpacity = _shadowOpacity
+        presentation._shadowOffset = _shadowOffset
+        presentation._shadowRadius = _shadowRadius
+
+        // Apply active animations
+        for (_, animation) in _animations {
+            applyAnimation(animation, to: presentation, at: currentTime)
+        }
+    }
+
+    /// Applies an animation to the presentation layer at the given time.
+    private func applyAnimation(_ animation: CAAnimation, to layer: CALayer, at time: CFTimeInterval) {
+        // Handle animation groups
+        if let animationGroup = animation as? CAAnimationGroup {
+            applyAnimationGroup(animationGroup, to: layer, at: time)
+            return
+        }
+
+        guard let propertyAnimation = animation as? CAPropertyAnimation,
+              let keyPath = propertyAnimation.keyPath else { return }
+
+        // Calculate animation progress consistently with processAnimationCompletions
+        // elapsed = currentTime - addedTime - beginTime
+        let elapsed = time - animation.addedTime - animation.beginTime
+
+        // Get the effective duration for a single cycle
+        let singleCycleDuration: CFTimeInterval
+        if let springAnimation = animation as? CASpringAnimation {
+            // For spring animations, use settlingDuration if duration is not explicitly set
+            singleCycleDuration = animation.duration > 0 ? animation.duration : springAnimation.settlingDuration
+        } else {
+            singleCycleDuration = animation.duration > 0 ? animation.duration : CATransaction.animationDuration()
+        }
+
+        guard singleCycleDuration > 0 else { return }
+
+        // Handle fillMode for animations that haven't started yet
+        if elapsed < 0 {
+            switch animation.fillMode {
+            case .backwards, .both:
+                // Show the initial state before animation starts
+                applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: 0)
+            default:
+                // Don't apply any animation value
+                return
+            }
+            return
+        }
+
+        var progress = elapsed / singleCycleDuration
+
+        // Handle repeat count and autoreverses
+        if animation.repeatCount > 0 || animation.autoreverses {
+            let totalCycles = animation.autoreverses ? 2.0 : 1.0
+            let effectiveRepeatCount = max(1, CFTimeInterval(animation.repeatCount))
+            let totalProgress = effectiveRepeatCount * totalCycles
+
+            if progress >= totalProgress {
+                // Animation has completed all cycles
+                switch animation.fillMode {
+                case .forwards, .both:
+                    // Keep final state - determine if we ended forward or reversed
+                    if animation.autoreverses && Int(effectiveRepeatCount * totalCycles) % 2 == 0 {
+                        progress = 0 // Ended on reverse, back at start
+                    } else {
+                        progress = 1 // Ended on forward
+                    }
+                default:
+                    // Animation completed, don't apply any value
+                    return
+                }
+            } else {
+                // Get progress within current cycle
+                let cycleProgress = progress.truncatingRemainder(dividingBy: totalCycles)
+
+                if animation.autoreverses {
+                    // In autoreverse mode: 0-1 is forward, 1-2 is reverse
+                    if cycleProgress < 1 {
+                        progress = cycleProgress
+                    } else {
+                        // Reverse: map 1-2 to 1-0
+                        progress = 2 - cycleProgress
+                    }
+                } else {
+                    progress = cycleProgress
+                }
+            }
+        } else if progress >= 1 {
+            // No repeat, animation completed
+            switch animation.fillMode {
+            case .forwards, .both:
+                progress = 1
+            default:
+                return
+            }
+        }
+
+        // Apply timing function
+        if let timingFunction = animation.timingFunction {
+            progress = CFTimeInterval(timingFunction.evaluate(at: Float(progress)))
+        }
+
+        progress = max(0, min(1, progress))
+
+        // Interpolate and apply value based on animation type
+        applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: progress)
+    }
+
+    /// Applies an animation group to the presentation layer.
+    private func applyAnimationGroup(_ group: CAAnimationGroup, to layer: CALayer, at time: CFTimeInterval) {
+        guard let animations = group.animations else { return }
+
+        for animation in animations {
+            // Child animations inherit timing properties from the group if not set
+            if animation.duration == 0 {
+                animation.duration = group.duration
+            }
+            if animation.addedTime == 0 {
+                animation.addedTime = group.addedTime
+            }
+            // Apply each child animation
+            applyAnimation(animation, to: layer, at: time)
+        }
+    }
+
+    /// Applies an animation value to a layer property.
+    private func applyAnimationValue(_ animation: CAPropertyAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        if let keyframeAnimation = animation as? CAKeyframeAnimation {
+            applyKeyframeAnimation(keyframeAnimation, to: layer, keyPath: keyPath, progress: progress)
+        } else if let basicAnimation = animation as? CABasicAnimation {
+            applyBasicAnimation(basicAnimation, to: layer, keyPath: keyPath, progress: progress)
+        }
+    }
+
+    /// Applies a basic animation to a layer property.
+    private func applyBasicAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        // Handle common animatable properties
+        applyFloatAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        applyPointAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        applyRectAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        applyTransformAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+    }
+
+    private func applyFloatAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        switch keyPath {
+        case "opacity":
+            guard let from = (animation.fromValue as? Float) ?? _opacity as Float?,
+                  let to = (animation.toValue as? Float) ?? _opacity as Float? else { return }
+            layer._opacity = from + Float(progress) * (to - from)
+        case "cornerRadius":
+            guard let from = (animation.fromValue as? CGFloat) ?? _cornerRadius as CGFloat?,
+                  let to = (animation.toValue as? CGFloat) ?? _cornerRadius as CGFloat? else { return }
+            layer._cornerRadius = from + CGFloat(progress) * (to - from)
+        case "borderWidth":
+            guard let from = (animation.fromValue as? CGFloat) ?? _borderWidth as CGFloat?,
+                  let to = (animation.toValue as? CGFloat) ?? _borderWidth as CGFloat? else { return }
+            layer._borderWidth = from + CGFloat(progress) * (to - from)
+        case "shadowRadius":
+            guard let from = (animation.fromValue as? CGFloat) ?? _shadowRadius as CGFloat?,
+                  let to = (animation.toValue as? CGFloat) ?? _shadowRadius as CGFloat? else { return }
+            layer._shadowRadius = from + CGFloat(progress) * (to - from)
+        case "shadowOpacity":
+            guard let from = (animation.fromValue as? Float) ?? _shadowOpacity as Float?,
+                  let to = (animation.toValue as? Float) ?? _shadowOpacity as Float? else { return }
+            layer._shadowOpacity = from + Float(progress) * (to - from)
+        case "zPosition":
+            guard let from = (animation.fromValue as? CGFloat) ?? _zPosition as CGFloat?,
+                  let to = (animation.toValue as? CGFloat) ?? _zPosition as CGFloat? else { return }
+            layer._zPosition = from + CGFloat(progress) * (to - from)
+        default:
+            break
+        }
+    }
+
+    private func applyPointAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        switch keyPath {
+        case "position":
+            guard let from = (animation.fromValue as? CGPoint) ?? _position as CGPoint?,
+                  let to = (animation.toValue as? CGPoint) ?? _position as CGPoint? else { return }
+            layer._position = CGPoint(
+                x: from.x + CGFloat(progress) * (to.x - from.x),
+                y: from.y + CGFloat(progress) * (to.y - from.y)
+            )
+        case "position.x":
+            guard let from = (animation.fromValue as? CGFloat) ?? _position.x as CGFloat?,
+                  let to = (animation.toValue as? CGFloat) ?? _position.x as CGFloat? else { return }
+            layer._position.x = from + CGFloat(progress) * (to - from)
+        case "position.y":
+            guard let from = (animation.fromValue as? CGFloat) ?? _position.y as CGFloat?,
+                  let to = (animation.toValue as? CGFloat) ?? _position.y as CGFloat? else { return }
+            layer._position.y = from + CGFloat(progress) * (to - from)
+        case "anchorPoint":
+            guard let from = (animation.fromValue as? CGPoint) ?? _anchorPoint as CGPoint?,
+                  let to = (animation.toValue as? CGPoint) ?? _anchorPoint as CGPoint? else { return }
+            layer._anchorPoint = CGPoint(
+                x: from.x + CGFloat(progress) * (to.x - from.x),
+                y: from.y + CGFloat(progress) * (to.y - from.y)
+            )
+        case "shadowOffset":
+            guard let from = (animation.fromValue as? CGSize) ?? _shadowOffset as CGSize?,
+                  let to = (animation.toValue as? CGSize) ?? _shadowOffset as CGSize? else { return }
+            layer._shadowOffset = CGSize(
+                width: from.width + CGFloat(progress) * (to.width - from.width),
+                height: from.height + CGFloat(progress) * (to.height - from.height)
+            )
+        default:
+            break
+        }
+    }
+
+    private func applyRectAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        switch keyPath {
+        case "bounds":
+            guard let from = (animation.fromValue as? CGRect) ?? _bounds as CGRect?,
+                  let to = (animation.toValue as? CGRect) ?? _bounds as CGRect? else { return }
+            layer._bounds = CGRect(
+                x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
+                y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
+                width: from.size.width + CGFloat(progress) * (to.size.width - from.size.width),
+                height: from.size.height + CGFloat(progress) * (to.size.height - from.size.height)
+            )
+        case "bounds.size":
+            guard let from = (animation.fromValue as? CGSize) ?? _bounds.size as CGSize?,
+                  let to = (animation.toValue as? CGSize) ?? _bounds.size as CGSize? else { return }
+            layer._bounds.size = CGSize(
+                width: from.width + CGFloat(progress) * (to.width - from.width),
+                height: from.height + CGFloat(progress) * (to.height - from.height)
+            )
+        default:
+            break
+        }
+    }
+
+    private func applyTransformAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        switch keyPath {
+        case "transform":
+            guard let from = (animation.fromValue as? CATransform3D) ?? _transform as CATransform3D?,
+                  let to = (animation.toValue as? CATransform3D) ?? _transform as CATransform3D? else { return }
+            layer._transform = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
+        case "transform.scale":
+            let from = (animation.fromValue as? CGFloat) ?? 1.0
+            let to = (animation.toValue as? CGFloat) ?? 1.0
+            let scale = from + CGFloat(progress) * (to - from)
+            layer._transform = CATransform3DMakeScale(scale, scale, scale)
+        case "transform.scale.x":
+            let from = (animation.fromValue as? CGFloat) ?? 1.0
+            let to = (animation.toValue as? CGFloat) ?? 1.0
+            layer._transform.m11 = from + CGFloat(progress) * (to - from)
+        case "transform.scale.y":
+            let from = (animation.fromValue as? CGFloat) ?? 1.0
+            let to = (animation.toValue as? CGFloat) ?? 1.0
+            layer._transform.m22 = from + CGFloat(progress) * (to - from)
+        case "transform.rotation.z":
+            let from = (animation.fromValue as? CGFloat) ?? 0
+            let to = (animation.toValue as? CGFloat) ?? 0
+            let angle = from + CGFloat(progress) * (to - from)
+            layer._transform = CATransform3DMakeRotation(angle, 0, 0, 1)
+        case "transform.translation.x":
+            let from = (animation.fromValue as? CGFloat) ?? 0
+            let to = (animation.toValue as? CGFloat) ?? 0
+            layer._transform.m41 = from + CGFloat(progress) * (to - from)
+        case "transform.translation.y":
+            let from = (animation.fromValue as? CGFloat) ?? 0
+            let to = (animation.toValue as? CGFloat) ?? 0
+            layer._transform.m42 = from + CGFloat(progress) * (to - from)
+        default:
+            break
+        }
+    }
+
+    /// Interpolates between two transforms.
+    private func interpolateTransform(from: CATransform3D, to: CATransform3D, progress: CGFloat) -> CATransform3D {
+        return CATransform3D(
+            m11: from.m11 + progress * (to.m11 - from.m11),
+            m12: from.m12 + progress * (to.m12 - from.m12),
+            m13: from.m13 + progress * (to.m13 - from.m13),
+            m14: from.m14 + progress * (to.m14 - from.m14),
+            m21: from.m21 + progress * (to.m21 - from.m21),
+            m22: from.m22 + progress * (to.m22 - from.m22),
+            m23: from.m23 + progress * (to.m23 - from.m23),
+            m24: from.m24 + progress * (to.m24 - from.m24),
+            m31: from.m31 + progress * (to.m31 - from.m31),
+            m32: from.m32 + progress * (to.m32 - from.m32),
+            m33: from.m33 + progress * (to.m33 - from.m33),
+            m34: from.m34 + progress * (to.m34 - from.m34),
+            m41: from.m41 + progress * (to.m41 - from.m41),
+            m42: from.m42 + progress * (to.m42 - from.m42),
+            m43: from.m43 + progress * (to.m43 - from.m43),
+            m44: from.m44 + progress * (to.m44 - from.m44)
+        )
+    }
+
+    /// Applies a keyframe animation to a layer property.
+    private func applyKeyframeAnimation(_ animation: CAKeyframeAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        guard let values = animation.values, values.count > 1 else { return }
+
+        // Determine which keyframe segment we're in
+        let keyTimes = animation.keyTimes ?? defaultKeyTimes(for: values.count)
+        let segmentIndex = findSegmentIndex(for: Float(progress), in: keyTimes)
+        let startIndex = segmentIndex
+        let endIndex = min(segmentIndex + 1, values.count - 1)
+
+        // Get local progress within the segment
+        let startTime = keyTimes[startIndex]
+        let endTime = keyTimes[endIndex]
+        let segmentProgress: Float
+        if endTime > startTime {
+            segmentProgress = (Float(progress) - startTime) / (endTime - startTime)
+        } else {
+            segmentProgress = 1.0
+        }
+
+        // Apply timing function for this segment if available
+        let adjustedProgress: Float
+        if let timingFunctions = animation.timingFunctions,
+           startIndex < timingFunctions.count {
+            adjustedProgress = timingFunctions[startIndex].evaluate(at: segmentProgress)
+        } else {
+            adjustedProgress = segmentProgress
+        }
+
+        // Interpolate between keyframe values based on calculation mode
+        let fromValue = values[startIndex]
+        let toValue = values[endIndex]
+
+        switch animation.calculationMode {
+        case .discrete:
+            // No interpolation, use the from value
+            applyKeyframeValue(fromValue, layer: layer, keyPath: keyPath)
+        case .linear, .cubic, .paced, .cubicPaced:
+            // Linear interpolation between values
+            interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
+        default:
+            interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
+        }
+    }
+
+    /// Generates default key times evenly distributed.
+    private func defaultKeyTimes(for count: Int) -> [Float] {
+        guard count > 1 else { return [0] }
+        return (0..<count).map { Float($0) / Float(count - 1) }
+    }
+
+    /// Finds the segment index for a given progress value.
+    private func findSegmentIndex(for progress: Float, in keyTimes: [Float]) -> Int {
+        for i in 0..<(keyTimes.count - 1) {
+            if progress >= keyTimes[i] && progress < keyTimes[i + 1] {
+                return i
+            }
+        }
+        return max(0, keyTimes.count - 2)
+    }
+
+    /// Applies a single keyframe value without interpolation.
+    private func applyKeyframeValue(_ value: Any, layer: CALayer, keyPath: String) {
+        switch keyPath {
+        case "opacity":
+            if let v = value as? Float { layer._opacity = v }
+        case "position":
+            if let v = value as? CGPoint { layer._position = v }
+        case "bounds":
+            if let v = value as? CGRect { layer._bounds = v }
+        case "cornerRadius":
+            if let v = value as? CGFloat { layer._cornerRadius = v }
+        case "borderWidth":
+            if let v = value as? CGFloat { layer._borderWidth = v }
+        case "zPosition":
+            if let v = value as? CGFloat { layer._zPosition = v }
+        case "transform":
+            if let v = value as? CATransform3D { layer._transform = v }
+        default:
+            break
+        }
+    }
+
+    /// Interpolates between two keyframe values.
+    private func interpolateKeyframeValue(from fromValue: Any, to toValue: Any, progress: CFTimeInterval, layer: CALayer, keyPath: String) {
+        switch keyPath {
+        case "opacity":
+            if let f = fromValue as? Float, let t = toValue as? Float {
+                layer._opacity = f + Float(progress) * (t - f)
+            }
+        case "position":
+            if let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
+                layer._position = CGPoint(
+                    x: f.x + CGFloat(progress) * (t.x - f.x),
+                    y: f.y + CGFloat(progress) * (t.y - f.y)
+                )
+            }
+        case "bounds":
+            if let f = fromValue as? CGRect, let t = toValue as? CGRect {
+                layer._bounds = CGRect(
+                    x: f.origin.x + CGFloat(progress) * (t.origin.x - f.origin.x),
+                    y: f.origin.y + CGFloat(progress) * (t.origin.y - f.origin.y),
+                    width: f.size.width + CGFloat(progress) * (t.size.width - f.size.width),
+                    height: f.size.height + CGFloat(progress) * (t.size.height - f.size.height)
+                )
+            }
+        case "cornerRadius", "borderWidth", "shadowRadius", "zPosition":
+            if let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                let value = f + CGFloat(progress) * (t - f)
+                switch keyPath {
+                case "cornerRadius": layer._cornerRadius = value
+                case "borderWidth": layer._borderWidth = value
+                case "shadowRadius": layer._shadowRadius = value
+                case "zPosition": layer._zPosition = value
+                default: break
+                }
+            }
+        case "transform":
+            if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
+                layer._transform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
+            }
+        default:
+            break
+        }
+    }
+
+    /// Returns the model layer object associated with the receiver, if any.
+    ///
+    /// - Returns: The model layer if this is a presentation layer, otherwise `self`.
+    open func model() -> Self {
+        if let model = _modelLayer as? Self {
+            return model
+        }
+        return self
+    }
+
+    // MARK: - Accessing the Delegate
+
+    /// The layer's delegate object.
+    open weak var delegate: (any CALayerDelegate)?
+
+    // MARK: - Providing the Layer's Content
+
+    /// An object that provides the contents of the layer. Animatable.
+    open var contents: CGImage?
+
+    /// The rectangle, in the unit coordinate space, that defines the portion of the layer's
+    /// contents that should be used. Animatable.
+    open var contentsRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+
+    /// The rectangle that defines how the layer contents are scaled if the layer's contents
+    /// are resized. Animatable.
+    open var contentsCenter: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+
+    /// Reloads the content of this layer.
+    open func display() {
+        delegate?.display(self)
+    }
+
+    /// Draws the layer's content using the specified graphics context.
+    open func draw(in ctx: CGContext) {
+        delegate?.draw(self, in: ctx)
+    }
+
+    // MARK: - Modifying the Layer's Appearance
+
+    /// A constant that specifies how the layer's contents are positioned or scaled within its bounds.
+    open var contentsGravity: CALayerContentsGravity = .resize
+
+    private var _opacity: Float = 1.0
+    /// The opacity of the receiver. Animatable.
+    open var opacity: Float {
+        get { return _opacity }
+        set { _opacity = max(0, min(1, newValue)) }
+    }
+
+    private var _isHidden: Bool = false
+    /// A Boolean indicating whether the layer is displayed. Animatable.
+    open var isHidden: Bool {
+        get { return _isHidden }
+        set { _isHidden = newValue }
+    }
+
+    private var _masksToBounds: Bool = false
+    /// A Boolean indicating whether sublayers are clipped to the layer's bounds. Animatable.
+    open var masksToBounds: Bool {
+        get { return _masksToBounds }
+        set { _masksToBounds = newValue }
+    }
+
+    /// An optional layer whose alpha channel is used to mask the layer's content.
+    open var mask: CALayer?
+
+    private var _isDoubleSided: Bool = true
+    /// A Boolean indicating whether the layer displays its content when facing away from the viewer. Animatable.
+    open var isDoubleSided: Bool {
+        get { return _isDoubleSided }
+        set { _isDoubleSided = newValue }
+    }
+
+    private var _cornerRadius: CGFloat = 0
+    /// The radius to use when drawing rounded corners for the layer's background. Animatable.
+    open var cornerRadius: CGFloat {
+        get { return _cornerRadius }
+        set { _cornerRadius = max(0, newValue) }
+    }
+
+    /// A bitmask defining which of the four corners receives the masking.
+    open var maskedCorners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+
+    /// The curve to use when drawing the rounded corners.
+    open var cornerCurve: CALayerCornerCurve = .circular
+
+    private var _borderWidth: CGFloat = 0
+    /// The width of the layer's border. Animatable.
+    open var borderWidth: CGFloat {
+        get { return _borderWidth }
+        set { _borderWidth = max(0, newValue) }
+    }
+
+    private var _borderColor: CGColor?
+    /// The color of the layer's border. Animatable.
+    open var borderColor: CGColor? {
+        get { return _borderColor }
+        set { _borderColor = newValue }
+    }
+
+    private var _backgroundColor: CGColor?
+    /// The background color of the receiver. Animatable.
+    open var backgroundColor: CGColor? {
+        get { return _backgroundColor }
+        set { _backgroundColor = newValue }
+    }
+
+    private var _shadowOpacity: Float = 0
+    /// The opacity of the layer's shadow. Animatable.
+    open var shadowOpacity: Float {
+        get { return _shadowOpacity }
+        set { _shadowOpacity = max(0, min(1, newValue)) }
+    }
+
+    private var _shadowRadius: CGFloat = 3
+    /// The blur radius (in points) used to render the layer's shadow. Animatable.
+    open var shadowRadius: CGFloat {
+        get { return _shadowRadius }
+        set { _shadowRadius = max(0, newValue) }
+    }
+
+    private var _shadowOffset: CGSize = CGSize(width: 0, height: -3)
+    /// The offset (in points) of the layer's shadow. Animatable.
+    open var shadowOffset: CGSize {
+        get { return _shadowOffset }
+        set { _shadowOffset = newValue }
+    }
+
+    private var _shadowColor: CGColor?
+    /// The color of the layer's shadow. Animatable.
+    open var shadowColor: CGColor? {
+        get { return _shadowColor }
+        set { _shadowColor = newValue }
+    }
+
+    private var _shadowPath: CGPath?
+    /// The shape of the layer's shadow. Animatable.
+    open var shadowPath: CGPath? {
+        get { return _shadowPath }
+        set { _shadowPath = newValue }
+    }
+
+    /// An optional dictionary used to store property values that aren't explicitly defined by the layer.
+    open var style: [AnyHashable: Any]?
+
+    /// A Boolean indicating whether the layer is allowed to perform edge antialiasing.
+    open var allowsEdgeAntialiasing: Bool = false
+
+    /// A Boolean indicating whether the layer is allowed to composite itself as a group separate from its parent.
+    open var allowsGroupOpacity: Bool = true
+
+    // MARK: - Layer Filters
+
+    /// An array of Core Image filters to apply to the contents of the layer and its sublayers. Animatable.
+    open var filters: [Any]?
+
+    /// A CoreImage filter used to composite the layer and the content behind it. Animatable.
+    open var compositingFilter: Any?
+
+    /// An array of Core Image filters to apply to the content immediately behind the layer. Animatable.
+    open var backgroundFilters: [Any]?
+
+    /// The filter used when reducing the size of the content.
+    open var minificationFilter: CALayerContentsFilter = .linear
+
+    /// The bias factor used by the minification filter to determine the levels of detail.
+    open var minificationFilterBias: Float = 0
+
+    /// The filter used when increasing the size of the content.
+    open var magnificationFilter: CALayerContentsFilter = .linear
+
+    // MARK: - Configuring the Layer's Rendering Behavior
+
+    /// A Boolean value indicating whether the layer contains completely opaque content.
+    open var isOpaque: Bool = false
+
+    /// A bitmask defining how the edges of the receiver are rasterized.
+    open var edgeAntialiasingMask: CAEdgeAntialiasingMask = [.layerLeftEdge, .layerRightEdge, .layerBottomEdge, .layerTopEdge]
+
+    /// Returns a Boolean indicating whether the layer content is implicitly flipped when rendered.
+    open func contentsAreFlipped() -> Bool {
+        return false
+    }
+
+    /// A Boolean that indicates whether the geometry of the layer and its sublayers is flipped vertically.
+    open var isGeometryFlipped: Bool = false
+
+    /// A Boolean indicating whether drawing commands are deferred and processed asynchronously in a background thread.
+    open var drawsAsynchronously: Bool = false
+
+    /// A Boolean that indicates whether the layer is rendered as a bitmap before compositing. Animatable.
+    open var shouldRasterize: Bool = false
+
+    /// The scale at which to rasterize content, relative to the coordinate space of the layer. Animatable.
+    open var rasterizationScale: CGFloat = 1.0
+
+    /// A hint for the desired storage format of the layer contents.
+    open var contentsFormat: CALayerContentsFormat = .RGBA8Uint
+
+    /// Renders the layer and its sublayers into the specified context.
+    ///
+    /// This method renders the layer's contents, including its visual appearance
+    /// (background color, border, shadow, etc.) and any sublayers.
+    ///
+    /// - Parameter ctx: The graphics context in which to render.
+    open func render(in ctx: CGContext) {
+        // Save the graphics state
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+
+        // Skip hidden layers
+        guard !isHidden && opacity > 0 else { return }
+
+        // Apply transform
+        if !CATransform3DIsIdentity(_transform) {
+            let affine = CATransform3DGetAffineTransform(_transform)
+            ctx.concatenate(affine)
+        }
+
+        // Apply opacity
+        ctx.setAlpha(CGFloat(opacity))
+
+        // Set up clipping if masksToBounds is true
+        if masksToBounds {
+            let clipPath = CGPath(roundedRect: bounds, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            ctx.addPath(clipPath)
+            ctx.clip()
+        }
+
+        // Draw shadow (before content)
+        if shadowOpacity > 0, let shadowColor = shadowColor {
+            ctx.setShadow(
+                offset: shadowOffset,
+                blur: shadowRadius,
+                color: shadowColor
+            )
+        }
+
+        // Draw background color
+        if let bgColor = backgroundColor {
+            ctx.setFillColor(bgColor)
+            if cornerRadius > 0 {
+                let path = CGPath(roundedRect: bounds, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+                ctx.addPath(path)
+                ctx.fillPath()
+            } else {
+                ctx.fill(bounds)
+            }
+        }
+
+        // Draw contents
+        if let contents = contents {
+            drawContents(contents, in: ctx)
+        }
+
+        // Let delegate draw if needed
+        delegate?.draw(self, in: ctx)
+
+        // Draw border
+        if borderWidth > 0, let borderColor = borderColor {
+            ctx.setStrokeColor(borderColor)
+            ctx.setLineWidth(borderWidth)
+            if cornerRadius > 0 {
+                let path = CGPath(roundedRect: bounds.insetBy(dx: borderWidth / 2, dy: borderWidth / 2),
+                                  cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+                ctx.addPath(path)
+                ctx.strokePath()
+            } else {
+                ctx.stroke(bounds.insetBy(dx: borderWidth / 2, dy: borderWidth / 2))
+            }
+        }
+
+        // Render sublayers
+        if let sublayers = sublayers {
+            for sublayer in sublayers {
+                ctx.saveGState()
+
+                // Translate to sublayer position
+                let sublayerOrigin = CGPoint(
+                    x: sublayer.position.x - sublayer.bounds.width * sublayer.anchorPoint.x,
+                    y: sublayer.position.y - sublayer.bounds.height * sublayer.anchorPoint.y
+                )
+                ctx.translateBy(x: sublayerOrigin.x, y: sublayerOrigin.y)
+
+                // Apply sublayer transform
+                if !CATransform3DIsIdentity(sublayerTransform) {
+                    let affine = CATransform3DGetAffineTransform(sublayerTransform)
+                    ctx.concatenate(affine)
+                }
+
+                sublayer.render(in: ctx)
+                ctx.restoreGState()
+            }
+        }
+    }
+
+    /// Draws the contents image into the context.
+    private func drawContents(_ image: CGImage, in ctx: CGContext) {
+        let destRect = calculateContentsRect(for: image)
+        ctx.draw(image, in: destRect)
+    }
+
+    /// Calculates the destination rectangle for drawing contents based on contentsGravity.
+    private func calculateContentsRect(for image: CGImage) -> CGRect {
+        let imageSize = CGSize(width: CGFloat(image.width), height: CGFloat(image.height))
+        let boundsSize = bounds.size
+
+        switch contentsGravity {
+        case .center:
+            return CGRect(
+                x: (boundsSize.width - imageSize.width) / 2,
+                y: (boundsSize.height - imageSize.height) / 2,
+                width: imageSize.width,
+                height: imageSize.height
+            )
+        case .resize:
+            return bounds
+        case .resizeAspect:
+            let scale = min(boundsSize.width / imageSize.width, boundsSize.height / imageSize.height)
+            let scaledSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+            return CGRect(
+                x: (boundsSize.width - scaledSize.width) / 2,
+                y: (boundsSize.height - scaledSize.height) / 2,
+                width: scaledSize.width,
+                height: scaledSize.height
+            )
+        case .resizeAspectFill:
+            let scale = max(boundsSize.width / imageSize.width, boundsSize.height / imageSize.height)
+            let scaledSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+            return CGRect(
+                x: (boundsSize.width - scaledSize.width) / 2,
+                y: (boundsSize.height - scaledSize.height) / 2,
+                width: scaledSize.width,
+                height: scaledSize.height
+            )
+        case .top:
+            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: 0, width: imageSize.width, height: imageSize.height)
+        case .bottom:
+            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        case .left:
+            return CGRect(x: 0, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
+        case .right:
+            return CGRect(x: boundsSize.width - imageSize.width, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
+        case .topLeft:
+            return CGRect(origin: .zero, size: imageSize)
+        case .topRight:
+            return CGRect(x: boundsSize.width - imageSize.width, y: 0, width: imageSize.width, height: imageSize.height)
+        case .bottomLeft:
+            return CGRect(x: 0, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        case .bottomRight:
+            return CGRect(x: boundsSize.width - imageSize.width, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        default:
+            return bounds
+        }
+    }
+
+    // MARK: - Modifying the Layer Geometry
+
+    /// The layer's frame rectangle.
+    ///
+    /// The frame is a derived property computed from `bounds`, `position`, `anchorPoint`, and `transform`.
+    /// When the transform is not the identity, the frame represents the smallest rectangle that
+    /// completely contains the transformed layer.
+    open var frame: CGRect {
+        get {
+            // If transform is identity, compute simple frame
+            if CATransform3DIsIdentity(_transform) {
+                let width = _bounds.size.width
+                let height = _bounds.size.height
+                let x = _position.x - width * _anchorPoint.x
+                let y = _position.y - height * _anchorPoint.y
+                return CGRect(x: x, y: y, width: width, height: height)
+            } else {
+                // For non-identity transforms, compute the bounding box of transformed corners
+                let width = _bounds.size.width
+                let height = _bounds.size.height
+
+                // Calculate the four corners relative to anchor point
+                let corners = [
+                    CGPoint(x: -width * _anchorPoint.x, y: -height * _anchorPoint.y),
+                    CGPoint(x: width * (1 - _anchorPoint.x), y: -height * _anchorPoint.y),
+                    CGPoint(x: -width * _anchorPoint.x, y: height * (1 - _anchorPoint.y)),
+                    CGPoint(x: width * (1 - _anchorPoint.x), y: height * (1 - _anchorPoint.y))
+                ]
+
+                // Transform corners and find bounding box
+                var minX = CGFloat.infinity
+                var minY = CGFloat.infinity
+                var maxX = -CGFloat.infinity
+                var maxY = -CGFloat.infinity
+
+                for corner in corners {
+                    // Apply 3D transform (simplified 2D projection)
+                    let tx = corner.x * _transform.m11 + corner.y * _transform.m21 + _transform.m41
+                    let ty = corner.x * _transform.m12 + corner.y * _transform.m22 + _transform.m42
+
+                    let transformedX = _position.x + tx
+                    let transformedY = _position.y + ty
+
+                    minX = min(minX, transformedX)
+                    minY = min(minY, transformedY)
+                    maxX = max(maxX, transformedX)
+                    maxY = max(maxY, transformedY)
+                }
+
+                return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+            }
+        }
+        set {
+            // Setting frame updates bounds.size and position
+            // This assumes identity transform; for non-identity transforms, behavior is undefined
+            _bounds.size = newValue.size
+            _position = CGPoint(
+                x: newValue.origin.x + newValue.size.width * _anchorPoint.x,
+                y: newValue.origin.y + newValue.size.height * _anchorPoint.y
+            )
+        }
+    }
+
+    private var _bounds: CGRect = .zero
+    /// The layer's bounds rectangle. Animatable.
+    open var bounds: CGRect {
+        get { return _bounds }
+        set { _bounds = newValue }
+    }
+
+    private var _position: CGPoint = .zero
+    /// The layer's position in its superlayer's coordinate space. Animatable.
+    open var position: CGPoint {
+        get { return _position }
+        set { _position = newValue }
+    }
+
+    private var _zPosition: CGFloat = 0
+    /// The layer's position on the z axis. Animatable.
+    open var zPosition: CGFloat {
+        get { return _zPosition }
+        set { _zPosition = newValue }
+    }
+
+    private var _anchorPointZ: CGFloat = 0
+    /// The anchor point for the layer's position along the z axis. Animatable.
+    open var anchorPointZ: CGFloat {
+        get { return _anchorPointZ }
+        set { _anchorPointZ = newValue }
+    }
+
+    private var _anchorPoint: CGPoint = CGPoint(x: 0.5, y: 0.5)
+    /// Defines the anchor point of the layer's bounds rectangle. Animatable.
+    open var anchorPoint: CGPoint {
+        get { return _anchorPoint }
+        set { _anchorPoint = newValue }
+    }
+
+    private var _contentsScale: CGFloat = 1.0
+    /// The scale factor applied to the layer.
+    open var contentsScale: CGFloat {
+        get { return _contentsScale }
+        set { _contentsScale = max(0, newValue) }
+    }
+
+    // MARK: - Managing the Layer's Transform
+
+    private var _transform: CATransform3D = CATransform3DIdentity
+    /// The transform applied to the layer's contents. Animatable.
+    open var transform: CATransform3D {
+        get { return _transform }
+        set { _transform = newValue }
+    }
+
+    private var _sublayerTransform: CATransform3D = CATransform3DIdentity
+    /// Specifies the transform to apply to sublayers when rendering. Animatable.
+    open var sublayerTransform: CATransform3D {
+        get { return _sublayerTransform }
+        set { _sublayerTransform = newValue }
+    }
+
+    /// Returns an affine version of the layer's transform.
+    open func affineTransform() -> CGAffineTransform {
+        return CATransform3DGetAffineTransform(_transform)
+    }
+
+    /// Sets the layer's transform to the specified affine transform.
+    open func setAffineTransform(_ m: CGAffineTransform) {
+        _transform = CATransform3DMakeAffineTransform(m)
+    }
+
+    // MARK: - Managing the Layer Hierarchy
+
+    private var _sublayers: [CALayer]?
+    /// An array containing the layer's sublayers.
+    open var sublayers: [CALayer]? {
+        get { return _sublayers }
+        set {
+            // Remove old sublayers
+            _sublayers?.forEach { $0._superlayer = nil }
+            // Set new sublayers
+            _sublayers = newValue
+            _sublayers?.forEach { $0._superlayer = self }
+        }
+    }
+
+    private weak var _superlayer: CALayer?
+    /// The superlayer of the layer.
+    open var superlayer: CALayer? {
+        return _superlayer
+    }
+
+    /// Appends the layer to the layer's list of sublayers.
+    open func addSublayer(_ layer: CALayer) {
+        layer.removeFromSuperlayer()
+        if _sublayers == nil {
+            _sublayers = []
+        }
+        _sublayers?.append(layer)
+        layer._superlayer = self
+    }
+
+    /// Detaches the layer from its parent layer.
+    open func removeFromSuperlayer() {
+        guard let superlayer = _superlayer else { return }
+        superlayer._sublayers?.removeAll { $0 === self }
+        _superlayer = nil
+    }
+
+    /// Inserts the specified layer into the receiver's list of sublayers at the specified index.
+    open func insertSublayer(_ layer: CALayer, at idx: UInt32) {
+        layer.removeFromSuperlayer()
+        if _sublayers == nil {
+            _sublayers = []
+        }
+        let index = min(Int(idx), _sublayers?.count ?? 0)
+        _sublayers?.insert(layer, at: index)
+        layer._superlayer = self
+    }
+
+    /// Inserts the specified sublayer below a different sublayer that already belongs to the receiver.
+    open func insertSublayer(_ layer: CALayer, below sibling: CALayer?) {
+        layer.removeFromSuperlayer()
+        if _sublayers == nil {
+            _sublayers = []
+        }
+        if let sibling = sibling, let index = _sublayers?.firstIndex(where: { $0 === sibling }) {
+            _sublayers?.insert(layer, at: index)
+        } else {
+            _sublayers?.insert(layer, at: 0)
+        }
+        layer._superlayer = self
+    }
+
+    /// Inserts the specified sublayer above a different sublayer that already belongs to the receiver.
+    open func insertSublayer(_ layer: CALayer, above sibling: CALayer?) {
+        layer.removeFromSuperlayer()
+        if _sublayers == nil {
+            _sublayers = []
+        }
+        if let sibling = sibling, let index = _sublayers?.firstIndex(where: { $0 === sibling }) {
+            _sublayers?.insert(layer, at: index + 1)
+        } else {
+            _sublayers?.append(layer)
+        }
+        layer._superlayer = self
+    }
+
+    /// Replaces the specified sublayer with a different layer object.
+    open func replaceSublayer(_ oldLayer: CALayer, with newLayer: CALayer) {
+        guard let index = _sublayers?.firstIndex(where: { $0 === oldLayer }) else { return }
+        newLayer.removeFromSuperlayer()
+        oldLayer._superlayer = nil
+        _sublayers?[index] = newLayer
+        newLayer._superlayer = self
+    }
+
+    // MARK: - Updating Layer Display
+
+    private var _needsDisplay: Bool = false
+
+    /// Marks the layer's contents as needing to be updated.
+    open func setNeedsDisplay() {
+        _needsDisplay = true
+    }
+
+    /// Marks the region within the specified rectangle as needing to be updated.
+    open func setNeedsDisplay(_ r: CGRect) {
+        _needsDisplay = true
+    }
+
+    /// A Boolean indicating whether the layer contents must be updated when its bounds rectangle changes.
+    open var needsDisplayOnBoundsChange: Bool = false
+
+    /// Initiates the update process for a layer if it is currently marked as needing an update.
+    open func displayIfNeeded() {
+        if _needsDisplay {
+            display()
+            _needsDisplay = false
+        }
+    }
+
+    /// Returns a Boolean indicating whether the layer has been marked as needing an update.
+    open func needsDisplay() -> Bool {
+        return _needsDisplay
+    }
+
+    /// Returns a Boolean indicating whether changes to the specified key require the layer to be redisplayed.
+    open class func needsDisplay(forKey key: String) -> Bool {
+        return false
+    }
+
+    // MARK: - Layer Animations
+
+    private var _animations: [String: CAAnimation] = [:]
+
+    private var _animationKeyCounter: Int = 0
+
+    /// Add the specified animation object to the layer's render tree.
+    open func add(_ anim: CAAnimation, forKey key: String?) {
+        let animKey: String
+        if let key = key {
+            animKey = key
+        } else {
+            _animationKeyCounter += 1
+            animKey = "animation_\(_animationKeyCounter)"
+        }
+
+        // Set up animation internal state
+        anim.addedTime = CACurrentMediaTime()
+        anim.isFinished = false
+        anim.attachedLayer = self
+        anim.animationKey = animKey
+
+        _animations[animKey] = anim
+
+        // Notify delegate that animation started
+        anim.delegate?.animationDidStart(anim)
+    }
+
+    /// Returns the animation object with the specified identifier.
+    open func animation(forKey key: String) -> CAAnimation? {
+        return _animations[key]
+    }
+
+    /// Remove all animations attached to the layer.
+    open func removeAllAnimations() {
+        // Notify delegates that animations were stopped
+        for (_, animation) in _animations {
+            if !animation.isFinished {
+                animation.markFinished(completed: false)
+            }
+        }
+        _animations.removeAll()
+    }
+
+    /// Remove the animation object with the specified key.
+    open func removeAnimation(forKey key: String) {
+        if let animation = _animations[key] {
+            // Notify delegate that animation was stopped (not completed naturally)
+            if !animation.isFinished {
+                animation.markFinished(completed: false)
+            }
+        }
+        _animations.removeValue(forKey: key)
+    }
+
+    /// Returns an array of strings that identify the animations currently attached to the layer.
+    open func animationKeys() -> [String]? {
+        return _animations.isEmpty ? nil : Array(_animations.keys)
+    }
+
+    /// Checks for completed animations and removes them if needed.
+    ///
+    /// This method is called by `CAAnimationEngine` during the display refresh cycle
+    /// to process animations that have naturally completed.
+    ///
+    /// You typically don't need to call this method directly. Instead, use
+    /// `CAAnimationEngine.shared` to manage the animation loop.
+    public func processAnimationCompletions() {
+        let currentTime = CACurrentMediaTime()
+        var keysToRemove: [String] = []
+
+        for (key, animation) in _animations {
+            guard !animation.isFinished else {
+                // Already finished, check if it should be removed
+                if animation.isRemovedOnCompletion {
+                    keysToRemove.append(key)
+                }
+                continue
+            }
+
+            let elapsed = currentTime - animation.addedTime - animation.beginTime
+            let totalDuration = animation.totalDuration
+
+            if elapsed >= totalDuration {
+                // Animation has completed
+                animation.markFinished(completed: true)
+
+                if animation.isRemovedOnCompletion {
+                    keysToRemove.append(key)
+                }
+            }
+        }
+
+        // Remove completed animations
+        for key in keysToRemove {
+            _animations.removeValue(forKey: key)
+        }
+    }
+
+    // MARK: - Managing Layer Resizing and Layout
+
+    /// The object responsible for laying out the layer's sublayers.
+    open var layoutManager: (any CALayoutManager)?
+
+    private var _needsLayout: Bool = false
+
+    /// Invalidates the layer's layout and marks it as needing an update.
+    open func setNeedsLayout() {
+        _needsLayout = true
+    }
+
+    /// Tells the layer to update its layout.
+    open func layoutSublayers() {
+        layoutManager?.layoutSublayers(of: self)
+        delegate?.layoutSublayers(of: self)
+    }
+
+    /// Recalculate the receiver's layout, if required.
+    open func layoutIfNeeded() {
+        if _needsLayout {
+            layoutSublayers()
+            _needsLayout = false
+        }
+    }
+
+    /// Returns a Boolean indicating whether the layer has been marked as needing a layout update.
+    open func needsLayout() -> Bool {
+        return _needsLayout
+    }
+
+    /// A bitmask defining how the layer is resized when the bounds of its superlayer changes.
+    open var autoresizingMask: CAAutoresizingMask = []
+
+    /// Informs the receiver that the size of its superlayer changed.
+    open func resize(withOldSuperlayerSize size: CGSize) {
+        // Default implementation
+    }
+
+    /// Informs the receiver's sublayers that the receiver's size has changed.
+    open func resizeSublayers(withOldSize size: CGSize) {
+        sublayers?.forEach { $0.resize(withOldSuperlayerSize: size) }
+    }
+
+    /// Returns the preferred size of the layer in the coordinate space of its superlayer.
+    open func preferredFrameSize() -> CGSize {
+        return layoutManager?.preferredSize(of: self) ?? bounds.size
+    }
+
+    // MARK: - Managing Layer Constraints
+
+    /// The constraints used to position this layer relative to sibling layers or its superlayer.
+    ///
+    /// Constraints define geometric relationships between this layer and other layers in the same
+    /// sibling group. The constraint's `sourceName` property identifies the reference layer by name,
+    /// or "superlayer" to reference the parent layer.
+    open var constraints: [CAConstraint]?
+
+    /// Adds the specified constraint to the layer.
+    ///
+    /// - Parameter c: The constraint to add. The constraint defines how this layer is positioned
+    ///   relative to a sibling layer or its superlayer.
+    open func addConstraint(_ c: CAConstraint) {
+        if constraints == nil {
+            constraints = []
+        }
+        constraints?.append(c)
+    }
+
+    // MARK: - Getting the Layer's Actions
+
+    /// Returns the action object assigned to the specified key.
+    open func action(forKey event: String) -> (any CAAction)? {
+        // First check the delegate
+        if let action = delegate?.action(for: self, forKey: event) {
+            return action
+        }
+        // Then check the actions dictionary
+        if let action = actions?[event] {
+            return action
+        }
+        // Finally check the class default
+        return Self.defaultAction(forKey: event)
+    }
+
+    /// A dictionary containing layer actions.
+    open var actions: [String: any CAAction]?
+
+    /// Returns the default action for the current class.
+    open class func defaultAction(forKey event: String) -> (any CAAction)? {
+        return nil
+    }
+
+    // MARK: - Mapping Between Coordinate and Time Spaces
+
+    /// Converts a point from this layer's local coordinates to its superlayer's coordinates.
+    private func convertPointToSuperlayer(_ p: CGPoint) -> CGPoint {
+        // First, offset by bounds origin (scroll offset)
+        var point = CGPoint(x: p.x - _bounds.origin.x, y: p.y - _bounds.origin.y)
+
+        // Then offset by anchor point (convert to anchor-relative coordinates)
+        point.x -= _bounds.size.width * _anchorPoint.x
+        point.y -= _bounds.size.height * _anchorPoint.y
+
+        // Apply transform
+        if !CATransform3DIsIdentity(_transform) {
+            let tx = point.x * _transform.m11 + point.y * _transform.m21 + _transform.m41
+            let ty = point.x * _transform.m12 + point.y * _transform.m22 + _transform.m42
+            point = CGPoint(x: tx, y: ty)
+        }
+
+        // Translate to superlayer coordinates using position
+        point.x += _position.x
+        point.y += _position.y
+
+        return point
+    }
+
+    /// Converts a point from this layer's superlayer's coordinates to local coordinates.
+    private func convertPointFromSuperlayer(_ p: CGPoint) -> CGPoint {
+        // Translate from superlayer coordinates using position
+        var point = CGPoint(x: p.x - _position.x, y: p.y - _position.y)
+
+        // Apply inverse transform
+        if !CATransform3DIsIdentity(_transform) {
+            let inverted = CATransform3DInvert(_transform)
+            let tx = point.x * inverted.m11 + point.y * inverted.m21 + inverted.m41
+            let ty = point.x * inverted.m12 + point.y * inverted.m22 + inverted.m42
+            point = CGPoint(x: tx, y: ty)
+        }
+
+        // Offset by anchor point (convert from anchor-relative to bounds-relative)
+        point.x += _bounds.size.width * _anchorPoint.x
+        point.y += _bounds.size.height * _anchorPoint.y
+
+        // Add bounds origin (scroll offset)
+        point.x += _bounds.origin.x
+        point.y += _bounds.origin.y
+
+        return point
+    }
+
+    /// Returns the chain of layers from this layer up to the root (or until reaching the specified ancestor).
+    private func ancestorChain(upTo ancestor: CALayer? = nil) -> [CALayer] {
+        var chain: [CALayer] = [self]
+        var current: CALayer? = _superlayer
+        while let layer = current {
+            if layer === ancestor { break }
+            chain.append(layer)
+            current = layer._superlayer
+        }
+        return chain
+    }
+
+    /// Converts the point from the specified layer's coordinate system to the receiver's coordinate system.
+    open func convert(_ p: CGPoint, from l: CALayer?) -> CGPoint {
+        guard let sourceLayer = l else { return p }
+        if sourceLayer === self { return p }
+
+        // Convert from source layer up to common ancestor (or root)
+        var point = p
+        var current: CALayer? = sourceLayer
+        while let layer = current, layer !== self {
+            point = layer.convertPointToSuperlayer(point)
+            current = layer._superlayer
+        }
+
+        // If we found self in the chain, we're done
+        if current === self {
+            return point
+        }
+
+        // Otherwise, we need to convert down from root to self
+        // First, get the chain from self to root
+        let selfChain = ancestorChain()
+
+        // Find common ancestor
+        var sourceAncestors = Set<ObjectIdentifier>()
+        current = sourceLayer
+        while let layer = current {
+            sourceAncestors.insert(ObjectIdentifier(layer))
+            current = layer._superlayer
+        }
+
+        var commonAncestorIndex = selfChain.count - 1
+        for (index, layer) in selfChain.enumerated() {
+            if sourceAncestors.contains(ObjectIdentifier(layer)) {
+                commonAncestorIndex = index
+                break
+            }
+        }
+
+        // Convert from source to common ancestor
+        point = p
+        current = sourceLayer
+        while let layer = current {
+            if selfChain.indices.contains(commonAncestorIndex) && layer === selfChain[commonAncestorIndex] {
+                break
+            }
+            point = layer.convertPointToSuperlayer(point)
+            current = layer._superlayer
+        }
+
+        // Convert from common ancestor down to self
+        if commonAncestorIndex > 0 {
+            for i in stride(from: commonAncestorIndex - 1, through: 0, by: -1) {
+                point = selfChain[i].convertPointFromSuperlayer(point)
+            }
+        }
+
+        return point
+    }
+
+    /// Converts the point from the receiver's coordinate system to the specified layer's coordinate system.
+    open func convert(_ p: CGPoint, to l: CALayer?) -> CGPoint {
+        guard let targetLayer = l else { return p }
+        if targetLayer === self { return p }
+
+        // Use the inverse operation
+        return targetLayer.convert(p, from: self)
+    }
+
+    /// Converts the rectangle from the specified layer's coordinate system to the receiver's coordinate system.
+    open func convert(_ r: CGRect, from l: CALayer?) -> CGRect {
+        guard let sourceLayer = l else { return r }
+        if sourceLayer === self { return r }
+
+        // For rectangles with transforms, we need to convert all four corners
+        // and compute the bounding box
+        let topLeft = convert(CGPoint(x: r.minX, y: r.minY), from: l)
+        let topRight = convert(CGPoint(x: r.maxX, y: r.minY), from: l)
+        let bottomLeft = convert(CGPoint(x: r.minX, y: r.maxY), from: l)
+        let bottomRight = convert(CGPoint(x: r.maxX, y: r.maxY), from: l)
+
+        let minX = min(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x)
+        let maxX = max(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x)
+        let minY = min(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y)
+        let maxY = max(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y)
+
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Converts the rectangle from the receiver's coordinate system to the specified layer's coordinate system.
+    open func convert(_ r: CGRect, to l: CALayer?) -> CGRect {
+        guard let targetLayer = l else { return r }
+        if targetLayer === self { return r }
+
+        // For rectangles with transforms, we need to convert all four corners
+        // and compute the bounding box
+        let topLeft = convert(CGPoint(x: r.minX, y: r.minY), to: l)
+        let topRight = convert(CGPoint(x: r.maxX, y: r.minY), to: l)
+        let bottomLeft = convert(CGPoint(x: r.minX, y: r.maxY), to: l)
+        let bottomRight = convert(CGPoint(x: r.maxX, y: r.maxY), to: l)
+
+        let minX = min(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x)
+        let maxX = max(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x)
+        let minY = min(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y)
+        let maxY = max(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y)
+
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Converts the time interval from the specified layer's time space to the receiver's time space.
+    open func convertTime(_ t: CFTimeInterval, from l: CALayer?) -> CFTimeInterval {
+        guard let sourceLayer = l else { return t }
+        if sourceLayer === self { return t }
+
+        // Convert time considering speed and timeOffset along the layer chain
+        var time = t
+        var current: CALayer? = sourceLayer
+
+        // Convert from source up to root
+        while let layer = current {
+            if layer === self { break }
+            // Apply layer's time mapping: parentTime = (localTime - timeOffset) * speed + beginTime
+            time = (time - layer.timeOffset) * CFTimeInterval(layer.speed) + layer.beginTime
+            current = layer._superlayer
+        }
+
+        if current === self {
+            return time
+        }
+
+        // Convert from root down to self (inverse time mapping)
+        let selfChain = ancestorChain()
+        for layer in selfChain.reversed() {
+            if layer === self { continue }
+            // Inverse: localTime = (parentTime - beginTime) / speed + timeOffset
+            if layer.speed != 0 {
+                time = (time - layer.beginTime) / CFTimeInterval(layer.speed) + layer.timeOffset
+            }
+        }
+
+        return time
+    }
+
+    /// Converts the time interval from the receiver's time space to the specified layer's time space.
+    open func convertTime(_ t: CFTimeInterval, to l: CALayer?) -> CFTimeInterval {
+        guard let targetLayer = l else { return t }
+        if targetLayer === self { return t }
+
+        return targetLayer.convertTime(t, from: self)
+    }
+
+    // MARK: - Hit Testing
+
+    /// Returns the farthest descendant of the receiver in the layer hierarchy (including itself)
+    /// that contains the specified point.
+    open func hitTest(_ p: CGPoint) -> CALayer? {
+        guard !isHidden && opacity > 0 else { return nil }
+        guard contains(p) else { return nil }
+
+        // Check sublayers in reverse order (front to back)
+        if let sublayers = sublayers?.reversed() {
+            for sublayer in sublayers {
+                let convertedPoint = sublayer.convert(p, from: self)
+                if let hit = sublayer.hitTest(convertedPoint) {
+                    return hit
+                }
+            }
+        }
+
+        return self
+    }
+
+    /// Returns whether the receiver contains a specified point.
+    open func contains(_ p: CGPoint) -> Bool {
+        return bounds.contains(p)
+    }
+
+    // MARK: - Scrolling
+
+    /// The visible region of the layer in its own coordinate space.
+    open var visibleRect: CGRect {
+        return bounds
+    }
+
+    /// Initiates a scroll in the layer's closest ancestor scroll layer so that the specified point
+    /// lies at the origin of the scroll layer.
+    open func scroll(_ p: CGPoint) {
+        // Default implementation
+    }
+
+    /// Initiates a scroll in the layer's closest ancestor scroll layer so that the specified rectangle
+    /// becomes visible.
+    open func scrollRectToVisible(_ r: CGRect) {
+        // Default implementation
+    }
+
+    // MARK: - Identifying the Layer
+
+    private var _name: String?
+    /// The name of the receiver.
+    open var name: String? {
+        get { return _name }
+        set { _name = newValue }
+    }
+
+    // MARK: - Key-Value Coding Extensions
+
+    /// Returns a Boolean indicating whether the value of the specified key should be archived.
+    open func shouldArchiveValue(forKey key: String) -> Bool {
+        return true
+    }
+
+    /// Specifies the default value associated with the specified key.
+    open class func defaultValue(forKey key: String) -> Any? {
+        return nil
+    }
+
+    // MARK: - Corner Curve
+
+    /// Returns the expansion factor required when using continuous corner curves.
+    open class func cornerCurveExpansionFactor(_ curve: CALayerCornerCurve) -> CGFloat {
+        switch curve {
+        case .continuous:
+            return 1.528665
+        default:
+            return 1.0
+        }
+    }
+
+    // MARK: - CAMediaTiming
+
+    /// Specifies the begin time of the receiver in relation to its parent object, if applicable.
+    open var beginTime: CFTimeInterval = 0
+
+    /// Specifies an additional time offset in active local time.
+    open var timeOffset: CFTimeInterval = 0
+
+    /// Determines the number of times the animation will repeat.
+    open var repeatCount: Float = 0
+
+    /// Determines how many seconds the animation will repeat for.
+    open var repeatDuration: CFTimeInterval = 0
+
+    /// Specifies the basic duration of the animation, in seconds.
+    open var duration: CFTimeInterval = 0
+
+    /// Specifies how time is mapped to receiver's time space from the parent time space.
+    open var speed: Float = 1
+
+    /// Determines if the receiver plays in the reverse upon completion.
+    open var autoreverses: Bool = false
+
+    /// Determines if the receiver's presentation is frozen or removed once its active duration has completed.
+    open var fillMode: CAMediaTimingFillMode = .removed
+
+    // MARK: - Hashable
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(self))
+    }
+
+    public static func == (lhs: CALayer, rhs: CALayer) -> Bool {
+        return lhs === rhs
+    }
+}
