@@ -166,6 +166,28 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._shadowOffset = _shadowOffset
         presentation._shadowRadius = _shadowRadius
 
+        // Copy CAShapeLayer properties if applicable
+        if let shapePresentation = presentation as? CAShapeLayer,
+           let shapeSelf = self as? CAShapeLayer {
+            shapePresentation._path = shapeSelf._path
+            shapePresentation._fillColor = shapeSelf._fillColor
+            shapePresentation._strokeColor = shapeSelf._strokeColor
+            shapePresentation._strokeStart = shapeSelf._strokeStart
+            shapePresentation._strokeEnd = shapeSelf._strokeEnd
+            shapePresentation._lineWidth = shapeSelf._lineWidth
+            shapePresentation._lineDashPhase = shapeSelf._lineDashPhase
+            shapePresentation._miterLimit = shapeSelf._miterLimit
+        }
+
+        // Copy CAGradientLayer properties if applicable
+        if let gradientPresentation = presentation as? CAGradientLayer,
+           let gradientSelf = self as? CAGradientLayer {
+            gradientPresentation._colors = gradientSelf._colors
+            gradientPresentation._locations = gradientSelf._locations
+            gradientPresentation._startPoint = gradientSelf._startPoint
+            gradientPresentation._endPoint = gradientSelf._endPoint
+        }
+
         // Apply active animations
         for (_, animation) in _animations {
             applyAnimation(animation, to: presentation, at: currentTime)
@@ -373,6 +395,8 @@ open class CALayer: CAMediaTiming, Hashable {
         applyPointAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
         applyRectAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
         applyTransformAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        applyColorAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        applyArrayAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
     }
 
     private func applyFloatAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
@@ -401,6 +425,39 @@ open class CALayer: CAMediaTiming, Hashable {
             guard let from = (animation.fromValue as? CGFloat) ?? _zPosition as CGFloat?,
                   let to = (animation.toValue as? CGFloat) ?? _zPosition as CGFloat? else { return }
             layer._zPosition = from + CGFloat(progress) * (to - from)
+
+        // CAShapeLayer properties
+        case "strokeStart":
+            guard let shapeLayer = layer as? CAShapeLayer,
+                  let modelShapeLayer = self as? CAShapeLayer else { return }
+            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._strokeStart
+            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._strokeStart
+            shapeLayer._strokeStart = from + CGFloat(progress) * (to - from)
+        case "strokeEnd":
+            guard let shapeLayer = layer as? CAShapeLayer,
+                  let modelShapeLayer = self as? CAShapeLayer else { return }
+            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._strokeEnd
+            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._strokeEnd
+            shapeLayer._strokeEnd = from + CGFloat(progress) * (to - from)
+        case "lineWidth":
+            guard let shapeLayer = layer as? CAShapeLayer,
+                  let modelShapeLayer = self as? CAShapeLayer else { return }
+            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._lineWidth
+            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._lineWidth
+            shapeLayer._lineWidth = from + CGFloat(progress) * (to - from)
+        case "lineDashPhase":
+            guard let shapeLayer = layer as? CAShapeLayer,
+                  let modelShapeLayer = self as? CAShapeLayer else { return }
+            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._lineDashPhase
+            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._lineDashPhase
+            shapeLayer._lineDashPhase = from + CGFloat(progress) * (to - from)
+        case "miterLimit":
+            guard let shapeLayer = layer as? CAShapeLayer,
+                  let modelShapeLayer = self as? CAShapeLayer else { return }
+            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._miterLimit
+            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._miterLimit
+            shapeLayer._miterLimit = from + CGFloat(progress) * (to - from)
+
         default:
             break
         }
@@ -437,6 +494,27 @@ open class CALayer: CAMediaTiming, Hashable {
                 width: from.width + CGFloat(progress) * (to.width - from.width),
                 height: from.height + CGFloat(progress) * (to.height - from.height)
             )
+
+        // CAGradientLayer properties
+        case "startPoint":
+            guard let gradientLayer = layer as? CAGradientLayer,
+                  let modelGradientLayer = self as? CAGradientLayer else { return }
+            let from = (animation.fromValue as? CGPoint) ?? modelGradientLayer._startPoint
+            let to = (animation.toValue as? CGPoint) ?? modelGradientLayer._startPoint
+            gradientLayer._startPoint = CGPoint(
+                x: from.x + CGFloat(progress) * (to.x - from.x),
+                y: from.y + CGFloat(progress) * (to.y - from.y)
+            )
+        case "endPoint":
+            guard let gradientLayer = layer as? CAGradientLayer,
+                  let modelGradientLayer = self as? CAGradientLayer else { return }
+            let from = (animation.fromValue as? CGPoint) ?? modelGradientLayer._endPoint
+            let to = (animation.toValue as? CGPoint) ?? modelGradientLayer._endPoint
+            gradientLayer._endPoint = CGPoint(
+                x: from.x + CGFloat(progress) * (to.x - from.x),
+                y: from.y + CGFloat(progress) * (to.y - from.y)
+            )
+
         default:
             break
         }
@@ -586,6 +664,128 @@ open class CALayer: CAMediaTiming, Hashable {
         )
     }
 
+    private func applyColorAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        switch keyPath {
+        case "backgroundColor":
+            guard let from = extractColor(animation.fromValue) ?? _backgroundColor,
+                  let to = extractColor(animation.toValue) ?? _backgroundColor else { return }
+            layer._backgroundColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+        case "borderColor":
+            guard let from = extractColor(animation.fromValue) ?? _borderColor,
+                  let to = extractColor(animation.toValue) ?? _borderColor else { return }
+            layer._borderColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+        case "shadowColor":
+            guard let from = extractColor(animation.fromValue) ?? _shadowColor,
+                  let to = extractColor(animation.toValue) ?? _shadowColor else { return }
+            layer._shadowColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+
+        // CAShapeLayer color properties
+        case "fillColor":
+            guard let shapeLayer = layer as? CAShapeLayer,
+                  let modelShapeLayer = self as? CAShapeLayer else { return }
+            guard let from = extractColor(animation.fromValue) ?? modelShapeLayer._fillColor,
+                  let to = extractColor(animation.toValue) ?? modelShapeLayer._fillColor else { return }
+            shapeLayer._fillColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+        case "strokeColor":
+            guard let shapeLayer = layer as? CAShapeLayer,
+                  let modelShapeLayer = self as? CAShapeLayer else { return }
+            guard let from = extractColor(animation.fromValue) ?? modelShapeLayer._strokeColor,
+                  let to = extractColor(animation.toValue) ?? modelShapeLayer._strokeColor else { return }
+            shapeLayer._strokeColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+
+        default:
+            break
+        }
+    }
+
+    /// Safely extracts a CGColor from an Any value.
+    private func extractColor(_ value: Any?) -> CGColor? {
+        guard let value = value else { return nil }
+        // Use type comparison to avoid CF type warnings
+        if type(of: value) == CGColor.self {
+            return (value as! CGColor)
+        }
+        return nil
+    }
+
+    /// Safely extracts a CGPath from an Any value.
+    private func extractPath(_ value: Any?) -> CGPath? {
+        guard let value = value else { return nil }
+        // Use type comparison to avoid CF type warnings
+        if type(of: value) == CGPath.self || type(of: value) == CGMutablePath.self {
+            return (value as! CGPath)
+        }
+        return nil
+    }
+
+    /// Interpolates between two colors in RGBA color space.
+    private func interpolateColor(from: CGColor, to: CGColor, progress: CGFloat) -> CGColor {
+        let fromComponents = from.components ?? [0, 0, 0, 1]
+        let toComponents = to.components ?? [0, 0, 0, 1]
+
+        // Ensure we have at least 4 components (RGBA)
+        let fromR = fromComponents.count > 0 ? fromComponents[0] : 0
+        let fromG = fromComponents.count > 1 ? fromComponents[1] : 0
+        let fromB = fromComponents.count > 2 ? fromComponents[2] : 0
+        let fromA = fromComponents.count > 3 ? fromComponents[3] : 1
+
+        let toR = toComponents.count > 0 ? toComponents[0] : 0
+        let toG = toComponents.count > 1 ? toComponents[1] : 0
+        let toB = toComponents.count > 2 ? toComponents[2] : 0
+        let toA = toComponents.count > 3 ? toComponents[3] : 1
+
+        let r = fromR + progress * (toR - fromR)
+        let g = fromG + progress * (toG - fromG)
+        let b = fromB + progress * (toB - fromB)
+        let a = fromA + progress * (toA - fromA)
+
+        return CGColor(red: r, green: g, blue: b, alpha: a)
+    }
+
+    private func applyArrayAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        switch keyPath {
+        // CAGradientLayer array properties
+        case "colors":
+            guard let gradientLayer = layer as? CAGradientLayer,
+                  let modelGradientLayer = self as? CAGradientLayer else { return }
+            guard let fromColors = (animation.fromValue as? [Any]) ?? modelGradientLayer._colors,
+                  let toColors = (animation.toValue as? [Any]) ?? modelGradientLayer._colors else { return }
+
+            // Interpolate each color in the array
+            let count = min(fromColors.count, toColors.count)
+            var interpolatedColors: [Any] = []
+            for i in 0..<count {
+                if let fromColor = extractColor(fromColors[i]),
+                   let toColor = extractColor(toColors[i]) {
+                    interpolatedColors.append(interpolateColor(from: fromColor, to: toColor, progress: CGFloat(progress)))
+                } else {
+                    // Can't interpolate, use from value
+                    interpolatedColors.append(fromColors[i])
+                }
+            }
+            gradientLayer._colors = interpolatedColors
+
+        case "locations":
+            guard let gradientLayer = layer as? CAGradientLayer,
+                  let modelGradientLayer = self as? CAGradientLayer else { return }
+            guard let fromLocations = (animation.fromValue as? [Float]) ?? modelGradientLayer._locations,
+                  let toLocations = (animation.toValue as? [Float]) ?? modelGradientLayer._locations else { return }
+
+            // Interpolate each location in the array
+            let count = min(fromLocations.count, toLocations.count)
+            var interpolatedLocations: [Float] = []
+            for i in 0..<count {
+                let from = fromLocations[i]
+                let to = toLocations[i]
+                interpolatedLocations.append(from + Float(progress) * (to - from))
+            }
+            gradientLayer._locations = interpolatedLocations
+
+        default:
+            break
+        }
+    }
+
     /// Applies a keyframe animation to a layer property.
     private func applyKeyframeAnimation(_ animation: CAKeyframeAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
         guard let values = animation.values, values.count > 1 else { return }
@@ -676,6 +876,43 @@ open class CALayer: CAMediaTiming, Hashable {
             if let v = value as? CGFloat { layer._zPosition = v }
         case "transform":
             if let v = value as? CATransform3D { layer._transform = v }
+
+        // Color properties
+        case "backgroundColor":
+            if let v = extractColor(value) { layer._backgroundColor = v }
+        case "borderColor":
+            if let v = extractColor(value) { layer._borderColor = v }
+        case "shadowColor":
+            if let v = extractColor(value) { layer._shadowColor = v }
+
+        // CAShapeLayer properties
+        case "strokeStart":
+            if let shapeLayer = layer as? CAShapeLayer, let v = value as? CGFloat { shapeLayer._strokeStart = v }
+        case "strokeEnd":
+            if let shapeLayer = layer as? CAShapeLayer, let v = value as? CGFloat { shapeLayer._strokeEnd = v }
+        case "lineWidth":
+            if let shapeLayer = layer as? CAShapeLayer, let v = value as? CGFloat { shapeLayer._lineWidth = v }
+        case "lineDashPhase":
+            if let shapeLayer = layer as? CAShapeLayer, let v = value as? CGFloat { shapeLayer._lineDashPhase = v }
+        case "miterLimit":
+            if let shapeLayer = layer as? CAShapeLayer, let v = value as? CGFloat { shapeLayer._miterLimit = v }
+        case "fillColor":
+            if let shapeLayer = layer as? CAShapeLayer, let v = extractColor(value) { shapeLayer._fillColor = v }
+        case "strokeColor":
+            if let shapeLayer = layer as? CAShapeLayer, let v = extractColor(value) { shapeLayer._strokeColor = v }
+        case "path":
+            if let shapeLayer = layer as? CAShapeLayer, let v = extractPath(value) { shapeLayer._path = v }
+
+        // CAGradientLayer properties
+        case "startPoint":
+            if let gradientLayer = layer as? CAGradientLayer, let v = value as? CGPoint { gradientLayer._startPoint = v }
+        case "endPoint":
+            if let gradientLayer = layer as? CAGradientLayer, let v = value as? CGPoint { gradientLayer._endPoint = v }
+        case "colors":
+            if let gradientLayer = layer as? CAGradientLayer, let v = value as? [Any] { gradientLayer._colors = v }
+        case "locations":
+            if let gradientLayer = layer as? CAGradientLayer, let v = value as? [Float] { gradientLayer._locations = v }
+
         default:
             break
         }
@@ -719,6 +956,103 @@ open class CALayer: CAMediaTiming, Hashable {
             if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
                 layer._transform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
             }
+
+        // Color properties
+        case "backgroundColor":
+            if let f = extractColor(fromValue), let t = extractColor(toValue) {
+                layer._backgroundColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
+            }
+        case "borderColor":
+            if let f = extractColor(fromValue), let t = extractColor(toValue) {
+                layer._borderColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
+            }
+        case "shadowColor":
+            if let f = extractColor(fromValue), let t = extractColor(toValue) {
+                layer._shadowColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
+            }
+
+        // CAShapeLayer float properties
+        case "strokeStart":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                shapeLayer._strokeStart = f + CGFloat(progress) * (t - f)
+            }
+        case "strokeEnd":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                shapeLayer._strokeEnd = f + CGFloat(progress) * (t - f)
+            }
+        case "lineWidth":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                shapeLayer._lineWidth = f + CGFloat(progress) * (t - f)
+            }
+        case "lineDashPhase":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                shapeLayer._lineDashPhase = f + CGFloat(progress) * (t - f)
+            }
+        case "miterLimit":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                shapeLayer._miterLimit = f + CGFloat(progress) * (t - f)
+            }
+
+        // CAShapeLayer color properties
+        case "fillColor":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = extractColor(fromValue), let t = extractColor(toValue) {
+                shapeLayer._fillColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
+            }
+        case "strokeColor":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = extractColor(fromValue), let t = extractColor(toValue) {
+                shapeLayer._strokeColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
+            }
+
+        // CAGradientLayer properties
+        case "startPoint":
+            if let gradientLayer = layer as? CAGradientLayer,
+               let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
+                gradientLayer._startPoint = CGPoint(
+                    x: f.x + CGFloat(progress) * (t.x - f.x),
+                    y: f.y + CGFloat(progress) * (t.y - f.y)
+                )
+            }
+        case "endPoint":
+            if let gradientLayer = layer as? CAGradientLayer,
+               let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
+                gradientLayer._endPoint = CGPoint(
+                    x: f.x + CGFloat(progress) * (t.x - f.x),
+                    y: f.y + CGFloat(progress) * (t.y - f.y)
+                )
+            }
+        case "colors":
+            if let gradientLayer = layer as? CAGradientLayer,
+               let fromColors = fromValue as? [Any], let toColors = toValue as? [Any] {
+                let count = min(fromColors.count, toColors.count)
+                var interpolatedColors: [Any] = []
+                for i in 0..<count {
+                    if let fromColor = extractColor(fromColors[i]),
+                       let toColor = extractColor(toColors[i]) {
+                        interpolatedColors.append(interpolateColor(from: fromColor, to: toColor, progress: CGFloat(progress)))
+                    } else {
+                        interpolatedColors.append(fromColors[i])
+                    }
+                }
+                gradientLayer._colors = interpolatedColors
+            }
+        case "locations":
+            if let gradientLayer = layer as? CAGradientLayer,
+               let fromLocations = fromValue as? [Float], let toLocations = toValue as? [Float] {
+                let count = min(fromLocations.count, toLocations.count)
+                var interpolatedLocations: [Float] = []
+                for i in 0..<count {
+                    interpolatedLocations.append(fromLocations[i] + Float(progress) * (toLocations[i] - fromLocations[i]))
+                }
+                gradientLayer._locations = interpolatedLocations
+            }
+
         default:
             break
         }
