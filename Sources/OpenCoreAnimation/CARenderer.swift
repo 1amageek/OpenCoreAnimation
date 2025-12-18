@@ -10,6 +10,8 @@ public enum CARendererError: Error {
     case bufferCreationFailed
     /// Failed to create texture.
     case textureCreationFailed
+    /// Failed to create GPU resource.
+    case resourceCreationFailed
     /// The canvas/view is not configured.
     case canvasNotConfigured
     /// General rendering error.

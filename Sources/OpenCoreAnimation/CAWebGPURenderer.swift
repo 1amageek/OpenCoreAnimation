@@ -160,6 +160,26 @@ public struct CARendererUniforms {
     }
 }
 
+/// Uniform data for textured layer rendering.
+public struct TexturedUniforms {
+    public var mvpMatrix: Matrix4x4
+    public var opacity: Float
+    public var cornerRadius: Float
+    public var layerSize: SIMD2<Float>
+
+    public init(
+        mvpMatrix: Matrix4x4 = .identity,
+        opacity: Float = 1.0,
+        cornerRadius: Float = 0.0,
+        layerSize: SIMD2<Float> = .zero
+    ) {
+        self.mvpMatrix = mvpMatrix
+        self.opacity = opacity
+        self.cornerRadius = cornerRadius
+        self.layerSize = layerSize
+    }
+}
+
 // MARK: - WASM Helper Extensions
 
 extension CALayer {
@@ -290,6 +310,20 @@ public final class CAWebGPURenderer: CARenderer {
 
     /// Current layer index during rendering.
     private var currentLayerIndex: Int = 0
+
+    // MARK: - Texture Rendering
+
+    /// The textured render pipeline.
+    private var texturedPipeline: GPURenderPipeline?
+
+    /// The bind group layout for textured rendering.
+    private var texturedBindGroupLayout: GPUBindGroupLayout?
+
+    /// The texture sampler.
+    private var textureSampler: GPUSampler?
+
+    /// Cache of GPU textures keyed by CGImage identity.
+    private var textureCache: [ObjectIdentifier: GPUTexture] = [:]
 
     // MARK: - Shader Code
 
@@ -478,6 +512,69 @@ public final class CAWebGPURenderer: CARenderer {
     }
     """
 
+    /// Shader code for textured rendering.
+    private let texturedShaderCode = """
+    struct Uniforms {
+        mvpMatrix: mat4x4<f32>,
+        opacity: f32,
+        cornerRadius: f32,
+        layerSize: vec2<f32>,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+    @group(0) @binding(1) var textureSampler: sampler;
+    @group(0) @binding(2) var textureData: texture_2d<f32>;
+
+    struct VertexInput {
+        @location(0) position: vec2<f32>,
+        @location(1) texCoord: vec2<f32>,
+        @location(2) color: vec4<f32>,
+    }
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) texCoord: vec2<f32>,
+        @location(1) color: vec4<f32>,
+    }
+
+    @vertex
+    fn vertexMain(input: VertexInput) -> VertexOutput {
+        var output: VertexOutput;
+        output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
+        output.texCoord = input.texCoord;
+        output.color = input.color * uniforms.opacity;
+        return output;
+    }
+
+    // Signed distance function for a rounded rectangle
+    fn sdRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, radius: f32) -> f32 {
+        let q = abs(p) - halfSize + radius;
+        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        // Sample texture
+        var texColor = textureSample(textureData, textureSampler, input.texCoord);
+
+        // Apply opacity
+        texColor.a *= uniforms.opacity;
+
+        // Apply corner radius if set
+        if (uniforms.cornerRadius > 0.0 && uniforms.layerSize.x > 0.0 && uniforms.layerSize.y > 0.0) {
+            let pixelCoord = (input.texCoord - 0.5) * uniforms.layerSize;
+            let halfSize = uniforms.layerSize * 0.5;
+            let maxRadius = min(halfSize.x, halfSize.y);
+            let radius = min(uniforms.cornerRadius, maxRadius);
+            let dist = sdRoundedBox(pixelCoord, halfSize, radius);
+            let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
+            texColor.a *= alpha;
+        }
+
+        return texColor;
+    }
+    """
+
     // MARK: - Initialization
 
     /// Creates a new WebGPU renderer with the specified canvas element.
@@ -629,6 +726,109 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Create depth texture
         createDepthTexture(width: Int(width), height: Int(height))
+
+        // Create textured pipeline
+        try createTexturedPipeline(device: device)
+    }
+
+    /// Creates the textured render pipeline for layer.contents rendering.
+    private func createTexturedPipeline(device: GPUDevice) throws {
+        // Create shader module
+        let shaderModule = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
+            code: texturedShaderCode
+        ))
+
+        // Create sampler
+        textureSampler = device.createSampler(descriptor: GPUSamplerDescriptor(
+            magFilter: .linear,
+            minFilter: .linear,
+            mipmapFilter: .linear,
+            addressModeU: .clampToEdge,
+            addressModeV: .clampToEdge,
+            addressModeW: .clampToEdge
+        ))
+
+        // Create bind group layout with uniform, sampler, and texture
+        texturedBindGroupLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
+            entries: [
+                GPUBindGroupLayoutEntry(
+                    binding: 0,
+                    visibility: [.vertex, .fragment],
+                    buffer: GPUBufferBindingLayout(
+                        type: .uniform,
+                        hasDynamicOffset: true,
+                        minBindingSize: UInt64(MemoryLayout<TexturedUniforms>.stride)
+                    )
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 1,
+                    visibility: .fragment,
+                    sampler: GPUSamplerBindingLayout(type: .filtering)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 2,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(
+                        sampleType: .float,
+                        viewDimension: .dimension2D
+                    )
+                )
+            ]
+        ))
+
+        guard let texturedBindGroupLayout = texturedBindGroupLayout else {
+            throw CARendererError.resourceCreationFailed
+        }
+
+        // Create pipeline layout
+        let pipelineLayout = device.createPipelineLayout(descriptor: GPUPipelineLayoutDescriptor(
+            bindGroupLayouts: [texturedBindGroupLayout]
+        ))
+
+        // Create textured render pipeline
+        texturedPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: shaderModule,
+                entryPoint: "vertexMain",
+                buffers: [
+                    GPUVertexBufferLayout(
+                        arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                        attributes: [
+                            GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                            GPUVertexAttribute(format: .float32x2, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride), shaderLocation: 1),
+                            GPUVertexAttribute(format: .float32x4, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2), shaderLocation: 2)
+                        ]
+                    )
+                ]
+            ),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plus,
+                depthWriteEnabled: true,
+                depthCompare: .lessEqual
+            ),
+            fragment: GPUFragmentState(
+                module: shaderModule,
+                entryPoint: "fragmentMain",
+                targets: [
+                    GPUColorTargetState(
+                        format: preferredFormat,
+                        blend: GPUBlendState(
+                            color: GPUBlendComponent(
+                                srcFactor: .srcAlpha,
+                                dstFactor: .oneMinusSrcAlpha,
+                                operation: .add
+                            ),
+                            alpha: GPUBlendComponent(
+                                srcFactor: .one,
+                                dstFactor: .oneMinusSrcAlpha,
+                                operation: .add
+                            )
+                        )
+                    )
+                ]
+            ),
+            layout: .layout(pipelineLayout)
+        ))
     }
 
     /// Creates or recreates the depth texture for the given size.
@@ -717,6 +917,10 @@ public final class CAWebGPURenderer: CARenderer {
         bindGroupLayout = nil
         depthTexture = nil
         pipeline = nil
+        texturedPipeline = nil
+        texturedBindGroupLayout = nil
+        textureSampler = nil
+        textureCache.removeAll()
         context = nil
         device = nil
     }
@@ -789,6 +993,11 @@ public final class CAWebGPURenderer: CARenderer {
            let colors = gradientLayer.colors, !colors.isEmpty {
             renderGradientLayer(gradientLayer, device: device, renderPass: renderPass,
                               modelMatrix: modelMatrix, bindGroup: bindGroup)
+        }
+        // Check if layer has contents (CGImage)
+        else if let contents = presentationLayer.contents {
+            renderContentsLayer(presentationLayer, contents: contents, device: device,
+                               renderPass: renderPass, modelMatrix: modelMatrix)
         }
         // Render background color if set (and not a gradient layer, or gradient has no colors)
         else if presentationLayer.backgroundColor != nil {
@@ -1091,15 +1300,259 @@ public final class CAWebGPURenderer: CARenderer {
         return min(max(value, minVal), maxVal)
     }
 
+    // MARK: - Contents Layer Rendering (CGImage)
+
+    /// Renders a layer with CGImage contents.
+    private func renderContentsLayer(
+        _ layer: CALayer,
+        contents: CGImage,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) {
+        guard let texturedPipeline = texturedPipeline,
+              let texturedBindGroupLayout = texturedBindGroupLayout,
+              let textureSampler = textureSampler,
+              let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer else { return }
+
+        guard currentLayerIndex < Self.maxLayers else { return }
+
+        let layerIndex = currentLayerIndex
+        currentLayerIndex += 1
+
+        // Get or create GPU texture from CGImage
+        let textureKey = ObjectIdentifier(contents)
+        let gpuTexture: GPUTexture
+        if let cached = textureCache[textureKey] {
+            gpuTexture = cached
+        } else {
+            guard let newTexture = createGPUTexture(from: contents, device: device) else { return }
+            textureCache[textureKey] = newTexture
+            gpuTexture = newTexture
+        }
+
+        // Create scale matrix for layer bounds
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(layer.bounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(layer.bounds.height), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+
+        let finalMatrix = modelMatrix * scaleMatrix
+
+        // Create uniforms for textured rendering
+        var uniforms = TexturedUniforms(
+            mvpMatrix: finalMatrix,
+            opacity: layer.opacity,
+            cornerRadius: Float(layer.cornerRadius),
+            layerSize: SIMD2<Float>(Float(layer.bounds.width), Float(layer.bounds.height))
+        )
+
+        // Write uniforms
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: uniformData
+        )
+
+        // Create vertices with white color (texture will provide color)
+        let white = SIMD4<Float>(1, 1, 1, 1)
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+        ]
+
+        // Write vertices
+        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+        let vertexData = createFloat32Array(from: &vertices)
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: vertexData
+        )
+
+        // Create bind group with texture
+        let texturedBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: texturedBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(
+                    binding: 0,
+                    resource: .bufferBinding(GPUBufferBinding(
+                        buffer: uniformBuffer,
+                        size: UInt64(MemoryLayout<TexturedUniforms>.stride)
+                    ))
+                ),
+                GPUBindGroupEntry(
+                    binding: 1,
+                    resource: .sampler(textureSampler)
+                ),
+                GPUBindGroupEntry(
+                    binding: 2,
+                    resource: .textureView(gpuTexture.createView())
+                )
+            ]
+        ))
+
+        // Switch to textured pipeline and render
+        renderPass.setPipeline(texturedPipeline)
+        renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.draw(vertexCount: 6)
+
+        // Switch back to non-textured pipeline for subsequent rendering
+        if let pipeline = pipeline {
+            renderPass.setPipeline(pipeline)
+        }
+    }
+
+    /// Creates a GPU texture from a CGImage.
+    private func createGPUTexture(from cgImage: CGImage, device: GPUDevice) -> GPUTexture? {
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 0 && height > 0 else { return nil }
+
+        // Get RGBA data
+        guard let rgbaData = getRGBAData(from: cgImage) else { return nil }
+
+        // Create texture
+        let textureDescriptor = GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: .rgba8unorm,
+            usage: [.textureBinding, .copyDst, .renderAttachment]
+        )
+
+        let texture = device.createTexture(descriptor: textureDescriptor)
+
+        // Create JS Uint8Array from data
+        let jsArray = createUint8Array(from: rgbaData)
+
+        // Upload data
+        device.queue.writeTexture(
+            destination: GPUImageCopyTexture(texture: texture),
+            data: jsArray,
+            dataLayout: GPUImageDataLayout(
+                offset: 0,
+                bytesPerRow: UInt32(width * 4),
+                rowsPerImage: UInt32(height)
+            ),
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height))
+        )
+
+        return texture
+    }
+
+    /// Converts CGImage data to RGBA format.
+    private func getRGBAData(from cgImage: CGImage) -> Data? {
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 0 && height > 0 else { return nil }
+
+        // If CGImage has data, try to use it directly
+        guard let sourceData = cgImage.data else { return nil }
+
+        let bytesPerPixel = cgImage.bitsPerPixel / 8
+        let sourceBytesPerRow = cgImage.bytesPerRow
+        let destBytesPerRow = width * 4
+        let totalBytes = destBytesPerRow * height
+
+        // If already RGBA8, use directly
+        if bytesPerPixel == 4 && sourceBytesPerRow == destBytesPerRow {
+            let isRGBA = cgImage.alphaInfo == .premultipliedLast ||
+                        cgImage.alphaInfo == .last ||
+                        cgImage.alphaInfo == .noneSkipLast
+            if isRGBA {
+                return sourceData
+            }
+        }
+
+        // Need to convert
+        var destData = Data(count: totalBytes)
+
+        sourceData.withUnsafeBytes { sourceBuffer in
+            destData.withUnsafeMutableBytes { destBuffer in
+                guard let sourceBase = sourceBuffer.baseAddress,
+                      let destBase = destBuffer.baseAddress else { return }
+
+                for y in 0..<height {
+                    for x in 0..<width {
+                        let destOffset = y * destBytesPerRow + x * 4
+                        let d = destBase.advanced(by: destOffset).assumingMemoryBound(to: UInt8.self)
+
+                        if bytesPerPixel == 4 {
+                            let sourceOffset = y * sourceBytesPerRow + x * 4
+                            let s = sourceBase.advanced(by: sourceOffset).assumingMemoryBound(to: UInt8.self)
+
+                            // Handle different alpha positions
+                            switch cgImage.alphaInfo {
+                            case .premultipliedFirst, .first:
+                                // ARGB -> RGBA
+                                d[0] = s[1]; d[1] = s[2]; d[2] = s[3]; d[3] = s[0]
+                            case .noneSkipFirst:
+                                // xRGB -> RGBA
+                                d[0] = s[1]; d[1] = s[2]; d[2] = s[3]; d[3] = 255
+                            case .noneSkipLast:
+                                // RGBx -> RGBA
+                                d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255
+                            default:
+                                // Assume RGBA
+                                d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3]
+                            }
+                        } else if bytesPerPixel == 3 {
+                            let sourceOffset = y * sourceBytesPerRow + x * 3
+                            let s = sourceBase.advanced(by: sourceOffset).assumingMemoryBound(to: UInt8.self)
+                            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = 255
+                        } else if bytesPerPixel == 1 {
+                            let sourceOffset = y * sourceBytesPerRow + x
+                            let gray = sourceBase.advanced(by: sourceOffset).assumingMemoryBound(to: UInt8.self)[0]
+                            d[0] = gray; d[1] = gray; d[2] = gray; d[3] = 255
+                        }
+                    }
+                }
+            }
+        }
+
+        return destData
+    }
+
+    /// Creates a JavaScript Uint8Array from Data.
+    private func createUint8Array(from data: Data) -> JSObject {
+        let uint8Array = JSObject.global.Uint8Array.function!.new(data.count)
+        data.withUnsafeBytes { bytes in
+            for i in 0..<data.count {
+                uint8Array[i] = .number(Double(bytes.load(fromByteOffset: i, as: UInt8.self)))
+            }
+        }
+        return uint8Array
+    }
+
+    /// Clears the texture cache for a specific CGImage.
+    public func removeTexture(for cgImage: CGImage) {
+        let key = ObjectIdentifier(cgImage)
+        textureCache.removeValue(forKey: key)
+    }
+
+    /// Clears all cached textures.
+    public func clearTextureCache() {
+        textureCache.removeAll()
+    }
+
     // MARK: - Text Layer Rendering
 
     /// Cache for text textures to avoid recreating them every frame.
-    private var textTextureCache: [ObjectIdentifier: (texture: GPUTexture, width: Int, height: Int)] = [:]
+    private var textTextureCache: [String: GPUTexture] = [:]
 
-    /// Renders a CATextLayer using Canvas2D for text rasterization.
+    /// Renders a CATextLayer using Canvas2D for text rasterization and texture-based rendering.
     ///
-    /// This method uses an offscreen Canvas2D to render the text, then creates
-    /// a WebGPU texture from the canvas data and displays it.
+    /// This method uses an offscreen Canvas2D to render the text, creates a WebGPU texture
+    /// from the canvas data, and displays it using the textured pipeline.
     private func renderTextLayer(
         _ textLayer: CATextLayer,
         device: GPUDevice,
@@ -1108,8 +1561,12 @@ public final class CAWebGPURenderer: CARenderer {
         bindGroup: GPUBindGroup
     ) {
         guard let string = textLayer.string else { return }
-        guard let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
+        guard let texturedPipeline = texturedPipeline,
+              let texturedBindGroupLayout = texturedBindGroupLayout,
+              let textureSampler = textureSampler,
+              let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer,
+              let pipeline = pipeline else { return }
 
         let text: String
         if let str = string as? String {
@@ -1129,11 +1586,19 @@ public final class CAWebGPURenderer: CARenderer {
 
         guard width > 0 && height > 0 else { return }
 
-        // Create offscreen canvas for text rendering
-        let document = JSObject.global.document
-        let offscreenCanvas = document.createElement("canvas")
-        offscreenCanvas.width = .number(Double(width))
-        offscreenCanvas.height = .number(Double(height))
+        // Create cache key based on text content and properties
+        let cacheKey = "\(text)_\(width)x\(height)_\(textLayer.fontSize)_\(textLayer.alignmentMode.rawValue)"
+
+        // Check cache first
+        let gpuTexture: GPUTexture
+        if let cached = textTextureCache[cacheKey] {
+            gpuTexture = cached
+        } else {
+            // Create offscreen canvas for text rendering
+            let document = JSObject.global.document
+            let offscreenCanvas = document.createElement("canvas")
+            offscreenCanvas.width = .number(Double(width))
+            offscreenCanvas.height = .number(Double(height))
 
         guard let ctx = offscreenCanvas.getContext("2d").object else { return }
 
@@ -1221,20 +1686,39 @@ public final class CAWebGPURenderer: CARenderer {
 
         let texture = device.createTexture(descriptor: textureDescriptor)
 
-        // Copy image data to texture
-        device.queue.writeTexture(
-            destination: GPUImageCopyTexture(texture: texture),
-            data: dataArray,
-            dataLayout: GPUImageDataLayout(
-                offset: 0,
-                bytesPerRow: UInt32(width * 4),
-                rowsPerImage: UInt32(height)
-            ),
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height))
+            // Copy image data to texture
+            device.queue.writeTexture(
+                destination: GPUImageCopyTexture(texture: texture),
+                data: dataArray,
+                dataLayout: GPUImageDataLayout(
+                    offset: 0,
+                    bytesPerRow: UInt32(width * 4),
+                    rowsPerImage: UInt32(height)
+                ),
+                size: GPUExtent3D(width: UInt32(width), height: UInt32(height))
+            )
+
+            // Cache the texture
+            textTextureCache[cacheKey] = texture
+            gpuTexture = texture
+        }
+
+        // Create texture view
+        let textureView = gpuTexture.createView()
+
+        // Create bind group with the texture
+        let texturedBindGroup = device.createBindGroup(
+            descriptor: GPUBindGroupDescriptor(
+                layout: texturedBindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(binding: 0, resource: .buffer(GPUBufferBinding(buffer: uniformBuffer))),
+                    GPUBindGroupEntry(binding: 1, resource: .sampler(textureSampler)),
+                    GPUBindGroupEntry(binding: 2, resource: .textureView(textureView))
+                ]
+            )
         )
 
-        // For now, render as a colored quad with the text layer's bounds
-        // A full implementation would use a texture-mapped shader
+        // Setup matrices
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(Float(textLayer.bounds.width), 0, 0, 0),
             SIMD4<Float>(0, Float(textLayer.bounds.height), 0, 0),
@@ -1260,21 +1744,15 @@ public final class CAWebGPURenderer: CARenderer {
             data: uniformData
         )
 
-        // Use foreground color for text (solid color rendering as fallback)
-        let color: SIMD4<Float>
-        if let fgColor = textLayer.foregroundColor {
-            color = cgColorToSIMD4(fgColor)
-        } else {
-            color = SIMD4<Float>(1, 1, 1, 1)
-        }
-
+        // White vertex color for texture rendering (texture provides actual color)
+        let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
         ]
 
         // Write vertices
@@ -1286,10 +1764,14 @@ public final class CAWebGPURenderer: CARenderer {
             data: vertexData
         )
 
-        // Draw
-        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        // Switch to textured pipeline and draw
+        renderPass.setPipeline(texturedPipeline)
+        renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
+
+        // Switch back to standard pipeline
+        renderPass.setPipeline(pipeline)
     }
 
     /// Draws wrapped text on a Canvas2D context.
