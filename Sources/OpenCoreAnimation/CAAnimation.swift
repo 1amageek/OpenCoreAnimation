@@ -110,6 +110,8 @@ open class CAAnimation: CAMediaTiming, CAAction {
     ///   - dict: A dictionary of additional parameters. May contain:
     ///     - `"previousValue"`: The value before the change.
     ///     - `"newValue"`: The new value after the change.
+    ///     - `"animationDuration"`: The animation duration captured at registration time.
+    ///     - `"animationTimingFunction"`: The timing function captured at registration time.
     open func run(forKey event: String, object anObject: Any, arguments dict: [AnyHashable: Any]?) {
         guard let layer = anObject as? CALayer else { return }
 
@@ -131,14 +133,24 @@ open class CAAnimation: CAMediaTiming, CAAction {
             }
         }
 
-        // Set duration from transaction if not explicitly set
+        // Set duration from captured settings (preferred) or fall back to transaction
+        // The captured duration ensures we use the settings from when the property was changed,
+        // not from when the animation is applied (transaction may have been popped by then)
         if duration == 0 {
-            duration = CATransaction.animationDuration()
+            if let capturedDuration = dict?["animationDuration"] as? CFTimeInterval {
+                duration = capturedDuration
+            } else {
+                duration = CATransaction.animationDuration()
+            }
         }
 
-        // Set timing function from transaction if not explicitly set
+        // Set timing function from captured settings or transaction
         if timingFunction == nil {
-            timingFunction = CATransaction.animationTimingFunction()
+            if let capturedTiming = dict?["animationTimingFunction"] as? CAMediaTimingFunction {
+                timingFunction = capturedTiming
+            } else {
+                timingFunction = CATransaction.animationTimingFunction()
+            }
         }
 
         // Add the animation to the layer

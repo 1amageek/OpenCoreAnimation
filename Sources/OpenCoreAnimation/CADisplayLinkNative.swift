@@ -2,6 +2,22 @@
 
 import Foundation
 
+/// A placeholder type for Selector on native platforms (for testing).
+///
+/// This library uses `CADisplayLinkDelegate` protocol instead of Objective-C selectors.
+/// This type exists for API compatibility with the WASM version and CoreAnimation.
+public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
+    public var description: String
+
+    public init(_ string: String) {
+        self.description = string
+    }
+
+    public init(stringLiteral value: String) {
+        self.description = value
+    }
+}
+
 /// A timer object that allows your application to synchronize its drawing to the refresh rate of the display.
 ///
 /// This native implementation uses `Timer` for testing purposes.

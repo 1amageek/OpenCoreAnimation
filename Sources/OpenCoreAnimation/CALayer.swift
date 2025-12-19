@@ -701,9 +701,15 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Safely extracts a CGColor from an Any value.
     private func extractColor(_ value: Any?) -> CGColor? {
         guard let value = value else { return nil }
-        // Use type comparison to avoid CF type warnings
-        if type(of: value) == CGColor.self {
-            return (value as! CGColor)
+        // Check if the value's type is CGColor or a subclass using type hierarchy
+        let valueType = type(of: value)
+        var currentType: Any.Type? = valueType
+        while let checkType = currentType {
+            if checkType == CGColor.self {
+                // We've verified the type is CGColor or a subclass, safe to cast
+                return unsafeBitCast(value as AnyObject, to: CGColor.self)
+            }
+            currentType = (checkType as? AnyClass)?.superclass()
         }
         return nil
     }
@@ -711,28 +717,23 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Safely extracts a CGPath from an Any value.
     private func extractPath(_ value: Any?) -> CGPath? {
         guard let value = value else { return nil }
-        // Use type comparison to avoid CF type warnings
-        if type(of: value) == CGPath.self || type(of: value) == CGMutablePath.self {
-            return (value as! CGPath)
+        // Check if the value's type is CGPath or CGMutablePath using type hierarchy
+        let valueType = type(of: value)
+        var currentType: Any.Type? = valueType
+        while let checkType = currentType {
+            if checkType == CGPath.self || checkType == CGMutablePath.self {
+                return unsafeBitCast(value as AnyObject, to: CGPath.self)
+            }
+            currentType = (checkType as? AnyClass)?.superclass()
         }
         return nil
     }
 
     /// Interpolates between two colors in RGBA color space.
     private func interpolateColor(from: CGColor, to: CGColor, progress: CGFloat) -> CGColor {
-        let fromComponents = from.components ?? [0, 0, 0, 1]
-        let toComponents = to.components ?? [0, 0, 0, 1]
-
-        // Ensure we have at least 4 components (RGBA)
-        let fromR = fromComponents.count > 0 ? fromComponents[0] : 0
-        let fromG = fromComponents.count > 1 ? fromComponents[1] : 0
-        let fromB = fromComponents.count > 2 ? fromComponents[2] : 0
-        let fromA = fromComponents.count > 3 ? fromComponents[3] : 1
-
-        let toR = toComponents.count > 0 ? toComponents[0] : 0
-        let toG = toComponents.count > 1 ? toComponents[1] : 0
-        let toB = toComponents.count > 2 ? toComponents[2] : 0
-        let toA = toComponents.count > 3 ? toComponents[3] : 1
+        // Convert both colors to RGBA format, handling different component counts
+        let (fromR, fromG, fromB, fromA) = extractRGBA(from: from)
+        let (toR, toG, toB, toA) = extractRGBA(from: to)
 
         let r = fromR + progress * (toR - fromR)
         let g = fromG + progress * (toG - fromG)
@@ -740,6 +741,38 @@ open class CALayer: CAMediaTiming, Hashable {
         let a = fromA + progress * (toA - fromA)
 
         return CGColor(red: r, green: g, blue: b, alpha: a)
+    }
+
+    /// Extracts RGBA components from a CGColor, handling different color space formats.
+    ///
+    /// - 1 component: gray (alpha = 1)
+    /// - 2 components: [gray, alpha]
+    /// - 3 components: [R, G, B] (alpha = 1)
+    /// - 4 components: [R, G, B, A]
+    private func extractRGBA(from color: CGColor) -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat) {
+        let components = color.components ?? [0, 0, 0, 1]
+        let count = components.count
+
+        switch count {
+        case 1:
+            // Gray only, assume alpha = 1
+            let gray = components[0]
+            return (gray, gray, gray, 1.0)
+        case 2:
+            // Grayscale: [gray, alpha]
+            let gray = components[0]
+            let alpha = components[1]
+            return (gray, gray, gray, alpha)
+        case 3:
+            // RGB without alpha
+            return (components[0], components[1], components[2], 1.0)
+        case 4:
+            // RGBA
+            return (components[0], components[1], components[2], components[3])
+        default:
+            // Fallback
+            return (0, 0, 0, 1)
+        }
     }
 
     private func applyArrayAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
@@ -2008,6 +2041,10 @@ open class CALayer: CAMediaTiming, Hashable {
     private var _animationKeyCounter: Int = 0
 
     /// Add the specified animation object to the layer's render tree.
+    ///
+    /// If an animation with the same key already exists, it is replaced.
+    /// The replaced animation's delegate receives `animationDidStop(_:finished:)`
+    /// with `finished: false` before the new animation starts.
     open func add(_ anim: CAAnimation, forKey key: String?) {
         let animKey: String
         if let key = key {
@@ -2015,6 +2052,13 @@ open class CALayer: CAMediaTiming, Hashable {
         } else {
             _animationKeyCounter += 1
             animKey = "animation_\(_animationKeyCounter)"
+        }
+
+        // If there's an existing animation with this key, stop it properly
+        if let existingAnimation = _animations[animKey] {
+            if !existingAnimation.isFinished {
+                existingAnimation.markFinished(completed: false)
+            }
         }
 
         // Set up animation internal state
