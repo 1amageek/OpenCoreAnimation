@@ -143,11 +143,38 @@ open class CALayer: CAMediaTiming, Hashable {
         return presentation
     }
 
+    /// Returns a presentation layer copy with animations evaluated at a specific time offset.
+    ///
+    /// This is used by CAReplicatorLayer to implement instanceDelay, where each
+    /// replicated instance has its animations delayed by a fixed amount.
+    ///
+    /// - Parameter timeOffset: The time offset to subtract from the current time when evaluating animations.
+    ///                         Positive values make the animation appear earlier (as if more time has passed).
+    /// - Returns: A new presentation layer with animations evaluated at the offset time.
+    public func presentationAtTimeOffset(_ timeOffset: CFTimeInterval) -> Self {
+        // Create a new presentation layer copy
+        let presentationClass = type(of: self)
+        let presentation = presentationClass.init(layer: self)
+        presentation._isPresentation = true
+        presentation._modelLayer = self
+
+        // Update with animations at the offset time
+        let evaluationTime = CACurrentMediaTime() - timeOffset
+        updatePresentationLayer(presentation, at: evaluationTime)
+
+        return presentation
+    }
+
     /// Updates the presentation layer with current animated values.
     private func updatePresentationLayer() {
         guard let presentation = _presentationLayer else { return }
 
         let currentTime = CACurrentMediaTime()
+        updatePresentationLayer(presentation, at: currentTime)
+    }
+
+    /// Updates a presentation layer with animated values at a specific time.
+    private func updatePresentationLayer(_ presentation: CALayer, at currentTime: CFTimeInterval) {
 
         // Copy current property values
         presentation._bounds = _bounds

@@ -85,7 +85,7 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
             maximum: preferredFrameRate,
             preferred: preferredFrameRate
         )
-        displayLink?.add(to: AnyObject.self as AnyObject, forMode: AnyObject.self as AnyObject)
+        displayLink?.add(to: .main, forMode: .common)
     }
 
     /// Stops the animation loop.

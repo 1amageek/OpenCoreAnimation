@@ -604,7 +604,7 @@ layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
 
 #### CADisplayLink
 
-While CADisplayLink maintains API signature compatibility, the callback mechanism differs on WASM:
+CADisplayLink maintains full API signature compatibility with Apple's CoreAnimation. The `add(to:forMode:)` method uses `RunLoop` and `RunLoop.Mode` types on both platforms.
 
 **CoreAnimation (Native):**
 ```swift
@@ -620,7 +620,7 @@ displayLink.add(to: .main, forMode: .common)
 ```swift
 // Selector is a placeholder type (no Objective-C runtime on WASM)
 let displayLink = CADisplayLink(target: self, selector: Selector(""))
-displayLink.add(to: AnyObject.self, forMode: AnyObject.self)
+displayLink.add(to: .main, forMode: .common)  // Same API!
 
 // Target must conform to CADisplayLinkDelegate
 extension MyClass: CADisplayLinkDelegate {
@@ -630,7 +630,326 @@ extension MyClass: CADisplayLinkDelegate {
 }
 ```
 
-**Migration:** When porting code to WASM, replace `@objc` selector-based callbacks with `CADisplayLinkDelegate` conformance.
+**Key Differences:**
+- **Selector**: On WASM, `Selector` is a stub type. Use `CADisplayLinkDelegate` for callbacks instead of `@objc` methods.
+- **RunLoop.Mode**: On WASM, `RunLoop.Mode` values (`.common`, `.default`) are accepted but ignored. JavaScript's `requestAnimationFrame` always fires when the browser is ready to paint, which is equivalent to `.common` mode behavior.
+- **RunLoop**: A stub `RunLoop` type is provided for API compatibility. On WASM, there is no actual run loop; `requestAnimationFrame` is used internally.
+
+**Migration:** When porting code to WASM, the only change required is replacing `@objc` selector-based callbacks with `CADisplayLinkDelegate` conformance. The `add(to:forMode:)` call remains identical.
+
+## OpenCoreGraphics Reference Architecture
+
+OpenCoreAnimation's WebGPU rendering should follow the patterns established in [OpenCoreGraphics](../OpenCoreGraphics). This section documents key architectural decisions that apply to CALayer rendering.
+
+### Project Structure Pattern
+
+OpenCoreGraphics separates API layer from rendering implementation:
+
+```
+Sources/OpenCoreGraphics/
+├── Graphics/                    # CoreGraphics-compatible API layer
+│   ├── CGContext.swift          # Drawing context (command recorder)
+│   ├── CGPath.swift             # Path primitives
+│   └── CGContextRendererDelegate.swift  # Renderer protocol
+└── Rendering/WebGPU/            # WASM-specific rendering
+    ├── CGWebGPUContextRenderer.swift    # Main renderer
+    ├── PathTessellator.swift            # Path → triangles
+    ├── Shaders.swift                    # WGSL shaders
+    └── Internal/
+        ├── BufferPool.swift             # Ring buffer pool
+        ├── TextureManager.swift         # LRU texture cache
+        └── GeometryCache.swift          # Tessellation cache
+```
+
+**Apply to OpenCoreAnimation:**
+```
+Sources/OpenCoreAnimation/
+├── Layers/                      # CALayer API (CoreAnimation-compatible)
+├── Animation/                   # CAAnimation API
+└── Rendering/WebGPU/            # WASM rendering
+    ├── CAWebGPURenderer.swift
+    ├── LayerTessellator.swift   # Layer bounds → quads
+    └── Internal/
+        ├── BufferPool.swift
+        └── TextureManager.swift
+```
+
+### Renderer Delegate Pattern
+
+OpenCoreGraphics uses a protocol-based renderer delegate:
+
+```swift
+// Protocol for stateless rendering commands
+public protocol CGContextRendererDelegate: AnyObject {
+    func fill(_ path: CGPath, using rule: CGPathFillRule, state: CGDrawingState)
+    func stroke(_ path: CGPath, state: CGDrawingState)
+    func drawImage(_ image: CGImage, in rect: CGRect, state: CGDrawingState)
+}
+
+// CGContext holds state and delegates to renderer
+public class CGContext {
+    public var rendererDelegate: CGContextRendererDelegate?
+
+    public func fillPath(using rule: CGPathFillRule) {
+        rendererDelegate?.fill(path, using: rule, state: currentState)
+    }
+}
+```
+
+**Apply to OpenCoreAnimation:**
+```swift
+// CALayer delegates rendering to a renderer
+public protocol CALayerRenderer: AnyObject {
+    func render(layer: CALayer, in context: CGContext)
+    func renderSublayers(of layer: CALayer, in context: CGContext)
+}
+```
+
+### Path Tessellation (CPU-side)
+
+OpenCoreGraphics converts vector paths to GPU triangles on CPU:
+
+1. **Bézier Flattening**: Recursive subdivision until flatness threshold
+2. **Polygon Triangulation**: Ear-clipping algorithm for fills
+3. **Stroke Mesh Generation**: Quads along path with caps/joins
+
+```swift
+// PathTessellator.swift pattern
+public struct PathTessellator {
+    public func tessellateFill(path: CGPath, transform: CGAffineTransform) -> [CGWebGPUVertex] {
+        let flattenedPoints = flattenPath(path, transform: transform)
+        let triangles = EarClipping.triangulate(polygon: flattenedPoints)
+        return triangles.map { CGWebGPUVertex(position: $0, color: fillColor) }
+    }
+}
+```
+
+**For CALayer**: Layers are typically rectangular, so tessellation is simpler (2 triangles per layer). Complex shapes use CAShapeLayer which delegates to CGContext.
+
+### Vertex Data Format
+
+OpenCoreGraphics uses interleaved vertex data:
+
+```swift
+public struct CGWebGPUVertex: Sendable {
+    public var x: Float        // NDC position X
+    public var y: Float        // NDC position Y
+    public var r: Float        // Color R (0-1)
+    public var g: Float        // Color G (0-1)
+    public var b: Float        // Color B (0-1)
+    public var a: Float        // Color A (0-1)
+
+    public static var stride: UInt64 { 24 }  // 6 floats × 4 bytes
+}
+
+// Batch conversion for GPU upload
+extension Array where Element == CGWebGPUVertex {
+    public func toFloatArray() -> [Float] {
+        var data: [Float] = []
+        data.reserveCapacity(count * 6)
+        for v in self {
+            data.append(contentsOf: [v.x, v.y, v.r, v.g, v.b, v.a])
+        }
+        return data
+    }
+}
+```
+
+### Coordinate Transformation
+
+CoreGraphics uses bottom-left origin (Y-up), WebGPU uses NDC (center origin, -1 to 1):
+
+```swift
+// Transform CG coords to NDC
+func toNDC(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat) -> (Float, Float) {
+    let ndcX = Float(2.0 * x / width - 1.0)
+    let ndcY = Float(2.0 * y / height - 1.0)
+    return (ndcX, ndcY)
+}
+```
+
+### GPU Memory Management
+
+OpenCoreGraphics implements several caching strategies:
+
+#### BufferPool (Ring Buffer)
+
+Prevents GPU/CPU synchronization stalls:
+
+```swift
+public final class BufferPool: @unchecked Sendable {
+    private let device: GPUDevice
+    private var buffers: [GPUBuffer] = []
+    private var currentIndex: Int = 0
+    private let frameCount: Int = 3  // Triple buffering
+
+    public func allocate(size: Int) -> GPUBuffer {
+        // Return buffer for current frame, cycle to next
+        let buffer = buffers[currentIndex]
+        currentIndex = (currentIndex + 1) % frameCount
+        return buffer
+    }
+}
+```
+
+#### TextureManager (LRU Cache)
+
+Caches CGImage → GPUTexture conversions:
+
+```swift
+public final class TextureManager: @unchecked Sendable {
+    private var cache: [ObjectIdentifier: CacheEntry] = [:]
+    private let maxMemoryBytes: Int = 256 * 1024 * 1024  // 256 MB
+
+    public func texture(for image: CGImage) -> GPUTexture {
+        let id = ObjectIdentifier(image)
+        if let cached = cache[id] {
+            cached.accessTime = CACurrentMediaTime()
+            return cached.texture
+        }
+        // Create new texture, evict LRU if needed
+        return createTexture(from: image)
+    }
+}
+```
+
+#### GeometryCache
+
+Caches tessellated vertex data for repeated paths:
+
+```swift
+public final class GeometryCache: @unchecked Sendable {
+    private var cache: [PathKey: CachedGeometry] = [:]
+    private let maxEntries: Int = 500
+
+    public func geometry(for path: CGPath, transform: CGAffineTransform) -> [CGWebGPUVertex]? {
+        let key = PathKey(path: path, transform: transform)
+        return cache[key]?.vertices
+    }
+}
+```
+
+### WGSL Shader Patterns
+
+OpenCoreGraphics defines shaders as Swift string constants:
+
+```swift
+// Shaders.swift
+public enum CGWebGPUShaders {
+    public static let simple2D = """
+    struct VertexInput {
+        @location(0) position: vec2f,
+        @location(1) color: vec4f,
+    }
+
+    struct VertexOutput {
+        @builtin(position) position: vec4f,
+        @location(0) color: vec4f,
+    }
+
+    @vertex
+    fn vs_main(input: VertexInput) -> VertexOutput {
+        var output: VertexOutput;
+        output.position = vec4f(input.position, 0.0, 1.0);
+        output.color = input.color;
+        return output;
+    }
+
+    @fragment
+    fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+        return input.color;
+    }
+    """
+
+    public static let linearGradient = """
+    // Gradient direction uniform
+    @group(0) @binding(0) var<uniform> gradientParams: GradientParams;
+
+    @fragment
+    fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+        let t = dot(input.position.xy, gradientParams.direction);
+        return mix(gradientParams.startColor, gradientParams.endColor, t);
+    }
+    """
+}
+```
+
+### Clipping Implementation
+
+Uses stencil buffer for complex clip paths:
+
+```swift
+// 1. Render clip path to stencil buffer (increment)
+// 2. Set stencil test (only render where stencil > 0)
+// 3. Render content
+// 4. Clear stencil for next clip
+
+let stencilState = GPUDepthStencilState(
+    format: .depth24plusStencil8,
+    depthWriteEnabled: false,
+    stencilFront: GPUStencilFaceState(
+        compare: .equal,
+        passOp: .keep
+    )
+)
+```
+
+### Shadow Rendering
+
+Uses offscreen rendering + blur:
+
+```swift
+// 1. Render shape to shadow mask texture
+// 2. Apply Gaussian blur (horizontal + vertical passes)
+// 3. Composite shadow with offset to main target
+
+func renderShadow(layer: CALayer, offset: CGSize, blur: CGFloat, color: CGColor) {
+    // Render to shadowMaskTexture
+    renderToTexture(shadowMaskTexture) {
+        renderLayerShape(layer)
+    }
+
+    // Apply blur passes
+    applyGaussianBlur(texture: shadowMaskTexture, radius: blur)
+
+    // Composite with offset
+    compositeTexture(shadowMaskTexture, offset: offset, color: color)
+}
+```
+
+### Rendering Pipeline Flow
+
+```
+CALayer API
+    ↓
+CAWebGPURenderer.render(rootLayer:)
+    ↓
+Layer tree traversal (respecting zPosition, sublayers)
+    ↓
+For each layer:
+    ├── Apply transform (position, anchorPoint, transform)
+    ├── Clip to bounds if masksToBounds
+    ├── Render shadow if shadowOpacity > 0
+    ├── Render backgroundColor (2 triangles)
+    ├── Render contents (CGImage texture)
+    ├── Render border if borderWidth > 0
+    └── Render sublayers recursively
+    ↓
+BufferPool.allocate() → GPUBuffer write
+    ↓
+GPURenderPass execution
+    ↓
+queue.submit([commandBuffer])
+```
+
+### Key Design Principles
+
+1. **API/Rendering Separation**: Keep CoreAnimation API layer separate from WebGPU implementation
+2. **CPU Tessellation**: Convert shapes to triangles on CPU, send vertex buffers to GPU
+3. **Efficient Memory**: Use ring buffers, LRU caches to minimize allocations
+4. **Lazy Compilation**: Create pipelines on-demand, cache for reuse
+5. **Stateless Commands**: Pass all state to shaders via uniforms/vertex data
+6. **Sendable Types**: All GPU resources marked `@unchecked Sendable` (WASM is single-threaded)
 
 ## Future Work (TODO)
 

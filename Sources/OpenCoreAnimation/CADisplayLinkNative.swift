@@ -104,7 +104,7 @@ open class CADisplayLink: @unchecked Sendable {
     /// - Parameters:
     ///   - runloop: The run loop to add the display link to.
     ///   - mode: The run loop mode.
-    open func add(to runloop: AnyObject, forMode mode: AnyObject) {
+    open func add(to runloop: RunLoop, forMode mode: RunLoop.Mode) {
         guard !isRunning else { return }
         isRunning = true
         if !isPaused {
@@ -123,7 +123,7 @@ open class CADisplayLink: @unchecked Sendable {
     /// - Parameters:
     ///   - runloop: The run loop to remove from.
     ///   - mode: The run loop mode to remove.
-    open func remove(from runloop: AnyObject, forMode mode: AnyObject) {
+    open func remove(from runloop: RunLoop, forMode mode: RunLoop.Mode) {
         invalidate()
     }
 

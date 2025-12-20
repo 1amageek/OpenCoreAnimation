@@ -31,7 +31,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
 ///     lazy var displayLink = CADisplayLink(target: self, selector: Selector(""))
 ///
 ///     func start() {
-///         displayLink.add(to: AnyObject.self, forMode: AnyObject.self)
+///         displayLink.add(to: .main, forMode: .common)
 ///     }
 ///
 ///     func displayLinkDidFire(_ displayLink: CADisplayLink) {
@@ -127,12 +127,14 @@ open class CADisplayLink: @unchecked Sendable {
 
     /// Registers the display link with a run loop.
     ///
-    /// On WASM, the run loop parameters are ignored. This method starts the `requestAnimationFrame` loop.
+    /// On WASM, the run loop and mode parameters are accepted for API compatibility but
+    /// are not used. This method starts the `requestAnimationFrame` loop, which is
+    /// equivalent to running in `.common` mode on Apple platforms.
     ///
     /// - Parameters:
-    ///   - runloop: Ignored on WASM.
-    ///   - mode: Ignored on WASM.
-    open func add(to runloop: AnyObject, forMode mode: AnyObject) {
+    ///   - runloop: The run loop to associate with the display link. Ignored on WASM.
+    ///   - mode: The run loop mode. Ignored on WASM.
+    open func add(to runloop: RunLoop, forMode mode: RunLoop.Mode) {
         guard !isRunning else { return }
         isRunning = true
         if !isPaused {
@@ -150,12 +152,13 @@ open class CADisplayLink: @unchecked Sendable {
 
     /// Removes the display link from the run loop for the given mode.
     ///
-    /// On WASM, this is equivalent to calling `invalidate()`.
+    /// On WASM, this is equivalent to calling `invalidate()` since there is only
+    /// one animation loop per display link.
     ///
     /// - Parameters:
-    ///   - runloop: Ignored on WASM.
-    ///   - mode: Ignored on WASM.
-    open func remove(from runloop: AnyObject, forMode mode: AnyObject) {
+    ///   - runloop: The run loop to remove from. Ignored on WASM.
+    ///   - mode: The run loop mode to remove. Ignored on WASM.
+    open func remove(from runloop: RunLoop, forMode mode: RunLoop.Mode) {
         invalidate()
     }
 
