@@ -1,6 +1,6 @@
+#if arch(wasm32)
 import JavaScriptKit
 import OpenCoreAnimation
-import OpenCoreGraphics
 
 // MARK: - Application Entry Point
 
@@ -36,10 +36,11 @@ struct BasicAnimationApp {
         """
         _ = document.body.appendChild(info)
 
-        // Initialize the renderer
+        // Initialize the animation engine with the canvas
+        let engine = CAAnimationEngine.shared
         do {
-            let renderer = try await CAWebGPURenderer(canvas: canvas.object!)
-            await runDemo(renderer: renderer, canvas: canvas.object!)
+            try await engine.setCanvas(canvas.object!)
+            await runDemo(engine: engine)
         } catch {
             print("Failed to initialize renderer: \(error)")
             let errorDiv = document.createElement("div")
@@ -49,7 +50,7 @@ struct BasicAnimationApp {
         }
     }
 
-    static func runDemo(renderer: CAWebGPURenderer, canvas: JSObject) async {
+    static func runDemo(engine: CAAnimationEngine) async {
         // Create root layer
         let rootLayer = CALayer()
         rootLayer.bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
@@ -152,10 +153,8 @@ struct BasicAnimationApp {
         addAnimations(to: boxLayer, gradientLayer: gradientLayer, shapeLayer: shapeLayer,
                       circleLayer: circleLayer, roundedRect: roundedRect)
 
-        // Setup animation engine
-        let engine = CAAnimationEngine.shared
+        // Setup animation engine with root layer
         engine.rootLayer = rootLayer
-        engine.renderer = renderer
 
         print("Starting animation loop...")
         engine.start()
@@ -260,3 +259,16 @@ struct BasicAnimationApp {
         return path
     }
 }
+
+#else
+// Native platforms: This example is WASM-only
+import Foundation
+
+@main
+struct BasicAnimationApp {
+    static func main() {
+        print("BasicAnimation example is designed for WASM only.")
+        print("Build with: swift build --triple wasm32-unknown-wasi")
+    }
+}
+#endif

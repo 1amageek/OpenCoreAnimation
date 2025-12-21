@@ -346,6 +346,39 @@ extension CALayer {
 
         return matrix
     }
+
+    /// Calculates the parent matrix for sublayer positioning.
+    ///
+    /// This includes the layer's model matrix, sublayerTransform, and bounds.origin offset.
+    /// The bounds.origin offset ensures that sublayers are correctly positioned when the
+    /// layer's bounds origin is non-zero (e.g., for CAScrollLayer scrolling).
+    ///
+    /// - Parameter modelMatrix: The layer's model matrix
+    /// - Returns: The matrix to use as parentMatrix for sublayer rendering
+    internal func sublayerMatrix(modelMatrix: Matrix4x4) -> Matrix4x4 {
+        var result = modelMatrix
+
+        // Apply sublayerTransform if not identity
+        if !CATransform3DIsIdentity(sublayerTransform) {
+            result = result * sublayerTransform.matrix4x4
+        }
+
+        // Apply bounds.origin offset
+        // In CoreAnimation, bounds.origin defines where the coordinate system origin is
+        // within the layer. A sublayer at position (0,0) with parent's bounds.origin = (50, 50)
+        // should appear at (-50, -50) relative to the parent's visible top-left.
+        // This is the scrolling behavior used by CAScrollLayer.
+        if bounds.origin.x != 0 || bounds.origin.y != 0 {
+            let boundsOriginOffset = Matrix4x4(translation: SIMD3<Float>(
+                Float(-bounds.origin.x),
+                Float(-bounds.origin.y),
+                0
+            ))
+            result = result * boundsOriginOffset
+        }
+
+        return result
+    }
 }
 
 extension CATransform3D {
@@ -875,12 +908,18 @@ public final class GPUTextureManager {
 /// A key for caching tessellated geometry.
 ///
 /// This key uniquely identifies a tessellated path based on:
-/// - The path itself (via hash)
+/// - The path identity (via ObjectIdentifier for reference types, or hash for value types)
 /// - Rendering parameters (line width, cap, join, fill rule)
 /// - Stroke/fill mode
+///
+/// ## Note on Path Identity
+///
+/// For best cache hit rates, use `ObjectIdentifier` of the CGPath object when the path
+/// object is reused across frames. If the path is recreated each frame with the same content,
+/// consider using a content-based hash instead.
 public struct GeometryCacheKey: Hashable {
-    /// Hash of the path data.
-    public let pathHash: Int
+    /// Unique identifier for the path object (ObjectIdentifier if available, or hash).
+    public let pathIdentifier: Int
 
     /// Whether this is for stroke (true) or fill (false).
     public let isStroke: Bool
@@ -906,8 +945,21 @@ public struct GeometryCacheKey: Hashable {
     /// Stroke end (0.0 to 1.0).
     public let strokeEnd: CGFloat
 
+    /// Creates a geometry cache key from a path object identifier.
+    ///
+    /// - Parameters:
+    ///   - pathIdentifier: Use `ObjectIdentifier(path).hashValue` for CGPath reference types,
+    ///     or `path.hashValue` for content-based hashing.
+    ///   - isStroke: Whether this is for stroke rendering.
+    ///   - lineWidth: Line width for strokes.
+    ///   - lineCap: Line cap style.
+    ///   - lineJoin: Line join style.
+    ///   - miterLimit: Miter limit for miter joins.
+    ///   - fillRule: Fill rule for fills.
+    ///   - strokeStart: Stroke start position (0.0 to 1.0).
+    ///   - strokeEnd: Stroke end position (0.0 to 1.0).
     public init(
-        pathHash: Int,
+        pathIdentifier: Int,
         isStroke: Bool,
         lineWidth: CGFloat = 1.0,
         lineCap: CAShapeLayerLineCap = .butt,
@@ -917,7 +969,38 @@ public struct GeometryCacheKey: Hashable {
         strokeStart: CGFloat = 0.0,
         strokeEnd: CGFloat = 1.0
     ) {
-        self.pathHash = pathHash
+        self.pathIdentifier = pathIdentifier
+        self.isStroke = isStroke
+        self.lineWidth = lineWidth
+        self.lineCap = lineCap
+        self.lineJoin = lineJoin
+        self.miterLimit = miterLimit
+        self.fillRule = fillRule
+        self.strokeStart = strokeStart
+        self.strokeEnd = strokeEnd
+    }
+
+    /// Creates a geometry cache key from a CGPath.
+    ///
+    /// Uses ObjectIdentifier for stable identity across frames when the same path object is reused.
+    ///
+    /// - Parameters:
+    ///   - path: The CGPath to create a key for.
+    ///   - isStroke: Whether this is for stroke rendering.
+    ///   - Other parameters same as main initializer.
+    public init(
+        path: CGPath,
+        isStroke: Bool,
+        lineWidth: CGFloat = 1.0,
+        lineCap: CAShapeLayerLineCap = .butt,
+        lineJoin: CAShapeLayerLineJoin = .miter,
+        miterLimit: CGFloat = 10.0,
+        fillRule: CAShapeLayerFillRule = .nonZero,
+        strokeStart: CGFloat = 0.0,
+        strokeEnd: CGFloat = 1.0
+    ) {
+        // Use ObjectIdentifier for stable identity when path object is reused
+        self.pathIdentifier = ObjectIdentifier(path).hashValue
         self.isStroke = isStroke
         self.lineWidth = lineWidth
         self.lineCap = lineCap
@@ -1186,7 +1269,8 @@ public final class GeometryCache {
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
 ///
 /// This is the primary renderer for OpenCoreAnimation in production.
-public final class CAWebGPURenderer: CARenderer {
+/// It conforms to both `CARenderer` (public API) and `CARendererDelegate` (internal).
+public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Constants
 
@@ -1372,6 +1456,9 @@ public final class CAWebGPURenderer: CARenderer {
         set { }  // Not used for writing - use textureManager instead
     }
 
+    /// Geometry cache for tessellated path data.
+    private var geometryCache: GeometryCache?
+
     // MARK: - Shadow Rendering
 
     /// Shadow mask texture for blur operations.
@@ -1409,6 +1496,35 @@ public final class CAWebGPURenderer: CARenderer {
 
     /// Cache of pre-blurred shadow textures keyed by layer identity.
     private var blurredShadowCache: [ObjectIdentifier: GPUTexture] = [:]
+
+    // MARK: - Filter Rendering (CAFilter)
+
+    /// Filter source texture - layer content is rendered here before blur.
+    private var filterSourceTexture: GPUTexture?
+
+    /// Filter blur intermediate texture for ping-pong blurring.
+    private var filterBlurTexture: GPUTexture?
+
+    /// Filter result texture - stores the final blurred result.
+    private var filterResultTexture: GPUTexture?
+
+    /// Bind group for filter horizontal blur (samples from filterSourceTexture).
+    private var filterBlurHorizontalBindGroup: GPUBindGroup?
+
+    /// Bind group for filter vertical blur (samples from filterBlurTexture).
+    private var filterBlurVerticalBindGroup: GPUBindGroup?
+
+    /// Filter composite pipeline for blending filtered result with optional tint.
+    private var filterCompositePipeline: GPURenderPipeline?
+
+    /// Indicates whether a filtered layer has been pre-rendered.
+    private var hasPrerenderredFilter: Bool = false
+
+    /// The layer that has been pre-rendered with filters.
+    private var prerenderredFilterLayer: CALayer?
+
+    /// The blur radius used for the pre-rendered filter.
+    private var prerenderredFilterBlurRadius: CGFloat = 0
 
     // MARK: - Mask Rendering (Stencil-based)
 
@@ -2127,6 +2243,12 @@ public final class CAWebGPURenderer: CARenderer {
             maxMemoryBytes: 256 * 1024 * 1024  // 256 MB
         )
 
+        // Create geometry cache for path tessellation
+        geometryCache = GeometryCache(
+            maxEntries: 256,
+            maxMemoryBytes: 64 * 1024 * 1024  // 64 MB
+        )
+
         // Get initial canvas size
         let width = canvas.width.number ?? 800
         let height = canvas.height.number ?? 600
@@ -2599,6 +2721,60 @@ public final class CAWebGPURenderer: CARenderer {
         ))
     }
 
+    /// Creates or recreates filter textures for the given size.
+    private func createFilterTextures(width: Int, height: Int) {
+        guard let device = device,
+              let shadowBindGroupLayout = shadowBindGroupLayout,
+              let blurSampler = blurSampler,
+              let blurUniformBuffer = blurUniformBuffer,
+              width > 0, height > 0 else { return }
+
+        // Filter source texture (stores layer content before blur)
+        filterSourceTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: .rgba8unorm,
+            usage: [.renderAttachment, .textureBinding]
+        ))
+
+        // Filter blur texture (for ping-pong blur)
+        filterBlurTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: .rgba8unorm,
+            usage: [.renderAttachment, .textureBinding]
+        ))
+
+        // Filter result texture (stores final blurred result)
+        filterResultTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: .rgba8unorm,
+            usage: [.renderAttachment, .textureBinding]
+        ))
+
+        // Create bind groups for filter blur passes
+        guard let filterSourceTexture = filterSourceTexture,
+              let filterBlurTexture = filterBlurTexture else { return }
+
+        // Horizontal blur: samples from filterSourceTexture, outputs to filterBlurTexture
+        filterBlurHorizontalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(filterSourceTexture.createView())),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+
+        // Vertical blur: samples from filterBlurTexture, outputs to filterResultTexture
+        filterBlurVerticalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(filterBlurTexture.createView())),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+    }
+
     /// Creates or recreates the depth texture for the given size.
     /// Uses depth24plus-stencil8 format to support both depth testing and stencil-based masking.
     private func createDepthTexture(width: Int, height: Int) {
@@ -2623,6 +2799,9 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Recreate shadow textures
         createShadowTextures(width: width, height: height)
+
+        // Recreate filter textures
+        createFilterTextures(width: width, height: height)
     }
 
     /// Tracks whether shadow pre-rendering has been done for this frame.
@@ -2649,6 +2828,11 @@ public final class CAWebGPURenderer: CARenderer {
         shadowsPrerendered = false
         hasPrerenderredShadow = false
 
+        // Reset filter pre-rendering state
+        hasPrerenderredFilter = false
+        prerenderredFilterLayer = nil
+        prerenderredFilterBlurRadius = 0
+
         // Get current texture
         let currentTexture = context.getCurrentTexture()
         let textureView = currentTexture.createView()
@@ -2669,6 +2853,9 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Pre-render shadows with 2-pass Gaussian blur
         prerenderShadows(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
+
+        // Pre-render layers with blur filters
+        prerenderFilteredLayers(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
 
         // Begin render pass with depth attachment
         let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
@@ -2701,13 +2888,15 @@ public final class CAWebGPURenderer: CARenderer {
         // Submit command buffer
         device.queue.submit([encoder.finish()])
 
-        // Advance buffer pools and texture manager to the next frame (triple buffering + LRU)
+        // Advance buffer pools, texture manager, and geometry cache to the next frame
         vertexBufferPool?.advanceFrame()
         uniformBufferPool?.advanceFrame()
         textureManager?.advanceFrame()
+        geometryCache?.advanceFrame()
 
-        // Periodically evict stale textures (not used in last 300 frames = ~5 seconds at 60fps)
+        // Periodically evict stale resources (not used in last 300 frames = ~5 seconds at 60fps)
         textureManager?.evictStale(olderThan: 300)
+        geometryCache?.evictStale(olderThan: 300)
     }
 
     public func invalidate() {
@@ -2720,6 +2909,10 @@ public final class CAWebGPURenderer: CARenderer {
         // Invalidate texture manager
         textureManager?.invalidate()
         textureManager = nil
+
+        // Invalidate geometry cache
+        geometryCache?.invalidate()
+        geometryCache = nil
 
         bindGroupLayout = nil
         depthTexture = nil
@@ -2741,6 +2934,17 @@ public final class CAWebGPURenderer: CARenderer {
         blurHorizontalBindGroup = nil
         blurVerticalBindGroup = nil
         blurredShadowCache.removeAll()
+
+        // Filter resources
+        filterSourceTexture = nil
+        filterBlurTexture = nil
+        filterResultTexture = nil
+        filterBlurHorizontalBindGroup = nil
+        filterBlurVerticalBindGroup = nil
+        filterCompositePipeline = nil
+        hasPrerenderredFilter = false
+        prerenderredFilterLayer = nil
+        prerenderredFilterBlurRadius = 0
 
         // Mask resources
         maskTexture = nil
@@ -2822,6 +3026,36 @@ public final class CAWebGPURenderer: CARenderer {
         }
 
         // Handle special layer types first
+
+        // Check for layer filters
+        // If this layer has a blur filter and was pre-rendered, composite the blurred result
+        let hasFilters = !presentationLayer.activeFilters.isEmpty
+        let blurRadius = presentationLayer.totalBlurRadius
+        if hasFilters && blurRadius > 0 {
+            // Check if this specific layer was pre-rendered
+            if hasPrerenderredFilter && prerenderredFilterLayer === layer {
+                // Composite the pre-rendered blurred texture
+                renderFilteredLayerComposite(
+                    layer,
+                    device: device,
+                    renderPass: renderPass,
+                    modelMatrix: modelMatrix
+                )
+                // Mark filter as consumed
+                hasPrerenderredFilter = false
+                prerenderredFilterLayer = nil
+
+                // Continue to render sublayers (they should render on top of the blurred content)
+                if let sublayers = layer.sublayers {
+                    let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
+                    for sublayer in sublayers {
+                        self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
+                    }
+                }
+                return
+            }
+        }
+
         // CATransformLayer: Only render sublayers, skip own properties
         if presentationLayer is CATransformLayer {
             renderTransformLayerSublayers(layer, renderPass: renderPass, parentMatrix: modelMatrix)
@@ -2834,8 +3068,10 @@ public final class CAWebGPURenderer: CARenderer {
                              modelMatrix: modelMatrix, bindGroup: bindGroup)
             // Render sublayers after particles
             if let sublayers = layer.sublayers {
+                // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+                let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
                 for sublayer in sublayers {
-                    self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: modelMatrix)
+                    self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
                 }
             }
             return
@@ -2995,10 +3231,8 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Render sublayers (use model layer hierarchy, but presentation layer's sublayerTransform)
         if let sublayers = layer.sublayers {
-            var sublayerMatrix = modelMatrix
-            if !CATransform3DIsIdentity(presentationLayer.sublayerTransform) {
-                sublayerMatrix = sublayerMatrix * presentationLayer.sublayerTransform.matrix4x4
-            }
+            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
             // Apply masksToBounds clipping if enabled
             let shouldClip = presentationLayer.masksToBounds
@@ -3285,10 +3519,8 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Recursively render sublayers
         if let sublayers = layer.sublayers {
-            var sublayerMatrix = modelMatrix
-            if !CATransform3DIsIdentity(presentationLayer.sublayerTransform) {
-                sublayerMatrix = sublayerMatrix * presentationLayer.sublayerTransform.matrix4x4
-            }
+            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
             for sublayer in sublayers {
                 renderLayerWithColorMultiplier(
@@ -3390,10 +3622,8 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Recursively render sublayers with the same time offset
         if let sublayers = layer.sublayers {
-            var sublayerMatrix = modelMatrix
-            if !CATransform3DIsIdentity(presentationLayer.sublayerTransform) {
-                sublayerMatrix = sublayerMatrix * presentationLayer.sublayerTransform.matrix4x4
-            }
+            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
             for sublayer in sublayers {
                 renderLayerWithColorMultiplierAndTimeOffset(
@@ -3414,6 +3644,310 @@ public final class CAWebGPURenderer: CARenderer {
 
     // MARK: - Contents Layer Rendering (CGImage)
 
+    /// Calculates the destination rectangle for contents based on contentsGravity.
+    ///
+    /// This determines where and how the image is positioned within the layer's bounds.
+    private func calculateContentsDestRect(
+        layer: CALayer,
+        imageWidth: Int,
+        imageHeight: Int
+    ) -> CGRect {
+        let imageSize = CGSize(width: CGFloat(imageWidth), height: CGFloat(imageHeight))
+        let boundsSize = layer.bounds.size
+
+        switch layer.contentsGravity {
+        case .center:
+            return CGRect(
+                x: (boundsSize.width - imageSize.width) / 2,
+                y: (boundsSize.height - imageSize.height) / 2,
+                width: imageSize.width,
+                height: imageSize.height
+            )
+        case .resize:
+            return CGRect(origin: .zero, size: boundsSize)
+        case .resizeAspect:
+            let scale = min(boundsSize.width / imageSize.width, boundsSize.height / imageSize.height)
+            let scaledSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+            return CGRect(
+                x: (boundsSize.width - scaledSize.width) / 2,
+                y: (boundsSize.height - scaledSize.height) / 2,
+                width: scaledSize.width,
+                height: scaledSize.height
+            )
+        case .resizeAspectFill:
+            let scale = max(boundsSize.width / imageSize.width, boundsSize.height / imageSize.height)
+            let scaledSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+            return CGRect(
+                x: (boundsSize.width - scaledSize.width) / 2,
+                y: (boundsSize.height - scaledSize.height) / 2,
+                width: scaledSize.width,
+                height: scaledSize.height
+            )
+        case .top:
+            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: 0, width: imageSize.width, height: imageSize.height)
+        case .bottom:
+            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        case .left:
+            return CGRect(x: 0, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
+        case .right:
+            return CGRect(x: boundsSize.width - imageSize.width, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
+        case .topLeft:
+            return CGRect(origin: .zero, size: imageSize)
+        case .topRight:
+            return CGRect(x: boundsSize.width - imageSize.width, y: 0, width: imageSize.width, height: imageSize.height)
+        case .bottomLeft:
+            return CGRect(x: 0, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        case .bottomRight:
+            return CGRect(x: boundsSize.width - imageSize.width, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        default:
+            return CGRect(origin: .zero, size: boundsSize)
+        }
+    }
+
+    /// Checks if 9-patch (contentsCenter) scaling is needed.
+    ///
+    /// Returns true if contentsCenter is not the default (0, 0, 1, 1),
+    /// indicating that 9-slice scaling should be applied.
+    private func needs9PatchScaling(_ layer: CALayer) -> Bool {
+        let center = layer.contentsCenter
+        return center.origin.x != 0 || center.origin.y != 0 ||
+               center.size.width != 1 || center.size.height != 1
+    }
+
+    /// Renders contents using 9-patch (9-slice) scaling.
+    ///
+    /// The contentsCenter property defines a rectangle in unit coordinates (0-1) that
+    /// specifies the center region. The image is divided into 9 regions:
+    ///
+    /// ```
+    /// +-------+---------------+-------+
+    /// |   1   |       2       |   3   |  <- corners don't stretch
+    /// +-------+---------------+-------+
+    /// |   4   |       5       |   6   |  <- edges stretch in one direction
+    /// +-------+---------------+-------+     center stretches in both
+    /// |   7   |       8       |   9   |
+    /// +-------+---------------+-------+
+    /// ```
+    ///
+    /// - Corners (1, 3, 7, 9): Fixed size, no stretching
+    /// - Horizontal edges (2, 8): Stretch horizontally only
+    /// - Vertical edges (4, 6): Stretch vertically only
+    /// - Center (5): Stretches in both directions
+    private func render9PatchContents(
+        layer: CALayer,
+        gpuTexture: GPUTexture,
+        imageWidth: Int,
+        imageHeight: Int,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) {
+        guard let texturedPipeline = texturedPipeline,
+              let texturedBindGroupLayout = texturedBindGroupLayout,
+              let textureSampler = textureSampler,
+              let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer else { return }
+
+        // Need to allocate slots for all 9 patches
+        guard currentLayerIndex + 9 <= Self.maxLayers else { return }
+
+        let boundsWidth = layer.bounds.width
+        let boundsHeight = layer.bounds.height
+        guard boundsWidth > 0 && boundsHeight > 0 else { return }
+
+        let imgW = CGFloat(imageWidth)
+        let imgH = CGFloat(imageHeight)
+
+        // contentsCenter defines the stretchable center region in normalized coordinates (0-1)
+        let center = layer.contentsCenter
+
+        // Calculate UV coordinates for the 9-patch grid
+        // UV coordinates (texture space, 0-1)
+        let uvLeft: Float = 0
+        let uvCenterLeft: Float = Float(center.origin.x)
+        let uvCenterRight: Float = Float(center.origin.x + center.size.width)
+        let uvRight: Float = 1
+
+        let uvTop: Float = 0
+        let uvCenterTop: Float = Float(center.origin.y)
+        let uvCenterBottom: Float = Float(center.origin.y + center.size.height)
+        let uvBottom: Float = 1
+
+        // Calculate destination positions in layer bounds
+        // The corner regions maintain their pixel size from the source image
+        // The center region stretches to fill the remaining space
+
+        // Source pixel sizes for corners/edges
+        let srcLeftWidth = center.origin.x * imgW
+        let srcCenterWidth = center.size.width * imgW
+        let srcRightWidth = (1 - center.origin.x - center.size.width) * imgW
+
+        let srcTopHeight = center.origin.y * imgH
+        let srcCenterHeight = center.size.height * imgH
+        let srcBottomHeight = (1 - center.origin.y - center.size.height) * imgH
+
+        // Calculate destination contentsScale factor
+        let contentsScale = layer.contentsScale > 0 ? layer.contentsScale : 1
+
+        // Destination sizes - corners/edges use source pixel size (accounting for contentsScale)
+        let destLeftWidth = srcLeftWidth / contentsScale
+        let destRightWidth = srcRightWidth / contentsScale
+        let destTopHeight = srcTopHeight / contentsScale
+        let destBottomHeight = srcBottomHeight / contentsScale
+
+        // Center region fills remaining space
+        let destCenterWidth = boundsWidth - destLeftWidth - destRightWidth
+        let destCenterHeight = boundsHeight - destTopHeight - destBottomHeight
+
+        // Handle case where layer is smaller than the fixed regions
+        // In this case, scale down proportionally
+        var scaleX: CGFloat = 1
+        var scaleY: CGFloat = 1
+
+        if destCenterWidth < 0 {
+            let totalFixedWidth = destLeftWidth + destRightWidth
+            scaleX = boundsWidth / totalFixedWidth
+        }
+        if destCenterHeight < 0 {
+            let totalFixedHeight = destTopHeight + destBottomHeight
+            scaleY = boundsHeight / totalFixedHeight
+        }
+
+        // Apply scale if needed
+        let finalLeftWidth = destLeftWidth * scaleX
+        let finalRightWidth = destRightWidth * scaleX
+        let finalCenterWidth = max(0, boundsWidth - finalLeftWidth - finalRightWidth)
+
+        let finalTopHeight = destTopHeight * scaleY
+        let finalBottomHeight = destBottomHeight * scaleY
+        let finalCenterHeight = max(0, boundsHeight - finalTopHeight - finalBottomHeight)
+
+        // Position coordinates in layer bounds (normalized 0-1)
+        let posLeft: Float = 0
+        let posCenterLeft: Float = Float(finalLeftWidth / boundsWidth)
+        let posCenterRight: Float = Float((finalLeftWidth + finalCenterWidth) / boundsWidth)
+        let posRight: Float = 1
+
+        let posTop: Float = 0
+        let posCenterTop: Float = Float(finalTopHeight / boundsHeight)
+        let posCenterBottom: Float = Float((finalTopHeight + finalCenterHeight) / boundsHeight)
+        let posBottom: Float = 1
+
+        // Create scale matrix for layer bounds
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(boundsWidth), 0, 0, 0),
+            SIMD4<Float>(0, Float(boundsHeight), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = modelMatrix * scaleMatrix
+
+        // Create uniforms (shared for all 9 patches)
+        var uniforms = TexturedUniforms(
+            mvpMatrix: finalMatrix,
+            opacity: layer.opacity,
+            cornerRadius: Float(layer.cornerRadius),
+            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight))
+        )
+
+        let white = SIMD4<Float>(1, 1, 1, 1)
+
+        // Define the 9 patches as (posXMin, posXMax, posYMin, posYMax, uvXMin, uvXMax, uvYMin, uvYMax)
+        let patches: [(Float, Float, Float, Float, Float, Float, Float, Float)] = [
+            // Row 1: Top
+            (posLeft, posCenterLeft, posTop, posCenterTop, uvLeft, uvCenterLeft, uvTop, uvCenterTop),           // 1: Top-left corner
+            (posCenterLeft, posCenterRight, posTop, posCenterTop, uvCenterLeft, uvCenterRight, uvTop, uvCenterTop), // 2: Top edge
+            (posCenterRight, posRight, posTop, posCenterTop, uvCenterRight, uvRight, uvTop, uvCenterTop),       // 3: Top-right corner
+
+            // Row 2: Middle
+            (posLeft, posCenterLeft, posCenterTop, posCenterBottom, uvLeft, uvCenterLeft, uvCenterTop, uvCenterBottom),           // 4: Left edge
+            (posCenterLeft, posCenterRight, posCenterTop, posCenterBottom, uvCenterLeft, uvCenterRight, uvCenterTop, uvCenterBottom), // 5: Center
+            (posCenterRight, posRight, posCenterTop, posCenterBottom, uvCenterRight, uvRight, uvCenterTop, uvCenterBottom),       // 6: Right edge
+
+            // Row 3: Bottom
+            (posLeft, posCenterLeft, posCenterBottom, posBottom, uvLeft, uvCenterLeft, uvCenterBottom, uvBottom),           // 7: Bottom-left corner
+            (posCenterLeft, posCenterRight, posCenterBottom, posBottom, uvCenterLeft, uvCenterRight, uvCenterBottom, uvBottom), // 8: Bottom edge
+            (posCenterRight, posRight, posCenterBottom, posBottom, uvCenterRight, uvRight, uvCenterBottom, uvBottom),       // 9: Bottom-right corner
+        ]
+
+        // Render each patch
+        for (index, patch) in patches.enumerated() {
+            let (pMinX, pMaxX, pMinY, pMaxY, uMinX, uMaxX, uMinY, uMaxY) = patch
+
+            // Skip patches with zero size (can happen when center is at edges)
+            if pMaxX <= pMinX || pMaxY <= pMinY {
+                continue
+            }
+
+            let layerIndex = currentLayerIndex
+            currentLayerIndex += 1
+
+            // Write uniforms for this patch
+            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+            var patchUniforms = uniforms
+            let uniformData = createFloat32Array(from: &patchUniforms)
+            device.queue.writeBuffer(
+                uniformBuffer,
+                bufferOffset: uniformOffset,
+                data: uniformData
+            )
+
+            // Create vertices for this patch (2 triangles = 6 vertices)
+            var vertices: [CARendererVertex] = [
+                // Triangle 1: bottom-left, bottom-right, top-left
+                CARendererVertex(position: SIMD2(pMinX, pMinY), texCoord: SIMD2(uMinX, uMinY), color: white),
+                CARendererVertex(position: SIMD2(pMaxX, pMinY), texCoord: SIMD2(uMaxX, uMinY), color: white),
+                CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMaxY), color: white),
+                // Triangle 2: bottom-right, top-right, top-left
+                CARendererVertex(position: SIMD2(pMaxX, pMinY), texCoord: SIMD2(uMaxX, uMinY), color: white),
+                CARendererVertex(position: SIMD2(pMaxX, pMaxY), texCoord: SIMD2(uMaxX, uMaxY), color: white),
+                CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMaxY), color: white),
+            ]
+
+            // Write vertices
+            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+            let vertexData = createFloat32Array(from: &vertices)
+            device.queue.writeBuffer(
+                vertexBuffer,
+                bufferOffset: vertexOffset,
+                data: vertexData
+            )
+
+            // Create bind group with texture
+            let texturedBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                layout: texturedBindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .bufferBinding(GPUBufferBinding(
+                            buffer: uniformBuffer,
+                            size: UInt64(MemoryLayout<TexturedUniforms>.stride)
+                        ))
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .sampler(textureSampler)
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 2,
+                        resource: .textureView(gpuTexture.createView())
+                    )
+                ]
+            ))
+
+            // Render this patch
+            renderPass.setPipeline(texturedPipeline)
+            renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+            renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+            renderPass.draw(vertexCount: 6)
+        }
+
+        // Switch back to non-textured pipeline for subsequent rendering
+        if let pipeline = pipeline {
+            renderPass.setPipeline(pipeline)
+        }
+    }
+
     /// Renders a layer with CGImage contents.
     private func renderContentsLayer(
         _ layer: CALayer,
@@ -3428,11 +3962,6 @@ public final class CAWebGPURenderer: CARenderer {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
 
-        guard currentLayerIndex < Self.maxLayers else { return }
-
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
-
         // Get or create GPU texture from CGImage using the texture manager
         let textureKey = ObjectIdentifier(contents)
         let imageWidth = contents.width
@@ -3446,10 +3975,51 @@ public final class CAWebGPURenderer: CARenderer {
             }
         ) else { return }
 
+        // Check if 9-patch scaling is needed
+        if needs9PatchScaling(layer) {
+            render9PatchContents(
+                layer: layer,
+                gpuTexture: gpuTexture,
+                imageWidth: imageWidth,
+                imageHeight: imageHeight,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+            return
+        }
+
+        // Standard single-quad rendering
+        guard currentLayerIndex < Self.maxLayers else { return }
+
+        let layerIndex = currentLayerIndex
+        currentLayerIndex += 1
+
+        // Calculate destination rectangle based on contentsGravity
+        let destRect = calculateContentsDestRect(layer: layer, imageWidth: imageWidth, imageHeight: imageHeight)
+
+        // Calculate source UV coordinates based on contentsRect
+        // contentsRect is in unit coordinate space (0-1), defining which portion of the image to use
+        let srcRect = layer.contentsRect
+        let uvMinX = Float(srcRect.origin.x)
+        let uvMinY = Float(srcRect.origin.y)
+        let uvMaxX = Float(srcRect.origin.x + srcRect.size.width)
+        let uvMaxY = Float(srcRect.origin.y + srcRect.size.height)
+
+        // Calculate normalized destination positions (0-1 in layer bounds)
+        let boundsWidth = layer.bounds.width
+        let boundsHeight = layer.bounds.height
+        guard boundsWidth > 0 && boundsHeight > 0 else { return }
+
+        let posMinX = Float(destRect.origin.x / boundsWidth)
+        let posMinY = Float(destRect.origin.y / boundsHeight)
+        let posMaxX = Float((destRect.origin.x + destRect.size.width) / boundsWidth)
+        let posMaxY = Float((destRect.origin.y + destRect.size.height) / boundsHeight)
+
         // Create scale matrix for layer bounds
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(layer.bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(layer.bounds.height), 0, 0),
+            SIMD4<Float>(Float(boundsWidth), 0, 0, 0),
+            SIMD4<Float>(0, Float(boundsHeight), 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
@@ -3461,7 +4031,7 @@ public final class CAWebGPURenderer: CARenderer {
             mvpMatrix: finalMatrix,
             opacity: layer.opacity,
             cornerRadius: Float(layer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(layer.bounds.width), Float(layer.bounds.height))
+            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight))
         )
 
         // Write uniforms
@@ -3473,15 +4043,17 @@ public final class CAWebGPURenderer: CARenderer {
             data: uniformData
         )
 
-        // Create vertices with white color (texture will provide color)
+        // Create vertices with contentsGravity-adjusted positions and contentsRect-adjusted UVs
         let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+            // Triangle 1: bottom-left, bottom-right, top-left
+            CARendererVertex(position: SIMD2(posMinX, posMinY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
+            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
+            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
+            // Triangle 2: bottom-right, top-right, top-left
+            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
+            CARendererVertex(position: SIMD2(posMaxX, posMaxY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
+            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
         ]
 
         // Write vertices
@@ -4725,6 +5297,175 @@ public final class CAWebGPURenderer: CARenderer {
         shadowsPrerendered = true
     }
 
+    /// Pre-renders layers with blur filters using 2-pass Gaussian blur.
+    ///
+    /// This method finds the first layer needing a blur filter and renders it.
+    /// Currently supports one filtered layer per frame due to texture sharing constraints.
+    private func prerenderFilteredLayers(
+        _ rootLayer: CALayer,
+        encoder: GPUCommandEncoder,
+        projectionMatrix: Matrix4x4
+    ) {
+        guard let device = device,
+              let pipeline = pipeline,
+              let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer,
+              let filterSourceTexture = filterSourceTexture,
+              let filterBlurTexture = filterBlurTexture,
+              let filterResultTexture = filterResultTexture,
+              let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
+              let shadowBlurVerticalPipeline = shadowBlurVerticalPipeline,
+              let filterBlurHorizontalBindGroup = filterBlurHorizontalBindGroup,
+              let filterBlurVerticalBindGroup = filterBlurVerticalBindGroup,
+              let blurUniformBuffer = blurUniformBuffer else { return }
+
+        // Find first layer with blur filter to pre-render
+        guard let (filteredLayer, layerMatrix, blurRadius) = findFirstFilteredLayer(rootLayer, parentMatrix: projectionMatrix) else {
+            return
+        }
+
+        let presentationLayer = filteredLayer.presentation() ?? filteredLayer
+
+        // Step 1: Render layer content to filter source texture
+        let contentRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: filterSourceTexture.createView(),
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ]
+        ))
+
+        // Render the layer's visual content (background, border, contents)
+        // We use identity matrix since we're rendering to a same-size texture
+        var contentUniforms = CARendererUniforms(
+            mvpMatrix: layerMatrix,
+            opacity: presentationLayer.opacity,
+            cornerRadius: Float(presentationLayer.cornerRadius),
+            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height))
+        )
+
+        let contentUniformData = createFloat32Array(from: &contentUniforms)
+        device.queue.writeBuffer(uniformBuffer, bufferOffset: 0, data: contentUniformData)
+
+        // Render background color if present
+        if let backgroundColor = presentationLayer.backgroundColor {
+            let colorComponents: SIMD4<Float>
+            if let components = backgroundColor.components, components.count >= 4 {
+                colorComponents = SIMD4<Float>(
+                    Float(components[0]),
+                    Float(components[1]),
+                    Float(components[2]),
+                    Float(components[3])
+                )
+            } else {
+                colorComponents = SIMD4<Float>(0, 0, 0, 1)
+            }
+
+            var vertices: [CARendererVertex] = [
+                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
+                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+                CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)), texCoord: SIMD2(1, 1), color: colorComponents),
+                CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+            ]
+
+            let vertexData = createFloat32Array(from: &vertices)
+            device.queue.writeBuffer(vertexBuffer, bufferOffset: 0, data: vertexData)
+
+            contentRenderPass.setPipeline(pipeline)
+            if let bindGroup = bindGroup {
+                contentRenderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [0])
+            }
+            contentRenderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: 0)
+            contentRenderPass.draw(vertexCount: 6)
+        }
+
+        contentRenderPass.end()
+
+        // Step 2: Horizontal blur (filterSourceTexture → filterBlurTexture)
+        var blurUniforms = BlurUniforms(
+            texelSize: SIMD2<Float>(1.0 / Float(size.width), 1.0 / Float(size.height)),
+            blurRadius: Float(blurRadius)
+        )
+        let blurUniformData = createFloat32Array(from: &blurUniforms)
+        device.queue.writeBuffer(blurUniformBuffer, bufferOffset: 0, data: blurUniformData)
+
+        let hBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: filterBlurTexture.createView(),
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ]
+        ))
+
+        hBlurPass.setPipeline(shadowBlurHorizontalPipeline)
+        hBlurPass.setBindGroup(0, bindGroup: filterBlurHorizontalBindGroup)
+        hBlurPass.draw(vertexCount: 6)
+        hBlurPass.end()
+
+        // Step 3: Vertical blur (filterBlurTexture → filterResultTexture)
+        let vBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: filterResultTexture.createView(),
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ]
+        ))
+
+        vBlurPass.setPipeline(shadowBlurVerticalPipeline)
+        vBlurPass.setBindGroup(0, bindGroup: filterBlurVerticalBindGroup)
+        vBlurPass.draw(vertexCount: 6)
+        vBlurPass.end()
+
+        // Mark that filter was pre-rendered
+        hasPrerenderredFilter = true
+        prerenderredFilterLayer = filteredLayer
+        prerenderredFilterBlurRadius = blurRadius
+    }
+
+    /// Finds the first layer in the hierarchy that has a blur filter.
+    private func findFirstFilteredLayer(
+        _ layer: CALayer,
+        parentMatrix: Matrix4x4
+    ) -> (layer: CALayer, matrix: Matrix4x4, blurRadius: CGFloat)? {
+        let presentationLayer = layer.presentation() ?? layer
+
+        guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else {
+            return nil
+        }
+
+        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+
+        // Check if this layer has a blur filter
+        let blurRadius = presentationLayer.totalBlurRadius
+        if blurRadius > 0 {
+            return (layer, modelMatrix, blurRadius)
+        }
+
+        // Recursively check sublayers
+        if let sublayers = layer.sublayers {
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
+
+            for sublayer in sublayers {
+                if let result = findFirstFilteredLayer(sublayer, parentMatrix: sublayerMatrix) {
+                    return result
+                }
+            }
+        }
+
+        return nil
+    }
+
     /// Finds the first layer in the hierarchy that has a visible shadow.
     private func findFirstShadowLayer(
         _ layer: CALayer,
@@ -4745,10 +5486,8 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Recursively check sublayers
         if let sublayers = layer.sublayers {
-            var sublayerMatrix = modelMatrix
-            if !CATransform3DIsIdentity(presentationLayer.sublayerTransform) {
-                sublayerMatrix = sublayerMatrix * presentationLayer.sublayerTransform.matrix4x4
-            }
+            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
             for sublayer in sublayers {
                 if let result = findFirstShadowLayer(sublayer, parentMatrix: sublayerMatrix) {
@@ -4923,6 +5662,85 @@ public final class CAWebGPURenderer: CARenderer {
         renderPass.draw(vertexCount: 6)
     }
 
+    /// Renders a filtered layer by compositing the pre-rendered blurred texture.
+    ///
+    /// This method draws a full-screen quad textured with the blurred layer content
+    /// from the filter pre-rendering pass.
+    private func renderFilteredLayerComposite(
+        _ layer: CALayer,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) {
+        guard let filterResultTexture = filterResultTexture,
+              let shadowCompositePipeline = shadowCompositePipeline,
+              let blurSampler = blurSampler,
+              let vertexBuffer = vertexBuffer,
+              currentLayerIndex < Self.maxLayers else { return }
+
+        let presentationLayer = layer.presentation() ?? layer
+        let layerIndex = currentLayerIndex
+        currentLayerIndex += 1
+
+        // Create uniforms for the composite pass
+        // Use white color with layer opacity - the texture already contains the layer colors
+        let colorComponents = SIMD4<Float>(1, 1, 1, presentationLayer.opacity)
+
+        var filterUniforms = ShadowUniforms(
+            mvpMatrix: Matrix4x4.orthographic(
+                left: 0, right: Float(size.width),
+                bottom: Float(size.height), top: 0,
+                near: -1000, far: 1000
+            ),
+            shadowColor: colorComponents,
+            shadowOffset: SIMD2<Float>(0, 0),
+            layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
+        )
+
+        // Create a temporary buffer for filter uniforms
+        let filterUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(MemoryLayout<ShadowUniforms>.stride),
+            usage: [.uniform, .copyDst]
+        ))
+
+        let filterUniformData = createFloat32Array(from: &filterUniforms)
+        device.queue.writeBuffer(filterUniformBuffer, bufferOffset: 0, data: filterUniformData)
+
+        // Create composite bind group with the blurred filter texture
+        let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowCompositePipeline.getBindGroupLayout(0),
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(filterUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(filterResultTexture.createView())),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+
+        // Full-screen quad vertices for compositing the filtered texture
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+        ]
+
+        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+        let vertexData = createFloat32Array(from: &vertices)
+        device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
+
+        renderPass.setPipeline(shadowCompositePipeline)
+        renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.draw(vertexCount: 6)
+
+        // Switch back to regular pipeline
+        if let pipeline = pipeline {
+            renderPass.setPipeline(pipeline)
+        }
+    }
+
     // MARK: - CATransformLayer Rendering
 
     /// Renders a CATransformLayer's sublayers without rendering the layer's own properties.
@@ -4946,12 +5764,10 @@ public final class CAWebGPURenderer: CARenderer {
         guard let sublayers = layer.sublayers else { return }
 
         // Apply the CATransformLayer's own transform (but not its content)
-        var sublayerMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
-        // Apply sublayerTransform if specified
-        if !CATransform3DIsIdentity(presentationLayer.sublayerTransform) {
-            sublayerMatrix = sublayerMatrix * presentationLayer.sublayerTransform.matrix4x4
-        }
+        // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+        let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
         // Render sublayers in array order.
         // The depth buffer handles z-ordering correctly - no pre-sorting needed.
@@ -5313,8 +6129,10 @@ public final class CAWebGPURenderer: CARenderer {
 
         // Render sublayers
         if let sublayers = tiledLayer.sublayers {
+            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+            let sublayerMatrix = tiledLayer.sublayerMatrix(modelMatrix: modelMatrix)
             for sublayer in sublayers {
-                self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: modelMatrix)
+                self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
             }
         }
     }

@@ -229,6 +229,12 @@ open class CALayer: CAMediaTiming, Hashable {
             return
         }
 
+        // Handle transitions
+        if let transition = animation as? CATransition {
+            applyTransition(transition, to: layer, at: time)
+            return
+        }
+
         guard let propertyAnimation = animation as? CAPropertyAnimation,
               let keyPath = propertyAnimation.keyPath else { return }
 
@@ -327,6 +333,152 @@ open class CALayer: CAMediaTiming, Hashable {
         applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: progress)
     }
 
+    /// Applies a transition animation to the presentation layer.
+    ///
+    /// Transitions provide animated effects when layer content changes.
+    /// Unlike property animations, transitions affect the overall appearance
+    /// of the layer during the transition period.
+    private func applyTransition(_ transition: CATransition, to layer: CALayer, at time: CFTimeInterval) {
+        // Calculate transition progress
+        let elapsed = time - transition.addedTime - transition.beginTime
+        let duration = transition.duration > 0 ? transition.duration : CATransaction.animationDuration()
+
+        guard duration > 0 else { return }
+
+        // Handle fillMode for transitions that haven't started yet
+        if elapsed < 0 {
+            switch transition.fillMode {
+            case .backwards, .both:
+                applyTransitionEffect(transition, to: layer, progress: 0)
+            default:
+                return
+            }
+            return
+        }
+
+        // Calculate base progress (0-1)
+        var progress = elapsed / duration
+
+        // Handle completed transitions
+        if progress >= 1 {
+            switch transition.fillMode {
+            case .forwards, .both:
+                progress = 1
+            default:
+                return
+            }
+        }
+
+        // Apply timing function if available
+        if let timingFunction = transition.timingFunction {
+            progress = CFTimeInterval(timingFunction.evaluate(at: Float(progress)))
+        }
+
+        // Apply start/end progress range
+        let startProgress = CFTimeInterval(transition.startProgress)
+        let endProgress = CFTimeInterval(transition.endProgress)
+        let adjustedProgress = startProgress + progress * (endProgress - startProgress)
+
+        // Apply the transition effect
+        applyTransitionEffect(transition, to: layer, progress: adjustedProgress)
+    }
+
+    /// Applies the visual effect of a transition at a given progress.
+    private func applyTransitionEffect(_ transition: CATransition, to layer: CALayer, progress: CFTimeInterval) {
+        let clampedProgress = max(0, min(1, progress))
+
+        switch transition.type {
+        case .fade:
+            // Fade: animate opacity from 0 to 1
+            layer._opacity = Float(clampedProgress)
+
+        case .push:
+            // Push: new content pushes old content out
+            // The direction determines which way the content moves
+            let offset = calculateTransitionOffset(
+                transition: transition,
+                layerBounds: layer.bounds,
+                progress: clampedProgress,
+                isPush: true
+            )
+            layer._position = CGPoint(
+                x: _position.x + offset.x,
+                y: _position.y + offset.y
+            )
+
+        case .moveIn:
+            // MoveIn: new content slides in over old content
+            // Similar to push but old content stays in place
+            let offset = calculateTransitionOffset(
+                transition: transition,
+                layerBounds: layer.bounds,
+                progress: clampedProgress,
+                isPush: false
+            )
+            layer._position = CGPoint(
+                x: _position.x + offset.x,
+                y: _position.y + offset.y
+            )
+            // Also fade in slightly for smoother effect
+            layer._opacity = Float(clampedProgress)
+
+        case .reveal:
+            // Reveal: content is gradually revealed from a direction
+            // This would typically use clipping, but we'll simulate with opacity/position
+            layer._opacity = Float(clampedProgress)
+            let offset = calculateTransitionOffset(
+                transition: transition,
+                layerBounds: layer.bounds,
+                progress: clampedProgress,
+                isPush: false
+            )
+            // Move content in opposite direction during reveal
+            layer._position = CGPoint(
+                x: _position.x - offset.x * 0.3,  // Subtle movement
+                y: _position.y - offset.y * 0.3
+            )
+
+        default:
+            // Default to fade for unknown transition types
+            layer._opacity = Float(clampedProgress)
+        }
+    }
+
+    /// Calculates the position offset for push/moveIn/reveal transitions.
+    private func calculateTransitionOffset(
+        transition: CATransition,
+        layerBounds: CGRect,
+        progress: CFTimeInterval,
+        isPush: Bool
+    ) -> CGPoint {
+        // Calculate the offset based on subtype (direction)
+        let width = layerBounds.width
+        let height = layerBounds.height
+
+        // For push, content moves from off-screen to on-screen
+        // Progress 0 = fully off-screen, Progress 1 = fully on-screen
+        let offsetMultiplier = CGFloat(1 - progress)
+
+        var offsetX: CGFloat = 0
+        var offsetY: CGFloat = 0
+
+        switch transition.subtype {
+        case .fromLeft:
+            offsetX = -width * offsetMultiplier
+        case .fromRight:
+            offsetX = width * offsetMultiplier
+        case .fromTop:
+            offsetY = -height * offsetMultiplier
+        case .fromBottom:
+            offsetY = height * offsetMultiplier
+        default:
+            // Default to fromLeft if no subtype specified
+            offsetX = -width * offsetMultiplier
+        }
+
+        return CGPoint(x: offsetX, y: offsetY)
+    }
+
     /// Applies an animation group to the presentation layer.
     private func applyAnimationGroup(_ group: CAAnimationGroup, to layer: CALayer, at time: CFTimeInterval) {
         guard let animations = group.animations else { return }
@@ -417,6 +569,12 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Applies a basic animation to a layer property.
     private func applyBasicAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        // Check for valueFunction - used to convert scalar values to transforms
+        if let valueFunction = animation.valueFunction {
+            applyValueFunctionAnimation(animation, valueFunction: valueFunction, to: layer, progress: progress)
+            return
+        }
+
         // Handle common animatable properties
         applyFloatAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
         applyPointAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
@@ -424,6 +582,74 @@ open class CALayer: CAMediaTiming, Hashable {
         applyTransformAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
         applyColorAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
         applyArrayAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+    }
+
+    /// Applies an animation using a value function to convert scalar values to transforms.
+    ///
+    /// Value functions allow animating transform properties using a single scalar value
+    /// instead of specifying full CATransform3D values.
+    private func applyValueFunctionAnimation(
+        _ animation: CABasicAnimation,
+        valueFunction: CAValueFunction,
+        to layer: CALayer,
+        progress: CFTimeInterval
+    ) {
+        // Get scalar values from the animation
+        let fromValue: CGFloat
+        if let from = animation.fromValue as? CGFloat {
+            fromValue = from
+        } else if let from = animation.fromValue as? Double {
+            fromValue = CGFloat(from)
+        } else if let from = animation.fromValue as? Float {
+            fromValue = CGFloat(from)
+        } else if let from = animation.fromValue as? Int {
+            fromValue = CGFloat(from)
+        } else {
+            // Default starting value depends on the function type
+            fromValue = defaultValueForFunction(valueFunction)
+        }
+
+        let toValue: CGFloat
+        if let to = animation.toValue as? CGFloat {
+            toValue = to
+        } else if let to = animation.toValue as? Double {
+            toValue = CGFloat(to)
+        } else if let to = animation.toValue as? Float {
+            toValue = CGFloat(to)
+        } else if let to = animation.toValue as? Int {
+            toValue = CGFloat(to)
+        } else {
+            // Default ending value depends on the function type
+            toValue = defaultValueForFunction(valueFunction)
+        }
+
+        // Use the value function to interpolate and get the transform
+        let transform = valueFunction.interpolate(from: fromValue, to: toValue, progress: CGFloat(progress))
+
+        // Apply the transform to the layer
+        // If the layer already has a transform, concatenate with it
+        let baseTransform = _transform
+        if CATransform3DIsIdentity(baseTransform) {
+            layer._transform = transform
+        } else {
+            layer._transform = CATransform3DConcat(baseTransform, transform)
+        }
+    }
+
+    /// Returns the default value for a given value function type.
+    ///
+    /// For rotation functions, 0 is the natural starting value.
+    /// For scale functions, 1 is the natural starting value.
+    /// For translation functions, 0 is the natural starting value.
+    private func defaultValueForFunction(_ valueFunction: CAValueFunction) -> CGFloat {
+        switch valueFunction.name {
+        case .scale, .scaleX, .scaleY, .scaleZ:
+            return 1.0  // Scale defaults to 1 (no scaling)
+        case .rotateX, .rotateY, .rotateZ, .translateX, .translateY, .translateZ:
+            return 0.0  // Rotation and translation default to 0
+        default:
+            return 0.0
+        }
     }
 
     private func applyFloatAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
@@ -846,8 +1072,169 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
+    // MARK: - Path Sampling for Keyframe Animation
+
+    /// Samples a CGPath at regular intervals and returns an array of points.
+    ///
+    /// The path is flattened (curves converted to line segments) and then points
+    /// are extracted at regular intervals based on arc length.
+    private func samplePathPoints(_ path: CGPath, numPoints: Int = 100) -> [CGPoint] {
+        var points: [CGPoint] = []
+        var currentPoint = CGPoint.zero
+        var subpathStart = CGPoint.zero
+
+        // First, flatten the path into line segments
+        path.applyWithBlock { elementPtr in
+            let element = elementPtr.pointee
+            switch element.type {
+            case .moveToPoint:
+                let point = element.points[0]
+                points.append(point)
+                currentPoint = point
+                subpathStart = point
+
+            case .addLineToPoint:
+                let point = element.points[0]
+                points.append(point)
+                currentPoint = point
+
+            case .addQuadCurveToPoint:
+                let control = element.points[0]
+                let end = element.points[1]
+                // Flatten quad bezier into line segments
+                for i in 1...10 {
+                    let t = CGFloat(i) / 10.0
+                    let tt = t * t
+                    let u = 1 - t
+                    let uu = u * u
+                    let x = uu * currentPoint.x + 2 * u * t * control.x + tt * end.x
+                    let y = uu * currentPoint.y + 2 * u * t * control.y + tt * end.y
+                    points.append(CGPoint(x: x, y: y))
+                }
+                currentPoint = end
+
+            case .addCurveToPoint:
+                let control1 = element.points[0]
+                let control2 = element.points[1]
+                let end = element.points[2]
+                // Flatten cubic bezier into line segments
+                for i in 1...10 {
+                    let t = CGFloat(i) / 10.0
+                    let tt = t * t
+                    let ttt = tt * t
+                    let u = 1 - t
+                    let uu = u * u
+                    let uuu = uu * u
+                    let x = uuu * currentPoint.x + 3 * uu * t * control1.x + 3 * u * tt * control2.x + ttt * end.x
+                    let y = uuu * currentPoint.y + 3 * uu * t * control1.y + 3 * u * tt * control2.y + ttt * end.y
+                    points.append(CGPoint(x: x, y: y))
+                }
+                currentPoint = end
+
+            case .closeSubpath:
+                if currentPoint != subpathStart {
+                    points.append(subpathStart)
+                }
+                currentPoint = subpathStart
+
+            @unknown default:
+                break
+            }
+        }
+
+        return points
+    }
+
+    /// Samples a point and optional tangent on a path at a given normalized progress (0-1).
+    ///
+    /// Uses arc-length parameterization for uniform motion along the path.
+    private func samplePathAtProgress(_ path: CGPath, progress: CGFloat) -> (point: CGPoint, tangent: CGFloat)? {
+        let points = samplePathPoints(path)
+        guard points.count >= 2 else { return nil }
+
+        // Calculate cumulative arc lengths
+        var arcLengths: [CGFloat] = [0]
+        for i in 1..<points.count {
+            let dx = points[i].x - points[i - 1].x
+            let dy = points[i].y - points[i - 1].y
+            let segmentLength = sqrt(dx * dx + dy * dy)
+            arcLengths.append(arcLengths.last! + segmentLength)
+        }
+
+        let totalLength = arcLengths.last!
+        guard totalLength > 0 else { return (points[0], 0) }
+
+        // Find the target arc length
+        let targetLength = totalLength * min(max(progress, 0), 1)
+
+        // Find the segment containing this arc length
+        var segmentIndex = 0
+        for i in 1..<arcLengths.count {
+            if arcLengths[i] >= targetLength {
+                segmentIndex = i - 1
+                break
+            }
+        }
+
+        // Interpolate within the segment
+        let segmentStart = arcLengths[segmentIndex]
+        let segmentEnd = arcLengths[segmentIndex + 1]
+        let segmentProgress: CGFloat
+        if segmentEnd > segmentStart {
+            segmentProgress = (targetLength - segmentStart) / (segmentEnd - segmentStart)
+        } else {
+            segmentProgress = 0
+        }
+
+        let p0 = points[segmentIndex]
+        let p1 = points[segmentIndex + 1]
+
+        let point = CGPoint(
+            x: p0.x + segmentProgress * (p1.x - p0.x),
+            y: p0.y + segmentProgress * (p1.y - p0.y)
+        )
+
+        // Calculate tangent angle
+        let dx = p1.x - p0.x
+        let dy = p1.y - p0.y
+        let tangent = atan2(dy, dx)
+
+        return (point, tangent)
+    }
+
+    /// Applies a path-based keyframe animation to a layer.
+    ///
+    /// The path is used for position animation, and optionally for rotation
+    /// if rotationMode is set.
+    private func applyPathKeyframeAnimation(_ animation: CAKeyframeAnimation, path: CGPath, to layer: CALayer, progress: CFTimeInterval) {
+        guard let sample = samplePathAtProgress(path, progress: CGFloat(progress)) else { return }
+
+        // Apply position
+        layer._position = sample.point
+
+        // Apply rotation if rotationMode is set
+        if let rotationMode = animation.rotationMode {
+            switch rotationMode {
+            case .rotateAuto:
+                // Rotate to match path tangent
+                layer._transform = CATransform3DMakeRotation(sample.tangent, 0, 0, 1)
+            case .rotateAutoReverse:
+                // Rotate to match path tangent + 180 degrees
+                layer._transform = CATransform3DMakeRotation(sample.tangent + .pi, 0, 0, 1)
+            default:
+                break
+            }
+        }
+    }
+
     /// Applies a keyframe animation to a layer property.
     private func applyKeyframeAnimation(_ animation: CAKeyframeAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        // Check if path is available for position animation
+        if let path = animation.path, keyPath == "position" {
+            applyPathKeyframeAnimation(animation, path: path, to: layer, progress: progress)
+            return
+        }
+
         guard let values = animation.values, values.count > 1 else { return }
 
         // For paced modes, remap progress based on arc length

@@ -5,6 +5,22 @@
 /// It clips its sublayers to its bounds and allows scrolling through the content.
 open class CAScrollLayer: CALayer {
 
+    // MARK: - Initialization
+
+    public required init() {
+        super.init()
+    }
+
+    /// Initializes a new scroll layer as a copy of the specified layer.
+    public required init(layer: Any) {
+        super.init(layer: layer)
+        if let scrollLayer = layer as? CAScrollLayer {
+            self.scrollMode = scrollLayer.scrollMode
+        }
+    }
+
+    // MARK: - Scroll Properties
+
     /// The scroll mode.
     ///
     /// Determines which directions the layer can be scrolled.

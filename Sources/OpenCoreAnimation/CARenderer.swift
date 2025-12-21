@@ -150,6 +150,39 @@ extension CALayer {
 
         return matrix
     }
+
+    /// Calculates the parent matrix for sublayer positioning.
+    ///
+    /// This includes the layer's sublayerTransform and bounds.origin offset.
+    /// The bounds.origin offset ensures that sublayers are correctly positioned when the
+    /// layer's bounds origin is non-zero (e.g., for CAScrollLayer scrolling).
+    ///
+    /// - Parameter modelMatrix: The layer's model matrix
+    /// - Returns: The matrix to use as parentMatrix for sublayer rendering
+    internal func sublayerMatrix(modelMatrix: simd_float4x4) -> simd_float4x4 {
+        var result = modelMatrix
+
+        // Apply sublayerTransform if not identity
+        if !CATransform3DIsIdentity(sublayerTransform) {
+            result = result * sublayerTransform.simdMatrix
+        }
+
+        // Apply bounds.origin offset
+        // In CoreAnimation, bounds.origin defines where the coordinate system origin is
+        // within the layer. A sublayer at position (0,0) with parent's bounds.origin = (50, 50)
+        // should appear at (-50, -50) relative to the parent's visible top-left.
+        // This is the scrolling behavior used by CAScrollLayer.
+        if bounds.origin.x != 0 || bounds.origin.y != 0 {
+            let boundsOriginOffset = simd_float4x4(translation: SIMD3<Float>(
+                Float(-bounds.origin.x),
+                Float(-bounds.origin.y),
+                0
+            ))
+            result = result * boundsOriginOffset
+        }
+
+        return result
+    }
 }
 
 extension CATransform3D {

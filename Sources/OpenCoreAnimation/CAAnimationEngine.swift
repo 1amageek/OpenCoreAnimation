@@ -11,12 +11,22 @@
 /// ```swift
 /// let engine = CAAnimationEngine.shared
 /// engine.rootLayer = myRootLayer
-/// engine.renderer = myRenderer
 /// engine.start()
 /// ```
 ///
 /// The engine automatically handles the display refresh cycle and ensures
 /// animations are properly updated each frame.
+///
+/// ## Renderer Delegate Pattern
+///
+/// The renderer is configured automatically based on the target architecture:
+/// - **WASM**: Uses `CAWebGPURenderer` (configured via `setCanvas(_:)`)
+/// - **Native**: Uses `CAMetalRendererDelegate` stub (for testing)
+///
+/// The renderer delegate is:
+/// - **Internal**: Not exposed to external users
+/// - **Non-weak**: The engine owns the renderer
+/// - **Auto-configured**: Selected based on architecture at initialization
 public final class CAAnimationEngine: CADisplayLinkDelegate {
 
     // MARK: - Singleton
@@ -34,12 +44,22 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
     /// recursively process animations for all sublayers.
     public weak var rootLayer: CALayer?
 
-    /// The renderer to use for drawing.
+    /// Internal renderer delegate - configured automatically based on architecture.
     ///
-    /// Set this to an appropriate renderer for your platform:
-    /// - `CAWebGPURenderer` for WASM/Web
-    /// - `CAMetalRenderer` for macOS/iOS
-    public var renderer: CARenderer?
+    /// - WASM: `CAWebGPURenderer`
+    /// - Native: `CAMetalRendererDelegate` stub (for testing)
+    ///
+    /// This is a strong reference because the engine owns the renderer.
+    /// The renderer is created automatically during initialization.
+    internal var rendererDelegate: CARendererDelegate?
+
+    /// Public accessor for the renderer (read-only).
+    ///
+    /// This provides access to the renderer for advanced use cases
+    /// while maintaining internal ownership.
+    public var renderer: CARenderer? {
+        return rendererDelegate as? CARenderer
+    }
 
     /// The display link driving the animation loop.
     private var displayLink: CADisplayLink?
@@ -63,11 +83,32 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
     /// Creates a new animation engine.
     ///
     /// For most use cases, use the shared instance instead of creating new engines.
-    public init() {}
+    /// The renderer is configured automatically based on the target architecture.
+    public init() {
+        #if !arch(wasm32)
+        // Native: auto-configure renderer for testing
+        rendererDelegate = CARendererDelegateFactory.createRenderer()
+        #endif
+    }
 
     deinit {
         stop()
     }
+
+    #if arch(wasm32)
+    // MARK: - WASM Configuration
+
+    /// Sets the canvas element for WebGPU rendering.
+    ///
+    /// This method must be called before starting the animation loop on WASM.
+    /// It initializes the WebGPU renderer with the provided canvas element.
+    ///
+    /// - Parameter canvas: The HTML canvas element to render to.
+    /// - Throws: `CARendererError` if renderer initialization fails.
+    public func setCanvas(_ canvas: JavaScriptKit.JSObject) async throws {
+        rendererDelegate = try await CARendererDelegateFactory.createRenderer(canvas: canvas)
+    }
+    #endif
 
     // MARK: - Control
 
@@ -121,9 +162,9 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
         // Process animation completions for all layers in the tree
         processAnimationsRecursively(rootLayer)
 
-        // Render the layer tree
-        if let rootLayer = rootLayer, let renderer = renderer {
-            renderer.render(layer: rootLayer)
+        // Render the layer tree using internal delegate
+        if let rootLayer = rootLayer, let delegate = rendererDelegate {
+            delegate.render(layer: rootLayer)
         }
     }
 
@@ -154,8 +195,8 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
     /// for example, after making changes that should be immediately visible.
     public func renderFrame() {
         processAnimationsRecursively(rootLayer)
-        if let rootLayer = rootLayer, let renderer = renderer {
-            renderer.render(layer: rootLayer)
+        if let rootLayer = rootLayer, let delegate = rendererDelegate {
+            delegate.render(layer: rootLayer)
         }
     }
 }

@@ -27,6 +27,25 @@
 /// ```
 open class CATiledLayer: CALayer {
 
+    // MARK: - Initialization
+
+    public required init() {
+        super.init()
+    }
+
+    /// Initializes a new tiled layer as a copy of the specified layer.
+    public required init(layer: Any) {
+        super.init(layer: layer)
+        if let tiledLayer = layer as? CATiledLayer {
+            self.levelsOfDetail = tiledLayer.levelsOfDetail
+            self.levelsOfDetailBias = tiledLayer.levelsOfDetailBias
+            self.tileSize = tiledLayer.tileSize
+            // Note: tileCache and loadingTiles are not copied as they are internal state
+        }
+    }
+
+    // MARK: - Tile Properties
+
     /// The number of levels of detail maintained by this layer.
     ///
     /// Each level of detail is rendered at half the resolution of the previous level.

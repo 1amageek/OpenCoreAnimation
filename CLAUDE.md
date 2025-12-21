@@ -600,6 +600,20 @@ layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
 - Always refer to Apple's official CoreAnimation documentation to ensure API signatures match exactly
 - Focus on APIs meaningful for WASM environments
 
+### Excluded APIs (Not Implemented)
+
+The following CoreAnimation APIs are **not implemented** and will not be added:
+
+| API | Status |
+|-----|--------|
+| `CAOpenGLLayer` | Deleted (legacy OpenGL) |
+| `CAEAGLLayer` | Deleted (legacy OpenGL ES for iOS) |
+| `CAMetalLayer` | Not implemented (Apple Metal specific) |
+| `CAMetalDrawable` | Not implemented (Apple Metal specific) |
+| `CAEDRMetadata` | Not implemented (Apple HDR specific) |
+
+OpenCoreAnimation targets WASM with WebGPU. Platform-specific GPU APIs (Metal, OpenGL) are out of scope.
+
 ### API Compatibility Notes
 
 #### CADisplayLink
@@ -674,36 +688,93 @@ Sources/OpenCoreAnimation/
         └── TextureManager.swift
 ```
 
-### Renderer Delegate Pattern
+### Renderer Delegate Pattern (Internal Architecture Switching)
 
-OpenCoreGraphics uses a protocol-based renderer delegate:
+OpenCoreGraphics uses a **protocol-based internal delegate** for rendering. The delegate is:
+
+- **Internal**: Not exposed to external users - implementation is selected automatically based on platform
+- **Non-weak (Strong reference)**: The context owns the renderer; no retain cycle exists
+- **Non-optional (Conceptually)**: On target platforms (WASM), a renderer is always required
+
+#### Key Design Principle
+
+The delegate is **not externally provided** - it is configured internally based on the target architecture at initialization time. This means:
+
+1. Users never set or access the renderer delegate directly
+2. The correct implementation is selected via `#if arch(wasm32)` at compile time
+3. The delegate has the same lifetime as the context that owns it
+
+#### OpenCoreGraphics Implementation
 
 ```swift
-// Protocol for stateless rendering commands
-public protocol CGContextRendererDelegate: AnyObject {
-    func fill(_ path: CGPath, using rule: CGPathFillRule, state: CGDrawingState)
-    func stroke(_ path: CGPath, state: CGDrawingState)
-    func drawImage(_ image: CGImage, in rect: CGRect, state: CGDrawingState)
+// CGContextRendererDelegate.swift - Internal protocol
+internal protocol CGContextRendererDelegate: AnyObject, Sendable {
+    func fill(path: CGPath, color: CGColor, alpha: CGFloat, blendMode: CGBlendMode, rule: CGPathFillRule)
+    func stroke(path: CGPath, color: CGColor, lineWidth: CGFloat, ...)
+    func draw(image: CGImage, in rect: CGRect, ...)
+    // ... other drawing operations
 }
 
-// CGContext holds state and delegates to renderer
+// CGContext.swift - Internal delegate ownership
 public class CGContext {
-    public var rendererDelegate: CGContextRendererDelegate?
+    /// Strong reference - CGContext owns the renderer on WASM.
+    /// The renderer is created internally and should live as long as the context.
+    internal var rendererDelegate: CGContextRendererDelegate?
+
+    public init?(width: Int, height: Int, ...) {
+        // Architecture-based internal initialization
+        #if arch(wasm32)
+        let renderer = CGWebGPUContextRenderer(width: width, height: height)
+        renderer.setup()
+        self.rendererDelegate = renderer  // Internal, not user-provided
+        #endif
+    }
 
     public func fillPath(using rule: CGPathFillRule) {
-        rendererDelegate?.fill(path, using: rule, state: currentState)
+        // Delegate call - always available on WASM
+        rendererDelegate?.fill(path: transformedPath, color: currentState.fillColor, ...)
     }
 }
 ```
 
-**Apply to OpenCoreAnimation:**
+#### Why Non-Weak and Non-Optional
+
+| Aspect | Reason |
+|--------|--------|
+| **Non-weak** | Context owns renderer; no back-reference that would cause retain cycle |
+| **Non-optional** | Rendering cannot proceed without a renderer on target platform (WASM) |
+| **Internal** | Implementation detail - users interact only with CGContext/CALayer API |
+| **Architecture-based** | `#if arch(wasm32)` selects WebGPU; native uses Metal for testing |
+
+#### Apply to OpenCoreAnimation
+
+CARenderer should follow the same pattern:
+
 ```swift
-// CALayer delegates rendering to a renderer
-public protocol CALayerRenderer: AnyObject {
-    func render(layer: CALayer, in context: CGContext)
-    func renderSublayers(of layer: CALayer, in context: CGContext)
+// CARenderer.swift - Protocol
+public protocol CARenderer: AnyObject {
+    func render(layer: CALayer)
+    func resize(width: Int, height: Int)
+    func invalidate()
+}
+
+// CAAnimationEngine.swift or similar - Internal delegate ownership
+public final class CAAnimationEngine {
+    /// Internal renderer - not weak, not optional on WASM.
+    /// Selected based on architecture at initialization.
+    internal var renderer: CARenderer
+
+    init() {
+        #if arch(wasm32)
+        self.renderer = CAWebGPURenderer()
+        #else
+        self.renderer = CAMetalRenderer()  // For testing
+        #endif
+    }
 }
 ```
+
+> **Note**: The current implementation uses `var renderer: CARenderer?` (optional) for flexibility during initialization. The principle is that once initialized on WASM, it should never be nil during normal operation.
 
 ### Path Tessellation (CPU-side)
 

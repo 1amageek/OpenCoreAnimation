@@ -7,33 +7,38 @@ import simd
 ///
 /// This renderer is used for testing and verification on macOS/iOS.
 /// In production WASM environments, `CAWebGPURenderer` is used instead.
-public final class CAMetalRenderer: CARenderer {
+///
+/// ## Protocol Conformance
+///
+/// Conforms to both `CARenderer` (public API) and `CARendererDelegate` (internal).
+/// This allows it to be used both directly and through `CAAnimationEngine`.
+public final class CAMetalRenderer: CARenderer, CARendererDelegate, @unchecked Sendable {
 
     // MARK: - Properties
 
     /// The Metal device.
-    private var device: MTLDevice?
+    private nonisolated(unsafe) var device: MTLDevice?
 
     /// The command queue.
-    private var commandQueue: MTLCommandQueue?
+    private nonisolated(unsafe) var commandQueue: MTLCommandQueue?
 
     /// The render pipeline state.
-    private var pipelineState: MTLRenderPipelineState?
+    private nonisolated(unsafe) var pipelineState: MTLRenderPipelineState?
 
     /// The vertex buffer for quad rendering.
-    private var vertexBuffer: MTLBuffer?
+    private nonisolated(unsafe) var vertexBuffer: MTLBuffer?
 
     /// The uniform buffer.
-    private var uniformBuffer: MTLBuffer?
+    private nonisolated(unsafe) var uniformBuffer: MTLBuffer?
 
     /// The current drawable size.
-    public private(set) var size: CGSize = CGSize(width: 0, height: 0)
+    public nonisolated(unsafe) var size: CGSize = CGSize(width: 0, height: 0)
 
     /// The pixel format for rendering.
     private let pixelFormat: MTLPixelFormat = .bgra8Unorm
 
     /// The target texture for offscreen rendering.
-    private var targetTexture: MTLTexture?
+    private nonisolated(unsafe) var targetTexture: MTLTexture?
 
     // MARK: - Initialization
 
@@ -322,11 +327,8 @@ public final class CAMetalRenderer: CARenderer {
 
         // Render sublayers
         if let sublayers = layer.sublayers {
-            // Apply sublayer transform
-            var sublayerMatrix = modelMatrix
-            if !CATransform3DIsIdentity(layer.sublayerTransform) {
-                sublayerMatrix = sublayerMatrix * layer.sublayerTransform.simdMatrix
-            }
+            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+            let sublayerMatrix = layer.sublayerMatrix(modelMatrix: modelMatrix)
 
             for sublayer in sublayers {
                 renderLayer(sublayer, encoder: encoder, parentMatrix: sublayerMatrix)
