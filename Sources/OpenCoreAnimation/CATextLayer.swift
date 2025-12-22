@@ -1,3 +1,12 @@
+//
+//  CATextLayerTruncationMode.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
 
 /// Constants that specify text truncation.
 public struct CATextLayerTruncationMode: Hashable, Equatable, RawRepresentable, Sendable {

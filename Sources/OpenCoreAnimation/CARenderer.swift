@@ -1,3 +1,11 @@
+// CGImageMetadataTag.swift
+// OpenCoreAnimation
+//
+// Full API compatibility with Apple's CoreAnimation framework
+
+import Foundation
+import OpenCoreGraphics
+
 /// Errors that can occur during renderer operations.
 public enum CARendererError: Error {
     /// The GPU/graphics device is not available.

@@ -5,6 +5,9 @@
 //  Internal delegate protocol for rendering layer trees.
 //
 
+import Foundation
+import OpenCoreGraphics
+
 // MARK: - Renderer Delegate Protocol
 
 /// Internal protocol for rendering backends that execute CALayer rendering operations.

@@ -1,3 +1,13 @@
+//
+//  CAValueFunction.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// An object that provides a flexible method of defining animated transformations.
 ///

@@ -1,3 +1,13 @@
+//
+//  CAScrollLayer.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// A layer that displays scrollable content larger than its own bounds.
 ///

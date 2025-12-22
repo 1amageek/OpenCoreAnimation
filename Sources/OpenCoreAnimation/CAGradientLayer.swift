@@ -1,3 +1,13 @@
+//
+//  CAGradientLayer.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// A layer that draws a color gradient over its background color, filling the shape of the layer.
 open class CAGradientLayer: CALayer {

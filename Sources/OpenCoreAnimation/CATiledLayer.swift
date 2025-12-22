@@ -1,3 +1,12 @@
+//
+//  CATiledLayer.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
 
 /// A layer that provides a way to asynchronously provide tiles of the layer's content,
 /// potentially cached at multiple levels of detail.

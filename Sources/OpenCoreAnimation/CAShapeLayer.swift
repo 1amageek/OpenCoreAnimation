@@ -1,3 +1,11 @@
+// CGImageMetadataTag.swift
+// OpenCoreAnimation
+//
+// Full API compatibility with Apple's CoreAnimation framework
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// A layer that draws a cubic Bezier spline in its coordinate space.
 ///

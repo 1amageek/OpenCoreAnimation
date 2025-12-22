@@ -1,3 +1,11 @@
+// CGImageMetadataTag.swift
+// OpenCoreAnimation
+//
+// Full API compatibility with Apple's CoreAnimation framework
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// A representation of a single layout constraint between two layers.
 ///

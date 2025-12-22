@@ -1,3 +1,13 @@
+//
+//  CATransformLayer.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// Objects used to create true 3D layer hierarchies, rather than the flattened hierarchy
 /// rendering model used by other layer types.

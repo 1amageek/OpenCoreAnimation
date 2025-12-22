@@ -1,3 +1,13 @@
+//
+//  CAConstraintLayoutManager.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// An object that provides a constraint-based layout manager.
 open class CAConstraintLayoutManager: CALayoutManager {

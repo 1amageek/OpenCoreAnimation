@@ -1,3 +1,11 @@
+// CGImageMetadataTag.swift
+// OpenCoreAnimation
+//
+// Full API compatibility with Apple's ImageIO framework
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// Methods that allow an object to manage the layout of a layer and its sublayers.
 public protocol CALayoutManager: AnyObject {

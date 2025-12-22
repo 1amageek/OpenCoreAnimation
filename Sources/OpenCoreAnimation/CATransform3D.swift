@@ -1,3 +1,13 @@
+//
+//  CATransform3D.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// The standard transform matrix used throughout Core Animation.
 ///

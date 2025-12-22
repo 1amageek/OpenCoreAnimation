@@ -1,3 +1,13 @@
+//
+//  CASpringAnimation.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// An animation that applies a spring-like force to a layer's properties.
 open class CASpringAnimation: CABasicAnimation {

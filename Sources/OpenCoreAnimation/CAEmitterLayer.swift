@@ -1,3 +1,10 @@
+// CGImageMetadataTag.swift
+// OpenCoreAnimation
+//
+// Full API compatibility with Apple's CoreAnimation framework
+
+import Foundation
+import OpenCoreGraphics
 
 /// A layer that emits, animates, and renders a particle system.
 open class CAEmitterLayer: CALayer {

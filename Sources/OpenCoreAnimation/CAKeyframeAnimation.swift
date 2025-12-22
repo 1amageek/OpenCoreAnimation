@@ -1,3 +1,12 @@
+//
+//  CAKeyframeAnimation.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
 
 /// An object that provides keyframe animation capabilities for a layer object.
 open class CAKeyframeAnimation: CAPropertyAnimation {

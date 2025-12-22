@@ -1,3 +1,14 @@
+//
+//  CAReplicatorLayer.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
+
 
 /// A layer that creates a specified number of sublayer copies with varying geometric,
 /// temporal, and color transformations.

@@ -1,3 +1,11 @@
+// CGImageMetadataTag.swift
+// OpenCoreAnimation
+//
+// Full API compatibility with Apple's CoreAnimation framework
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// A filter effect that can be applied to layer content.
 ///

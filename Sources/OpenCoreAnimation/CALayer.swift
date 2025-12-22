@@ -1,3 +1,13 @@
+//
+//  CALayer.swift
+//  OpenCoreAnimation
+//
+//  Internal delegate protocol for rendering layer trees.
+//
+
+import Foundation
+import OpenCoreGraphics
+
 
 /// An object that manages image-based content and allows you to perform animations on that content.
 ///
@@ -1086,21 +1096,22 @@ open class CALayer: CAMediaTiming, Hashable {
         // First, flatten the path into line segments
         path.applyWithBlock { elementPtr in
             let element = elementPtr.pointee
+            guard let elementPoints = element.points else { return }
             switch element.type {
             case .moveToPoint:
-                let point = element.points[0]
+                let point = elementPoints[0]
                 points.append(point)
                 currentPoint = point
                 subpathStart = point
 
             case .addLineToPoint:
-                let point = element.points[0]
+                let point = elementPoints[0]
                 points.append(point)
                 currentPoint = point
 
             case .addQuadCurveToPoint:
-                let control = element.points[0]
-                let end = element.points[1]
+                let control = elementPoints[0]
+                let end = elementPoints[1]
                 // Flatten quad bezier into line segments
                 for i in 1...10 {
                     let t = CGFloat(i) / 10.0
@@ -1114,9 +1125,9 @@ open class CALayer: CAMediaTiming, Hashable {
                 currentPoint = end
 
             case .addCurveToPoint:
-                let control1 = element.points[0]
-                let control2 = element.points[1]
-                let end = element.points[2]
+                let control1 = elementPoints[0]
+                let control2 = elementPoints[1]
+                let end = elementPoints[2]
                 // Flatten cubic bezier into line segments
                 for i in 1...10 {
                     let t = CGFloat(i) / 10.0
@@ -1162,7 +1173,7 @@ open class CALayer: CAMediaTiming, Hashable {
         }
 
         let totalLength = arcLengths.last!
-        guard totalLength > 0 else { return (points[0], 0) }
+        guard totalLength > 0 else { return (point: points[0], tangent: 0) }
 
         // Find the target arc length
         let targetLength = totalLength * min(max(progress, 0), 1)
@@ -1197,9 +1208,9 @@ open class CALayer: CAMediaTiming, Hashable {
         // Calculate tangent angle
         let dx = p1.x - p0.x
         let dy = p1.y - p0.y
-        let tangent = atan2(dy, dx)
+        let tangent = CGFloat(atan2(dy, dx))
 
-        return (point, tangent)
+        return (point: point, tangent: tangent)
     }
 
     /// Applies a path-based keyframe animation to a layer.
