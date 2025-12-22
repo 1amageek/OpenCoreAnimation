@@ -1,4 +1,6 @@
 #if arch(wasm32)
+import Foundation
+import OpenCoreGraphics
 import JavaScriptKit
 import SwiftWebGPU
 
@@ -2401,12 +2403,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create sampler
         textureSampler = device.createSampler(descriptor: GPUSamplerDescriptor(
-            magFilter: .linear,
-            minFilter: .linear,
-            mipmapFilter: .linear,
             addressModeU: .clampToEdge,
             addressModeV: .clampToEdge,
-            addressModeW: .clampToEdge
+            addressModeW: .clampToEdge,
+            magFilter: .linear,
+            minFilter: .linear,
+            mipmapFilter: .linear
         ))
 
         // Create bind group layout with uniform, sampler, and texture
@@ -2431,7 +2433,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     visibility: .fragment,
                     texture: GPUTextureBindingLayout(
                         sampleType: .float,
-                        viewDimension: .dimension2D
+                        viewDimension: .type2D
                     )
                 )
             ]
@@ -2508,11 +2510,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func createShadowPipelines(device: GPUDevice) throws {
         // Create blur sampler
         blurSampler = device.createSampler(descriptor: GPUSamplerDescriptor(
-            magFilter: .linear,
-            minFilter: .linear,
             addressModeU: .clampToEdge,
             addressModeV: .clampToEdge,
-            addressModeW: .clampToEdge
+            addressModeW: .clampToEdge,
+            magFilter: .linear,
+            minFilter: .linear
         ))
 
         // Create blur bind group layout
@@ -2526,7 +2528,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 GPUBindGroupLayoutEntry(
                     binding: 1,
                     visibility: .fragment,
-                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .dimension2D)
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
                 ),
                 GPUBindGroupLayoutEntry(
                     binding: 2,
@@ -2593,7 +2595,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 GPUBindGroupLayoutEntry(
                     binding: 1,
                     visibility: .fragment,
-                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .dimension2D)
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
                 ),
                 GPUBindGroupLayoutEntry(
                     binding: 2,

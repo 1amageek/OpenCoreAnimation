@@ -1,8 +1,7 @@
 
+import Foundation
 #if arch(wasm32)
 import JavaScriptKit
-#else
-import Foundation
 #endif
 
 /// Represents the state of a single transaction level.
