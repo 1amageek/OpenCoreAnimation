@@ -196,6 +196,15 @@ public struct Matrix4x4 {
         default: break
         }
     }
+
+    /// Matrix-vector multiplication
+    public static func * (lhs: Matrix4x4, rhs: SIMD4<Float>) -> SIMD4<Float> {
+        let x = lhs.columns.0 * rhs.x
+        let y = lhs.columns.1 * rhs.y
+        let z = lhs.columns.2 * rhs.z
+        let w = lhs.columns.3 * rhs.w
+        return x + y + z + w
+    }
 }
 
 // MARK: - WASM Renderer Types
@@ -1434,7 +1443,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Applies the current clip rect to the render pass.
     private func applyScissorRect(_ renderPass: GPURenderPassEncoder) {
         let clip = currentClipRect
-        renderPass.setScissorRect(x: clip.x, y: clip.y, width: clip.width, height: clip.height)
+        renderPass.setScissorRect(x: UInt32(max(0, clip.x)), y: UInt32(max(0, clip.y)), width: clip.width, height: clip.height)
     }
 
     // MARK: - Texture Rendering
@@ -2147,7 +2156,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             entries: [
                 GPUBindGroupLayoutEntry(
                     binding: 0,
-                    visibility: .vertex,
+                    visibility: [.vertex, .fragment],
                     buffer: GPUBufferBindingLayout(
                         type: .uniform,
                         hasDynamicOffset: true,
@@ -2255,6 +2264,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let width = canvas.width.number ?? 800
         let height = canvas.height.number ?? 600
         size = CGSize(width: width, height: height)
+        print("CAWebGPURenderer initialized with size: \(Int(width))x\(Int(height))")
 
         // Create depth texture
         createDepthTexture(width: Int(width), height: Int(height))
@@ -2790,11 +2800,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     }
 
     public func resize(width: Int, height: Int) {
+        print("CAWebGPURenderer.resize called with: \(width)x\(height)")
         size = CGSize(width: width, height: height)
 
         // Update canvas size
         canvas.width = .number(Double(width))
         canvas.height = .number(Double(height))
+
+        // Reconfigure context for new size
+        if let device = device {
+            context?.configure(GPUCanvasConfiguration(
+                device: device,
+                format: preferredFormat
+            ))
+        }
 
         // Recreate depth texture
         createDepthTexture(width: width, height: height)
@@ -2881,6 +2900,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         renderPass.setPipeline(pipeline)
+
+        // Set viewport to full canvas size
+        renderPass.setViewport(
+            x: 0,
+            y: 0,
+            width: Float(size.width),
+            height: Float(size.height),
+            minDepth: 0,
+            maxDepth: 1
+        )
 
         // Render layer tree (projectionMatrix already created above for shadow pre-rendering)
         renderLayer(rootLayer, renderPass: renderPass, parentMatrix: projectionMatrix)
@@ -4269,8 +4298,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let layerIndex = currentLayerIndex
         currentLayerIndex += 1
 
-        let width = Int(textLayer.bounds.width)
-        let height = Int(textLayer.bounds.height)
+        // Determine text size: use bounds if set, otherwise measure with Canvas2D
+        let width: Int
+        let height: Int
+        if textLayer.bounds.width > 0 && textLayer.bounds.height > 0 {
+            width = Int(textLayer.bounds.width)
+            height = Int(textLayer.bounds.height)
+        } else {
+            // Measure text size using Canvas2D
+            let measuredSize = measureTextSize(
+                text: text,
+                font: textLayer.font as? String,
+                fontSize: textLayer.fontSize,
+                isWrapped: textLayer.isWrapped,
+                maxWidth: textLayer.bounds.width > 0 ? textLayer.bounds.width : nil
+            )
+            width = Int(ceil(measuredSize.width))
+            height = Int(ceil(measuredSize.height))
+        }
 
         guard width > 0 && height > 0 else { return }
 
@@ -4399,17 +4444,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             descriptor: GPUBindGroupDescriptor(
                 layout: texturedBindGroupLayout,
                 entries: [
-                    GPUBindGroupEntry(binding: 0, resource: .buffer(GPUBufferBinding(buffer: uniformBuffer))),
+                    GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<CARendererUniforms>.stride))),
                     GPUBindGroupEntry(binding: 1, resource: .sampler(textureSampler)),
                     GPUBindGroupEntry(binding: 2, resource: .textureView(textureView))
                 ]
             )
         )
 
-        // Setup matrices
+        // Setup matrices using measured/actual text size
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(textLayer.bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(textLayer.bounds.height), 0, 0),
+            SIMD4<Float>(Float(width), 0, 0, 0),
+            SIMD4<Float>(0, Float(height), 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
@@ -4421,7 +4466,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             mvpMatrix: finalMatrix,
             opacity: textLayer.opacity,
             cornerRadius: Float(textLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(textLayer.bounds.width), Float(textLayer.bounds.height))
+            layerSize: SIMD2<Float>(Float(width), Float(height))
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -4485,6 +4530,84 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         if !line.isEmpty {
             _ = ctx.fillText!(line, x, currentY)
+        }
+    }
+
+    /// Measures text size using Canvas2D measureText API.
+    /// - Parameters:
+    ///   - text: The text to measure
+    ///   - font: Font family name (nil for system default)
+    ///   - fontSize: Font size in points
+    ///   - isWrapped: Whether text should wrap
+    ///   - maxWidth: Maximum width for wrapping (nil for single line)
+    /// - Returns: The measured size
+    private func measureTextSize(
+        text: String,
+        font: String?,
+        fontSize: CGFloat,
+        isWrapped: Bool,
+        maxWidth: CGFloat?
+    ) -> CGSize {
+        // Use shared measurement canvas or create one
+        let document = JSObject.global.document
+        let measureCanvas = document.createElement("canvas")
+        guard let ctx = measureCanvas.getContext("2d").object else {
+            // Fallback to estimation
+            let estimatedWidth = CGFloat(text.count) * fontSize * 0.6
+            let estimatedHeight = fontSize * 1.2
+            return CGSize(width: estimatedWidth, height: estimatedHeight)
+        }
+
+        // Set font
+        let fontFamily = font ?? "sans-serif"
+        ctx.font = .string("\(Int(fontSize))px \(fontFamily)")
+
+        // Measure text
+        let metrics = ctx.measureText!(text)
+        let measuredWidth = metrics.width.number ?? Double(text.count) * Double(fontSize) * 0.6
+
+        // Get height from font metrics if available, otherwise estimate
+        let ascent = metrics.actualBoundingBoxAscent.number ?? Double(fontSize) * 0.8
+        let descent = metrics.actualBoundingBoxDescent.number ?? Double(fontSize) * 0.2
+        let lineHeight = ascent + descent
+
+        if isWrapped, let maxWidth = maxWidth, CGFloat(measuredWidth) > maxWidth {
+            // Calculate wrapped text height using the same algorithm as drawWrappedText
+            // This ensures consistency between size calculation and actual rendering
+            let words = text.split(separator: " ")
+            var lineCount = 1
+            var line = ""
+
+            for word in words {
+                let testLine = line.isEmpty ? String(word) : line + " " + String(word)
+                let testMetrics = ctx.measureText!(testLine)
+                let testWidth = testMetrics.width.number ?? 0
+
+                if testWidth > Double(maxWidth) && !line.isEmpty {
+                    lineCount += 1
+                    line = String(word)
+                } else {
+                    line = testLine
+                }
+            }
+
+            return CGSize(
+                width: maxWidth,
+                height: CGFloat(lineHeight) * CGFloat(lineCount) * 1.2
+            )
+        } else if let maxWidth = maxWidth, CGFloat(measuredWidth) > maxWidth {
+            // Not wrapped but has maxWidth constraint - text will be clipped
+            // Return maxWidth as the size to match the canvas dimensions
+            return CGSize(
+                width: maxWidth,
+                height: CGFloat(lineHeight) * 1.2
+            )
+        } else {
+            // Single line, no constraints - add some padding
+            return CGSize(
+                width: CGFloat(measuredWidth) + fontSize * 0.1,
+                height: CGFloat(lineHeight) * 1.2
+            )
         }
     }
 
@@ -5568,7 +5691,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
             // Create shadow composite bind group with the blurred texture
             let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-                layout: shadowCompositePipeline.getBindGroupLayout(0),
+                layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
                 entries: [
                     GPUBindGroupEntry(binding: 0, resource: .buffer(shadowUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
                     GPUBindGroupEntry(binding: 1, resource: .textureView(shadowMaskTexture.createView())),
@@ -5710,7 +5833,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create composite bind group with the blurred filter texture
         let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowCompositePipeline.getBindGroupLayout(0),
+            layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
             entries: [
                 GPUBindGroupEntry(binding: 0, resource: .buffer(filterUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
                 GPUBindGroupEntry(binding: 1, resource: .textureView(filterResultTexture.createView())),
@@ -5875,7 +5998,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
                 // Calculate velocity
                 let angle = Float(cell.emissionLongitude) + randomSignedFloat() * Float(cell.emissionRange)
-                let velocity = Float(cell.velocity + randomSignedFloat() * CGFloat(cell.velocityRange)) * emitterLayer.velocity
+                let velocity = Float(cell.velocity + CGFloat(randomSignedFloat()) * CGFloat(cell.velocityRange)) * emitterLayer.velocity
                 particle.velocity = SIMD3(velocity * cos(angle), velocity * sin(angle), 0)
                 particle.acceleration = SIMD3(Float(cell.xAcceleration), Float(cell.yAcceleration), Float(cell.zAcceleration))
 
@@ -5885,11 +6008,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 particle.maxLifetime = particle.lifetime
 
                 // Set scale
-                particle.scale = Float(cell.scale + randomSignedFloat() * CGFloat(cell.scaleRange)) * emitterLayer.scale
+                particle.scale = Float(cell.scale + CGFloat(randomSignedFloat()) * CGFloat(cell.scaleRange)) * emitterLayer.scale
                 particle.scaleSpeed = Float(cell.scaleSpeed)
 
                 // Set rotation
-                particle.rotationSpeed = Float(cell.spin + randomSignedFloat() * CGFloat(cell.spinRange)) * emitterLayer.spin
+                particle.rotationSpeed = Float(cell.spin + CGFloat(randomSignedFloat()) * CGFloat(cell.spinRange)) * emitterLayer.spin
 
                 // Set color
                 if let cellColor = cell.color, let components = cellColor.components, components.count >= 3 {
@@ -6166,7 +6289,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             width: imageWidth,
             height: imageHeight,
             factory: { [weak self] in
-                self?.createTexture(from: image, device: device)
+                self?.createGPUTexture(from: image, device: device)
             }
         ) else { return }
 

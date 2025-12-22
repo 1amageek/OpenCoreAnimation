@@ -7,6 +7,9 @@
 
 import Foundation
 import OpenCoreGraphics
+#if arch(wasm32)
+import JavaScriptKit
+#endif
 
 // MARK: - Renderer Delegate Protocol
 
@@ -51,7 +54,7 @@ import OpenCoreGraphics
 ///     }
 /// }
 /// ```
-internal protocol CARendererDelegate: AnyObject, Sendable {
+internal protocol CARendererDelegate: AnyObject {
 
     // MARK: - Properties
 

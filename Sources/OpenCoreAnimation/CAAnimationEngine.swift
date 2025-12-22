@@ -1,3 +1,7 @@
+#if arch(wasm32)
+import JavaScriptKit
+#endif
+
 /// The animation engine orchestrates the animation loop, connecting
 /// display link timing to layer presentation updates and rendering.
 ///

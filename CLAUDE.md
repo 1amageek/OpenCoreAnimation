@@ -1013,6 +1013,126 @@ GPURenderPass execution
 queue.submit([commandBuffer])
 ```
 
+### Text Layer Rendering (CATextLayer)
+
+CATextLayer rendering uses Canvas2D for text measurement and rendering, then converts to WebGPU texture.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  CAWebGPURenderer.renderTextLayer()                             │
+├─────────────────────────────────────────────────────────────────┤
+│  1. Size Determination                                          │
+│     if bounds.isEmpty → measureTextSize() with Canvas2D         │
+│     else → use provided bounds                                  │
+│                                                                 │
+│  2. Text Rendering (to offscreen canvas)                        │
+│     - Create canvas with measured dimensions                    │
+│     - Set font, color, alignment                                │
+│     - if isWrapped → drawWrappedText()                         │
+│     - else → fillText()                                         │
+│                                                                 │
+│  3. Texture Conversion                                          │
+│     - getImageData() from canvas                                │
+│     - Create GPUTexture with measured size                      │
+│     - writeTexture() to upload pixel data                       │
+│     - Cache texture by content key                              │
+│                                                                 │
+│  4. Quad Rendering                                              │
+│     - Create textured quad with layer transform                 │
+│     - Render with textured pipeline                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Size Measurement (measureTextSize)
+
+Auto-measures text size when CATextLayer.bounds is empty or incomplete:
+
+```swift
+private func measureTextSize(
+    text: String,
+    font: String?,
+    fontSize: CGFloat,
+    isWrapped: Bool,
+    maxWidth: CGFloat?
+) -> CGSize {
+    // Create measurement canvas
+    let ctx = canvas.getContext("2d")
+    ctx.font = "\(fontSize)px \(font ?? "sans-serif")"
+
+    // Measure with Canvas2D API
+    let metrics = ctx.measureText(text)
+    let measuredWidth = metrics.width
+    let lineHeight = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent
+
+    // Handle wrapping with same algorithm as drawWrappedText
+    if isWrapped, let maxWidth, measuredWidth > maxWidth {
+        // Word-wrap calculation
+        var lineCount = 1
+        var line = ""
+        for word in text.split(separator: " ") {
+            let testLine = line.isEmpty ? String(word) : line + " " + String(word)
+            if ctx.measureText(testLine).width > maxWidth && !line.isEmpty {
+                lineCount += 1
+                line = String(word)
+            } else {
+                line = testLine
+            }
+        }
+        return CGSize(width: maxWidth, height: lineHeight * lineCount * 1.2)
+    } else if let maxWidth, measuredWidth > maxWidth {
+        // Not wrapped but constrained - text will be clipped
+        return CGSize(width: maxWidth, height: lineHeight * 1.2)
+    } else {
+        // Single line, auto-width
+        return CGSize(width: measuredWidth + fontSize * 0.1, height: lineHeight * 1.2)
+    }
+}
+```
+
+#### Algorithm Consistency
+
+**Critical**: `measureTextSize()` and `drawWrappedText()` use **identical** word-wrapping logic to ensure measured size matches rendered output:
+
+```swift
+// Same algorithm in both functions
+let testLine = line.isEmpty ? String(word) : line + " " + String(word)
+let testWidth = ctx.measureText(testLine).width
+if testWidth > maxWidth && !line.isEmpty {
+    // Start new line
+    lineCount += 1  // measureTextSize
+    // or
+    ctx.fillText(line, x, y); y += lineHeight  // drawWrappedText
+    line = String(word)
+} else {
+    line = testLine
+}
+```
+
+#### Texture Caching
+
+Text textures are cached by content key to avoid re-rendering:
+
+```swift
+let cacheKey = "\(text)_\(width)x\(height)_\(fontSize)_\(alignmentMode.rawValue)"
+
+if let cached = textTextureCache[cacheKey] {
+    return cached  // Reuse existing texture
+}
+// Otherwise create new texture and cache it
+```
+
+#### Size Scenarios
+
+| CATextLayer State | measureTextSize Behavior |
+|-------------------|--------------------------|
+| `bounds = .zero` | Auto-measure width and height |
+| `bounds.width > 0, height = 0` | Use width, measure height |
+| `bounds.width > 0, height > 0` | Use provided bounds (skip measurement) |
+| `isWrapped = true` | Calculate multi-line height |
+| `isWrapped = false, width constrained` | Return maxWidth (text clips) |
+
 ### Key Design Principles
 
 1. **API/Rendering Separation**: Keep CoreAnimation API layer separate from WebGPU implementation

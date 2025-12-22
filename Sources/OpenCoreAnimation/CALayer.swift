@@ -963,31 +963,16 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Safely extracts a CGColor from an Any value.
     private func extractColor(_ value: Any?) -> CGColor? {
-        guard let value = value else { return nil }
-        // Check if the value's type is CGColor or a subclass using type hierarchy
-        let valueType = type(of: value)
-        var currentType: Any.Type? = valueType
-        while let checkType = currentType {
-            if checkType == CGColor.self {
-                // We've verified the type is CGColor or a subclass, safe to cast
-                return unsafeBitCast(value as AnyObject, to: CGColor.self)
-            }
-            currentType = (checkType as? AnyClass)?.superclass()
-        }
-        return nil
+        return value as? CGColor
     }
 
     /// Safely extracts a CGPath from an Any value.
     private func extractPath(_ value: Any?) -> CGPath? {
-        guard let value = value else { return nil }
-        // Check if the value's type is CGPath or CGMutablePath using type hierarchy
-        let valueType = type(of: value)
-        var currentType: Any.Type? = valueType
-        while let checkType = currentType {
-            if checkType == CGPath.self || checkType == CGMutablePath.self {
-                return unsafeBitCast(value as AnyObject, to: CGPath.self)
-            }
-            currentType = (checkType as? AnyClass)?.superclass()
+        if let path = value as? CGPath {
+            return path
+        }
+        if let mutablePath = value as? CGMutablePath {
+            return mutablePath
         }
         return nil
     }

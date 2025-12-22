@@ -51,7 +51,7 @@ private final class CATransactionStack: @unchecked Sendable {
 
 #if arch(wasm32)
 /// WASM is single-threaded, so we use a single global stack.
-private var _wasmTransactionStack = CATransactionStack()
+nonisolated(unsafe) private var _wasmTransactionStack = CATransactionStack()
 
 private func getCurrentTransactionStack() -> CATransactionStack {
     return _wasmTransactionStack
