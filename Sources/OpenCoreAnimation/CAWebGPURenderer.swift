@@ -4,1276 +4,18 @@ import OpenCoreGraphics
 import JavaScriptKit
 import SwiftWebGPU
 
-// MARK: - Particle Data Structure
+// Types, helpers, and shaders are now organized in the Rendering/WebGPU directory:
+// - Types/Matrix4x4.swift
+// - Types/RendererTypes.swift
+// - Types/ParticleTypes.swift
+// - Types/GeometryTypes.swift
+// - Internal/BufferPool.swift
+// - Internal/TextureManager.swift
+// - Internal/GeometryCache.swift
+// - Shaders/CAWebGPUShaders.swift
+// - Extensions/CALayerWebGPUExtensions.swift
 
-/// Represents a single particle in the emitter system.
-public struct EmitterParticle {
-    public var position: SIMD3<Float> = .zero
-    public var velocity: SIMD3<Float> = .zero
-    public var acceleration: SIMD3<Float> = .zero
-    public var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
-    public var colorSpeed: SIMD4<Float> = .zero
-    public var scale: Float = 1.0
-    public var scaleSpeed: Float = 0.0
-    public var rotation: Float = 0.0
-    public var rotationSpeed: Float = 0.0
-    public var lifetime: Float = 0.0
-    public var maxLifetime: Float = 1.0
-    public var isAlive: Bool = false
 
-    public init() {}
-
-    /// Updates the particle state for the given time delta.
-    public mutating func update(deltaTime: Float) {
-        guard isAlive else { return }
-
-        lifetime -= deltaTime
-        if lifetime <= 0 {
-            isAlive = false
-            return
-        }
-
-        // Update position
-        velocity += acceleration * deltaTime
-        position += velocity * deltaTime
-
-        // Update color
-        color += colorSpeed * deltaTime
-        color = SIMD4(
-            max(0, min(1, color.x)),
-            max(0, min(1, color.y)),
-            max(0, min(1, color.z)),
-            max(0, min(1, color.w))
-        )
-
-        // Update scale
-        scale += scaleSpeed * deltaTime
-        scale = max(0, scale)
-
-        // Update rotation
-        rotation += rotationSpeed * deltaTime
-    }
-}
-
-/// GPU-compatible particle instance data.
-public struct ParticleInstanceData {
-    public var position: SIMD3<Float>
-    public var color: SIMD4<Float>
-    public var scaleRotation: SIMD2<Float>
-
-    public init(from particle: EmitterParticle) {
-        self.position = particle.position
-        self.color = particle.color
-        self.scaleRotation = SIMD2(particle.scale, particle.rotation)
-    }
-
-    public static var stride: UInt64 {
-        return UInt64(MemoryLayout<ParticleInstanceData>.stride)
-    }
-}
-
-/// Blur uniform data.
-public struct BlurUniforms {
-    public var texelSize: SIMD2<Float>
-    public var blurRadius: Float
-    public var padding: Float = 0
-
-    public init(texelSize: SIMD2<Float>, blurRadius: Float) {
-        self.texelSize = texelSize
-        self.blurRadius = blurRadius
-    }
-}
-
-/// Shadow uniform data.
-public struct ShadowUniforms {
-    public var mvpMatrix: Matrix4x4
-    public var shadowColor: SIMD4<Float>
-    public var shadowOffset: SIMD2<Float>
-    public var layerSize: SIMD2<Float>
-
-    public init(
-        mvpMatrix: Matrix4x4 = .identity,
-        shadowColor: SIMD4<Float> = SIMD4(0, 0, 0, 1),
-        shadowOffset: SIMD2<Float> = .zero,
-        layerSize: SIMD2<Float> = .zero
-    ) {
-        self.mvpMatrix = mvpMatrix
-        self.shadowColor = shadowColor
-        self.shadowOffset = shadowOffset
-        self.layerSize = layerSize
-    }
-}
-
-// MARK: - WASM Matrix Types (simd replacement)
-
-/// A 4x4 matrix of Float values for WASM environments.
-/// This replaces simd_float4x4 which is not available on WASM.
-public struct Matrix4x4 {
-    public var columns: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
-
-    public init(columns: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)) {
-        self.columns = columns
-    }
-
-    /// Identity matrix
-    public static var identity: Matrix4x4 {
-        Matrix4x4(columns: (
-            SIMD4<Float>(1, 0, 0, 0),
-            SIMD4<Float>(0, 1, 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
-        ))
-    }
-
-    /// Creates a translation matrix.
-    public init(translation: SIMD3<Float>) {
-        self = .identity
-        self.columns.3 = SIMD4<Float>(translation.x, translation.y, translation.z, 1)
-    }
-
-    /// Creates an orthographic projection matrix for WebGPU (depth range 0 to 1).
-    ///
-    /// WebGPU uses a depth range of [0, 1] in clip space, unlike OpenGL which uses [-1, 1].
-    /// This matrix maps:
-    /// - X: [left, right] → [-1, 1]
-    /// - Y: [bottom, top] → [-1, 1]
-    /// - Z: [near, far] → [0, 1]
-    public static func orthographic(
-        left: Float,
-        right: Float,
-        bottom: Float,
-        top: Float,
-        near: Float,
-        far: Float
-    ) -> Matrix4x4 {
-        let width = right - left
-        let height = top - bottom
-        let depth = far - near
-
-        // WebGPU depth range [0, 1]:
-        // z_ndc = (z_eye - near) / (far - near)
-        //       = z_eye / depth - near / depth
-        return Matrix4x4(columns: (
-            SIMD4<Float>(2 / width, 0, 0, 0),
-            SIMD4<Float>(0, 2 / height, 0, 0),
-            SIMD4<Float>(0, 0, 1 / depth, 0),
-            SIMD4<Float>(-(right + left) / width, -(top + bottom) / height, -near / depth, 1)
-        ))
-    }
-
-    /// Matrix multiplication
-    public static func * (lhs: Matrix4x4, rhs: Matrix4x4) -> Matrix4x4 {
-        var result = Matrix4x4.identity
-
-        for i in 0..<4 {
-            let col = getColumn(rhs, i)
-            let x = lhs.columns.0 * col.x
-            let y = lhs.columns.1 * col.y
-            let z = lhs.columns.2 * col.z
-            let w = lhs.columns.3 * col.w
-            setColumn(&result, i, x + y + z + w)
-        }
-
-        return result
-    }
-
-    private static func getColumn(_ m: Matrix4x4, _ i: Int) -> SIMD4<Float> {
-        switch i {
-        case 0: return m.columns.0
-        case 1: return m.columns.1
-        case 2: return m.columns.2
-        case 3: return m.columns.3
-        default: return .zero
-        }
-    }
-
-    private static func setColumn(_ m: inout Matrix4x4, _ i: Int, _ v: SIMD4<Float>) {
-        switch i {
-        case 0: m.columns.0 = v
-        case 1: m.columns.1 = v
-        case 2: m.columns.2 = v
-        case 3: m.columns.3 = v
-        default: break
-        }
-    }
-
-    /// Matrix-vector multiplication
-    public static func * (lhs: Matrix4x4, rhs: SIMD4<Float>) -> SIMD4<Float> {
-        let x = lhs.columns.0 * rhs.x
-        let y = lhs.columns.1 * rhs.y
-        let z = lhs.columns.2 * rhs.z
-        let w = lhs.columns.3 * rhs.w
-        return x + y + z + w
-    }
-}
-
-// MARK: - WASM Renderer Types
-
-/// A structure representing a vertex for layer rendering (WASM version).
-public struct CARendererVertex {
-    public var position: SIMD2<Float>
-    public var texCoord: SIMD2<Float>
-    public var color: SIMD4<Float>
-
-    public init(position: SIMD2<Float>, texCoord: SIMD2<Float>, color: SIMD4<Float>) {
-        self.position = position
-        self.texCoord = texCoord
-        self.color = color
-    }
-}
-
-/// Maximum number of gradient color stops supported.
-public let kMaxGradientStops: Int = 8
-
-/// Uniform data passed to shaders for each layer (WASM version).
-public struct CARendererUniforms {
-    public var mvpMatrix: Matrix4x4
-    public var opacity: Float
-    public var cornerRadius: Float
-    public var layerSize: SIMD2<Float>
-    public var borderWidth: Float
-    public var renderMode: Float  // 0 = fill, 1 = border, 2 = gradient
-    public var gradientStartPoint: SIMD2<Float>
-    public var gradientEndPoint: SIMD2<Float>
-    public var gradientColorCount: Float
-    public var padding3: SIMD3<Float>
-    // Gradient color stops: each is vec4 color + vec4 (location, 0, 0, 0) = 8 bytes per stop
-    // For simplicity, we'll pack 8 colors and 8 locations separately
-    public var gradientColors: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>,
-                                SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
-    public var gradientLocations: SIMD4<Float>  // First 4 locations
-    public var gradientLocations2: SIMD4<Float> // Next 4 locations
-
-    public init(
-        mvpMatrix: Matrix4x4 = .identity,
-        opacity: Float = 1.0,
-        cornerRadius: Float = 0.0,
-        layerSize: SIMD2<Float> = .zero,
-        borderWidth: Float = 0.0,
-        renderMode: Float = 0.0,
-        gradientStartPoint: SIMD2<Float> = .zero,
-        gradientEndPoint: SIMD2<Float> = SIMD2(0, 1),
-        gradientColorCount: Float = 0
-    ) {
-        self.mvpMatrix = mvpMatrix
-        self.opacity = opacity
-        self.cornerRadius = cornerRadius
-        self.layerSize = layerSize
-        self.borderWidth = borderWidth
-        self.renderMode = renderMode
-        self.gradientStartPoint = gradientStartPoint
-        self.gradientEndPoint = gradientEndPoint
-        self.gradientColorCount = gradientColorCount
-        self.padding3 = .zero
-        self.gradientColors = (.zero, .zero, .zero, .zero, .zero, .zero, .zero, .zero)
-        self.gradientLocations = .zero
-        self.gradientLocations2 = .zero
-    }
-}
-
-/// Uniform data for textured layer rendering.
-public struct TexturedUniforms {
-    public var mvpMatrix: Matrix4x4
-    public var opacity: Float
-    public var cornerRadius: Float
-    public var layerSize: SIMD2<Float>
-
-    public init(
-        mvpMatrix: Matrix4x4 = .identity,
-        opacity: Float = 1.0,
-        cornerRadius: Float = 0.0,
-        layerSize: SIMD2<Float> = .zero
-    ) {
-        self.mvpMatrix = mvpMatrix
-        self.opacity = opacity
-        self.cornerRadius = cornerRadius
-        self.layerSize = layerSize
-    }
-}
-
-// MARK: - WASM Helper Extensions
-
-extension CALayer {
-    /// Converts the layer's background color to SIMD4<Float>.
-    internal var backgroundColorComponents: SIMD4<Float> {
-        guard let color = backgroundColor,
-              let components = color.components,
-              components.count >= 4 else {
-            return SIMD4<Float>(0, 0, 0, 0)
-        }
-        return SIMD4<Float>(
-            Float(components[0]),
-            Float(components[1]),
-            Float(components[2]),
-            Float(components[3])
-        )
-    }
-
-    /// Converts the layer's border color to SIMD4<Float>.
-    internal var borderColorComponents: SIMD4<Float> {
-        guard let color = borderColor,
-              let components = color.components,
-              components.count >= 4 else {
-            return SIMD4<Float>(0, 0, 0, 0)
-        }
-        return SIMD4<Float>(
-            Float(components[0]),
-            Float(components[1]),
-            Float(components[2]),
-            Float(components[3])
-        )
-    }
-
-    /// Calculates the model matrix for this layer.
-    ///
-    /// The z-coordinate is negated to match CoreAnimation's convention where
-    /// higher zPosition values appear "in front" (closer to the viewer).
-    /// With WebGPU's depth range [0, 1] and lessEqual comparison:
-    /// - Lower z in eye space → lower clip z → passes depth test → in front
-    /// - So we negate zPosition: higher zPosition → lower z_eye → in front
-    internal func modelMatrix(parentMatrix: Matrix4x4 = .identity) -> Matrix4x4 {
-        var matrix = parentMatrix
-
-        // Negate zPosition so higher values appear in front (CoreAnimation convention)
-        let translation = Matrix4x4(translation: SIMD3<Float>(
-            Float(position.x),
-            Float(position.y),
-            Float(-zPosition)  // Negated for correct z-ordering
-        ))
-        matrix = matrix * translation
-
-        if !CATransform3DIsIdentity(transform) {
-            let layerTransform = transform.matrix4x4
-            matrix = matrix * layerTransform
-        }
-
-        // Negate anchorPointZ to match the z-coordinate convention
-        let anchorOffset = Matrix4x4(translation: SIMD3<Float>(
-            Float(-bounds.width * anchorPoint.x),
-            Float(-bounds.height * anchorPoint.y),
-            Float(anchorPointZ)  // Negated (double negation with the minus sign)
-        ))
-        matrix = matrix * anchorOffset
-
-        return matrix
-    }
-
-    /// Calculates the parent matrix for sublayer positioning.
-    ///
-    /// This includes the layer's model matrix, sublayerTransform, and bounds.origin offset.
-    /// The bounds.origin offset ensures that sublayers are correctly positioned when the
-    /// layer's bounds origin is non-zero (e.g., for CAScrollLayer scrolling).
-    ///
-    /// - Parameter modelMatrix: The layer's model matrix
-    /// - Returns: The matrix to use as parentMatrix for sublayer rendering
-    internal func sublayerMatrix(modelMatrix: Matrix4x4) -> Matrix4x4 {
-        var result = modelMatrix
-
-        // Apply sublayerTransform if not identity
-        if !CATransform3DIsIdentity(sublayerTransform) {
-            result = result * sublayerTransform.matrix4x4
-        }
-
-        // Apply bounds.origin offset
-        // In CoreAnimation, bounds.origin defines where the coordinate system origin is
-        // within the layer. A sublayer at position (0,0) with parent's bounds.origin = (50, 50)
-        // should appear at (-50, -50) relative to the parent's visible top-left.
-        // This is the scrolling behavior used by CAScrollLayer.
-        if bounds.origin.x != 0 || bounds.origin.y != 0 {
-            let boundsOriginOffset = Matrix4x4(translation: SIMD3<Float>(
-                Float(-bounds.origin.x),
-                Float(-bounds.origin.y),
-                0
-            ))
-            result = result * boundsOriginOffset
-        }
-
-        return result
-    }
-}
-
-extension CATransform3D {
-    /// Converts CATransform3D to Matrix4x4.
-    internal var matrix4x4: Matrix4x4 {
-        return Matrix4x4(columns: (
-            SIMD4<Float>(Float(m11), Float(m21), Float(m31), Float(m41)),
-            SIMD4<Float>(Float(m12), Float(m22), Float(m32), Float(m42)),
-            SIMD4<Float>(Float(m13), Float(m23), Float(m33), Float(m43)),
-            SIMD4<Float>(Float(m14), Float(m24), Float(m34), Float(m44))
-        ))
-    }
-}
-
-// MARK: - Buffer Pool (Triple Buffering)
-
-/// A pool of GPU buffers for triple buffering.
-///
-/// Triple buffering prevents GPU stalls by allowing the CPU to write to one buffer
-/// while the GPU is reading from another. This class manages a ring buffer of GPU buffers
-/// that cycle each frame.
-///
-/// ## Usage
-///
-/// ```swift
-/// let pool = GPUBufferPool(device: device, bufferSize: 1024, usage: [.vertex, .copyDst], bufferCount: 3)
-///
-/// // Each frame
-/// let buffer = pool.currentBuffer
-/// pool.advanceFrame()
-/// ```
-public final class GPUBufferPool {
-
-    // MARK: - Properties
-
-    /// The GPU buffers in the pool.
-    private var buffers: [GPUBuffer]
-
-    /// The current buffer index.
-    private var currentIndex: Int = 0
-
-    /// Number of buffers in the pool.
-    public let bufferCount: Int
-
-    /// Size of each buffer in bytes.
-    public let bufferSize: UInt64
-
-    /// The current frame number (incremented each advanceFrame call).
-    public private(set) var frameNumber: UInt64 = 0
-
-    // MARK: - Initialization
-
-    /// Creates a new buffer pool with the specified configuration.
-    ///
-    /// - Parameters:
-    ///   - device: The GPU device to create buffers on.
-    ///   - bufferSize: The size of each buffer in bytes.
-    ///   - usage: The usage flags for the buffers.
-    ///   - bufferCount: The number of buffers in the pool (default: 3 for triple buffering).
-    public init(device: GPUDevice, bufferSize: UInt64, usage: GPUBufferUsage, bufferCount: Int = 3) {
-        self.bufferSize = bufferSize
-        self.bufferCount = bufferCount
-        self.buffers = []
-
-        for _ in 0..<bufferCount {
-            let buffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-                size: bufferSize,
-                usage: usage
-            ))
-            buffers.append(buffer)
-        }
-    }
-
-    // MARK: - Public Methods
-
-    /// The current buffer to use for this frame.
-    public var currentBuffer: GPUBuffer {
-        return buffers[currentIndex]
-    }
-
-    /// The buffer at the specified offset from the current buffer.
-    ///
-    /// - Parameter offset: Offset from current buffer (0 = current, 1 = next, etc.)
-    /// - Returns: The buffer at the specified offset, wrapping around if necessary.
-    public func buffer(at offset: Int) -> GPUBuffer {
-        let index = (currentIndex + offset) % bufferCount
-        return buffers[index]
-    }
-
-    /// Advances to the next buffer in the pool.
-    ///
-    /// Call this at the end of each frame to cycle to the next buffer.
-    public func advanceFrame() {
-        currentIndex = (currentIndex + 1) % bufferCount
-        frameNumber += 1
-    }
-
-    /// Resets the pool to its initial state.
-    public func reset() {
-        currentIndex = 0
-        frameNumber = 0
-    }
-
-    /// Destroys all buffers in the pool.
-    public func invalidate() {
-        buffers.removeAll()
-        currentIndex = 0
-        frameNumber = 0
-    }
-}
-
-/// A pool of uniform buffers with bind group management.
-///
-/// This specialized pool manages uniform buffers along with their bind groups,
-/// which is the common pattern for per-frame uniform data in WebGPU.
-public final class UniformBufferPool {
-
-    // MARK: - Properties
-
-    /// The buffer pool for uniform data.
-    private let bufferPool: GPUBufferPool
-
-    /// The bind groups for each buffer in the pool.
-    private var bindGroups: [GPUBindGroup]
-
-    /// The bind group layout used for creating bind groups.
-    public let bindGroupLayout: GPUBindGroupLayout
-
-    // MARK: - Initialization
-
-    /// Creates a new uniform buffer pool.
-    ///
-    /// - Parameters:
-    ///   - device: The GPU device.
-    ///   - bufferSize: The size of each uniform buffer in bytes.
-    ///   - bindGroupLayout: The layout for creating bind groups.
-    ///   - bindingSize: The size of the buffer binding (may be smaller than bufferSize for dynamic offsets).
-    ///   - bufferCount: Number of buffers in the pool (default: 3).
-    public init(
-        device: GPUDevice,
-        bufferSize: UInt64,
-        bindGroupLayout: GPUBindGroupLayout,
-        bindingSize: UInt64,
-        bufferCount: Int = 3
-    ) {
-        self.bindGroupLayout = bindGroupLayout
-        self.bufferPool = GPUBufferPool(
-            device: device,
-            bufferSize: bufferSize,
-            usage: [.uniform, .copyDst],
-            bufferCount: bufferCount
-        )
-        self.bindGroups = []
-
-        // Create bind groups for each buffer
-        for i in 0..<bufferCount {
-            let buffer = bufferPool.buffer(at: i)
-            let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-                layout: bindGroupLayout,
-                entries: [
-                    GPUBindGroupEntry(
-                        binding: 0,
-                        resource: .bufferBinding(GPUBufferBinding(
-                            buffer: buffer,
-                            size: bindingSize
-                        ))
-                    )
-                ]
-            ))
-            bindGroups.append(bindGroup)
-        }
-    }
-
-    // MARK: - Public Methods
-
-    /// The current uniform buffer for this frame.
-    public var currentBuffer: GPUBuffer {
-        return bufferPool.currentBuffer
-    }
-
-    /// The current bind group for this frame.
-    public var currentBindGroup: GPUBindGroup {
-        return bindGroups[currentIndex]
-    }
-
-    /// Current buffer index.
-    private var currentIndex: Int {
-        return Int(bufferPool.frameNumber % UInt64(bufferPool.bufferCount))
-    }
-
-    /// Advances to the next buffer/bind group pair.
-    public func advanceFrame() {
-        bufferPool.advanceFrame()
-    }
-
-    /// Resets the pool to its initial state.
-    public func reset() {
-        bufferPool.reset()
-    }
-
-    /// Destroys all resources in the pool.
-    public func invalidate() {
-        bufferPool.invalidate()
-        bindGroups.removeAll()
-    }
-}
-
-/// A pool of vertex buffers for efficient vertex data management.
-public final class VertexBufferPool {
-
-    // MARK: - Properties
-
-    /// The buffer pool for vertex data.
-    private let bufferPool: GPUBufferPool
-
-    // MARK: - Initialization
-
-    /// Creates a new vertex buffer pool.
-    ///
-    /// - Parameters:
-    ///   - device: The GPU device.
-    ///   - bufferSize: The size of each vertex buffer in bytes.
-    ///   - bufferCount: Number of buffers in the pool (default: 3).
-    public init(device: GPUDevice, bufferSize: UInt64, bufferCount: Int = 3) {
-        self.bufferPool = GPUBufferPool(
-            device: device,
-            bufferSize: bufferSize,
-            usage: [.vertex, .copyDst],
-            bufferCount: bufferCount
-        )
-    }
-
-    // MARK: - Public Methods
-
-    /// The current vertex buffer for this frame.
-    public var currentBuffer: GPUBuffer {
-        return bufferPool.currentBuffer
-    }
-
-    /// Advances to the next vertex buffer.
-    public func advanceFrame() {
-        bufferPool.advanceFrame()
-    }
-
-    /// Resets the pool to its initial state.
-    public func reset() {
-        bufferPool.reset()
-    }
-
-    /// Destroys all buffers in the pool.
-    public func invalidate() {
-        bufferPool.invalidate()
-    }
-}
-
-// MARK: - Texture Manager (LRU Cache)
-
-/// A texture cache entry with access tracking for LRU eviction.
-private struct TextureCacheEntry {
-    let texture: GPUTexture
-    let width: Int
-    let height: Int
-    var lastAccessFrame: UInt64
-    var accessCount: UInt64
-
-    /// Approximate memory usage in bytes (4 bytes per pixel for RGBA8).
-    var memorySize: UInt64 {
-        return UInt64(width * height * 4)
-    }
-}
-
-/// A texture manager with LRU (Least Recently Used) cache eviction.
-///
-/// This class manages GPU textures with automatic memory management.
-/// When the cache exceeds its capacity, the least recently used textures
-/// are evicted to make room for new ones.
-///
-/// ## Usage
-///
-/// ```swift
-/// let manager = GPUTextureManager(device: device, maxTextures: 256, maxMemory: 256 * 1024 * 1024)
-///
-/// // Get or create a texture
-/// let texture = manager.getOrCreateTexture(for: imageId) { device in
-///     return createTextureFromImage(image, device: device)
-/// }
-///
-/// // At end of frame, update frame counter
-/// manager.advanceFrame()
-/// ```
-public final class GPUTextureManager {
-
-    // MARK: - Properties
-
-    /// The GPU device for creating textures.
-    private weak var device: GPUDevice?
-
-    /// Cache of textures keyed by ObjectIdentifier.
-    private var cache: [ObjectIdentifier: TextureCacheEntry] = [:]
-
-    /// Current frame number for LRU tracking.
-    private var currentFrame: UInt64 = 0
-
-    /// Maximum number of textures in the cache.
-    public let maxTextures: Int
-
-    /// Maximum total memory in bytes for cached textures.
-    public let maxMemoryBytes: UInt64
-
-    /// Current number of textures in the cache.
-    public var textureCount: Int {
-        return cache.count
-    }
-
-    /// Current total memory usage in bytes.
-    public private(set) var currentMemoryBytes: UInt64 = 0
-
-    /// Number of cache hits since creation.
-    public private(set) var cacheHits: UInt64 = 0
-
-    /// Number of cache misses since creation.
-    public private(set) var cacheMisses: UInt64 = 0
-
-    /// Cache hit rate (0.0 to 1.0).
-    public var hitRate: Double {
-        let total = cacheHits + cacheMisses
-        return total > 0 ? Double(cacheHits) / Double(total) : 0.0
-    }
-
-    // MARK: - Initialization
-
-    /// Creates a new texture manager.
-    ///
-    /// - Parameters:
-    ///   - device: The GPU device for creating textures.
-    ///   - maxTextures: Maximum number of textures to cache (default: 256).
-    ///   - maxMemoryBytes: Maximum memory in bytes (default: 256MB).
-    public init(device: GPUDevice, maxTextures: Int = 256, maxMemoryBytes: UInt64 = 256 * 1024 * 1024) {
-        self.device = device
-        self.maxTextures = maxTextures
-        self.maxMemoryBytes = maxMemoryBytes
-    }
-
-    // MARK: - Public Methods
-
-    /// Gets a cached texture or creates a new one using the provided factory.
-    ///
-    /// - Parameters:
-    ///   - key: The unique identifier for the texture (typically ObjectIdentifier of source image).
-    ///   - width: Width of the texture (used for memory tracking).
-    ///   - height: Height of the texture (used for memory tracking).
-    ///   - factory: A closure that creates the texture if not cached.
-    /// - Returns: The cached or newly created texture.
-    public func getOrCreateTexture(
-        for key: ObjectIdentifier,
-        width: Int,
-        height: Int,
-        factory: () -> GPUTexture?
-    ) -> GPUTexture? {
-        // Check cache first
-        if var entry = cache[key] {
-            // Update access tracking
-            entry.lastAccessFrame = currentFrame
-            entry.accessCount += 1
-            cache[key] = entry
-            cacheHits += 1
-            return entry.texture
-        }
-
-        // Cache miss - create new texture
-        cacheMisses += 1
-
-        guard let texture = factory() else {
-            return nil
-        }
-
-        let memorySize = UInt64(width * height * 4)
-
-        // Evict if necessary
-        evictIfNeeded(forNewMemory: memorySize)
-
-        // Add to cache
-        let entry = TextureCacheEntry(
-            texture: texture,
-            width: width,
-            height: height,
-            lastAccessFrame: currentFrame,
-            accessCount: 1
-        )
-        cache[key] = entry
-        currentMemoryBytes += memorySize
-
-        return texture
-    }
-
-    /// Gets a cached texture if it exists.
-    ///
-    /// - Parameter key: The unique identifier for the texture.
-    /// - Returns: The cached texture, or nil if not found.
-    public func getCachedTexture(for key: ObjectIdentifier) -> GPUTexture? {
-        guard var entry = cache[key] else {
-            return nil
-        }
-
-        // Update access tracking
-        entry.lastAccessFrame = currentFrame
-        entry.accessCount += 1
-        cache[key] = entry
-        cacheHits += 1
-
-        return entry.texture
-    }
-
-    /// Manually adds a texture to the cache.
-    ///
-    /// - Parameters:
-    ///   - texture: The texture to cache.
-    ///   - key: The unique identifier for the texture.
-    ///   - width: Width of the texture.
-    ///   - height: Height of the texture.
-    public func cacheTexture(_ texture: GPUTexture, for key: ObjectIdentifier, width: Int, height: Int) {
-        // Remove existing entry if present
-        if let existing = cache[key] {
-            currentMemoryBytes -= existing.memorySize
-        }
-
-        let memorySize = UInt64(width * height * 4)
-        evictIfNeeded(forNewMemory: memorySize)
-
-        let entry = TextureCacheEntry(
-            texture: texture,
-            width: width,
-            height: height,
-            lastAccessFrame: currentFrame,
-            accessCount: 1
-        )
-        cache[key] = entry
-        currentMemoryBytes += memorySize
-    }
-
-    /// Removes a specific texture from the cache.
-    ///
-    /// - Parameter key: The unique identifier of the texture to remove.
-    public func removeTexture(for key: ObjectIdentifier) {
-        if let entry = cache.removeValue(forKey: key) {
-            currentMemoryBytes -= entry.memorySize
-        }
-    }
-
-    /// Advances the frame counter for LRU tracking.
-    ///
-    /// Call this at the end of each frame.
-    public func advanceFrame() {
-        currentFrame += 1
-    }
-
-    /// Clears all cached textures.
-    public func clearAll() {
-        cache.removeAll()
-        currentMemoryBytes = 0
-    }
-
-    /// Invalidates the texture manager.
-    public func invalidate() {
-        clearAll()
-        device = nil
-    }
-
-    /// Evicts textures that haven't been used for the specified number of frames.
-    ///
-    /// - Parameter frameThreshold: Number of frames after which unused textures are evicted.
-    public func evictStale(olderThan frameThreshold: UInt64) {
-        let cutoffFrame = currentFrame > frameThreshold ? currentFrame - frameThreshold : 0
-
-        var keysToRemove: [ObjectIdentifier] = []
-        for (key, entry) in cache {
-            if entry.lastAccessFrame < cutoffFrame {
-                keysToRemove.append(key)
-            }
-        }
-
-        for key in keysToRemove {
-            if let entry = cache.removeValue(forKey: key) {
-                currentMemoryBytes -= entry.memorySize
-            }
-        }
-    }
-
-    // MARK: - Private Methods
-
-    /// Evicts least recently used textures if the cache is over capacity.
-    private func evictIfNeeded(forNewMemory newMemory: UInt64) {
-        // Check if we need to evict based on count
-        while cache.count >= maxTextures {
-            evictLeastRecentlyUsed()
-        }
-
-        // Check if we need to evict based on memory
-        while currentMemoryBytes + newMemory > maxMemoryBytes && !cache.isEmpty {
-            evictLeastRecentlyUsed()
-        }
-    }
-
-    /// Evicts the single least recently used texture.
-    private func evictLeastRecentlyUsed() {
-        guard !cache.isEmpty else { return }
-
-        // Find the entry with the oldest last access frame
-        var oldestKey: ObjectIdentifier?
-        var oldestFrame: UInt64 = .max
-
-        for (key, entry) in cache {
-            if entry.lastAccessFrame < oldestFrame {
-                oldestFrame = entry.lastAccessFrame
-                oldestKey = key
-            }
-        }
-
-        if let key = oldestKey, let entry = cache.removeValue(forKey: key) {
-            currentMemoryBytes -= entry.memorySize
-        }
-    }
-}
-
-// MARK: - Geometry Cache (Path Tessellation)
-
-/// A key for caching tessellated geometry.
-///
-/// This key uniquely identifies a tessellated path based on:
-/// - The path identity (via ObjectIdentifier for reference types, or hash for value types)
-/// - Rendering parameters (line width, cap, join, fill rule)
-/// - Stroke/fill mode
-///
-/// ## Note on Path Identity
-///
-/// For best cache hit rates, use `ObjectIdentifier` of the CGPath object when the path
-/// object is reused across frames. If the path is recreated each frame with the same content,
-/// consider using a content-based hash instead.
-public struct GeometryCacheKey: Hashable {
-    /// Unique identifier for the path object (ObjectIdentifier if available, or hash).
-    public let pathIdentifier: Int
-
-    /// Whether this is for stroke (true) or fill (false).
-    public let isStroke: Bool
-
-    /// Line width for strokes.
-    public let lineWidth: CGFloat
-
-    /// Line cap style for strokes.
-    public let lineCap: CAShapeLayerLineCap
-
-    /// Line join style for strokes.
-    public let lineJoin: CAShapeLayerLineJoin
-
-    /// Miter limit for miter joins.
-    public let miterLimit: CGFloat
-
-    /// Fill rule for fills.
-    public let fillRule: CAShapeLayerFillRule
-
-    /// Stroke start (0.0 to 1.0).
-    public let strokeStart: CGFloat
-
-    /// Stroke end (0.0 to 1.0).
-    public let strokeEnd: CGFloat
-
-    /// Creates a geometry cache key from a path object identifier.
-    ///
-    /// - Parameters:
-    ///   - pathIdentifier: Use `ObjectIdentifier(path).hashValue` for CGPath reference types,
-    ///     or `path.hashValue` for content-based hashing.
-    ///   - isStroke: Whether this is for stroke rendering.
-    ///   - lineWidth: Line width for strokes.
-    ///   - lineCap: Line cap style.
-    ///   - lineJoin: Line join style.
-    ///   - miterLimit: Miter limit for miter joins.
-    ///   - fillRule: Fill rule for fills.
-    ///   - strokeStart: Stroke start position (0.0 to 1.0).
-    ///   - strokeEnd: Stroke end position (0.0 to 1.0).
-    public init(
-        pathIdentifier: Int,
-        isStroke: Bool,
-        lineWidth: CGFloat = 1.0,
-        lineCap: CAShapeLayerLineCap = .butt,
-        lineJoin: CAShapeLayerLineJoin = .miter,
-        miterLimit: CGFloat = 10.0,
-        fillRule: CAShapeLayerFillRule = .nonZero,
-        strokeStart: CGFloat = 0.0,
-        strokeEnd: CGFloat = 1.0
-    ) {
-        self.pathIdentifier = pathIdentifier
-        self.isStroke = isStroke
-        self.lineWidth = lineWidth
-        self.lineCap = lineCap
-        self.lineJoin = lineJoin
-        self.miterLimit = miterLimit
-        self.fillRule = fillRule
-        self.strokeStart = strokeStart
-        self.strokeEnd = strokeEnd
-    }
-
-    /// Creates a geometry cache key from a CGPath.
-    ///
-    /// Uses ObjectIdentifier for stable identity across frames when the same path object is reused.
-    ///
-    /// - Parameters:
-    ///   - path: The CGPath to create a key for.
-    ///   - isStroke: Whether this is for stroke rendering.
-    ///   - Other parameters same as main initializer.
-    public init(
-        path: CGPath,
-        isStroke: Bool,
-        lineWidth: CGFloat = 1.0,
-        lineCap: CAShapeLayerLineCap = .butt,
-        lineJoin: CAShapeLayerLineJoin = .miter,
-        miterLimit: CGFloat = 10.0,
-        fillRule: CAShapeLayerFillRule = .nonZero,
-        strokeStart: CGFloat = 0.0,
-        strokeEnd: CGFloat = 1.0
-    ) {
-        // Use ObjectIdentifier for stable identity when path object is reused
-        self.pathIdentifier = ObjectIdentifier(path).hashValue
-        self.isStroke = isStroke
-        self.lineWidth = lineWidth
-        self.lineCap = lineCap
-        self.lineJoin = lineJoin
-        self.miterLimit = miterLimit
-        self.fillRule = fillRule
-        self.strokeStart = strokeStart
-        self.strokeEnd = strokeEnd
-    }
-}
-
-/// Cached tessellated geometry data.
-public struct TessellatedGeometry {
-    /// Triangle vertices for rendering.
-    public let vertices: [CGPoint]
-
-    /// Number of triangles (vertices.count / 3).
-    public var triangleCount: Int {
-        return vertices.count / 3
-    }
-
-    /// Approximate memory usage in bytes.
-    public var memorySize: Int {
-        return vertices.count * MemoryLayout<CGPoint>.stride
-    }
-
-    public init(vertices: [CGPoint]) {
-        self.vertices = vertices
-    }
-}
-
-/// A cache entry with access tracking for LRU eviction.
-private struct GeometryCacheEntry {
-    let geometry: TessellatedGeometry
-    var lastAccessFrame: UInt64
-    var accessCount: UInt64
-}
-
-/// A cache for tessellated path geometry with LRU eviction.
-///
-/// Path tessellation (converting bezier curves to triangles) is computationally
-/// expensive. This cache stores tessellated geometry so paths that haven't changed
-/// don't need to be re-tessellated every frame.
-///
-/// ## Usage
-///
-/// ```swift
-/// let cache = GeometryCache(maxEntries: 256, maxMemoryBytes: 64 * 1024 * 1024)
-///
-/// // Create a cache key for a shape layer's path
-/// let key = GeometryCacheKey(
-///     pathHash: path.hashValue,
-///     isStroke: true,
-///     lineWidth: shapeLayer.lineWidth,
-///     lineCap: shapeLayer.lineCap,
-///     lineJoin: shapeLayer.lineJoin
-/// )
-///
-/// // Get cached geometry or compute it
-/// if let cached = cache.getGeometry(for: key) {
-///     // Use cached geometry
-/// } else {
-///     let geometry = tessellate(path)
-///     cache.cacheGeometry(geometry, for: key)
-/// }
-///
-/// // At end of frame
-/// cache.advanceFrame()
-/// ```
-public final class GeometryCache {
-
-    // MARK: - Properties
-
-    /// Cache of tessellated geometry keyed by GeometryCacheKey.
-    private var cache: [GeometryCacheKey: GeometryCacheEntry] = [:]
-
-    /// Current frame number for LRU tracking.
-    private var currentFrame: UInt64 = 0
-
-    /// Maximum number of entries in the cache.
-    public let maxEntries: Int
-
-    /// Maximum total memory in bytes for cached geometry.
-    public let maxMemoryBytes: Int
-
-    /// Current number of entries in the cache.
-    public var entryCount: Int {
-        return cache.count
-    }
-
-    /// Current total memory usage in bytes.
-    public private(set) var currentMemoryBytes: Int = 0
-
-    /// Number of cache hits since creation.
-    public private(set) var cacheHits: UInt64 = 0
-
-    /// Number of cache misses since creation.
-    public private(set) var cacheMisses: UInt64 = 0
-
-    /// Cache hit rate (0.0 to 1.0).
-    public var hitRate: Double {
-        let total = cacheHits + cacheMisses
-        return total > 0 ? Double(cacheHits) / Double(total) : 0.0
-    }
-
-    // MARK: - Initialization
-
-    /// Creates a new geometry cache.
-    ///
-    /// - Parameters:
-    ///   - maxEntries: Maximum number of entries to cache (default: 256).
-    ///   - maxMemoryBytes: Maximum memory in bytes (default: 64MB).
-    public init(maxEntries: Int = 256, maxMemoryBytes: Int = 64 * 1024 * 1024) {
-        self.maxEntries = maxEntries
-        self.maxMemoryBytes = maxMemoryBytes
-    }
-
-    // MARK: - Public Methods
-
-    /// Gets cached tessellated geometry if it exists.
-    ///
-    /// - Parameter key: The cache key.
-    /// - Returns: The cached geometry, or nil if not found.
-    public func getGeometry(for key: GeometryCacheKey) -> TessellatedGeometry? {
-        guard var entry = cache[key] else {
-            cacheMisses += 1
-            return nil
-        }
-
-        // Update access tracking
-        entry.lastAccessFrame = currentFrame
-        entry.accessCount += 1
-        cache[key] = entry
-        cacheHits += 1
-
-        return entry.geometry
-    }
-
-    /// Caches tessellated geometry.
-    ///
-    /// - Parameters:
-    ///   - geometry: The tessellated geometry to cache.
-    ///   - key: The cache key.
-    public func cacheGeometry(_ geometry: TessellatedGeometry, for key: GeometryCacheKey) {
-        // Remove existing entry if present
-        if let existing = cache[key] {
-            currentMemoryBytes -= existing.geometry.memorySize
-        }
-
-        let memorySize = geometry.memorySize
-        evictIfNeeded(forNewMemory: memorySize)
-
-        let entry = GeometryCacheEntry(
-            geometry: geometry,
-            lastAccessFrame: currentFrame,
-            accessCount: 1
-        )
-        cache[key] = entry
-        currentMemoryBytes += memorySize
-    }
-
-    /// Gets cached geometry or creates it using the provided factory.
-    ///
-    /// - Parameters:
-    ///   - key: The cache key.
-    ///   - factory: A closure that creates the geometry if not cached.
-    /// - Returns: The cached or newly created geometry.
-    public func getOrCreateGeometry(
-        for key: GeometryCacheKey,
-        factory: () -> TessellatedGeometry
-    ) -> TessellatedGeometry {
-        if let cached = getGeometry(for: key) {
-            return cached
-        }
-
-        let geometry = factory()
-        cacheGeometry(geometry, for: key)
-        return geometry
-    }
-
-    /// Removes a specific geometry from the cache.
-    ///
-    /// - Parameter key: The cache key.
-    public func removeGeometry(for key: GeometryCacheKey) {
-        if let entry = cache.removeValue(forKey: key) {
-            currentMemoryBytes -= entry.geometry.memorySize
-        }
-    }
-
-    /// Advances the frame counter for LRU tracking.
-    ///
-    /// Call this at the end of each frame.
-    public func advanceFrame() {
-        currentFrame += 1
-    }
-
-    /// Clears all cached geometry.
-    public func clearAll() {
-        cache.removeAll()
-        currentMemoryBytes = 0
-    }
-
-    /// Invalidates the cache.
-    public func invalidate() {
-        clearAll()
-    }
-
-    /// Evicts geometry that hasn't been used for the specified number of frames.
-    ///
-    /// - Parameter frameThreshold: Number of frames after which unused geometry is evicted.
-    public func evictStale(olderThan frameThreshold: UInt64) {
-        let cutoffFrame = currentFrame > frameThreshold ? currentFrame - frameThreshold : 0
-
-        var keysToRemove: [GeometryCacheKey] = []
-        for (key, entry) in cache {
-            if entry.lastAccessFrame < cutoffFrame {
-                keysToRemove.append(key)
-            }
-        }
-
-        for key in keysToRemove {
-            if let entry = cache.removeValue(forKey: key) {
-                currentMemoryBytes -= entry.geometry.memorySize
-            }
-        }
-    }
-
-    // MARK: - Private Methods
-
-    /// Evicts least recently used entries if the cache is over capacity.
-    private func evictIfNeeded(forNewMemory newMemory: Int) {
-        // Check if we need to evict based on count
-        while cache.count >= maxEntries {
-            evictLeastRecentlyUsed()
-        }
-
-        // Check if we need to evict based on memory
-        while currentMemoryBytes + newMemory > maxMemoryBytes && !cache.isEmpty {
-            evictLeastRecentlyUsed()
-        }
-    }
-
-    /// Evicts the single least recently used entry.
-    private func evictLeastRecentlyUsed() {
-        guard !cache.isEmpty else { return }
-
-        // Find the entry with the oldest last access frame
-        var oldestKey: GeometryCacheKey?
-        var oldestFrame: UInt64 = .max
-
-        for (key, entry) in cache {
-            if entry.lastAccessFrame < oldestFrame {
-                oldestFrame = entry.lastAccessFrame
-                oldestKey = key
-            }
-        }
-
-        if let key = oldestKey, let entry = cache.removeValue(forKey: key) {
-            currentMemoryBytes -= entry.geometry.memorySize
-        }
-    }
-}
 
 // MARK: - WebGPU Renderer
 
@@ -1347,8 +89,42 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// The canvas element (JavaScript object).
     private let canvas: JSObject
 
-    /// Current layer index during rendering.
+    /// Current layer index during rendering (used for uniform buffer indexing).
     private var currentLayerIndex: Int = 0
+
+    /// Current vertex buffer offset during rendering (dynamic allocation).
+    private var currentVertexOffset: UInt64 = 0
+
+    /// Maximum vertex buffer size (1MB to accommodate complex shapes).
+    private static let maxVertexBufferSize: UInt64 = 1024 * 1024
+
+    // MARK: - Dynamic Vertex Allocation
+
+    /// Allocates space for vertices in the vertex buffer.
+    ///
+    /// - Parameter count: The number of vertices to allocate.
+    /// - Returns: A tuple of (vertexOffset, uniformIndex) if allocation succeeds, nil if buffer is full.
+    private func allocateVertices(count: Int) -> (vertexOffset: UInt64, uniformIndex: Int)? {
+        let requiredSize = UInt64(count * MemoryLayout<CARendererVertex>.stride)
+
+        // Check vertex buffer capacity
+        guard currentVertexOffset + requiredSize <= Self.maxVertexBufferSize else {
+            return nil
+        }
+
+        // Check uniform count limit
+        guard currentLayerIndex < Self.maxLayers else {
+            return nil
+        }
+
+        let result = (vertexOffset: currentVertexOffset, uniformIndex: currentLayerIndex)
+
+        // Advance pointers
+        currentVertexOffset += requiredSize
+        currentLayerIndex += 1
+
+        return result
+    }
 
     // MARK: - Clipping (masksToBounds)
 
@@ -2230,7 +1006,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         // Create triple-buffered vertex buffer pool
-        let vertexBufferSize = UInt64(MemoryLayout<CARendererVertex>.stride * 6 * Self.maxLayers)
+        // Use maxVertexBufferSize (1MB) to accommodate complex shapes with many vertices
+        let vertexBufferSize = Self.maxVertexBufferSize
         vertexBufferPool = VertexBufferPool(
             device: device,
             bufferSize: vertexBufferSize,
@@ -2839,8 +1616,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               bindGroup != nil,
               let depthTexture = depthTexture else { return }
 
-        // Reset layer index for this frame
+        // Reset layer index and vertex offset for this frame
         currentLayerIndex = 0
+        currentVertexOffset = 0
 
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
@@ -3043,9 +1821,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Skip hidden layers (using presentation layer values)
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
 
-        // Check layer limit
-        guard currentLayerIndex < Self.maxLayers else { return }
-
         // Calculate model matrix using presentation layer values
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
@@ -3122,14 +1897,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // Check if this is a text layer
-        if let textLayer = presentationLayer as? CATextLayer, textLayer.string != nil {
-            renderTextLayer(textLayer, device: device, renderPass: renderPass,
-                           modelMatrix: modelMatrix, bindGroup: bindGroup)
+        if let textLayer = presentationLayer as? CATextLayer {
+            if textLayer.string != nil {
+                renderTextLayer(textLayer, device: device, renderPass: renderPass,
+                               modelMatrix: modelMatrix, bindGroup: bindGroup)
+            }
         }
         // Check if this is a shape layer
-        else if let shapeLayer = presentationLayer as? CAShapeLayer, shapeLayer.path != nil {
-            renderShapeLayer(shapeLayer, device: device, renderPass: renderPass,
-                            modelMatrix: modelMatrix, bindGroup: bindGroup)
+        else if let shapeLayer = presentationLayer as? CAShapeLayer {
+            if shapeLayer.path != nil {
+                renderShapeLayer(shapeLayer, device: device, renderPass: renderPass,
+                                modelMatrix: modelMatrix, bindGroup: bindGroup)
+            }
         }
         // Check if this is a gradient layer
         else if let gradientLayer = presentationLayer as? CAGradientLayer,
@@ -3144,8 +1923,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
         // Render background color if set (and not a gradient layer, or gradient has no colors)
         else if presentationLayer.backgroundColor != nil {
-            let layerIndex = currentLayerIndex
-            currentLayerIndex += 1
+            // Create vertices using presentation layer color
+            let color = presentationLayer.backgroundColorComponents
+            var vertices: [CARendererVertex] = [
+                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+            ]
+
+            // Allocate vertices dynamically
+            guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+                return  // Buffer full
+            }
 
             // Create scale matrix for layer bounds (column-major order)
             let scaleMatrix = Matrix4x4(columns: (
@@ -3165,7 +1957,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height))
             )
 
-            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+            let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
             let uniformData = createFloat32Array(from: &uniforms)
             device.queue.writeBuffer(
                 uniformBuffer,
@@ -3173,19 +1965,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 data: uniformData
             )
 
-            // Create vertices using presentation layer color
-            let color = presentationLayer.backgroundColorComponents
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-            ]
-
-            // Write vertices at the correct offset
-            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+            // Write vertices at dynamically allocated offset
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(
                 vertexBuffer,
@@ -3201,10 +1981,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Render border if set
         if presentationLayer.borderWidth > 0 && presentationLayer.borderColor != nil {
-            guard currentLayerIndex < Self.maxLayers else { return }
+            // Create vertices using border color
+            let color = presentationLayer.borderColorComponents
+            var vertices: [CARendererVertex] = [
+                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+            ]
 
-            let layerIndex = currentLayerIndex
-            currentLayerIndex += 1
+            // Allocate vertices dynamically
+            guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+                return  // Buffer full
+            }
 
             // Create scale matrix for layer bounds (column-major order)
             let scaleMatrix = Matrix4x4(columns: (
@@ -3226,7 +2017,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 renderMode: 1.0  // Border mode
             )
 
-            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+            let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
             let uniformData = createFloat32Array(from: &uniforms)
             device.queue.writeBuffer(
                 uniformBuffer,
@@ -3234,19 +2025,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 data: uniformData
             )
 
-            // Create vertices using border color
-            let color = presentationLayer.borderColorComponents
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-            ]
-
-            // Write vertices at the correct offset
-            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+            // Write vertices at dynamically allocated offset
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(
                 vertexBuffer,
@@ -3334,10 +2113,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let maskPresentationLayer = maskLayer.presentation() ?? maskLayer
         let maskModelMatrix = maskPresentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
-        // Render mask layer content to stencil
-        guard currentLayerIndex < Self.maxLayers else { return }
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
+        // Render mask layer content to stencil - use dynamic vertex allocation
+        let maskColor = SIMD4<Float>(1, 1, 1, 1)
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: maskColor),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: maskColor),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: maskColor),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: maskColor),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: maskColor),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: maskColor),
+        ]
+
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
 
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(Float(maskPresentationLayer.bounds.width), 0, 0, 0),
@@ -3358,19 +2146,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
         let uniformData = createFloat32Array(from: &uniforms)
         device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
-
-        // Use white color (alpha = 1 everywhere mask is visible)
-        let maskColor = SIMD4<Float>(1, 1, 1, 1)
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: maskColor),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: maskColor),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: maskColor),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: maskColor),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: maskColor),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: maskColor),
-        ]
-
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
@@ -3486,14 +2261,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let presentationLayer = layer.presentation() ?? layer
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
-        guard currentLayerIndex < Self.maxLayers else { return }
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
         // For now, render background color with the color multiplier applied
         if presentationLayer.backgroundColor != nil {
-            let layerIndex = currentLayerIndex
-            currentLayerIndex += 1
+            // Apply color multiplier to the layer's background color
+            var baseColor = presentationLayer.backgroundColorComponents
+            baseColor.x *= colorMultiplier.x
+            baseColor.y *= colorMultiplier.y
+            baseColor.z *= colorMultiplier.z
+            baseColor.w *= colorMultiplier.w
+
+            var vertices: [CARendererVertex] = [
+                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: baseColor),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
+                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: baseColor),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
+            ]
+
+            guard let allocation = allocateVertices(count: vertices.count) else { return }
+            let (vertexOffset, layerIndex) = allocation
 
             let scaleMatrix = Matrix4x4(columns: (
                 SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
@@ -3519,23 +2309,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 data: uniformData
             )
 
-            // Apply color multiplier to the layer's background color
-            var baseColor = presentationLayer.backgroundColorComponents
-            baseColor.x *= colorMultiplier.x
-            baseColor.y *= colorMultiplier.y
-            baseColor.z *= colorMultiplier.z
-            baseColor.w *= colorMultiplier.w
-
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-            ]
-
-            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(
                 vertexBuffer,
@@ -3589,14 +2362,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
-        guard currentLayerIndex < Self.maxLayers else { return }
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
         // Render background color with the color multiplier applied
         if presentationLayer.backgroundColor != nil {
-            let layerIndex = currentLayerIndex
-            currentLayerIndex += 1
+            // Apply color multiplier to the layer's background color
+            var baseColor = presentationLayer.backgroundColorComponents
+            baseColor.x *= colorMultiplier.x
+            baseColor.y *= colorMultiplier.y
+            baseColor.z *= colorMultiplier.z
+            baseColor.w *= colorMultiplier.w
+
+            var vertices: [CARendererVertex] = [
+                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: baseColor),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
+                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
+                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: baseColor),
+                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
+            ]
+
+            guard let allocation = allocateVertices(count: vertices.count) else { return }
+            let (vertexOffset, layerIndex) = allocation
 
             let scaleMatrix = Matrix4x4(columns: (
                 SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
@@ -3622,23 +2410,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 data: uniformData
             )
 
-            // Apply color multiplier to the layer's background color
-            var baseColor = presentationLayer.backgroundColorComponents
-            baseColor.x *= colorMultiplier.x
-            baseColor.y *= colorMultiplier.y
-            baseColor.z *= colorMultiplier.z
-            baseColor.w *= colorMultiplier.w
-
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-            ]
-
-            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(
                 vertexBuffer,
@@ -3779,9 +2550,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
 
-        // Need to allocate slots for all 9 patches
-        guard currentLayerIndex + 9 <= Self.maxLayers else { return }
-
         let boundsWidth = layer.bounds.width
         let boundsHeight = layer.bounds.height
         guard boundsWidth > 0 && boundsHeight > 0 else { return }
@@ -3910,19 +2678,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 continue
             }
 
-            let layerIndex = currentLayerIndex
-            currentLayerIndex += 1
-
-            // Write uniforms for this patch
-            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-            var patchUniforms = uniforms
-            let uniformData = createFloat32Array(from: &patchUniforms)
-            device.queue.writeBuffer(
-                uniformBuffer,
-                bufferOffset: uniformOffset,
-                data: uniformData
-            )
-
             // Create vertices for this patch (2 triangles = 6 vertices)
             var vertices: [CARendererVertex] = [
                 // Triangle 1: bottom-left, bottom-right, top-left
@@ -3935,8 +2690,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMaxY), color: white),
             ]
 
-            // Write vertices
-            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+            guard let allocation = allocateVertices(count: vertices.count) else { continue }
+            let (vertexOffset, layerIndex) = allocation
+
+            // Write uniforms for this patch
+            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+            var patchUniforms = uniforms
+            let uniformData = createFloat32Array(from: &patchUniforms)
+            device.queue.writeBuffer(
+                uniformBuffer,
+                bufferOffset: uniformOffset,
+                data: uniformData
+            )
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(
                 vertexBuffer,
@@ -4021,11 +2786,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // Standard single-quad rendering
-        guard currentLayerIndex < Self.maxLayers else { return }
-
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
-
         // Calculate destination rectangle based on contentsGravity
         let destRect = calculateContentsDestRect(layer: layer, imageWidth: imageWidth, imageHeight: imageHeight)
 
@@ -4046,6 +2806,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let posMinY = Float(destRect.origin.y / boundsHeight)
         let posMaxX = Float((destRect.origin.x + destRect.size.width) / boundsWidth)
         let posMaxY = Float((destRect.origin.y + destRect.size.height) / boundsHeight)
+
+        // Create vertices with contentsGravity-adjusted positions and contentsRect-adjusted UVs
+        let white = SIMD4<Float>(1, 1, 1, 1)
+        var vertices: [CARendererVertex] = [
+            // Triangle 1: bottom-left, bottom-right, top-left
+            CARendererVertex(position: SIMD2(posMinX, posMinY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
+            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
+            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
+            // Triangle 2: bottom-right, top-right, top-left
+            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
+            CARendererVertex(position: SIMD2(posMaxX, posMaxY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
+            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
+        ]
+
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
 
         // Create scale matrix for layer bounds
         let scaleMatrix = Matrix4x4(columns: (
@@ -4073,22 +2849,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             bufferOffset: uniformOffset,
             data: uniformData
         )
-
-        // Create vertices with contentsGravity-adjusted positions and contentsRect-adjusted UVs
-        let white = SIMD4<Float>(1, 1, 1, 1)
-        var vertices: [CARendererVertex] = [
-            // Triangle 1: bottom-left, bottom-right, top-left
-            CARendererVertex(position: SIMD2(posMinX, posMinY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
-            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
-            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
-            // Triangle 2: bottom-right, top-right, top-left
-            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
-            CARendererVertex(position: SIMD2(posMaxX, posMaxY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
-            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
-        ]
-
-        // Write vertices
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(
             vertexBuffer,
@@ -4277,13 +3037,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         modelMatrix: Matrix4x4,
         bindGroup: GPUBindGroup
     ) {
-        guard let string = textLayer.string else { return }
+        print("[DEBUG] renderTextLayer called")
+        guard let string = textLayer.string else {
+            print("[DEBUG] renderTextLayer: string is nil, returning")
+            return
+        }
         guard let texturedPipeline = texturedPipeline,
               let texturedBindGroupLayout = texturedBindGroupLayout,
               let textureSampler = textureSampler,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let pipeline = pipeline else { return }
+              let pipeline = pipeline else {
+            print("[DEBUG] renderTextLayer: missing pipeline resources, returning")
+            return
+        }
 
         let text: String
         if let str = string as? String {
@@ -4291,12 +3058,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         } else {
             text = String(describing: string)
         }
+        print("[DEBUG] renderTextLayer: text='\(text)'")
 
-        guard !text.isEmpty else { return }
-        guard currentLayerIndex < Self.maxLayers else { return }
-
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
+        guard !text.isEmpty else {
+            print("[DEBUG] renderTextLayer: text is empty, returning")
+            return
+        }
 
         // Determine text size: use bounds if set, otherwise measure with Canvas2D
         let width: Int
@@ -4304,6 +3071,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if textLayer.bounds.width > 0 && textLayer.bounds.height > 0 {
             width = Int(textLayer.bounds.width)
             height = Int(textLayer.bounds.height)
+            print("[DEBUG] renderTextLayer: using bounds size \(width)x\(height)")
         } else {
             // Measure text size using Canvas2D
             let measuredSize = measureTextSize(
@@ -4315,9 +3083,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
             width = Int(ceil(measuredSize.width))
             height = Int(ceil(measuredSize.height))
+            print("[DEBUG] renderTextLayer: measured size \(width)x\(height)")
         }
 
-        guard width > 0 && height > 0 else { return }
+        guard width > 0 && height > 0 else {
+            print("[DEBUG] renderTextLayer: invalid size \(width)x\(height), returning")
+            return
+        }
+        print("[DEBUG] renderTextLayer: proceeding with size \(width)x\(height)")
 
         // Create cache key based on text content and properties
         let cacheKey = "\(text)_\(width)x\(height)_\(textLayer.fontSize)_\(textLayer.alignmentMode.rawValue)"
@@ -4451,6 +3224,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         )
 
+        // White vertex color for texture rendering (texture provides actual color)
+        let white = SIMD4<Float>(1, 1, 1, 1)
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+        ]
+
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
+
         // Setup matrices using measured/actual text size
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(Float(width), 0, 0, 0),
@@ -4476,20 +3263,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             bufferOffset: uniformOffset,
             data: uniformData
         )
-
-        // White vertex color for texture rendering (texture provides actual color)
-        let white = SIMD4<Float>(1, 1, 1, 1)
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
-        ]
-
-        // Write vertices
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(
             vertexBuffer,
@@ -5017,13 +3790,28 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         modelMatrix: Matrix4x4,
         bindGroup: GPUBindGroup
     ) {
-        guard let path = shapeLayer.path else { return }
+        print("[DEBUG] renderShapeLayer called")
+        guard let path = shapeLayer.path else {
+            print("[DEBUG] renderShapeLayer: path is nil, returning")
+            return
+        }
         guard let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
+              let uniformBuffer = uniformBuffer else {
+            print("[DEBUG] renderShapeLayer: missing buffers, returning")
+            return
+        }
+
+        print("[DEBUG] renderShapeLayer: path bounds = \(path.boundingBox)")
 
         // Flatten the path
         let polylines = flattenPath(path)
-        guard !polylines.isEmpty else { return }
+        print("[DEBUG] renderShapeLayer: polylines count = \(polylines.count)")
+        guard !polylines.isEmpty else {
+            print("[DEBUG] renderShapeLayer: no polylines, returning")
+            return
+        }
+
+        print("[DEBUG] renderShapeLayer: fillColor = \(String(describing: shapeLayer.fillColor)), strokeColor = \(String(describing: shapeLayer.strokeColor))")
 
         // Render fill if fillColor is set
         if let fillColor = shapeLayer.fillColor {
@@ -5033,10 +3821,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 // Triangulate the polygon
                 let indices = triangulatePolygon(polyline)
                 guard !indices.isEmpty else { continue }
-
-                guard currentLayerIndex < Self.maxLayers else { return }
-                let layerIndex = currentLayerIndex
-                currentLayerIndex += 1
 
                 // Create vertices from triangulation
                 var vertices: [CARendererVertex] = []
@@ -5053,6 +3837,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
                 guard !vertices.isEmpty else { continue }
 
+                // Allocate vertices dynamically
+                guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+                    continue  // Buffer full, skip this polyline
+                }
+
                 // Update uniforms
                 var uniforms = CARendererUniforms(
                     mvpMatrix: modelMatrix,
@@ -5061,7 +3850,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     layerSize: .zero  // No SDF-based corner radius for shapes
                 )
 
-                let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+                let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
                 let uniformData = createFloat32Array(from: &uniforms)
                 device.queue.writeBuffer(
                     uniformBuffer,
@@ -5069,8 +3858,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     data: uniformData
                 )
 
-                // Write vertices
-                let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+                // Write vertices at dynamically allocated offset
                 let vertexData = createFloat32Array(from: &vertices)
                 device.queue.writeBuffer(
                     vertexBuffer,
@@ -5099,10 +3887,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 )
                 guard !strokeVertices.isEmpty else { continue }
 
-                guard currentLayerIndex < Self.maxLayers else { return }
-                let layerIndex = currentLayerIndex
-                currentLayerIndex += 1
-
                 // Create vertices
                 var vertices: [CARendererVertex] = []
                 let colorComponents = cgColorToSIMD4(strokeColor)
@@ -5115,6 +3899,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     ))
                 }
 
+                // Allocate vertices dynamically
+                guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+                    continue  // Buffer full, skip this polyline
+                }
+
                 // Update uniforms
                 var uniforms = CARendererUniforms(
                     mvpMatrix: modelMatrix,
@@ -5123,7 +3912,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     layerSize: .zero
                 )
 
-                let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+                let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
                 let uniformData = createFloat32Array(from: &uniforms)
                 device.queue.writeBuffer(
                     uniformBuffer,
@@ -5131,8 +3920,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     data: uniformData
                 )
 
-                // Write vertices
-                let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+                // Write vertices at dynamically allocated offset
                 let vertexData = createFloat32Array(from: &vertices)
                 device.queue.writeBuffer(
                     vertexBuffer,
@@ -5174,11 +3962,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let colors = gradientLayer.colors, !colors.isEmpty else { return }
-
-        guard currentLayerIndex < Self.maxLayers else { return }
-
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
 
         // Create scale matrix for layer bounds
         let scaleMatrix = Matrix4x4(columns: (
@@ -5250,15 +4033,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         uniforms.gradientLocations = SIMD4<Float>(locations[0], locations[1], locations[2], locations[3])
         uniforms.gradientLocations2 = SIMD4<Float>(locations[4], locations[5], locations[6], locations[7])
 
-        // Write uniforms
-        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-        let uniformData = createFloat32Array(from: &uniforms)
-        device.queue.writeBuffer(
-            uniformBuffer,
-            bufferOffset: uniformOffset,
-            data: uniformData
-        )
-
         // Create vertices (color doesn't matter for gradient, shader uses gradient uniforms)
         let dummyColor = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
@@ -5270,8 +4044,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: dummyColor),
         ]
 
-        // Write vertices
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
+
+        // Write uniforms
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: uniformData
+        )
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(
             vertexBuffer,
@@ -5638,11 +4421,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let pipeline = pipeline,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup,
-              currentLayerIndex < Self.maxLayers else { return }
-
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
+              let bindGroup = bindGroup else { return }
 
         // Get shadow properties
         let shadowOpacity = layer.shadowOpacity
@@ -5709,7 +4488,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
             ]
 
-            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+            guard let allocation = allocateVertices(count: vertices.count) else { return }
+            let (vertexOffset, _) = allocation
+
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
@@ -5748,6 +4529,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Use larger corner radius to simulate blur
         let effectiveCornerRadius = Float(layer.cornerRadius + shadowRadius * 0.5)
 
+        // Create shadow vertices
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: colorComponents),
+        ]
+
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
+
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
             opacity: 1.0,
@@ -5763,17 +4557,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             data: uniformData
         )
 
-        // Create shadow vertices
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: colorComponents),
-        ]
-
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(
             vertexBuffer,
@@ -5800,16 +4583,26 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard let filterResultTexture = filterResultTexture,
               let shadowCompositePipeline = shadowCompositePipeline,
               let blurSampler = blurSampler,
-              let vertexBuffer = vertexBuffer,
-              currentLayerIndex < Self.maxLayers else { return }
+              let vertexBuffer = vertexBuffer else { return }
 
         let presentationLayer = layer.presentation() ?? layer
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
 
         // Create uniforms for the composite pass
         // Use white color with layer opacity - the texture already contains the layer colors
         let colorComponents = SIMD4<Float>(1, 1, 1, presentationLayer.opacity)
+
+        // Full-screen quad vertices for compositing the filtered texture
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+        ]
+
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, _) = allocation
 
         var filterUniforms = ShadowUniforms(
             mvpMatrix: Matrix4x4.orthographic(
@@ -5840,18 +4633,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
         ))
-
-        // Full-screen quad vertices for compositing the filtered texture
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
-        ]
-
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
@@ -6034,12 +4815,27 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Render particles
         for particle in activeParticles where particle.isAlive {
-            guard currentLayerIndex < Self.maxLayers else { break }
-
-            let layerIndex = currentLayerIndex
-            currentLayerIndex += 1
-
             let scale = particle.scale * 20
+
+            // Apply rotation to vertices
+            let rotation = particle.rotation
+            let p0 = rotatePoint(SIMD2(0, 0), angle: rotation)
+            let p1 = rotatePoint(SIMD2(1, 0), angle: rotation)
+            let p2 = rotatePoint(SIMD2(0, 1), angle: rotation)
+            let p3 = rotatePoint(SIMD2(1, 1), angle: rotation)
+
+            var vertices: [CARendererVertex] = [
+                CARendererVertex(position: p0, texCoord: SIMD2(0, 0), color: particle.color),
+                CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
+                CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
+                CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
+                CARendererVertex(position: p3, texCoord: SIMD2(1, 1), color: particle.color),
+                CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
+            ]
+
+            guard let allocation = allocateVertices(count: vertices.count) else { break }
+            let (vertexOffset, layerIndex) = allocation
+
             let scaleMatrix = Matrix4x4(columns: (
                 SIMD4<Float>(scale, 0, 0, 0),
                 SIMD4<Float>(0, scale, 0, 0),
@@ -6066,24 +4862,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
             let uniformData = createFloat32Array(from: &uniforms)
             device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
-
-            // Apply rotation to vertices
-            let rotation = particle.rotation
-            let p0 = rotatePoint(SIMD2(0, 0), angle: rotation)
-            let p1 = rotatePoint(SIMD2(1, 0), angle: rotation)
-            let p2 = rotatePoint(SIMD2(0, 1), angle: rotation)
-            let p3 = rotatePoint(SIMD2(1, 1), angle: rotation)
-
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: p0, texCoord: SIMD2(0, 0), color: particle.color),
-                CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
-                CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
-                CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
-                CARendererVertex(position: p3, texCoord: SIMD2(1, 1), color: particle.color),
-                CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
-            ]
-
-            let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
@@ -6191,8 +4969,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Render tiles
         for ty in 0..<tilesY {
             for tx in 0..<tilesX {
-                guard currentLayerIndex < Self.maxLayers else { return }
-
                 let tileKey = CATiledLayer.TileKey(column: tx, row: ty, lodLevel: lodLevel)
                 let tileX = CGFloat(tx) * adjustedTileSize.width
                 let tileY = CGFloat(ty) * adjustedTileSize.height
@@ -6276,10 +5052,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let uniformBuffer = uniformBuffer,
               let textureSampler = textureSampler else { return }
 
-        guard currentLayerIndex < Self.maxLayers else { return }
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
-
         // Get or create texture for image using the texture manager
         let imageId = ObjectIdentifier(image as AnyObject)
         let imageWidth = image.width
@@ -6293,18 +5065,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
         ) else { return }
 
-        // Create uniforms
-        var uniforms = CARendererUniforms(
-            mvpMatrix: tileMatrix,
-            opacity: opacity,
-            cornerRadius: 0,
-            layerSize: SIMD2<Float>(Float(tileSize.width), Float(tileSize.height))
-        )
-
-        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-        let uniformData = createFloat32Array(from: &uniforms)
-        device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
-
         // Create vertices with white color (texture provides color)
         let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
@@ -6316,7 +5076,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
         ]
 
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
+
+        // Create uniforms
+        var uniforms = CARendererUniforms(
+            mvpMatrix: tileMatrix,
+            opacity: opacity,
+            cornerRadius: 0,
+            layerSize: SIMD2<Float>(Float(tileSize.width), Float(tileSize.height))
+        )
+
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
@@ -6358,21 +5131,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
 
-        guard currentLayerIndex < Self.maxLayers else { return }
-        let layerIndex = currentLayerIndex
-        currentLayerIndex += 1
-
-        var uniforms = CARendererUniforms(
-            mvpMatrix: tileMatrix,
-            opacity: opacity,
-            cornerRadius: 0,
-            layerSize: SIMD2<Float>(Float(tileSize.width), Float(tileSize.height))
-        )
-
-        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-        let uniformData = createFloat32Array(from: &uniforms)
-        device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
-
         // Generate placeholder color based on LOD level and position
         let isEven = (tileKey.column + tileKey.row) % 2 == 0
         let lodTint = 1.0 - Float(lodLevel) * 0.1
@@ -6388,7 +5146,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: tileColor),
         ]
 
-        let vertexOffset = UInt64(layerIndex * 6 * MemoryLayout<CARendererVertex>.stride)
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
+
+        var uniforms = CARendererUniforms(
+            mvpMatrix: tileMatrix,
+            opacity: opacity,
+            cornerRadius: 0,
+            layerSize: SIMD2<Float>(Float(tileSize.width), Float(tileSize.height))
+        )
+
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 

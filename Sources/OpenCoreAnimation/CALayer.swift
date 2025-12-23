@@ -216,6 +216,19 @@ open class CALayer: CAMediaTiming, Hashable {
             shapePresentation._miterLimit = shapeSelf._miterLimit
         }
 
+        // Copy CATextLayer properties if applicable
+        if let textPresentation = presentation as? CATextLayer,
+           let textSelf = self as? CATextLayer {
+            textPresentation.string = textSelf.string
+            textPresentation.font = textSelf.font
+            textPresentation._fontSize = textSelf._fontSize
+            textPresentation._foregroundColor = textSelf._foregroundColor
+            textPresentation.isWrapped = textSelf.isWrapped
+            textPresentation.truncationMode = textSelf.truncationMode
+            textPresentation.alignmentMode = textSelf.alignmentMode
+            textPresentation.allowsFontSubpixelQuantization = textSelf.allowsFontSubpixelQuantization
+        }
+
         // Copy CAGradientLayer properties if applicable
         if let gradientPresentation = presentation as? CAGradientLayer,
            let gradientSelf = self as? CAGradientLayer {
