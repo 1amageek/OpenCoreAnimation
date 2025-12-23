@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "OpenCoreAnimation",
     platforms: [
-        .macOS(.v14),
+        .macOS(.v15),
         .iOS(.v17)
     ],
     products: [
@@ -16,7 +16,7 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/1amageek/OpenCoreGraphics.git", branch: "main"),
+        .package(path: "../OpenCoreGraphics"),
         .package(url: "https://github.com/1amageek/swift-webgpu.git", branch: "main"),
     ],
     targets: [
