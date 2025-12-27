@@ -1109,11 +1109,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let encoder = device.createCommandEncoder()
 
         // Create projection matrix (needed for shadow pre-rendering)
+        // Note: For SpriteKit/CALayer coordinate system, Y=0 is at the bottom and increases upward
+        // So bottom=0 and top=height gives correct Y orientation
         let projectionMatrix = Matrix4x4.orthographic(
             left: 0,
             right: Float(size.width),
-            bottom: Float(size.height),
-            top: 0,
+            bottom: 0,
+            top: Float(size.height),
             near: -1000,
             far: 1000
         )
@@ -1388,6 +1390,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         else if let contents = presentationLayer.contents {
             renderContentsLayer(presentationLayer, contents: contents, device: device,
                                renderPass: renderPass, modelMatrix: modelMatrix)
+        }
+        // Debug: Log layers with nil contents that have non-zero bounds
+        else if presentationLayer.bounds.width > 0 && presentationLayer.bounds.height > 0 {
+            // Uncomment for debugging:
+            // print("CAWebGPURenderer: Layer has nil contents, bounds=\(presentationLayer.bounds), zPosition=\(presentationLayer.zPosition)")
         }
         // Render background color if set (and not a gradient layer, or gradient has no colors)
         else if presentationLayer.backgroundColor != nil {
@@ -2090,15 +2097,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let finalCenterHeight = max(0, boundsHeight - finalTopHeight - finalBottomHeight)
 
         // Position coordinates in layer bounds (normalized 0-1)
+        // X coordinates (left to right)
         let posLeft: Float = 0
         let posCenterLeft: Float = Float(finalLeftWidth / boundsWidth)
         let posCenterRight: Float = Float((finalLeftWidth + finalCenterWidth) / boundsWidth)
         let posRight: Float = 1
 
-        let posTop: Float = 0
-        let posCenterTop: Float = Float(finalTopHeight / boundsHeight)
-        let posCenterBottom: Float = Float((finalTopHeight + finalCenterHeight) / boundsHeight)
-        let posBottom: Float = 1
+        // Y coordinates for Y-up system (Y=0 at bottom, Y=1 at top)
+        // Image top border maps to layer top, image bottom border maps to layer bottom
+        let posBottom: Float = 0
+        let posCenterBottom: Float = Float(finalBottomHeight / boundsHeight)
+        let posCenterTop: Float = Float((boundsHeight - finalTopHeight) / boundsHeight)
+        let posTop: Float = 1
 
         // Create scale matrix for layer bounds
         let scaleMatrix = Matrix4x4(columns: (
@@ -2120,21 +2130,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let white = SIMD4<Float>(1, 1, 1, 1)
 
         // Define the 9 patches as (posXMin, posXMax, posYMin, posYMax, uvXMin, uvXMax, uvYMin, uvYMax)
+        // Note: In Y-up screen coordinates, posYMin < posYMax (bottom to top)
+        // In texture coordinates, uvYMin < uvYMax (top to bottom, V=0 at top)
         let patches: [(Float, Float, Float, Float, Float, Float, Float, Float)] = [
-            // Row 1: Top
-            (posLeft, posCenterLeft, posTop, posCenterTop, uvLeft, uvCenterLeft, uvTop, uvCenterTop),           // 1: Top-left corner
-            (posCenterLeft, posCenterRight, posTop, posCenterTop, uvCenterLeft, uvCenterRight, uvTop, uvCenterTop), // 2: Top edge
-            (posCenterRight, posRight, posTop, posCenterTop, uvCenterRight, uvRight, uvTop, uvCenterTop),       // 3: Top-right corner
+            // Row 1: Top (high Y positions in screen space, low V in texture space)
+            (posLeft, posCenterLeft, posCenterTop, posTop, uvLeft, uvCenterLeft, uvTop, uvCenterTop),           // 1: Top-left corner
+            (posCenterLeft, posCenterRight, posCenterTop, posTop, uvCenterLeft, uvCenterRight, uvTop, uvCenterTop), // 2: Top edge
+            (posCenterRight, posRight, posCenterTop, posTop, uvCenterRight, uvRight, uvTop, uvCenterTop),       // 3: Top-right corner
 
             // Row 2: Middle
-            (posLeft, posCenterLeft, posCenterTop, posCenterBottom, uvLeft, uvCenterLeft, uvCenterTop, uvCenterBottom),           // 4: Left edge
-            (posCenterLeft, posCenterRight, posCenterTop, posCenterBottom, uvCenterLeft, uvCenterRight, uvCenterTop, uvCenterBottom), // 5: Center
-            (posCenterRight, posRight, posCenterTop, posCenterBottom, uvCenterRight, uvRight, uvCenterTop, uvCenterBottom),       // 6: Right edge
+            (posLeft, posCenterLeft, posCenterBottom, posCenterTop, uvLeft, uvCenterLeft, uvCenterTop, uvCenterBottom),           // 4: Left edge
+            (posCenterLeft, posCenterRight, posCenterBottom, posCenterTop, uvCenterLeft, uvCenterRight, uvCenterTop, uvCenterBottom), // 5: Center
+            (posCenterRight, posRight, posCenterBottom, posCenterTop, uvCenterRight, uvRight, uvCenterTop, uvCenterBottom),       // 6: Right edge
 
-            // Row 3: Bottom
-            (posLeft, posCenterLeft, posCenterBottom, posBottom, uvLeft, uvCenterLeft, uvCenterBottom, uvBottom),           // 7: Bottom-left corner
-            (posCenterLeft, posCenterRight, posCenterBottom, posBottom, uvCenterLeft, uvCenterRight, uvCenterBottom, uvBottom), // 8: Bottom edge
-            (posCenterRight, posRight, posCenterBottom, posBottom, uvCenterRight, uvRight, uvCenterBottom, uvBottom),       // 9: Bottom-right corner
+            // Row 3: Bottom (low Y positions in screen space, high V in texture space)
+            (posLeft, posCenterLeft, posBottom, posCenterBottom, uvLeft, uvCenterLeft, uvCenterBottom, uvBottom),           // 7: Bottom-left corner
+            (posCenterLeft, posCenterRight, posBottom, posCenterBottom, uvCenterLeft, uvCenterRight, uvCenterBottom, uvBottom), // 8: Bottom edge
+            (posCenterRight, posRight, posBottom, posCenterBottom, uvCenterRight, uvRight, uvCenterBottom, uvBottom),       // 9: Bottom-right corner
         ]
 
         // Render each patch
@@ -2147,15 +2159,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
 
             // Create vertices for this patch (2 triangles = 6 vertices)
+            // Note: Screen coordinates have Y=0 at bottom (pMinY), but texture coordinates have V=0 at top
+            // So we flip V: position bottom (pMinY) uses texture bottom (uMaxY)
             var vertices: [CARendererVertex] = [
                 // Triangle 1: bottom-left, bottom-right, top-left
-                CARendererVertex(position: SIMD2(pMinX, pMinY), texCoord: SIMD2(uMinX, uMinY), color: white),
-                CARendererVertex(position: SIMD2(pMaxX, pMinY), texCoord: SIMD2(uMaxX, uMinY), color: white),
-                CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMaxY), color: white),
+                CARendererVertex(position: SIMD2(pMinX, pMinY), texCoord: SIMD2(uMinX, uMaxY), color: white),
+                CARendererVertex(position: SIMD2(pMaxX, pMinY), texCoord: SIMD2(uMaxX, uMaxY), color: white),
+                CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMinY), color: white),
                 // Triangle 2: bottom-right, top-right, top-left
-                CARendererVertex(position: SIMD2(pMaxX, pMinY), texCoord: SIMD2(uMaxX, uMinY), color: white),
-                CARendererVertex(position: SIMD2(pMaxX, pMaxY), texCoord: SIMD2(uMaxX, uMaxY), color: white),
-                CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMaxY), color: white),
+                CARendererVertex(position: SIMD2(pMaxX, pMinY), texCoord: SIMD2(uMaxX, uMaxY), color: white),
+                CARendererVertex(position: SIMD2(pMaxX, pMaxY), texCoord: SIMD2(uMaxX, uMinY), color: white),
+                CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMinY), color: white),
             ]
 
             guard let allocation = allocateVertices(count: vertices.count) else { continue }
@@ -2276,16 +2290,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let posMaxY = Float((destRect.origin.y + destRect.size.height) / boundsHeight)
 
         // Create vertices with contentsGravity-adjusted positions and contentsRect-adjusted UVs
+        // Note: Screen coordinates have Y=0 at bottom, but texture coordinates have V=0 at top
+        // So we flip V: position bottom (posMinY) uses texture bottom (uvMaxY)
         let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
             // Triangle 1: bottom-left, bottom-right, top-left
-            CARendererVertex(position: SIMD2(posMinX, posMinY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
-            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
-            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
+            CARendererVertex(position: SIMD2(posMinX, posMinY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
+            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
+            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
             // Triangle 2: bottom-right, top-right, top-left
-            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
-            CARendererVertex(position: SIMD2(posMaxX, posMaxY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
-            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
+            CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
+            CARendererVertex(position: SIMD2(posMaxX, posMaxY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
+            CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else { return }
@@ -2400,8 +2416,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let height = cgImage.height
         guard width > 0 && height > 0 else { return nil }
 
-        // If CGImage has data, try to use it directly
-        guard let sourceData = cgImage.data else { return nil }
+        // Try to get source data from cgImage.data or dataProvider
+        let sourceData: Data
+        if let directData = cgImage.data {
+            sourceData = directData
+        } else if let provider = cgImage.dataProvider, let providerData = provider.data {
+            sourceData = providerData
+        } else {
+            print("CAWebGPURenderer: ERROR - CGImage has no data (width=\(width), height=\(height))")
+            return nil
+        }
 
         let bytesPerPixel = cgImage.bitsPerPixel / 8
         let sourceBytesPerRow = cgImage.bytesPerRow
@@ -3916,10 +3940,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
            let blurSampler = blurSampler {
 
             // Create shadow uniforms for the composite shader
+            // Use correct Y orientation (bottom=0, top=height)
             var shadowUniforms = ShadowUniforms(
                 mvpMatrix: Matrix4x4.orthographic(
                     left: 0, right: Float(size.width),
-                    bottom: Float(size.height), top: 0,
+                    bottom: 0, top: Float(size.height),
                     near: -1000, far: 1000
                 ),
                 shadowColor: colorComponents,
@@ -4072,10 +4097,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard let allocation = allocateVertices(count: vertices.count) else { return }
         let (vertexOffset, _) = allocation
 
+        // Use correct Y orientation (bottom=0, top=height)
         var filterUniforms = ShadowUniforms(
             mvpMatrix: Matrix4x4.orthographic(
                 left: 0, right: Float(size.width),
-                bottom: Float(size.height), top: 0,
+                bottom: 0, top: Float(size.height),
                 near: -1000, far: 1000
             ),
             shadowColor: colorComponents,

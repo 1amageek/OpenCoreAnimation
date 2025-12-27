@@ -203,6 +203,12 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._shadowOffset = _shadowOffset
         presentation._shadowRadius = _shadowRadius
 
+        // Copy contents-related properties (critical for texture animation)
+        presentation.contents = contents
+        presentation.contentsRect = contentsRect
+        presentation.contentsCenter = contentsCenter
+        presentation.contentsGravity = contentsGravity
+
         // Copy CAShapeLayer properties if applicable
         if let shapePresentation = presentation as? CAShapeLayer,
            let shapeSelf = self as? CAShapeLayer {
