@@ -35,6 +35,33 @@ extension CALayer {
         )
     }
 
+    /// Calculates per-corner radii based on maskedCorners and cornerRadius.
+    ///
+    /// Returns a SIMD4<Float> with the radius for each corner:
+    /// - x: minXminY (bottom-left in screen coordinates with Y-down)
+    /// - y: maxXminY (bottom-right in screen coordinates)
+    /// - z: minXmaxY (top-left in screen coordinates)
+    /// - w: maxXmaxY (top-right in screen coordinates)
+    ///
+    /// If maskedCorners contains all four corners (or is empty with a non-zero cornerRadius),
+    /// all four values will be the same. Otherwise, unmasked corners will have 0 radius.
+    internal var cornerRadiiComponents: SIMD4<Float> {
+        let radius = Float(cornerRadius)
+
+        // If cornerRadius is 0, return all zeros regardless of mask
+        guard radius > 0 else {
+            return .zero
+        }
+
+        // Check which corners should have the radius applied
+        let minXminY: Float = maskedCorners.contains(.layerMinXMinYCorner) ? radius : 0
+        let maxXminY: Float = maskedCorners.contains(.layerMaxXMinYCorner) ? radius : 0
+        let minXmaxY: Float = maskedCorners.contains(.layerMinXMaxYCorner) ? radius : 0
+        let maxXmaxY: Float = maskedCorners.contains(.layerMaxXMaxYCorner) ? radius : 0
+
+        return SIMD4<Float>(minXminY, maxXminY, minXmaxY, maxXmaxY)
+    }
+
     /// Calculates the model matrix for this layer.
     ///
     /// The z-coordinate is negated to match CoreAnimation's convention where

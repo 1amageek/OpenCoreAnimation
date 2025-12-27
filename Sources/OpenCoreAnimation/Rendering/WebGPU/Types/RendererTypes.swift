@@ -31,6 +31,9 @@ public struct CARendererUniforms {
     public var gradientEndPoint: SIMD2<Float>
     public var gradientColorCount: Float
     public var padding3: SIMD3<Float>
+    /// Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
+    /// Corresponds to CACornerMask corners for selective corner rounding.
+    public var cornerRadii: SIMD4<Float>
     // Gradient color stops: each is vec4 color + vec4 (location, 0, 0, 0) = 8 bytes per stop
     // For simplicity, we'll pack 8 colors and 8 locations separately
     public var gradientColors: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>,
@@ -47,7 +50,8 @@ public struct CARendererUniforms {
         renderMode: Float = 0.0,
         gradientStartPoint: SIMD2<Float> = .zero,
         gradientEndPoint: SIMD2<Float> = SIMD2(0, 1),
-        gradientColorCount: Float = 0
+        gradientColorCount: Float = 0,
+        cornerRadii: SIMD4<Float> = .zero
     ) {
         self.mvpMatrix = mvpMatrix
         self.opacity = opacity
@@ -59,6 +63,7 @@ public struct CARendererUniforms {
         self.gradientEndPoint = gradientEndPoint
         self.gradientColorCount = gradientColorCount
         self.padding3 = .zero
+        self.cornerRadii = cornerRadii
         self.gradientColors = (.zero, .zero, .zero, .zero, .zero, .zero, .zero, .zero)
         self.gradientLocations = .zero
         self.gradientLocations2 = .zero
@@ -71,17 +76,21 @@ public struct TexturedUniforms {
     public var opacity: Float
     public var cornerRadius: Float
     public var layerSize: SIMD2<Float>
+    /// Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
+    public var cornerRadii: SIMD4<Float>
 
     public init(
         mvpMatrix: Matrix4x4 = .identity,
         opacity: Float = 1.0,
         cornerRadius: Float = 0.0,
-        layerSize: SIMD2<Float> = .zero
+        layerSize: SIMD2<Float> = .zero,
+        cornerRadii: SIMD4<Float> = .zero
     ) {
         self.mvpMatrix = mvpMatrix
         self.opacity = opacity
         self.cornerRadius = cornerRadius
         self.layerSize = layerSize
+        self.cornerRadii = cornerRadii
     }
 }
 

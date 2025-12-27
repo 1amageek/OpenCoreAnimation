@@ -13,3 +13,15 @@ public protocol CAAction {
     ///   - dict: A dictionary containing parameters associated with this event, or `nil` if there are no parameters.
     func run(forKey event: String, object anObject: Any, arguments dict: [AnyHashable: Any]?)
 }
+
+// MARK: - Action Identifiers
+
+/// The identifier that represents the action taken when a layer becomes visible,
+/// either as a result of being inserted into the visible layer hierarchy or the layer is no longer set as hidden.
+public let kCAOnOrderIn: String = "onOrderIn"
+
+/// The identifier that represents the action taken when the layer is removed from the layer hierarchy or is hidden.
+public let kCAOnOrderOut: String = "onOrderOut"
+
+/// The identifier that represents a transition animation.
+public let kCATransition: String = "transition"

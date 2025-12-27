@@ -1430,7 +1430,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 mvpMatrix: finalMatrix,
                 opacity: presentationLayer.opacity,
                 cornerRadius: Float(presentationLayer.cornerRadius),
-                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height))
+                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+                cornerRadii: presentationLayer.cornerRadiiComponents
             )
 
             let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
@@ -1490,7 +1491,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 cornerRadius: Float(presentationLayer.cornerRadius),
                 layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
                 borderWidth: Float(presentationLayer.borderWidth),
-                renderMode: 1.0  // Border mode
+                renderMode: 1.0,  // Border mode
+                cornerRadii: presentationLayer.cornerRadiiComponents
             )
 
             let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
@@ -1616,7 +1618,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             mvpMatrix: finalMatrix,
             opacity: 1.0,  // Full opacity for stencil write
             cornerRadius: Float(maskPresentationLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(maskPresentationLayer.bounds.width), Float(maskPresentationLayer.bounds.height))
+            layerSize: SIMD2<Float>(Float(maskPresentationLayer.bounds.width), Float(maskPresentationLayer.bounds.height)),
+            cornerRadii: maskPresentationLayer.cornerRadiiComponents
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -1774,7 +1777,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 mvpMatrix: finalMatrix,
                 opacity: presentationLayer.opacity,
                 cornerRadius: Float(presentationLayer.cornerRadius),
-                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height))
+                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+                cornerRadii: presentationLayer.cornerRadiiComponents
             )
 
             let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -1875,7 +1879,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 mvpMatrix: finalMatrix,
                 opacity: presentationLayer.opacity,
                 cornerRadius: Float(presentationLayer.cornerRadius),
-                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height))
+                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+                cornerRadii: presentationLayer.cornerRadiiComponents
             )
 
             let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -2746,7 +2751,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             mvpMatrix: finalMatrix,
             opacity: textLayer.opacity,
             cornerRadius: Float(textLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(width), Float(height))
+            layerSize: SIMD2<Float>(Float(width), Float(height)),
+            cornerRadii: textLayer.cornerRadiiComponents
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -3476,7 +3482,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             renderMode: 2.0,  // Gradient mode
             gradientStartPoint: SIMD2<Float>(Float(gradientLayer.startPoint.x), Float(gradientLayer.startPoint.y)),
             gradientEndPoint: SIMD2<Float>(Float(gradientLayer.endPoint.x), Float(gradientLayer.endPoint.y)),
-            gradientColorCount: Float(min(colors.count, kMaxGradientStops))
+            gradientColorCount: Float(min(colors.count, kMaxGradientStops)),
+            cornerRadii: gradientLayer.cornerRadiiComponents
         )
 
         // Extract gradient colors
@@ -3623,7 +3630,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             mvpMatrix: finalMatrix,
             opacity: 1.0,
             cornerRadius: Float(presentationLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height))
+            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+            cornerRadii: presentationLayer.cornerRadiiComponents
         )
 
         // Write mask uniforms
@@ -3745,7 +3753,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             mvpMatrix: layerMatrix,
             opacity: presentationLayer.opacity,
             cornerRadius: Float(presentationLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height))
+            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+            cornerRadii: presentationLayer.cornerRadiiComponents
         )
 
         let contentUniformData = createFloat32Array(from: &contentUniforms)

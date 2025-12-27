@@ -21,6 +21,9 @@ public enum CAWebGPUShaders {
         gradientEndPoint: vec2<f32>,
         gradientColorCount: f32,
         padding3: vec3<f32>,
+        // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
+        // In screen coordinates (Y-down): (bottomLeft, bottomRight, topLeft, topRight)
+        cornerRadii: vec4<f32>,
         gradientColor0: vec4<f32>,
         gradientColor1: vec4<f32>,
         gradientColor2: vec4<f32>,
@@ -56,10 +59,61 @@ public enum CAWebGPUShaders {
         return output;
     }
 
-    // Signed distance function for a rounded rectangle
+    // Signed distance function for a rounded rectangle with uniform radius
     fn sdRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, radius: f32) -> f32 {
         let q = abs(p) - halfSize + radius;
         return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    }
+
+    // Signed distance function for a rounded rectangle with per-corner radii
+    // radii: (minXminY, maxXminY, minXmaxY, maxXmaxY) - corresponds to CACornerMask corners
+    // In screen space with texCoord centered:
+    //   - negative x, negative y -> minXminY (bottom-left in screen coords)
+    //   - positive x, negative y -> maxXminY (bottom-right in screen coords)
+    //   - negative x, positive y -> minXmaxY (top-left in screen coords)
+    //   - positive x, positive y -> maxXmaxY (top-right in screen coords)
+    fn sdRoundedBoxVariable(p: vec2<f32>, halfSize: vec2<f32>, radii: vec4<f32>) -> f32 {
+        // Select the appropriate corner radius based on which quadrant we're in
+        // radii.x = minXminY (x<0, y<0) - bottom-left in Y-down
+        // radii.y = maxXminY (x>0, y<0) - bottom-right in Y-down
+        // radii.z = minXmaxY (x<0, y>0) - top-left in Y-down
+        // radii.w = maxXmaxY (x>0, y>0) - top-right in Y-down
+        var r: f32;
+        if (p.x >= 0.0) {
+            if (p.y >= 0.0) {
+                r = radii.w;  // maxXmaxY - top-right
+            } else {
+                r = radii.y;  // maxXminY - bottom-right
+            }
+        } else {
+            if (p.y >= 0.0) {
+                r = radii.z;  // minXmaxY - top-left
+            } else {
+                r = radii.x;  // minXminY - bottom-left
+            }
+        }
+
+        // Clamp radius to half the smaller dimension
+        let maxRadius = min(halfSize.x, halfSize.y);
+        r = min(r, maxRadius);
+
+        let q = abs(p) - halfSize + r;
+        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    }
+
+    // Check if all corner radii are the same (for optimization)
+    fn hasUniformCorners(radii: vec4<f32>) -> bool {
+        return radii.x == radii.y && radii.y == radii.z && radii.z == radii.w;
+    }
+
+    // Get effective corner radii (uses cornerRadii if set, otherwise falls back to cornerRadius)
+    fn getEffectiveRadii() -> vec4<f32> {
+        // If cornerRadii are all zero, use the legacy cornerRadius for all corners
+        if (uniforms.cornerRadii.x == 0.0 && uniforms.cornerRadii.y == 0.0 &&
+            uniforms.cornerRadii.z == 0.0 && uniforms.cornerRadii.w == 0.0) {
+            return vec4<f32>(uniforms.cornerRadius);
+        }
+        return uniforms.cornerRadii;
     }
 
     // Get gradient color at index
@@ -133,9 +187,9 @@ public enum CAWebGPUShaders {
         // Calculate half-size of the rectangle in pixels
         let halfSize = uniforms.layerSize * 0.5;
 
-        // Clamp corner radius to half the smaller dimension
-        let maxRadius = min(halfSize.x, halfSize.y);
-        let radius = min(uniforms.cornerRadius, maxRadius);
+        // Get effective corner radii (per-corner or uniform)
+        let radii = getEffectiveRadii();
+        let hasAnyCornerRadius = radii.x > 0.0 || radii.y > 0.0 || radii.z > 0.0 || radii.w > 0.0;
 
         // Gradient rendering mode
         if (uniforms.renderMode > 1.5) {
@@ -153,9 +207,9 @@ public enum CAWebGPUShaders {
             var gradientColor = sampleGradient(t);
             gradientColor.a *= uniforms.opacity;
 
-            // Apply corner radius if set
-            if (radius > 0.0) {
-                let dist = sdRoundedBox(pixelCoord, halfSize, radius);
+            // Apply corner radius if set (using per-corner radii)
+            if (hasAnyCornerRadius) {
+                let dist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
                 let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
                 gradientColor.a *= alpha;
             }
@@ -165,11 +219,18 @@ public enum CAWebGPUShaders {
 
         // Border rendering mode
         if (uniforms.renderMode > 0.5) {
-            // Calculate outer and inner signed distances
-            let outerDist = sdRoundedBox(pixelCoord, halfSize, radius);
+            // Calculate outer signed distance with per-corner radii
+            let outerDist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
+
+            // Calculate inner radii (subtract border width from each corner)
+            let innerRadii = vec4<f32>(
+                max(0.0, radii.x - uniforms.borderWidth),
+                max(0.0, radii.y - uniforms.borderWidth),
+                max(0.0, radii.z - uniforms.borderWidth),
+                max(0.0, radii.w - uniforms.borderWidth)
+            );
             let innerHalfSize = halfSize - uniforms.borderWidth;
-            let innerRadius = max(0.0, radius - uniforms.borderWidth);
-            let innerDist = sdRoundedBox(pixelCoord, innerHalfSize, innerRadius);
+            let innerDist = sdRoundedBoxVariable(pixelCoord, innerHalfSize, innerRadii);
 
             // Border is where we're inside outer but outside inner
             let outerAlpha = 1.0 - smoothstep(-1.0, 1.0, outerDist);
@@ -180,12 +241,12 @@ public enum CAWebGPUShaders {
         }
 
         // Fill rendering mode (default)
-        if (uniforms.cornerRadius <= 0.0) {
+        if (!hasAnyCornerRadius) {
             return input.color;
         }
 
-        // Calculate signed distance for fill
-        let dist = sdRoundedBox(pixelCoord, halfSize, radius);
+        // Calculate signed distance for fill using per-corner radii
+        let dist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
 
         // Anti-aliased edge (smooth over 1 pixel)
         let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
@@ -203,6 +264,8 @@ public enum CAWebGPUShaders {
         opacity: f32,
         cornerRadius: f32,
         layerSize: vec2<f32>,
+        // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
+        cornerRadii: vec4<f32>,
     }
 
     @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -230,10 +293,35 @@ public enum CAWebGPUShaders {
         return output;
     }
 
-    // Signed distance function for a rounded rectangle
-    fn sdRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, radius: f32) -> f32 {
-        let q = abs(p) - halfSize + radius;
-        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    // Signed distance function for a rounded rectangle with per-corner radii
+    fn sdRoundedBoxVariable(p: vec2<f32>, halfSize: vec2<f32>, radii: vec4<f32>) -> f32 {
+        var r: f32;
+        if (p.x >= 0.0) {
+            if (p.y >= 0.0) {
+                r = radii.w;  // maxXmaxY - top-right
+            } else {
+                r = radii.y;  // maxXminY - bottom-right
+            }
+        } else {
+            if (p.y >= 0.0) {
+                r = radii.z;  // minXmaxY - top-left
+            } else {
+                r = radii.x;  // minXminY - bottom-left
+            }
+        }
+        let maxRadius = min(halfSize.x, halfSize.y);
+        r = min(r, maxRadius);
+        let q = abs(p) - halfSize + r;
+        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    }
+
+    // Get effective corner radii
+    fn getEffectiveRadii() -> vec4<f32> {
+        if (uniforms.cornerRadii.x == 0.0 && uniforms.cornerRadii.y == 0.0 &&
+            uniforms.cornerRadii.z == 0.0 && uniforms.cornerRadii.w == 0.0) {
+            return vec4<f32>(uniforms.cornerRadius);
+        }
+        return uniforms.cornerRadii;
     }
 
     @fragment
@@ -244,13 +332,15 @@ public enum CAWebGPUShaders {
         // Apply opacity
         texColor.a *= uniforms.opacity;
 
+        // Get effective corner radii
+        let radii = getEffectiveRadii();
+        let hasAnyCornerRadius = radii.x > 0.0 || radii.y > 0.0 || radii.z > 0.0 || radii.w > 0.0;
+
         // Apply corner radius if set
-        if (uniforms.cornerRadius > 0.0 && uniforms.layerSize.x > 0.0 && uniforms.layerSize.y > 0.0) {
+        if (hasAnyCornerRadius && uniforms.layerSize.x > 0.0 && uniforms.layerSize.y > 0.0) {
             let pixelCoord = (input.texCoord - 0.5) * uniforms.layerSize;
             let halfSize = uniforms.layerSize * 0.5;
-            let maxRadius = min(halfSize.x, halfSize.y);
-            let radius = min(uniforms.cornerRadius, maxRadius);
-            let dist = sdRoundedBox(pixelCoord, halfSize, radius);
+            let dist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
             let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
             texColor.a *= alpha;
         }
@@ -268,6 +358,8 @@ public enum CAWebGPUShaders {
         opacity: f32,
         cornerRadius: f32,
         layerSize: vec2<f32>,
+        // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
+        cornerRadii: vec4<f32>,
     }
 
     @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -291,9 +383,25 @@ public enum CAWebGPUShaders {
         return output;
     }
 
-    fn sdRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, radius: f32) -> f32 {
-        let q = abs(p) - halfSize + radius;
-        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    // Per-corner SDF
+    fn sdRoundedBoxVariable(p: vec2<f32>, halfSize: vec2<f32>, radii: vec4<f32>) -> f32 {
+        var r: f32;
+        if (p.x >= 0.0) {
+            if (p.y >= 0.0) { r = radii.w; } else { r = radii.y; }
+        } else {
+            if (p.y >= 0.0) { r = radii.z; } else { r = radii.x; }
+        }
+        r = min(r, min(halfSize.x, halfSize.y));
+        let q = abs(p) - halfSize + r;
+        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    }
+
+    fn getEffectiveRadii() -> vec4<f32> {
+        if (uniforms.cornerRadii.x == 0.0 && uniforms.cornerRadii.y == 0.0 &&
+            uniforms.cornerRadii.z == 0.0 && uniforms.cornerRadii.w == 0.0) {
+            return vec4<f32>(uniforms.cornerRadius);
+        }
+        return uniforms.cornerRadii;
     }
 
     @fragment
@@ -303,9 +411,8 @@ public enum CAWebGPUShaders {
         }
         let pixelCoord = (input.texCoord - 0.5) * uniforms.layerSize;
         let halfSize = uniforms.layerSize * 0.5;
-        let maxRadius = min(halfSize.x, halfSize.y);
-        let radius = min(uniforms.cornerRadius, maxRadius);
-        let dist = sdRoundedBox(pixelCoord, halfSize, radius);
+        let radii = getEffectiveRadii();
+        let dist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
         let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
         return vec4<f32>(alpha, alpha, alpha, alpha);
     }
@@ -457,6 +564,8 @@ public enum CAWebGPUShaders {
         opacity: f32,
         cornerRadius: f32,
         layerSize: vec2<f32>,
+        // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
+        cornerRadii: vec4<f32>,
     }
 
     @group(0) @binding(0) var<uniform> uniforms: Uniforms;
