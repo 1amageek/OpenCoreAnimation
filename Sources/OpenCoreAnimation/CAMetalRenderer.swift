@@ -108,12 +108,14 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate, @unchecked S
 
         encoder.setRenderPipelineState(pipelineState)
 
-        // Create projection matrix
+        // Create projection matrix for SpriteKit/CoreAnimation coordinate system (Y+ up)
+        // - y=0 maps to NDC=-1 (bottom of screen)
+        // - y=height maps to NDC=+1 (top of screen)
         let projectionMatrix = simd_float4x4.orthographic(
             left: 0,
             right: Float(size.width),
-            bottom: Float(size.height),
-            top: 0,
+            bottom: 0,
+            top: Float(size.height),
             near: -1000,
             far: 1000
         )

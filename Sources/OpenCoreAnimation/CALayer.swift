@@ -250,6 +250,59 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
+    /// Calculates normalized animation progress (0-1) accounting for repeats, autoreverses, and fill modes.
+    private func normalizedProgress(
+        for animation: CAAnimation,
+        elapsed: CFTimeInterval,
+        singleCycleDuration: CFTimeInterval
+    ) -> CFTimeInterval? {
+        guard singleCycleDuration > 0 else { return nil }
+
+        if elapsed < 0 {
+            switch animation.fillMode {
+            case .backwards, .both:
+                return 0
+            default:
+                return nil
+            }
+        }
+
+        let baseCycles: CFTimeInterval
+        if animation.repeatDuration > 0 {
+            baseCycles = animation.repeatDuration / singleCycleDuration
+        } else if animation.repeatCount > 0 {
+            baseCycles = CFTimeInterval(max(1, animation.repeatCount))
+        } else {
+            baseCycles = 1
+        }
+
+        let totalCycles = baseCycles * (animation.autoreverses ? 2 : 1)
+        var progressCycles = elapsed / singleCycleDuration
+
+        if progressCycles >= totalCycles {
+            switch animation.fillMode {
+            case .forwards, .both:
+                progressCycles = totalCycles
+            default:
+                return nil
+            }
+        }
+
+        if animation.autoreverses {
+            let cycle = progressCycles.truncatingRemainder(dividingBy: 2)
+            if cycle <= 1 {
+                return cycle
+            }
+            return 2 - cycle
+        }
+
+        let fractional = progressCycles.truncatingRemainder(dividingBy: 1)
+        if abs(fractional) < 0.000_000_001 {
+            return progressCycles == 0 ? 0 : 1
+        }
+        return fractional
+    }
+
     /// Applies an animation to the presentation layer at the given time.
     private func applyAnimation(_ animation: CAAnimation, to layer: CALayer, at time: CFTimeInterval) {
         // Handle animation groups
@@ -280,86 +333,30 @@ open class CALayer: CAMediaTiming, Hashable {
             singleCycleDuration = animation.duration > 0 ? animation.duration : CATransaction.animationDuration()
         }
 
-        guard singleCycleDuration > 0 else { return }
-
-        // Handle fillMode for animations that haven't started yet
-        if elapsed < 0 {
-            switch animation.fillMode {
-            case .backwards, .both:
-                // Show the initial state before animation starts
-                applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: 0)
-            default:
-                // Don't apply any animation value
-                return
-            }
-            return
-        }
-
-        var progress = elapsed / singleCycleDuration
-
-        // Handle repeat count and autoreverses
-        if animation.repeatCount > 0 || animation.autoreverses {
-            let totalCycles = animation.autoreverses ? 2.0 : 1.0
-            let effectiveRepeatCount = max(1, CFTimeInterval(animation.repeatCount))
-            let totalProgress = effectiveRepeatCount * totalCycles
-
-            if progress >= totalProgress {
-                // Animation has completed all cycles
-                switch animation.fillMode {
-                case .forwards, .both:
-                    // Keep final state - determine if we ended forward or reversed
-                    if animation.autoreverses && Int(effectiveRepeatCount * totalCycles) % 2 == 0 {
-                        progress = 0 // Ended on reverse, back at start
-                    } else {
-                        progress = 1 // Ended on forward
-                    }
-                default:
-                    // Animation completed, don't apply any value
-                    return
-                }
-            } else {
-                // Get progress within current cycle
-                let cycleProgress = progress.truncatingRemainder(dividingBy: totalCycles)
-
-                if animation.autoreverses {
-                    // In autoreverse mode: 0-1 is forward, 1-2 is reverse
-                    if cycleProgress < 1 {
-                        progress = cycleProgress
-                    } else {
-                        // Reverse: map 1-2 to 1-0
-                        progress = 2 - cycleProgress
-                    }
-                } else {
-                    progress = cycleProgress
-                }
-            }
-        } else if progress >= 1 {
-            // No repeat, animation completed
-            switch animation.fillMode {
-            case .forwards, .both:
-                progress = 1
-            default:
-                return
-            }
-        }
+        guard let progress = normalizedProgress(
+            for: animation,
+            elapsed: elapsed,
+            singleCycleDuration: singleCycleDuration
+        ) else { return }
 
         // Apply spring physics or timing function
+        var adjustedProgress = progress
         if let springAnimation = animation as? CASpringAnimation {
             // For spring animations, use physics-based interpolation
             // Calculate the actual elapsed time for spring physics
-            let springTime = progress * singleCycleDuration
-            progress = CFTimeInterval(springAnimation.springValue(at: springTime))
+            let springTime = adjustedProgress * singleCycleDuration
+            adjustedProgress = CFTimeInterval(springAnimation.springValue(at: springTime))
             // Spring animations can overshoot, so don't clamp to 0-1
         } else if let timingFunction = animation.timingFunction {
             // Apply timing function for non-spring animations
-            progress = CFTimeInterval(timingFunction.evaluate(at: Float(progress)))
-            progress = max(0, min(1, progress))
+            adjustedProgress = CFTimeInterval(timingFunction.evaluate(at: Float(adjustedProgress)))
+            adjustedProgress = max(0, min(1, adjustedProgress))
         } else {
-            progress = max(0, min(1, progress))
+            adjustedProgress = max(0, min(1, adjustedProgress))
         }
 
         // Interpolate and apply value based on animation type
-        applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: progress)
+        applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: adjustedProgress)
     }
 
     /// Applies a transition animation to the presentation layer.
@@ -372,44 +369,25 @@ open class CALayer: CAMediaTiming, Hashable {
         let elapsed = time - transition.addedTime - transition.beginTime
         let duration = transition.duration > 0 ? transition.duration : CATransaction.animationDuration()
 
-        guard duration > 0 else { return }
-
-        // Handle fillMode for transitions that haven't started yet
-        if elapsed < 0 {
-            switch transition.fillMode {
-            case .backwards, .both:
-                applyTransitionEffect(transition, to: layer, progress: 0)
-            default:
-                return
-            }
-            return
-        }
-
-        // Calculate base progress (0-1)
-        var progress = elapsed / duration
-
-        // Handle completed transitions
-        if progress >= 1 {
-            switch transition.fillMode {
-            case .forwards, .both:
-                progress = 1
-            default:
-                return
-            }
-        }
+        guard let progress = normalizedProgress(
+            for: transition,
+            elapsed: elapsed,
+            singleCycleDuration: duration
+        ) else { return }
 
         // Apply timing function if available
+        var adjustedProgress = progress
         if let timingFunction = transition.timingFunction {
-            progress = CFTimeInterval(timingFunction.evaluate(at: Float(progress)))
+            adjustedProgress = CFTimeInterval(timingFunction.evaluate(at: Float(adjustedProgress)))
         }
 
         // Apply start/end progress range
         let startProgress = CFTimeInterval(transition.startProgress)
         let endProgress = CFTimeInterval(transition.endProgress)
-        let adjustedProgress = startProgress + progress * (endProgress - startProgress)
+        let rangedProgress = startProgress + adjustedProgress * (endProgress - startProgress)
 
         // Apply the transition effect
-        applyTransitionEffect(transition, to: layer, progress: adjustedProgress)
+        applyTransitionEffect(transition, to: layer, progress: rangedProgress)
     }
 
     /// Applies the visual effect of a transition at a given progress.

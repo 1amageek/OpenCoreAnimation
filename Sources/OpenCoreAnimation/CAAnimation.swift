@@ -68,16 +68,17 @@ open class CAAnimation: CAMediaTiming, CAAction {
         let baseDuration = effectiveBaseDuration
         var total = baseDuration
 
-        if repeatCount > 0 {
+        // Note: If both repeatDuration and repeatCount are specified,
+        // the behavior is undefined according to Apple docs.
+        // We prioritize repeatDuration when set.
+        if repeatDuration > 0 {
+            total = repeatDuration
+        } else if repeatCount > 0 {
             total *= CFTimeInterval(repeatCount)
         }
 
         if autoreverses {
             total *= 2
-        }
-
-        if repeatDuration > 0 {
-            total = min(total, repeatDuration)
         }
 
         return total

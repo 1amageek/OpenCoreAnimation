@@ -1108,9 +1108,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Create command encoder
         let encoder = device.createCommandEncoder()
 
-        // Create projection matrix (needed for shadow pre-rendering)
-        // Note: For SpriteKit/CALayer coordinate system, Y=0 is at the bottom and increases upward
-        // So bottom=0 and top=height gives correct Y orientation
+        // Create projection matrix for SpriteKit/CoreAnimation coordinate system (Y+ up)
+        // - y=0 maps to NDC=-1 (bottom of screen)
+        // - y=height maps to NDC=+1 (top of screen)
+        // This matches SpriteKit's coordinate system where origin is at bottom-left
         let projectionMatrix = Matrix4x4.orthographic(
             left: 0,
             right: Float(size.width),
@@ -3940,7 +3941,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
            let blurSampler = blurSampler {
 
             // Create shadow uniforms for the composite shader
-            // Use correct Y orientation (bottom=0, top=height)
+            // SpriteKit/CoreAnimation coordinate system (Y+ up)
             var shadowUniforms = ShadowUniforms(
                 mvpMatrix: Matrix4x4.orthographic(
                     left: 0, right: Float(size.width),
@@ -4097,7 +4098,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard let allocation = allocateVertices(count: vertices.count) else { return }
         let (vertexOffset, _) = allocation
 
-        // Use correct Y orientation (bottom=0, top=height)
+        // SpriteKit/CoreAnimation coordinate system (Y+ up)
         var filterUniforms = ShadowUniforms(
             mvpMatrix: Matrix4x4.orthographic(
                 left: 0, right: Float(size.width),

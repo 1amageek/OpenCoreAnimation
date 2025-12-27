@@ -1,4 +1,9 @@
 import Testing
+#if canImport(CoreGraphics)
+import CoreGraphics
+#else
+import OpenCoreGraphics
+#endif
 @testable import OpenCoreAnimation
 
 // MARK: - CATransform3D Tests
@@ -188,6 +193,32 @@ struct CATransform3DTests {
         #expect(!CATransform3DEqualToTransform(t1, t3))
         #expect(t1 == t2)
         #expect(t1 != t3)
+    }
+}
+
+// MARK: - CAAnimation Repeat Duration Tests
+
+@Suite("CAAnimation Repeat Duration Tests")
+struct CAAnimationRepeatDurationTests {
+
+    @Test("repeatDuration repeats presentation progress across cycles")
+    func repeatDurationAppliesToPresentation() {
+        let layer = CALayer()
+        layer.opacity = 0
+
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.duration = 1.0
+        animation.repeatDuration = 2.5
+
+        layer.add(animation, forKey: "opacity")
+
+        let now = CACurrentMediaTime()
+        animation.addedTime = now - 2.25
+
+        let presentation = layer.presentationAtTimeOffset(0)
+        #expect(abs(presentation.opacity - 0.25) < 0.0001)
     }
 }
 
@@ -920,14 +951,37 @@ struct CAAnimationTests {
         #expect(animation.totalDuration == 4.0)
     }
 
-    @Test("Total duration capped by repeatDuration")
-    func totalDurationCappedByRepeatDuration() {
+    @Test("Total duration with repeatDuration prioritized over repeatCount")
+    func totalDurationWithRepeatDurationPrioritized() {
         let animation = CABasicAnimation()
         animation.duration = 1.0
         animation.repeatCount = 10
         animation.repeatDuration = 3.0
 
+        // When both are set, repeatDuration takes priority (behavior is undefined per Apple docs)
         #expect(animation.totalDuration == 3.0)
+    }
+
+    @Test("Total duration with repeatDuration only")
+    func totalDurationWithRepeatDurationOnly() {
+        let animation = CABasicAnimation()
+        animation.duration = 1.0
+        animation.repeatDuration = 5.0
+        // repeatCount = 0 (default)
+
+        // repeatDuration defines the total duration for repeating
+        #expect(animation.totalDuration == 5.0)
+    }
+
+    @Test("Total duration with repeatDuration and autoreverses")
+    func totalDurationWithRepeatDurationAndAutoreverses() {
+        let animation = CABasicAnimation()
+        animation.duration = 1.0
+        animation.repeatDuration = 4.0
+        animation.autoreverses = true
+
+        // repeatDuration * 2 (autoreverses)
+        #expect(animation.totalDuration == 8.0)
     }
 }
 
