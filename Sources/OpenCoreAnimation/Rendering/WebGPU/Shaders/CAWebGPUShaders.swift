@@ -22,7 +22,7 @@ public enum CAWebGPUShaders {
         gradientColorCount: f32,
         padding3: vec3<f32>,
         // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
-        // In screen coordinates (Y-down): (bottomLeft, bottomRight, topLeft, topRight)
+        // Corresponds to: (bottom-left, bottom-right, top-left, top-right)
         cornerRadii: vec4<f32>,
         gradientColor0: vec4<f32>,
         gradientColor1: vec4<f32>,
@@ -67,17 +67,17 @@ public enum CAWebGPUShaders {
 
     // Signed distance function for a rounded rectangle with per-corner radii
     // radii: (minXminY, maxXminY, minXmaxY, maxXmaxY) - corresponds to CACornerMask corners
-    // In screen space with texCoord centered:
-    //   - negative x, negative y -> minXminY (bottom-left in screen coords)
-    //   - positive x, negative y -> maxXminY (bottom-right in screen coords)
-    //   - negative x, positive y -> minXmaxY (top-left in screen coords)
-    //   - positive x, positive y -> maxXmaxY (top-right in screen coords)
+    // In screen space with texCoord centered (Y-up coordinate system):
+    //   - negative x, negative y -> minXminY (bottom-left)
+    //   - positive x, negative y -> maxXminY (bottom-right)
+    //   - negative x, positive y -> minXmaxY (top-left)
+    //   - positive x, positive y -> maxXmaxY (top-right)
     fn sdRoundedBoxVariable(p: vec2<f32>, halfSize: vec2<f32>, radii: vec4<f32>) -> f32 {
         // Select the appropriate corner radius based on which quadrant we're in
-        // radii.x = minXminY (x<0, y<0) - bottom-left in Y-down
-        // radii.y = maxXminY (x>0, y<0) - bottom-right in Y-down
-        // radii.z = minXmaxY (x<0, y>0) - top-left in Y-down
-        // radii.w = maxXmaxY (x>0, y>0) - top-right in Y-down
+        // radii.x = minXminY (x<0, y<0) - bottom-left
+        // radii.y = maxXminY (x>0, y<0) - bottom-right
+        // radii.z = minXmaxY (x<0, y>0) - top-left
+        // radii.w = maxXmaxY (x>0, y>0) - top-right
         var r: f32;
         if (p.x >= 0.0) {
             if (p.y >= 0.0) {

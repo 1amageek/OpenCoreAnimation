@@ -2723,14 +2723,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         // White vertex color for texture rendering (texture provides actual color)
+        // Flip V coordinates for Y-up coordinate system:
+        // Canvas renders Y-down (V=0 at top), but screen is Y-up (Y=0 at bottom)
+        // So we flip V: position bottom (Y=0) uses texture bottom (V=1)
         let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+            // Triangle 1: bottom-left, bottom-right, top-left
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
+            // Triangle 2: bottom-right, top-right, top-left
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else { return }

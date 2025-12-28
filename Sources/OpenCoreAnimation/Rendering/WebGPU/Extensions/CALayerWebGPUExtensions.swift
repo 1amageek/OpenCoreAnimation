@@ -38,10 +38,10 @@ extension CALayer {
     /// Calculates per-corner radii based on maskedCorners and cornerRadius.
     ///
     /// Returns a SIMD4<Float> with the radius for each corner:
-    /// - x: minXminY (bottom-left in screen coordinates with Y-down)
-    /// - y: maxXminY (bottom-right in screen coordinates)
-    /// - z: minXmaxY (top-left in screen coordinates)
-    /// - w: maxXmaxY (top-right in screen coordinates)
+    /// - x: minXminY (bottom-left)
+    /// - y: maxXminY (bottom-right)
+    /// - z: minXmaxY (top-left)
+    /// - w: maxXmaxY (top-right)
     ///
     /// If maskedCorners contains all four corners (or is empty with a non-zero cornerRadius),
     /// all four values will be the same. Otherwise, unmasked corners will have 0 radius.
