@@ -4,6 +4,8 @@ import OpenCoreGraphics
 import JavaScriptKit
 import SwiftWebGPU
 
+// MARK: - File Organization
+//
 // Types, helpers, and shaders are now organized in the Rendering/WebGPU directory:
 // - Types/Matrix4x4.swift
 // - Types/RendererTypes.swift
@@ -15,7 +17,46 @@ import SwiftWebGPU
 // - Shaders/CAWebGPUShaders.swift
 // - Extensions/CALayerWebGPUExtensions.swift
 
-
+// MARK: - Coordinate System Documentation
+//
+// OpenCoreAnimation uses a **SpriteKit-compatible coordinate system (Y-up)**:
+//
+//   ┌─────────────────────────────────┐
+//   │ Origin: Bottom-left (0, 0)     │
+//   │ X-axis: Positive X → RIGHT     │
+//   │ Y-axis: Positive Y → UP        │
+//   └─────────────────────────────────┘
+//
+// Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
+// "A positive x coordinate goes to the right and a positive y coordinate goes up the screen."
+//
+// This differs from iOS UIKit/CoreAnimation which uses Y-down (origin at top-left).
+//
+// ## Why Y-up?
+//
+// 1. SpriteKit compatibility - Same coordinate system as Apple's game framework
+// 2. Mathematical convention - Standard Cartesian coordinate system
+// 3. WebGPU NDC alignment - WebGPU NDC is Y-up (-1 at bottom, +1 at top)
+//
+// ## Texture Coordinate Handling
+//
+// Image and text textures store pixel data with row 0 at the TOP.
+// For Y-up rendering, the V coordinate must be flipped:
+//
+//   Screen (Y-up)         Texture
+//   Y=height ───          V=0 ─── (top of image)
+//            │              │
+//            │   flip V     │
+//            │              │
+//   Y=0      ───          V=1 ─── (bottom of image)
+//
+// V-flip is applied to:
+// - Image rendering (renderImageContents)
+// - Text rendering (renderTextLayer)
+// - 9-patch rendering (render9PatchImage)
+//
+// V-flip is NOT applied to solid color rendering because texCoord is used
+// for position-based calculations (corner radius, gradients), not texture sampling.
 
 // MARK: - WebGPU Renderer
 
@@ -94,6 +135,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Current vertex buffer offset during rendering (dynamic allocation).
     private var currentVertexOffset: UInt64 = 0
+
+    /// Root layer reference during rendering (to skip its backgroundColor rendering).
+    /// SKScene's backgroundColor is rendered via clear color instead.
+    private weak var currentRootLayer: CALayer?
 
     /// Maximum vertex buffer size (1MB to accommodate complex shapes).
     private static let maxVertexBufferSize: UInt64 = 1024 * 1024
@@ -1108,10 +1153,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Create command encoder
         let encoder = device.createCommandEncoder()
 
-        // Create projection matrix for SpriteKit/CoreAnimation coordinate system (Y+ up)
-        // - y=0 maps to NDC=-1 (bottom of screen)
-        // - y=height maps to NDC=+1 (top of screen)
-        // This matches SpriteKit's coordinate system where origin is at bottom-left
+        // MARK: - SpriteKit-Compatible Coordinate System (Y-up)
+        //
+        // OpenCoreAnimation uses a SpriteKit-compatible coordinate system:
+        // - Origin (0, 0) is at the BOTTOM-LEFT corner
+        // - Positive X goes RIGHT
+        // - Positive Y goes UP
+        //
+        // Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
+        // "A positive x coordinate goes to the right and a positive y coordinate goes up the screen."
+        //
+        // This projection matrix maps world coordinates to WebGPU NDC:
+        // - World Y=0 → NDC Y=-1 (bottom of screen)
+        // - World Y=height → NDC Y=+1 (top of screen)
+        // - World X=0 → NDC X=-1 (left of screen)
+        // - World X=width → NDC X=+1 (right of screen)
+        //
+        // Note: This differs from iOS UIKit/CoreAnimation which uses Y-down (origin at top-left).
+        // OpenCoreAnimation intentionally follows SpriteKit's Y-up convention for consistency
+        // with game development and standard mathematical coordinate systems.
         let projectionMatrix = Matrix4x4.orthographic(
             left: 0,
             right: Float(size.width),
@@ -1127,12 +1187,32 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Pre-render layers with blur filters
         prerenderFilteredLayers(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
 
+        // Use root layer's backgroundColor as clear color (for SKScene background)
+        // This prevents SKScene's backgroundColor from rendering at zPosition=0
+        // which would occlude child layers with negative zPosition (like backgroundLayer)
+        let clearColor: GPUColor
+        if let bgColor = rootLayer.backgroundColor,
+           let components = bgColor.components,
+           components.count >= 4 {
+            clearColor = GPUColor(
+                r: components[0],
+                g: components[1],
+                b: components[2],
+                a: components[3]
+            )
+        } else {
+            clearColor = GPUColor(r: 0, g: 0, b: 0, a: 1)
+        }
+
+        // Store root layer to skip its backgroundColor rendering in renderLayer()
+        currentRootLayer = rootLayer
+
         // Begin render pass with depth attachment
         let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
                     view: textureView,
-                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 1),
+                    clearValue: clearColor,
                     loadOp: .clear,
                     storeOp: .store
                 )
@@ -1392,13 +1472,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             renderContentsLayer(presentationLayer, contents: contents, device: device,
                                renderPass: renderPass, modelMatrix: modelMatrix)
         }
-        // Debug: Log layers with nil contents that have non-zero bounds
-        else if presentationLayer.bounds.width > 0 && presentationLayer.bounds.height > 0 {
-            // Uncomment for debugging:
-            // print("CAWebGPURenderer: Layer has nil contents, bounds=\(presentationLayer.bounds), zPosition=\(presentationLayer.zPosition)")
-        }
-        // Render background color if set (and not a gradient layer, or gradient has no colors)
-        else if presentationLayer.backgroundColor != nil {
+        // Render background color if set (for color-only layers like SKSpriteNode(color:size:))
+        // Skip root layer - its backgroundColor is rendered via clear color to avoid z-fighting
+        else if presentationLayer.backgroundColor != nil && presentationLayer.bounds.width > 0 && presentationLayer.bounds.height > 0 && layer !== currentRootLayer {
             // Create vertices using presentation layer color
             let color = presentationLayer.backgroundColorComponents
             var vertices: [CARendererVertex] = [
@@ -2295,16 +2371,34 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let posMaxX = Float((destRect.origin.x + destRect.size.width) / boundsWidth)
         let posMaxY = Float((destRect.origin.y + destRect.size.height) / boundsHeight)
 
-        // Create vertices with contentsGravity-adjusted positions and contentsRect-adjusted UVs
-        // Note: Screen coordinates have Y=0 at bottom, but texture coordinates have V=0 at top
-        // So we flip V: position bottom (posMinY) uses texture bottom (uvMaxY)
+        // MARK: Texture V-Coordinate Flipping for Y-up Coordinate System
+        //
+        // OpenCoreAnimation uses SpriteKit-compatible Y-up coordinates (origin at bottom-left),
+        // but image textures store pixel data with row 0 at the TOP (standard image format).
+        //
+        // Coordinate systems:
+        //   Screen (Y-up):              Texture:
+        //   Y=height ─────────          V=0 ─────────  (top of image)
+        //            │ TOP   │              │ TOP   │
+        //            │       │              │       │
+        //            │BOTTOM │              │BOTTOM │
+        //   Y=0     ─────────              V=1 ─────────  (bottom of image)
+        //   (bottom of screen)
+        //
+        // To display an image right-side up, we must flip the V coordinate:
+        //   - Screen bottom (posMinY) → Texture bottom (uvMaxY)
+        //   - Screen top (posMaxY) → Texture top (uvMinY)
+        //
+        // Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
         let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
             // Triangle 1: bottom-left, bottom-right, top-left
+            // posMinY (screen bottom) uses uvMaxY (texture bottom) - V-flipped
             CARendererVertex(position: SIMD2(posMinX, posMinY), texCoord: SIMD2(uvMinX, uvMaxY), color: white),
             CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
             CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
             // Triangle 2: bottom-right, top-right, top-left
+            // posMaxY (screen top) uses uvMinY (texture top) - V-flipped
             CARendererVertex(position: SIMD2(posMaxX, posMinY), texCoord: SIMD2(uvMaxX, uvMaxY), color: white),
             CARendererVertex(position: SIMD2(posMaxX, posMaxY), texCoord: SIMD2(uvMaxX, uvMinY), color: white),
             CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
@@ -2722,17 +2816,34 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         )
 
-        // White vertex color for texture rendering (texture provides actual color)
-        // Flip V coordinates for Y-up coordinate system:
-        // Canvas renders Y-down (V=0 at top), but screen is Y-up (Y=0 at bottom)
-        // So we flip V: position bottom (Y=0) uses texture bottom (V=1)
+        // MARK: Text Texture V-Coordinate Flipping for Y-up Coordinate System
+        //
+        // OpenCoreAnimation uses SpriteKit-compatible Y-up coordinates (origin at bottom-left),
+        // but HTML Canvas (used for text rendering) uses Y-down coordinates (origin at top-left).
+        //
+        // Coordinate systems:
+        //   Screen (Y-up):              Canvas/Texture:
+        //   Y=1   ─────────             V=0 ─────────  (Canvas Y=0, top)
+        //         │ TOP   │                 │ TOP   │
+        //         │ text  │                 │ text  │
+        //         │BOTTOM │                 │BOTTOM │
+        //   Y=0   ─────────             V=1 ─────────  (Canvas Y=height, bottom)
+        //   (bottom of screen)
+        //
+        // To display text right-side up, we must flip the V coordinate:
+        //   - Screen bottom (Y=0) → Texture bottom (V=1)
+        //   - Screen top (Y=1) → Texture top (V=0)
+        //
+        // Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
         let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
             // Triangle 1: bottom-left, bottom-right, top-left
+            // Y=0 (screen bottom) uses V=1 (texture bottom) - V-flipped
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
             // Triangle 2: bottom-right, top-right, top-left
+            // Y=1 (screen top) uses V=0 (texture top) - V-flipped
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
             CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: white),
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),

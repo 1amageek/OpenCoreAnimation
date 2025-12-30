@@ -4,6 +4,51 @@ import Foundation
 // MARK: - WebGPU Shader Code
 
 /// A container for all WGSL shader code used by the WebGPU renderer.
+///
+/// ## Coordinate System: SpriteKit-Compatible (Y-up)
+///
+/// OpenCoreAnimation uses a SpriteKit-compatible coordinate system:
+/// - **Origin**: Bottom-left corner (0, 0)
+/// - **X-axis**: Positive X goes RIGHT
+/// - **Y-axis**: Positive Y goes UP
+///
+/// Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
+///
+/// > "A positive x coordinate goes to the right and a positive y coordinate goes up the screen."
+///
+/// ### Coordinate Transformations
+///
+/// The projection matrix transforms world coordinates to WebGPU NDC (Normalized Device Coordinates):
+/// ```
+/// World (Y-up)          NDC
+/// Y=height  ───         Y=+1  ───
+///           │             │
+///           │     →       │
+///           │             │
+/// Y=0       ───         Y=-1  ───
+/// (bottom)              (bottom)
+/// ```
+///
+/// ### Texture Coordinate Handling
+///
+/// Textures store pixel data with row 0 at the TOP (standard image format).
+/// For Y-up rendering, the V coordinate must be flipped:
+/// ```
+/// Screen (Y-up)         Texture
+/// Y=height ───          V=0 ─── (image top)
+///          │              │
+///          │    flip V    │
+///          │              │
+/// Y=0      ───          V=1 ─── (image bottom)
+/// ```
+///
+/// This applies to:
+/// - Image rendering (CGImage contents)
+/// - Text rendering (Canvas2D rendered text)
+/// - 9-patch rendering (contentsCenter)
+///
+/// Solid color rendering does NOT flip V because texCoord is used for
+/// position-based calculations (corner radius, gradients), not texture sampling.
 public enum CAWebGPUShaders {
 
     // MARK: - Main Layer Shader
