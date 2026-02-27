@@ -271,7 +271,7 @@ open class CALayer: CAMediaTiming, Hashable {
         if animation.repeatDuration > 0 {
             baseCycles = animation.repeatDuration / singleCycleDuration
         } else if animation.repeatCount > 0 {
-            baseCycles = CFTimeInterval(max(1, animation.repeatCount))
+            baseCycles = CFTimeInterval(animation.repeatCount)
         } else {
             baseCycles = 1
         }
@@ -320,9 +320,11 @@ open class CALayer: CAMediaTiming, Hashable {
         guard let propertyAnimation = animation as? CAPropertyAnimation,
               let keyPath = propertyAnimation.keyPath else { return }
 
-        // Calculate animation progress consistently with processAnimationCompletions
-        // elapsed = currentTime - addedTime - beginTime
-        let elapsed = time - animation.addedTime - animation.beginTime
+        // Calculate animation progress in local time space.
+        // Apply speed and timeOffset per CAMediaTiming specification:
+        // localTime = (parentTime - beginTime) * speed + timeOffset
+        let rawElapsed = time - animation.addedTime - animation.beginTime
+        let elapsed = rawElapsed * CFTimeInterval(animation.speed) + animation.timeOffset
 
         // Get the effective duration for a single cycle
         let singleCycleDuration: CFTimeInterval
@@ -409,8 +411,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 isPush: true
             )
             layer._position = CGPoint(
-                x: _position.x + offset.x,
-                y: _position.y + offset.y
+                x: layer._position.x + offset.x,
+                y: layer._position.y + offset.y
             )
 
         case .moveIn:
@@ -423,8 +425,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 isPush: false
             )
             layer._position = CGPoint(
-                x: _position.x + offset.x,
-                y: _position.y + offset.y
+                x: layer._position.x + offset.x,
+                y: layer._position.y + offset.y
             )
             // Also fade in slightly for smoother effect
             layer._opacity = Float(clampedProgress)
@@ -441,8 +443,8 @@ open class CALayer: CAMediaTiming, Hashable {
             )
             // Move content in opposite direction during reveal
             layer._position = CGPoint(
-                x: _position.x - offset.x * 0.3,  // Subtle movement
-                y: _position.y - offset.y * 0.3
+                x: layer._position.x - offset.x * 0.3,  // Subtle movement
+                y: layer._position.y - offset.y * 0.3
             )
 
         default:
@@ -515,8 +517,10 @@ open class CALayer: CAMediaTiming, Hashable {
         guard let propertyAnimation = animation as? CAPropertyAnimation,
               let keyPath = propertyAnimation.keyPath else { return }
 
-        // Calculate animation progress with effective timing
-        let elapsed = time - effectiveAddedTime - animation.beginTime
+        // Calculate animation progress with effective timing.
+        // Apply speed and timeOffset per CAMediaTiming specification.
+        let rawElapsed = time - effectiveAddedTime - animation.beginTime
+        let elapsed = rawElapsed * CFTimeInterval(animation.speed) + animation.timeOffset
 
         // Get the effective duration for a single cycle
         let singleCycleDuration: CFTimeInterval
@@ -528,28 +532,12 @@ open class CALayer: CAMediaTiming, Hashable {
 
         guard singleCycleDuration > 0 else { return }
 
-        // Handle fillMode for animations that haven't started yet
-        if elapsed < 0 {
-            switch animation.fillMode {
-            case .backwards, .both:
-                applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: 0)
-            default:
-                return
-            }
-            return
-        }
-
-        var progress = elapsed / singleCycleDuration
-
-        // Handle repeat count and autoreverses (simplified for group context)
-        if progress >= 1 {
-            switch animation.fillMode {
-            case .forwards, .both:
-                progress = 1
-            default:
-                return
-            }
-        }
+        // Use normalizedProgress for consistent handling of repeatCount, autoreverses, and fillMode
+        guard var progress = normalizedProgress(
+            for: animation,
+            elapsed: elapsed,
+            singleCycleDuration: singleCycleDuration
+        ) else { return }
 
         // Apply spring physics or timing function
         if let springAnimation = animation as? CASpringAnimation {
@@ -582,13 +570,34 @@ open class CALayer: CAMediaTiming, Hashable {
             return
         }
 
-        // Handle common animatable properties
-        applyFloatAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
-        applyPointAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
-        applyRectAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
-        applyTransformAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
-        applyColorAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
-        applyArrayAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        // Dispatch to the correct type-specific method based on keyPath
+        switch keyPath {
+        // Float/CGFloat properties
+        case "opacity", "cornerRadius", "borderWidth", "shadowRadius", "shadowOpacity",
+             "zPosition", "strokeStart", "strokeEnd", "lineWidth", "lineDashPhase", "miterLimit":
+            applyFloatAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+
+        // Point/Size properties
+        case "position", "position.x", "position.y", "anchorPoint", "shadowOffset",
+             "startPoint", "endPoint":
+            applyPointAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+
+        // Rect properties
+        case "bounds", "bounds.size":
+            applyRectAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+
+        // Transform properties
+        case _ where keyPath == "transform" || keyPath.hasPrefix("transform."):
+            applyTransformAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+
+        // Color properties
+        case "backgroundColor", "borderColor", "shadowColor", "fillColor", "strokeColor":
+            applyColorAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+
+        // Array properties (locations, colors, etc.)
+        default:
+            applyArrayAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        }
     }
 
     /// Applies an animation using a value function to convert scalar values to transforms.
@@ -659,64 +668,151 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
+    // MARK: - byValue Resolution Helpers
+
+    /// Resolves from/to values for a CGFloat animation, considering `byValue`.
+    ///
+    /// Resolution rules:
+    /// - `from` + `to`: use as-is
+    /// - `from` + `by`: to = from + by
+    /// - `to` + `by`: from = to - by
+    /// - `by` only: from = currentValue, to = currentValue + by
+    /// - `from` only: to = currentValue
+    /// - `to` only: from = currentValue
+    private func resolveFromTo(_ animation: CABasicAnimation, currentValue: CGFloat) -> (from: CGFloat, to: CGFloat)? {
+        let fromVal = (animation.fromValue as? CGFloat) ?? (animation.fromValue as? Double).map { CGFloat($0) } ?? (animation.fromValue as? Float).map { CGFloat($0) }
+        let toVal = (animation.toValue as? CGFloat) ?? (animation.toValue as? Double).map { CGFloat($0) } ?? (animation.toValue as? Float).map { CGFloat($0) }
+        let byVal = (animation.byValue as? CGFloat) ?? (animation.byValue as? Double).map { CGFloat($0) } ?? (animation.byValue as? Float).map { CGFloat($0) }
+
+        if let from = fromVal, let to = toVal {
+            return (from, to)
+        } else if let from = fromVal, let by = byVal {
+            return (from, from + by)
+        } else if let to = toVal, let by = byVal {
+            return (to - by, to)
+        } else if let by = byVal {
+            return (currentValue, currentValue + by)
+        } else if let from = fromVal {
+            return (from, currentValue)
+        } else if let to = toVal {
+            return (currentValue, to)
+        }
+        return nil
+    }
+
+    /// Resolves from/to Float values for animations, considering `byValue`.
+    private func resolveFromToFloat(_ animation: CABasicAnimation, currentValue: Float) -> (from: Float, to: Float)? {
+        let fromVal = (animation.fromValue as? Float) ?? (animation.fromValue as? Double).map { Float($0) }
+        let toVal = (animation.toValue as? Float) ?? (animation.toValue as? Double).map { Float($0) }
+        let byVal = (animation.byValue as? Float) ?? (animation.byValue as? Double).map { Float($0) }
+
+        if let from = fromVal, let to = toVal {
+            return (from, to)
+        } else if let from = fromVal, let by = byVal {
+            return (from, from + by)
+        } else if let to = toVal, let by = byVal {
+            return (to - by, to)
+        } else if let by = byVal {
+            return (currentValue, currentValue + by)
+        } else if let from = fromVal {
+            return (from, currentValue)
+        } else if let to = toVal {
+            return (currentValue, to)
+        }
+        return nil
+    }
+
+    /// Resolves from/to CGPoint values for animations, considering `byValue`.
+    private func resolveFromToPoint(_ animation: CABasicAnimation, currentValue: CGPoint) -> (from: CGPoint, to: CGPoint)? {
+        let fromVal = animation.fromValue as? CGPoint
+        let toVal = animation.toValue as? CGPoint
+        let byVal = animation.byValue as? CGPoint
+
+        if let from = fromVal, let to = toVal {
+            return (from, to)
+        } else if let from = fromVal, let by = byVal {
+            return (from, CGPoint(x: from.x + by.x, y: from.y + by.y))
+        } else if let to = toVal, let by = byVal {
+            return (CGPoint(x: to.x - by.x, y: to.y - by.y), to)
+        } else if let by = byVal {
+            return (currentValue, CGPoint(x: currentValue.x + by.x, y: currentValue.y + by.y))
+        } else if let from = fromVal {
+            return (from, currentValue)
+        } else if let to = toVal {
+            return (currentValue, to)
+        }
+        return nil
+    }
+
+    /// Resolves from/to CGSize values for animations, considering `byValue`.
+    private func resolveFromToSize(_ animation: CABasicAnimation, currentValue: CGSize) -> (from: CGSize, to: CGSize)? {
+        let fromVal = animation.fromValue as? CGSize
+        let toVal = animation.toValue as? CGSize
+        let byVal = animation.byValue as? CGSize
+
+        if let from = fromVal, let to = toVal {
+            return (from, to)
+        } else if let from = fromVal, let by = byVal {
+            return (from, CGSize(width: from.width + by.width, height: from.height + by.height))
+        } else if let to = toVal, let by = byVal {
+            return (CGSize(width: to.width - by.width, height: to.height - by.height), to)
+        } else if let by = byVal {
+            return (currentValue, CGSize(width: currentValue.width + by.width, height: currentValue.height + by.height))
+        } else if let from = fromVal {
+            return (from, currentValue)
+        } else if let to = toVal {
+            return (currentValue, to)
+        }
+        return nil
+    }
+
     private func applyFloatAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
         switch keyPath {
         case "opacity":
-            guard let from = (animation.fromValue as? Float) ?? _opacity as Float?,
-                  let to = (animation.toValue as? Float) ?? _opacity as Float? else { return }
-            layer._opacity = from + Float(progress) * (to - from)
+            guard let resolved = resolveFromToFloat(animation, currentValue: _opacity) else { return }
+            layer._opacity = resolved.from + Float(progress) * (resolved.to - resolved.from)
         case "cornerRadius":
-            guard let from = (animation.fromValue as? CGFloat) ?? _cornerRadius as CGFloat?,
-                  let to = (animation.toValue as? CGFloat) ?? _cornerRadius as CGFloat? else { return }
-            layer._cornerRadius = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: _cornerRadius) else { return }
+            layer._cornerRadius = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "borderWidth":
-            guard let from = (animation.fromValue as? CGFloat) ?? _borderWidth as CGFloat?,
-                  let to = (animation.toValue as? CGFloat) ?? _borderWidth as CGFloat? else { return }
-            layer._borderWidth = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: _borderWidth) else { return }
+            layer._borderWidth = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "shadowRadius":
-            guard let from = (animation.fromValue as? CGFloat) ?? _shadowRadius as CGFloat?,
-                  let to = (animation.toValue as? CGFloat) ?? _shadowRadius as CGFloat? else { return }
-            layer._shadowRadius = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: _shadowRadius) else { return }
+            layer._shadowRadius = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "shadowOpacity":
-            guard let from = (animation.fromValue as? Float) ?? _shadowOpacity as Float?,
-                  let to = (animation.toValue as? Float) ?? _shadowOpacity as Float? else { return }
-            layer._shadowOpacity = from + Float(progress) * (to - from)
+            guard let resolved = resolveFromToFloat(animation, currentValue: _shadowOpacity) else { return }
+            layer._shadowOpacity = resolved.from + Float(progress) * (resolved.to - resolved.from)
         case "zPosition":
-            guard let from = (animation.fromValue as? CGFloat) ?? _zPosition as CGFloat?,
-                  let to = (animation.toValue as? CGFloat) ?? _zPosition as CGFloat? else { return }
-            layer._zPosition = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: _zPosition) else { return }
+            layer._zPosition = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
 
         // CAShapeLayer properties
         case "strokeStart":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._strokeStart
-            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._strokeStart
-            shapeLayer._strokeStart = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._strokeStart) else { return }
+            shapeLayer._strokeStart = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "strokeEnd":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._strokeEnd
-            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._strokeEnd
-            shapeLayer._strokeEnd = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._strokeEnd) else { return }
+            shapeLayer._strokeEnd = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "lineWidth":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._lineWidth
-            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._lineWidth
-            shapeLayer._lineWidth = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._lineWidth) else { return }
+            shapeLayer._lineWidth = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "lineDashPhase":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._lineDashPhase
-            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._lineDashPhase
-            shapeLayer._lineDashPhase = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._lineDashPhase) else { return }
+            shapeLayer._lineDashPhase = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "miterLimit":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            let from = (animation.fromValue as? CGFloat) ?? modelShapeLayer._miterLimit
-            let to = (animation.toValue as? CGFloat) ?? modelShapeLayer._miterLimit
-            shapeLayer._miterLimit = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._miterLimit) else { return }
+            shapeLayer._miterLimit = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
 
         default:
             break
@@ -726,53 +822,46 @@ open class CALayer: CAMediaTiming, Hashable {
     private func applyPointAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
         switch keyPath {
         case "position":
-            guard let from = (animation.fromValue as? CGPoint) ?? _position as CGPoint?,
-                  let to = (animation.toValue as? CGPoint) ?? _position as CGPoint? else { return }
+            guard let resolved = resolveFromToPoint(animation, currentValue: _position) else { return }
             layer._position = CGPoint(
-                x: from.x + CGFloat(progress) * (to.x - from.x),
-                y: from.y + CGFloat(progress) * (to.y - from.y)
+                x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
+                y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
         case "position.x":
-            guard let from = (animation.fromValue as? CGFloat) ?? _position.x as CGFloat?,
-                  let to = (animation.toValue as? CGFloat) ?? _position.x as CGFloat? else { return }
-            layer._position.x = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: _position.x) else { return }
+            layer._position.x = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "position.y":
-            guard let from = (animation.fromValue as? CGFloat) ?? _position.y as CGFloat?,
-                  let to = (animation.toValue as? CGFloat) ?? _position.y as CGFloat? else { return }
-            layer._position.y = from + CGFloat(progress) * (to - from)
+            guard let resolved = resolveFromTo(animation, currentValue: _position.y) else { return }
+            layer._position.y = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
         case "anchorPoint":
-            guard let from = (animation.fromValue as? CGPoint) ?? _anchorPoint as CGPoint?,
-                  let to = (animation.toValue as? CGPoint) ?? _anchorPoint as CGPoint? else { return }
+            guard let resolved = resolveFromToPoint(animation, currentValue: _anchorPoint) else { return }
             layer._anchorPoint = CGPoint(
-                x: from.x + CGFloat(progress) * (to.x - from.x),
-                y: from.y + CGFloat(progress) * (to.y - from.y)
+                x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
+                y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
         case "shadowOffset":
-            guard let from = (animation.fromValue as? CGSize) ?? _shadowOffset as CGSize?,
-                  let to = (animation.toValue as? CGSize) ?? _shadowOffset as CGSize? else { return }
+            guard let resolved = resolveFromToSize(animation, currentValue: _shadowOffset) else { return }
             layer._shadowOffset = CGSize(
-                width: from.width + CGFloat(progress) * (to.width - from.width),
-                height: from.height + CGFloat(progress) * (to.height - from.height)
+                width: resolved.from.width + CGFloat(progress) * (resolved.to.width - resolved.from.width),
+                height: resolved.from.height + CGFloat(progress) * (resolved.to.height - resolved.from.height)
             )
 
         // CAGradientLayer properties
         case "startPoint":
             guard let gradientLayer = layer as? CAGradientLayer,
                   let modelGradientLayer = self as? CAGradientLayer else { return }
-            let from = (animation.fromValue as? CGPoint) ?? modelGradientLayer._startPoint
-            let to = (animation.toValue as? CGPoint) ?? modelGradientLayer._startPoint
+            guard let resolved = resolveFromToPoint(animation, currentValue: modelGradientLayer._startPoint) else { return }
             gradientLayer._startPoint = CGPoint(
-                x: from.x + CGFloat(progress) * (to.x - from.x),
-                y: from.y + CGFloat(progress) * (to.y - from.y)
+                x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
+                y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
         case "endPoint":
             guard let gradientLayer = layer as? CAGradientLayer,
                   let modelGradientLayer = self as? CAGradientLayer else { return }
-            let from = (animation.fromValue as? CGPoint) ?? modelGradientLayer._endPoint
-            let to = (animation.toValue as? CGPoint) ?? modelGradientLayer._endPoint
+            guard let resolved = resolveFromToPoint(animation, currentValue: modelGradientLayer._endPoint) else { return }
             gradientLayer._endPoint = CGPoint(
-                x: from.x + CGFloat(progress) * (to.x - from.x),
-                y: from.y + CGFloat(progress) * (to.y - from.y)
+                x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
+                y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
 
         default:
@@ -783,8 +872,10 @@ open class CALayer: CAMediaTiming, Hashable {
     private func applyRectAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
         switch keyPath {
         case "bounds":
-            guard let from = (animation.fromValue as? CGRect) ?? _bounds as CGRect?,
-                  let to = (animation.toValue as? CGRect) ?? _bounds as CGRect? else { return }
+            let fromVal = animation.fromValue as? CGRect
+            let toVal = animation.toValue as? CGRect
+            let from = fromVal ?? _bounds
+            let to = toVal ?? _bounds
             layer._bounds = CGRect(
                 x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
                 y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
@@ -792,11 +883,10 @@ open class CALayer: CAMediaTiming, Hashable {
                 height: from.size.height + CGFloat(progress) * (to.size.height - from.size.height)
             )
         case "bounds.size":
-            guard let from = (animation.fromValue as? CGSize) ?? _bounds.size as CGSize?,
-                  let to = (animation.toValue as? CGSize) ?? _bounds.size as CGSize? else { return }
+            guard let resolved = resolveFromToSize(animation, currentValue: _bounds.size) else { return }
             layer._bounds.size = CGSize(
-                width: from.width + CGFloat(progress) * (to.width - from.width),
-                height: from.height + CGFloat(progress) * (to.height - from.height)
+                width: resolved.from.width + CGFloat(progress) * (resolved.to.width - resolved.from.width),
+                height: resolved.from.height + CGFloat(progress) * (resolved.to.height - resolved.from.height)
             )
         default:
             break
@@ -902,7 +992,14 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    /// Interpolates between two transforms.
+    /// Interpolates between two transforms using naive element-wise linear interpolation.
+    ///
+    /// - Note: This approach does not correctly interpolate rotations or combined transforms.
+    ///   A proper implementation should decompose each matrix into translation, rotation, scale,
+    ///   and skew components, interpolate each independently (using slerp for rotation),
+    ///   and recompose. This is a known limitation.
+    ///
+    /// - TODO: Implement matrix decomposition for correct transform interpolation.
     private func interpolateTransform(from: CATransform3D, to: CATransform3D, progress: CGFloat) -> CATransform3D {
         return CATransform3D(
             m11: from.m11 + progress * (to.m11 - from.m11),
@@ -2209,10 +2306,11 @@ open class CALayer: CAMediaTiming, Hashable {
             }
         }
         set {
-            // Setting frame updates bounds.size and position
-            // This assumes identity transform; for non-identity transforms, behavior is undefined
-            _bounds.size = newValue.size
-            _position = CGPoint(
+            // Setting frame updates bounds.size and position through their public setters
+            // so that transactions are properly registered for implicit animations.
+            // This assumes identity transform; for non-identity transforms, behavior is undefined.
+            bounds = CGRect(origin: bounds.origin, size: newValue.size)
+            position = CGPoint(
                 x: newValue.origin.x + newValue.size.width * _anchorPoint.x,
                 y: newValue.origin.y + newValue.size.height * _anchorPoint.y
             )
@@ -2532,10 +2630,12 @@ open class CALayer: CAMediaTiming, Hashable {
                 continue
             }
 
-            let elapsed = currentTime - animation.addedTime - animation.beginTime
+            // Use raw wall-clock elapsed time for completion check.
+            // totalDuration already accounts for speed.
+            let rawElapsed = currentTime - animation.addedTime - animation.beginTime
             let totalDuration = animation.totalDuration
 
-            if elapsed >= totalDuration {
+            if rawElapsed >= totalDuration {
                 // Animation has completed
                 animation.markFinished(completed: true)
 

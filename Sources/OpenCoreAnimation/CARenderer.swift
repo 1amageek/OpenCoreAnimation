@@ -1,4 +1,4 @@
-// CGImageMetadataTag.swift
+// CARenderer.swift
 // OpenCoreAnimation
 //
 // Full API compatibility with Apple's CoreAnimation framework
@@ -226,12 +226,14 @@ extension simd_float4x4 {
         let height = top - bottom
         let depth = far - near
 
-        // simd_float4x4 is column-major, so we construct from columns
+        // simd_float4x4 is column-major, so we construct from columns.
+        // Metal uses [0,1] depth range convention (not [-1,1] like OpenGL),
+        // so Z column uses 1/depth and translation uses -near/depth.
         return simd_float4x4(columns: (
             SIMD4<Float>(2 / width, 0, 0, 0),
             SIMD4<Float>(0, 2 / height, 0, 0),
-            SIMD4<Float>(0, 0, -2 / depth, 0),
-            SIMD4<Float>(-(right + left) / width, -(top + bottom) / height, -(far + near) / depth, 1)
+            SIMD4<Float>(0, 0, 1 / depth, 0),
+            SIMD4<Float>(-(right + left) / width, -(top + bottom) / height, -near / depth, 1)
         ))
     }
 }

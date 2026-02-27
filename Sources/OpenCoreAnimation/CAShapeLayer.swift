@@ -1,4 +1,4 @@
-// CGImageMetadataTag.swift
+// CAShapeLayer.swift
 // OpenCoreAnimation
 //
 // Full API compatibility with Apple's CoreAnimation framework
@@ -57,7 +57,7 @@ open class CAShapeLayer: CALayer {
 
     // MARK: - Accessing Shape Style Properties
 
-    internal var _fillColor: CGColor?
+    internal var _fillColor: CGColor? = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
     /// The color used to fill the shape's path. Animatable.
     open var fillColor: CGColor? {
         get { return _fillColor }

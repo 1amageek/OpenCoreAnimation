@@ -47,9 +47,17 @@ open class CASpringAnimation: CABasicAnimation {
         let dampingRatio = safeDamping / (2 * sqrt(safeStiffness * safeMass))
 
         if dampingRatio >= 1 {
-            // Overdamped or critically damped
-            // Settling time ≈ 4 * τ where τ = m / c
-            return 4 * safeMass / safeDamping
+            // Natural frequency: ω_n = sqrt(k / m)
+            let naturalFrequency = sqrt(safeStiffness / safeMass)
+            if dampingRatio == 1 {
+                // Critically damped: settling time ≈ 4 / ω_n
+                return 4 / naturalFrequency
+            } else {
+                // Overdamped: settling time ≈ 4 / (ω_n * (ζ - sqrt(ζ² - 1)))
+                // Uses the slower eigenvalue for accurate settling
+                let slowEigenvalue = naturalFrequency * (dampingRatio - sqrt(dampingRatio * dampingRatio - 1))
+                return 4 / slowEigenvalue
+            }
         } else {
             // Underdamped
             // Natural frequency: ω_n = sqrt(k / m)

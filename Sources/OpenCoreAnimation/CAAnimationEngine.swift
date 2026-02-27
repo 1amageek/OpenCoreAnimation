@@ -160,16 +160,20 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
     /// Called by the display link on each frame refresh.
     ///
     /// This method:
-    /// 1. Processes animation completions for all layers
-    /// 2. Renders the layer tree using presentation layer values
+    /// 1. Renders the layer tree using presentation layer values
+    /// 2. Processes animation completions for all layers
+    ///
+    /// Rendering must happen before completion processing so that
+    /// `.forwards` fill mode animations render their final frame
+    /// before being removed.
     public func displayLinkDidFire(_ displayLink: CADisplayLink) {
-        // Process animation completions for all layers in the tree
-        processAnimationsRecursively(rootLayer)
-
-        // Render the layer tree using internal delegate
+        // Render the layer tree first using internal delegate
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
             delegate.render(layer: rootLayer)
         }
+
+        // Process animation completions after rendering
+        processAnimationsRecursively(rootLayer)
     }
 
     // MARK: - Private Methods
@@ -198,9 +202,9 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
     /// Use this method when you need to render without the animation loop running,
     /// for example, after making changes that should be immediately visible.
     public func renderFrame() {
-        processAnimationsRecursively(rootLayer)
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
             delegate.render(layer: rootLayer)
         }
+        processAnimationsRecursively(rootLayer)
     }
 }

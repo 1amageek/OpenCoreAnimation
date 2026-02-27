@@ -66,7 +66,7 @@ open class CAReplicatorLayer: CALayer {
         }
     }
 
-    internal var _instanceColor: CGColor?
+    internal var _instanceColor: CGColor? = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
     /// The color used to multiply the source object. Animatable.
     open var instanceColor: CGColor? {
         get { return _instanceColor }

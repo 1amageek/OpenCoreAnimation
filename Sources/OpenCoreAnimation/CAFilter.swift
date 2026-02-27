@@ -1,4 +1,4 @@
-// CGImageMetadataTag.swift
+// CAFilter.swift
 // OpenCoreAnimation
 //
 // Full API compatibility with Apple's CoreAnimation framework

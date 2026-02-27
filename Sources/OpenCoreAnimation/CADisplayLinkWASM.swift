@@ -90,7 +90,7 @@ open class CADisplayLink: @unchecked Sendable {
     private var selector: Selector
     private var isRunning: Bool = false
     private var animationFrameCallback: JSClosure?
-    private var animationFrameId: Int32 = 0
+    private var animationFrameId: Int = 0
 
     /// The timestamp of the last frame that was dispatched to the delegate.
     private var lastDispatchedTimestamp: CFTimeInterval = 0
@@ -213,7 +213,7 @@ open class CADisplayLink: @unchecked Sendable {
     private func requestNextFrame() {
         guard let callback = animationFrameCallback else { return }
         let result = JSObject.global.requestAnimationFrame!(callback)
-        animationFrameId = Int32(result.number ?? 0)
+        animationFrameId = Int(result.number ?? 0)
     }
 
     private func stopAnimationLoop() {

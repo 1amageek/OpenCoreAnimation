@@ -1,7 +1,7 @@
-// CGImageMetadataTag.swift
+// CALayoutManager.swift
 // OpenCoreAnimation
 //
-// Full API compatibility with Apple's ImageIO framework
+// Full API compatibility with Apple's CoreAnimation framework
 
 import Foundation
 import OpenCoreGraphics

@@ -1,4 +1,4 @@
-// CGImageMetadataTag.swift
+// CAAnimationGroup.swift
 // OpenCoreAnimation
 //
 // Full API compatibility with Apple's CoreAnimation framework

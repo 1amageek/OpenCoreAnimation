@@ -383,7 +383,10 @@ public enum CAWebGPUShaders {
 
         // Apply corner radius if set
         if (hasAnyCornerRadius && uniforms.layerSize.x > 0.0 && uniforms.layerSize.y > 0.0) {
-            let pixelCoord = (input.texCoord - 0.5) * uniforms.layerSize;
+            // Compensate for V-flip: texCoord.y is flipped for texture sampling,
+            // but SDF needs unflipped coordinates for correct corner placement.
+            let sdfCoord = vec2<f32>(input.texCoord.x, 1.0 - input.texCoord.y);
+            let pixelCoord = (sdfCoord - 0.5) * uniforms.layerSize;
             let halfSize = uniforms.layerSize * 0.5;
             let dist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
             let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);

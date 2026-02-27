@@ -1,4 +1,4 @@
-// CGImageMetadataTag.swift
+// CALayerDelegate.swift
 // OpenCoreAnimation
 //
 // Full API compatibility with Apple's CoreAnimation framework

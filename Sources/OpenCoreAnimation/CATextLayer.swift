@@ -1,8 +1,8 @@
 //
-//  CATextLayerTruncationMode.swift
+//  CATextLayer.swift
 //  OpenCoreAnimation
 //
-//  Internal delegate protocol for rendering layer trees.
+//  Full API compatibility with Apple's CoreAnimation framework.
 //
 
 import Foundation
@@ -96,7 +96,7 @@ open class CATextLayer: CALayer {
         }
     }
 
-    internal var _foregroundColor: CGColor?
+    internal var _foregroundColor: CGColor? = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
     /// The color used to render the receiver's text. Animatable.
     open var foregroundColor: CGColor? {
         get { return _foregroundColor }

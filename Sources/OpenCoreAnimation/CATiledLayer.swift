@@ -84,12 +84,12 @@ open class CATiledLayer: CALayer {
     // MARK: - Tile Cache
 
     /// Represents a unique identifier for a tile.
-    public struct TileKey: Hashable {
-        public let column: Int
-        public let row: Int
-        public let lodLevel: Int
+    internal struct TileKey: Hashable {
+        internal let column: Int
+        internal let row: Int
+        internal let lodLevel: Int
 
-        public init(column: Int, row: Int, lodLevel: Int) {
+        internal init(column: Int, row: Int, lodLevel: Int) {
             self.column = column
             self.row = row
             self.lodLevel = lodLevel
@@ -109,7 +109,7 @@ open class CATiledLayer: CALayer {
     ///
     /// Call this when the layer's content needs to be completely redrawn,
     /// such as when the underlying data changes.
-    public func clearTileCache() {
+    internal func clearTileCache() {
         tileCache.removeAll()
         loadingTiles.removeAll()
         setNeedsDisplay()
@@ -118,18 +118,18 @@ open class CATiledLayer: CALayer {
     /// Clears a specific tile from the cache.
     ///
     /// Use this to invalidate individual tiles when only part of the content changes.
-    public func clearTile(at key: TileKey) {
+    internal func clearTile(at key: TileKey) {
         tileCache.removeValue(forKey: key)
         loadingTiles.remove(key)
     }
 
     /// Returns the cached image for a tile, or nil if not cached.
-    public func cachedImage(for key: TileKey) -> CGImage? {
+    internal func cachedImage(for key: TileKey) -> CGImage? {
         return tileCache[key]
     }
 
     /// Stores a rendered tile image in the cache.
-    public func cacheImage(_ image: CGImage, for key: TileKey) {
+    internal func cacheImage(_ image: CGImage, for key: TileKey) {
         tileCache[key] = image
         loadingTiles.remove(key)
     }

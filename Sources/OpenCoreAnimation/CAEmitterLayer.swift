@@ -1,4 +1,4 @@
-// CGImageMetadataTag.swift
+// CAEmitterLayer.swift
 // OpenCoreAnimation
 //
 // Full API compatibility with Apple's CoreAnimation framework
@@ -23,7 +23,7 @@ open class CAEmitterLayer: CALayer {
             self._emitterPosition = emitterLayer._emitterPosition
             self._emitterZPosition = emitterLayer._emitterZPosition
             self._emitterSize = emitterLayer._emitterSize
-            self.emitterDepth = emitterLayer.emitterDepth
+            self._emitterDepth = emitterLayer._emitterDepth
             self.emitterShape = emitterLayer.emitterShape
             self.emitterMode = emitterLayer.emitterMode
             self.renderMode = emitterLayer.renderMode
@@ -31,7 +31,7 @@ open class CAEmitterLayer: CALayer {
             self._birthRate = emitterLayer._birthRate
             self._lifetime = emitterLayer._lifetime
             self._velocity = emitterLayer._velocity
-            self.scale = emitterLayer.scale
+            self._scale = emitterLayer._scale
             self._spin = emitterLayer._spin
             self.seed = emitterLayer.seed
         }
@@ -77,8 +77,16 @@ open class CAEmitterLayer: CALayer {
         }
     }
 
+    internal var _emitterDepth: CGFloat = 0
     /// The depth of the particle emitter. Animatable.
-    open var emitterDepth: CGFloat = 0
+    open var emitterDepth: CGFloat {
+        get { return _emitterDepth }
+        set {
+            let oldValue = _emitterDepth
+            _emitterDepth = newValue
+            CATransaction.registerChange(layer: self, keyPath: "emitterDepth", oldValue: oldValue, newValue: newValue)
+        }
+    }
 
     /// The shape of the particle emitter.
     open var emitterShape: CAEmitterLayerEmitterShape = .point
@@ -127,8 +135,16 @@ open class CAEmitterLayer: CALayer {
         }
     }
 
-    /// Defines a multiplier applied to the cell-defined scale.
-    open var scale: Float = 1
+    internal var _scale: Float = 1
+    /// Defines a multiplier applied to the cell-defined scale. Animatable.
+    open var scale: Float {
+        get { return _scale }
+        set {
+            let oldValue = _scale
+            _scale = newValue
+            CATransaction.registerChange(layer: self, keyPath: "scale", oldValue: oldValue, newValue: newValue)
+        }
+    }
 
     internal var _spin: Float = 1
     /// Defines a multiplier applied to the cell-defined spin. Animatable.
@@ -151,9 +167,11 @@ open class CAEmitterLayer: CALayer {
         "emitterPosition",
         "emitterZPosition",
         "emitterSize",
+        "emitterDepth",
         "birthRate",
         "lifetime",
         "velocity",
+        "scale",
         "spin"
     ]
 

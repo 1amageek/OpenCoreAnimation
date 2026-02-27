@@ -97,6 +97,11 @@ open class CADisplayLink: @unchecked Sendable {
         invalidate()
     }
 
+    /// The run loop to which the timer is attached.
+    private var attachedRunLoop: RunLoop?
+    /// The run loop mode used for scheduling.
+    private var attachedMode: RunLoop.Mode?
+
     // MARK: - Scheduling
 
     /// Registers the display link with a run loop.
@@ -107,6 +112,8 @@ open class CADisplayLink: @unchecked Sendable {
     open func add(to runloop: RunLoop, forMode mode: RunLoop.Mode) {
         guard !isRunning else { return }
         isRunning = true
+        attachedRunLoop = runloop
+        attachedMode = mode
         if !isPaused {
             startTimer()
         }
@@ -116,6 +123,8 @@ open class CADisplayLink: @unchecked Sendable {
     open func invalidate() {
         isRunning = false
         stopTimer()
+        attachedRunLoop = nil
+        attachedMode = nil
     }
 
     /// Removes the display link from the run loop for the given mode.
@@ -133,7 +142,7 @@ open class CADisplayLink: @unchecked Sendable {
         stopTimer()
 
         let interval = duration
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+        let newTimer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             guard self.isRunning && !self.isPaused else { return }
 
@@ -144,6 +153,12 @@ open class CADisplayLink: @unchecked Sendable {
                 delegate.displayLinkDidFire(self)
             }
         }
+        timer = newTimer
+
+        // Add the timer to the stored run loop and mode
+        let runloop = attachedRunLoop ?? .main
+        let mode = attachedMode ?? .common
+        runloop.add(newTimer, forMode: mode)
     }
 
     private func stopTimer() {

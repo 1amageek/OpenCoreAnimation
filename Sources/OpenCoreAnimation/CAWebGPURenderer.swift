@@ -222,24 +222,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         var maxX: Float = -.greatestFiniteMagnitude
         var maxY: Float = -.greatestFiniteMagnitude
 
+        // Viewport dimensions for NDC-to-screen conversion
+        let viewWidth = Float(size.width)
+        let viewHeight = Float(size.height)
+
         for corner in corners {
             // Apply model matrix (which includes projection)
             let transformed = modelMatrix * corner
             // Perspective divide (w should be 1 for orthographic, but handle it anyway)
             let w = transformed.w != 0 ? transformed.w : 1
-            let x = transformed.x / w
-            let y = transformed.y / w
+            let ndcX = transformed.x / w
+            let ndcY = transformed.y / w
 
-            minX = min(minX, x)
-            minY = min(minY, y)
-            maxX = max(maxX, x)
-            maxY = max(maxY, y)
+            // Convert NDC [-1,1] to screen coordinates [0, viewWidth/viewHeight]
+            let screenX = (ndcX + 1) * 0.5 * viewWidth
+            let screenY = (ndcY + 1) * 0.5 * viewHeight
+
+            minX = min(minX, screenX)
+            minY = min(minY, screenY)
+            maxX = max(maxX, screenX)
+            maxY = max(maxY, screenY)
         }
 
         // Clamp to viewport bounds
-        let viewWidth = Float(size.width)
-        let viewHeight = Float(size.height)
-
         let clampedMinX = max(0, minX)
         let clampedMinY = max(0, minY)
         let clampedMaxX = min(viewWidth, maxX)
@@ -346,6 +351,32 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Bind group for filter vertical blur (samples from filterBlurTexture).
     private var filterBlurVerticalBindGroup: GPUBindGroup?
 
+    // MARK: - Pre-Render Dedicated Buffers
+
+    /// Dedicated vertex buffer for pre-render passes (shadow mask, filter source).
+    /// Prevents overwriting main render vertex data at offset 0.
+    private var preRenderVertexBuffer: GPUBuffer?
+
+    /// Dedicated uniform buffer for pre-render passes.
+    private var preRenderUniformBuffer: GPUBuffer?
+
+    /// Dedicated bind group for the pre-render uniform buffer.
+    private var preRenderBindGroup: GPUBindGroup?
+
+    // MARK: - Composite Buffers
+
+    /// Pre-allocated vertex buffer for shadow composite rendering.
+    private var shadowCompositeVertexBuffer: GPUBuffer?
+
+    /// Pre-allocated uniform buffer for shadow composite rendering.
+    private var shadowCompositeUniformBuffer: GPUBuffer?
+
+    /// Pre-allocated vertex buffer for filter composite rendering.
+    private var filterCompositeVertexBuffer: GPUBuffer?
+
+    /// Pre-allocated uniform buffer for filter composite rendering.
+    private var filterCompositeUniformBuffer: GPUBuffer?
+
     /// Filter composite pipeline for blending filtered result with optional tint.
     private var filterCompositePipeline: GPURenderPipeline?
 
@@ -379,6 +410,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Current stencil reference value for nested masks.
     private var currentStencilValue: UInt32 = 0
+
+    /// Tracks whether rendering is inside a mask context (stencil test is active).
+    /// When true, textured and composite pipelines must use stencil-aware variants.
+    private var insideMaskContext: Bool = false
+
+    /// Stencil-aware textured pipeline (tests stencil buffer for mask).
+    private var texturedStencilPipeline: GPURenderPipeline?
+
+    /// Stencil-aware shadow composite pipeline (tests stencil buffer for mask).
+    private var shadowCompositeStencilPipeline: GPURenderPipeline?
 
     // MARK: - Particle System (CAEmitterLayer)
 
@@ -554,7 +595,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let width = canvas.width.number ?? 800
         let height = canvas.height.number ?? 600
         size = CGSize(width: width, height: height)
-        print("CAWebGPURenderer initialized with size: \(Int(width))x\(Int(height))")
 
         // Create depth texture
         createDepthTexture(width: Int(width), height: Int(height))
@@ -570,6 +610,53 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create stencil pipelines for CALayer.mask
         try createStencilPipelines(device: device)
+
+        // Create dedicated pre-render buffers (6 vertices max for a quad)
+        let preRenderVertexSize = UInt64(6 * MemoryLayout<CARendererVertex>.stride)
+        preRenderVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: preRenderVertexSize,
+            usage: [.vertex, .copyDst]
+        ))
+
+        let preRenderUniformSize = Self.alignedUniformSize
+        preRenderUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: preRenderUniformSize,
+            usage: [.uniform, .copyDst]
+        ))
+
+        // Create bind group for pre-render uniform buffer
+        if let bindGroupLayout = bindGroupLayout, let preRenderUniformBuffer = preRenderUniformBuffer {
+            preRenderBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                layout: bindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .buffer(GPUBufferBinding(
+                            buffer: preRenderUniformBuffer,
+                            size: UInt64(MemoryLayout<CARendererUniforms>.stride)
+                        ))
+                    )
+                ]
+            ))
+        }
+
+        // Create composite buffers
+        shadowCompositeVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: preRenderVertexSize,
+            usage: [.vertex, .copyDst]
+        ))
+        shadowCompositeUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: preRenderUniformSize,
+            usage: [.uniform, .copyDst]
+        ))
+        filterCompositeVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: preRenderVertexSize,
+            usage: [.vertex, .copyDst]
+        ))
+        filterCompositeUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: preRenderUniformSize,
+            usage: [.uniform, .copyDst]
+        ))
     }
 
     /// Creates stencil pipelines for CALayer.mask functionality.
@@ -804,6 +891,64 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(pipelineLayout)
         ))
+
+        // Create stencil-aware textured pipeline (tests stencil buffer for mask).
+        // Same as texturedPipeline but with stencilFront.compare: .equal instead of .always.
+        texturedStencilPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: shaderModule,
+                entryPoint: "vertexMain",
+                buffers: [
+                    GPUVertexBufferLayout(
+                        arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                        attributes: [
+                            GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                            GPUVertexAttribute(format: .float32x2, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride), shaderLocation: 1),
+                            GPUVertexAttribute(format: .float32x4, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2), shaderLocation: 2)
+                        ]
+                    )
+                ]
+            ),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plusStencil8,
+                depthWriteEnabled: true,
+                depthCompare: .lessEqual,
+                stencilFront: GPUStencilFaceState(
+                    compare: .equal,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                ),
+                stencilBack: GPUStencilFaceState(
+                    compare: .equal,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                )
+            ),
+            fragment: GPUFragmentState(
+                module: shaderModule,
+                entryPoint: "fragmentMain",
+                targets: [
+                    GPUColorTargetState(
+                        format: preferredFormat,
+                        blend: GPUBlendState(
+                            color: GPUBlendComponent(
+                                srcFactor: .srcAlpha,
+                                dstFactor: .oneMinusSrcAlpha,
+                                operation: .add
+                            ),
+                            alpha: GPUBlendComponent(
+                                srcFactor: .one,
+                                dstFactor: .oneMinusSrcAlpha,
+                                operation: .add
+                            )
+                        )
+                    )
+                ]
+            ),
+            layout: .layout(pipelineLayout)
+        ))
     }
 
     /// Creates shadow and blur pipelines.
@@ -968,6 +1113,99 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(shadowCompositePipelineLayout)
         ))
+
+        // Create stencil-aware shadow composite pipeline (tests stencil buffer for mask).
+        // Same as shadowCompositePipeline but with stencilFront.compare: .equal instead of .always.
+        shadowCompositeStencilPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: shadowCompositeShaderModule,
+                entryPoint: "vertexMain",
+                buffers: [
+                    GPUVertexBufferLayout(
+                        arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                        attributes: [
+                            GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                            GPUVertexAttribute(format: .float32x2, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride), shaderLocation: 1),
+                            GPUVertexAttribute(format: .float32x4, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2), shaderLocation: 2)
+                        ]
+                    )
+                ]
+            ),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plusStencil8,
+                depthWriteEnabled: false,
+                depthCompare: .lessEqual,
+                stencilFront: GPUStencilFaceState(
+                    compare: .equal,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                ),
+                stencilBack: GPUStencilFaceState(
+                    compare: .equal,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                )
+            ),
+            fragment: GPUFragmentState(
+                module: shadowCompositeShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [
+                    GPUColorTargetState(
+                        format: preferredFormat,
+                        blend: GPUBlendState(
+                            color: GPUBlendComponent(
+                                srcFactor: .srcAlpha,
+                                dstFactor: .oneMinusSrcAlpha,
+                                operation: .add
+                            ),
+                            alpha: GPUBlendComponent(
+                                srcFactor: .one,
+                                dstFactor: .oneMinusSrcAlpha,
+                                operation: .add
+                            )
+                        )
+                    )
+                ]
+            ),
+            layout: .layout(shadowCompositePipelineLayout)
+        ))
+
+        // Create shadow mask pipeline (same as main pipeline but WITHOUT depth/stencil).
+        // The shadow mask render pass has no depth attachment, so using the main pipeline
+        // (which has depthStencil state) would cause a mismatch.
+        guard let bindGroupLayout = bindGroupLayout else { return }
+        let maskPipelineLayout = device.createPipelineLayout(descriptor: GPUPipelineLayoutDescriptor(
+            bindGroupLayouts: [bindGroupLayout]
+        ))
+        let maskShaderModule = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
+            code: CAWebGPUShaders.main
+        ))
+        shadowMaskPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: maskShaderModule,
+                entryPoint: "vertexMain",
+                buffers: [
+                    GPUVertexBufferLayout(
+                        arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                        attributes: [
+                            GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                            GPUVertexAttribute(format: .float32x2, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride), shaderLocation: 1),
+                            GPUVertexAttribute(format: .float32x4, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2), shaderLocation: 2)
+                        ]
+                    )
+                ]
+            ),
+            fragment: GPUFragmentState(
+                module: maskShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [
+                    GPUColorTargetState(format: .rgba8unorm)
+                ]
+            ),
+            layout: .layout(maskPipelineLayout)
+        ))
     }
 
     /// Creates or recreates shadow textures for the given size.
@@ -1090,7 +1328,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     }
 
     public func resize(width: Int, height: Int) {
-        print("CAWebGPURenderer.resize called with: \(width)x\(height)")
         size = CGSize(width: width, height: height)
 
         // Update canvas size
@@ -1295,6 +1532,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         blurVerticalBindGroup = nil
         blurredShadowCache.removeAll()
 
+        // Pre-render buffers
+        preRenderVertexBuffer = nil
+        preRenderUniformBuffer = nil
+        preRenderBindGroup = nil
+        shadowCompositeVertexBuffer = nil
+        shadowCompositeUniformBuffer = nil
+        filterCompositeVertexBuffer = nil
+        filterCompositeUniformBuffer = nil
+
         // Filter resources
         filterSourceTexture = nil
         filterBlurTexture = nil
@@ -1314,6 +1560,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Stencil resources
         stencilWritePipeline = nil
         stencilTestPipeline = nil
+        texturedStencilPipeline = nil
+        shadowCompositeStencilPipeline = nil
+        insideMaskContext = false
         currentStencilValue = 0
 
         // Particle resources
@@ -1712,6 +1961,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if let stencilTestPipeline = stencilTestPipeline {
             renderPass.setPipeline(stencilTestPipeline)
         }
+        insideMaskContext = true
     }
 
     /// Clears the stencil mask after layer rendering is complete.
@@ -1726,6 +1976,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             renderPass.setPipeline(pipeline)
             renderPass.setStencilReference(0)
         }
+        insideMaskContext = false
     }
 
     // MARK: - Replicator Layer Rendering
@@ -2043,21 +2294,27 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 height: scaledSize.height
             )
         case .top:
-            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: 0, width: imageSize.width, height: imageSize.height)
-        case .bottom:
+            // Y-up: top = high Y value
             return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        case .bottom:
+            // Y-up: bottom = Y=0
+            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: 0, width: imageSize.width, height: imageSize.height)
         case .left:
             return CGRect(x: 0, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
         case .right:
             return CGRect(x: boundsSize.width - imageSize.width, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
         case .topLeft:
-            return CGRect(origin: .zero, size: imageSize)
-        case .topRight:
-            return CGRect(x: boundsSize.width - imageSize.width, y: 0, width: imageSize.width, height: imageSize.height)
-        case .bottomLeft:
+            // Y-up: top-left = (0, boundsHeight - imageHeight)
             return CGRect(x: 0, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
-        case .bottomRight:
+        case .topRight:
+            // Y-up: top-right = (boundsWidth - imageWidth, boundsHeight - imageHeight)
             return CGRect(x: boundsSize.width - imageSize.width, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
+        case .bottomLeft:
+            // Y-up: bottom-left = origin
+            return CGRect(origin: .zero, size: imageSize)
+        case .bottomRight:
+            // Y-up: bottom-right = (boundsWidth - imageWidth, 0)
+            return CGRect(x: boundsSize.width - imageSize.width, y: 0, width: imageSize.width, height: imageSize.height)
         default:
             return CGRect(origin: .zero, size: boundsSize)
         }
@@ -2296,7 +2553,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ))
 
             // Render this patch
-            renderPass.setPipeline(texturedPipeline)
+            renderPass.setPipeline(insideMaskContext ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
             renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
             renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
             renderPass.draw(vertexCount: 6)
@@ -2463,7 +2720,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         // Switch to textured pipeline and render
-        renderPass.setPipeline(texturedPipeline)
+        renderPass.setPipeline(insideMaskContext ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -2629,9 +2886,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         modelMatrix: Matrix4x4,
         bindGroup: GPUBindGroup
     ) {
-        print("[DEBUG] renderTextLayer called")
         guard let string = textLayer.string else {
-            print("[DEBUG] renderTextLayer: string is nil, returning")
             return
         }
         guard let texturedPipeline = texturedPipeline,
@@ -2640,7 +2895,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let pipeline = pipeline else {
-            print("[DEBUG] renderTextLayer: missing pipeline resources, returning")
             return
         }
 
@@ -2650,10 +2904,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         } else {
             text = String(describing: string)
         }
-        print("[DEBUG] renderTextLayer: text='\(text)'")
 
         guard !text.isEmpty else {
-            print("[DEBUG] renderTextLayer: text is empty, returning")
             return
         }
 
@@ -2663,7 +2915,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if textLayer.bounds.width > 0 && textLayer.bounds.height > 0 {
             width = Int(textLayer.bounds.width)
             height = Int(textLayer.bounds.height)
-            print("[DEBUG] renderTextLayer: using bounds size \(width)x\(height)")
         } else {
             // Measure text size using Canvas2D
             let measuredSize = measureTextSize(
@@ -2675,14 +2926,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
             width = Int(ceil(measuredSize.width))
             height = Int(ceil(measuredSize.height))
-            print("[DEBUG] renderTextLayer: measured size \(width)x\(height)")
         }
 
         guard width > 0 && height > 0 else {
-            print("[DEBUG] renderTextLayer: invalid size \(width)x\(height), returning")
             return
         }
-        print("[DEBUG] renderTextLayer: proceeding with size \(width)x\(height)")
 
         // Create cache key based on text content and properties
         let cacheKey = "\(text)_\(width)x\(height)_\(textLayer.fontSize)_\(textLayer.alignmentMode.rawValue)"
@@ -2886,7 +3134,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         // Switch to textured pipeline and draw
-        renderPass.setPipeline(texturedPipeline)
+        renderPass.setPipeline(insideMaskContext ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -3405,28 +3653,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         modelMatrix: Matrix4x4,
         bindGroup: GPUBindGroup
     ) {
-        print("[DEBUG] renderShapeLayer called")
         guard let path = shapeLayer.path else {
-            print("[DEBUG] renderShapeLayer: path is nil, returning")
             return
         }
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else {
-            print("[DEBUG] renderShapeLayer: missing buffers, returning")
             return
         }
-
-        print("[DEBUG] renderShapeLayer: path bounds = \(path.boundingBox)")
 
         // Flatten the path
         let polylines = flattenPath(path)
-        print("[DEBUG] renderShapeLayer: polylines count = \(polylines.count)")
         guard !polylines.isEmpty else {
-            print("[DEBUG] renderShapeLayer: no polylines, returning")
             return
         }
-
-        print("[DEBUG] renderShapeLayer: fillColor = \(String(describing: shapeLayer.fillColor)), strokeColor = \(String(describing: shapeLayer.strokeColor))")
 
         // Render fill if fillColor is set
         if let fillColor = shapeLayer.fillColor {
@@ -3698,8 +3937,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) {
         guard let device = device,
               let pipeline = pipeline,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
+              let preRenderVertexBuffer = preRenderVertexBuffer,
+              let preRenderUniformBuffer = preRenderUniformBuffer,
+              let preRenderBindGroup = preRenderBindGroup,
               let shadowMaskTexture = shadowMaskTexture,
               let shadowBlurTexture = shadowBlurTexture,
               let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
@@ -3750,9 +3990,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadii: presentationLayer.cornerRadiiComponents
         )
 
-        // Write mask uniforms
+        // Write mask uniforms to dedicated pre-render buffer
         let maskUniformData = createFloat32Array(from: &maskUniforms)
-        device.queue.writeBuffer(uniformBuffer, bufferOffset: 0, data: maskUniformData)
+        device.queue.writeBuffer(preRenderUniformBuffer, bufferOffset: 0, data: maskUniformData)
 
         // Create white vertices for the mask
         let whiteColor = SIMD4<Float>(1, 1, 1, 1)
@@ -3766,13 +4006,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ]
 
         let maskVertexData = createFloat32Array(from: &maskVertices)
-        device.queue.writeBuffer(vertexBuffer, bufferOffset: 0, data: maskVertexData)
+        device.queue.writeBuffer(preRenderVertexBuffer, bufferOffset: 0, data: maskVertexData)
 
-        maskRenderPass.setPipeline(pipeline)
-        if let bindGroup = bindGroup {
-            maskRenderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [0])
-        }
-        maskRenderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: 0)
+        // Use shadowMaskPipeline (no depth/stencil) since the mask pass has no depth attachment
+        maskRenderPass.setPipeline(shadowMaskPipeline ?? pipeline)
+        maskRenderPass.setBindGroup(0, bindGroup: preRenderBindGroup, dynamicOffsets: [0])
+        maskRenderPass.setVertexBuffer(0, buffer: preRenderVertexBuffer, offset: 0)
         maskRenderPass.draw(vertexCount: 6)
         maskRenderPass.end()
 
@@ -3833,8 +4072,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) {
         guard let device = device,
               let pipeline = pipeline,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
+              let preRenderVertexBuffer = preRenderVertexBuffer,
+              let preRenderUniformBuffer = preRenderUniformBuffer,
+              let preRenderBindGroup = preRenderBindGroup,
               let filterSourceTexture = filterSourceTexture,
               let filterBlurTexture = filterBlurTexture,
               let filterResultTexture = filterResultTexture,
@@ -3874,7 +4114,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         let contentUniformData = createFloat32Array(from: &contentUniforms)
-        device.queue.writeBuffer(uniformBuffer, bufferOffset: 0, data: contentUniformData)
+        device.queue.writeBuffer(preRenderUniformBuffer, bufferOffset: 0, data: contentUniformData)
 
         // Render background color if present
         if let backgroundColor = presentationLayer.backgroundColor {
@@ -3900,13 +4140,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ]
 
             let vertexData = createFloat32Array(from: &vertices)
-            device.queue.writeBuffer(vertexBuffer, bufferOffset: 0, data: vertexData)
+            device.queue.writeBuffer(preRenderVertexBuffer, bufferOffset: 0, data: vertexData)
 
             contentRenderPass.setPipeline(pipeline)
-            if let bindGroup = bindGroup {
-                contentRenderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [0])
-            }
-            contentRenderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: 0)
+            contentRenderPass.setBindGroup(0, bindGroup: preRenderBindGroup, dynamicOffsets: [0])
+            contentRenderPass.setVertexBuffer(0, buffer: preRenderVertexBuffer, offset: 0)
             contentRenderPass.draw(vertexCount: 6)
         }
 
@@ -4078,20 +4316,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
             )
 
-            // Create a temporary buffer for shadow uniforms
-            let shadowUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-                size: UInt64(MemoryLayout<ShadowUniforms>.stride),
-                usage: [.uniform, .copyDst]
-            ))
+            // Use pre-allocated shadow composite uniform buffer
+            guard let shadowCompositeUniformBuffer = shadowCompositeUniformBuffer else { return }
 
             let shadowUniformData = createFloat32Array(from: &shadowUniforms)
-            device.queue.writeBuffer(shadowUniformBuffer, bufferOffset: 0, data: shadowUniformData)
+            device.queue.writeBuffer(shadowCompositeUniformBuffer, bufferOffset: 0, data: shadowUniformData)
 
             // Create shadow composite bind group with the blurred texture
             let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
                 layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
                 entries: [
-                    GPUBindGroupEntry(binding: 0, resource: .buffer(shadowUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
+                    GPUBindGroupEntry(binding: 0, resource: .buffer(shadowCompositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
                     GPUBindGroupEntry(binding: 1, resource: .textureView(shadowMaskTexture.createView())),
                     GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
                 ]
@@ -4113,7 +4348,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
-            renderPass.setPipeline(shadowCompositePipeline)
+            renderPass.setPipeline(insideMaskContext ? (shadowCompositeStencilPipeline ?? shadowCompositePipeline) : shadowCompositePipeline)
             renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
             renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
             renderPass.draw(vertexCount: 6)
@@ -4235,20 +4470,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
         )
 
-        // Create a temporary buffer for filter uniforms
-        let filterUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: UInt64(MemoryLayout<ShadowUniforms>.stride),
-            usage: [.uniform, .copyDst]
-        ))
+        // Use pre-allocated filter composite uniform buffer
+        guard let filterCompositeUniformBuffer = filterCompositeUniformBuffer else { return }
 
         let filterUniformData = createFloat32Array(from: &filterUniforms)
-        device.queue.writeBuffer(filterUniformBuffer, bufferOffset: 0, data: filterUniformData)
+        device.queue.writeBuffer(filterCompositeUniformBuffer, bufferOffset: 0, data: filterUniformData)
 
         // Create composite bind group with the blurred filter texture
         let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
             layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
             entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(filterUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
+                GPUBindGroupEntry(binding: 0, resource: .buffer(filterCompositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
                 GPUBindGroupEntry(binding: 1, resource: .textureView(filterResultTexture.createView())),
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
@@ -4256,7 +4488,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
-        renderPass.setPipeline(shadowCompositePipeline)
+        renderPass.setPipeline(insideMaskContext ? (shadowCompositeStencilPipeline ?? shadowCompositePipeline) : shadowCompositePipeline)
         renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -4686,14 +4918,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ) else { return }
 
         // Create vertices with white color (texture provides color)
+        // V-flip: in Y-up system, bottom vertices (y=0) get V=1, top vertices (y=1) get V=0
         let white = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else { return }
@@ -4730,7 +4963,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ]
         ))
 
-        renderPass.setPipeline(texturedPipeline)
+        renderPass.setPipeline(insideMaskContext ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)

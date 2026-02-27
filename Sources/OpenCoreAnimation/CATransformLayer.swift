@@ -30,8 +30,23 @@ open class CATransformLayer: CALayer {
 
     // MARK: - Hit Testing
 
-    /// Transform layers do not render their content, so hitTest always returns nil.
+    /// Transform layers do not render their own content, but forward hit testing
+    /// to sublayers. A CATransformLayer never returns itself from hitTest.
     open override func hitTest(_ p: CGPoint) -> CALayer? {
+        guard !isHidden, opacity > 0 else { return nil }
+
+        // Check sublayers in reverse order (front-to-back)
+        if let sublayers = sublayers {
+            for sublayer in sublayers.reversed() {
+                // Convert point to sublayer's coordinate space
+                let convertedPoint = sublayer.convert(p, from: self)
+                if let hit = sublayer.hitTest(convertedPoint) {
+                    return hit
+                }
+            }
+        }
+
+        // Never return self for CATransformLayer
         return nil
     }
 }

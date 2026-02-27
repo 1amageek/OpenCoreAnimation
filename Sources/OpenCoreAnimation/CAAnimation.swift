@@ -62,7 +62,11 @@ open class CAAnimation: CAMediaTiming, CAAction {
     /// The key used when this animation was added to the layer.
     internal var animationKey: String?
 
-    /// Calculates the total duration including repeats and autoreverses.
+    /// Calculates the total wall-clock duration including repeats, autoreverses, and speed.
+    ///
+    /// The returned duration represents actual elapsed time (wall-clock),
+    /// accounting for the `speed` multiplier. When `speed` is 0, the animation
+    /// never completes, so `.infinity` is returned.
     internal var totalDuration: CFTimeInterval {
         // Get base duration - subclasses may override effectiveBaseDuration
         let baseDuration = effectiveBaseDuration
@@ -81,7 +85,13 @@ open class CAAnimation: CAMediaTiming, CAAction {
             total *= 2
         }
 
-        return total
+        // Convert from local time to wall-clock time by dividing by abs(speed).
+        // speed=0 means the animation is paused and never completes.
+        let absSpeed = abs(Double(speed))
+        if absSpeed < 0.0001 {
+            return .infinity
+        }
+        return total / absSpeed
     }
 
     /// The effective base duration for the animation.
