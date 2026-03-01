@@ -12,6 +12,13 @@ OpenCoreAnimation is a Swift library that provides **full API compatibility with
 - Identical type names, method signatures, and property names
 - Same behavior and semantics as CoreAnimation
 - Code written for CoreAnimation should compile and work without modification when using OpenCoreAnimation
+- **Property types must exactly match Apple's Swift interface** — Do NOT guess types based on property names or similar APIs. Always verify against Apple's documentation. A type mismatch (`Float` vs `CGFloat`) is a compile error for users.
+- **Foundation types unavailable on WASM** (`NSNumber`, `NSValue`, etc.) must be replaced with the equivalent Swift numeric type that preserves the same precision and semantics (e.g., `[NSNumber]?` → `[CGFloat]?`)
+
+### Float vs CGFloat の使い分け
+
+- **公開API**: Appleの定義に従う。自分で判断しない。
+- **内部実装**: `CGFloat`プロパティから流れる値の計算には`CGFloat`を使う。`Float`はGPUに渡すデータ（頂点、uniform）、および`Float`で定義された既存APIとの境界でのみ使う。
 
 ### How `canImport` Works
 

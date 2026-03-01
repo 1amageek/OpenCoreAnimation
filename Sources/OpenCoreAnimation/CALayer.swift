@@ -1354,16 +1354,16 @@ open class CALayer: CAMediaTiming, Hashable {
         case "locations":
             guard let gradientLayer = layer as? CAGradientLayer,
                   let modelGradientLayer = self as? CAGradientLayer else { return }
-            guard let fromLocations = (animation.fromValue as? [Float]) ?? modelGradientLayer._locations,
-                  let toLocations = (animation.toValue as? [Float]) ?? modelGradientLayer._locations else { return }
+            guard let fromLocations = (animation.fromValue as? [CGFloat]) ?? modelGradientLayer._locations,
+                  let toLocations = (animation.toValue as? [CGFloat]) ?? modelGradientLayer._locations else { return }
 
             // Interpolate each location in the array
             let count = min(fromLocations.count, toLocations.count)
-            var interpolatedLocations: [Float] = []
+            var interpolatedLocations: [CGFloat] = []
             for i in 0..<count {
                 let from = fromLocations[i]
                 let to = toLocations[i]
-                interpolatedLocations.append(from + Float(progress) * (to - from))
+                interpolatedLocations.append(from + CGFloat(progress) * (to - from))
             }
             gradientLayer._locations = interpolatedLocations
 
@@ -1540,12 +1540,12 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // For paced modes, remap progress based on arc length
         let effectiveProgress: CFTimeInterval
-        var effectiveKeyTimes: [Float]
+        var effectiveKeyTimes: [CGFloat]
 
         switch animation.calculationMode {
         case .paced, .cubicPaced:
             // Calculate arc-length parameterized progress
-            let (remappedProgress, pacedKeyTimes) = calculatePacedProgress(progress: Float(progress), values: values, cubic: animation.calculationMode == .cubicPaced)
+            let (remappedProgress, pacedKeyTimes) = calculatePacedProgress(progress: CGFloat(progress), values: values, cubic: animation.calculationMode == .cubicPaced)
             effectiveProgress = CFTimeInterval(remappedProgress)
             effectiveKeyTimes = pacedKeyTimes
         default:
@@ -1554,7 +1554,7 @@ open class CALayer: CAMediaTiming, Hashable {
         }
 
         // Determine which keyframe segment we're in
-        let segmentIndex = findSegmentIndex(for: Float(effectiveProgress), in: effectiveKeyTimes)
+        let segmentIndex = findSegmentIndex(for: CGFloat(effectiveProgress), in: effectiveKeyTimes)
         let startIndex = segmentIndex
         let endIndex = min(segmentIndex + 1, values.count - 1)
 
@@ -1563,7 +1563,7 @@ open class CALayer: CAMediaTiming, Hashable {
         let endTime = effectiveKeyTimes[endIndex]
         let segmentProgress: Float
         if endTime > startTime {
-            segmentProgress = (Float(effectiveProgress) - startTime) / (endTime - startTime)
+            segmentProgress = Float((CGFloat(effectiveProgress) - startTime) / (endTime - startTime))
         } else {
             segmentProgress = 1.0
         }
@@ -1609,7 +1609,7 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Calculates arc-length parameterized progress for paced animation modes.
     ///
     /// Returns the remapped progress and the paced key times array.
-    private func calculatePacedProgress(progress: Float, values: [Any], cubic: Bool) -> (Float, [Float]) {
+    private func calculatePacedProgress(progress: CGFloat, values: [Any], cubic: Bool) -> (CGFloat, [CGFloat]) {
         guard values.count > 1 else { return (progress, [0]) }
 
         // Calculate distances between consecutive keyframes
@@ -1640,9 +1640,9 @@ open class CALayer: CAMediaTiming, Hashable {
         let totalDistance = cumulativeDistances.last!
 
         // Calculate paced key times (normalized by total distance)
-        var pacedKeyTimes: [Float] = []
+        var pacedKeyTimes: [CGFloat] = []
         for cumDist in cumulativeDistances {
-            pacedKeyTimes.append(Float(cumDist / totalDistance))
+            pacedKeyTimes.append(cumDist / totalDistance)
         }
 
         return (progress, pacedKeyTimes)
@@ -1736,13 +1736,13 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// Generates default key times evenly distributed.
-    private func defaultKeyTimes(for count: Int) -> [Float] {
+    private func defaultKeyTimes(for count: Int) -> [CGFloat] {
         guard count > 1 else { return [0] }
-        return (0..<count).map { Float($0) / Float(count - 1) }
+        return (0..<count).map { CGFloat($0) / CGFloat(count - 1) }
     }
 
     /// Finds the segment index for a given progress value.
-    private func findSegmentIndex(for progress: Float, in keyTimes: [Float]) -> Int {
+    private func findSegmentIndex(for progress: CGFloat, in keyTimes: [CGFloat]) -> Int {
         for i in 0..<(keyTimes.count - 1) {
             if progress >= keyTimes[i] && progress < keyTimes[i + 1] {
                 return i
@@ -1841,7 +1841,7 @@ open class CALayer: CAMediaTiming, Hashable {
         case "colors":
             if let gradientLayer = layer as? CAGradientLayer, let v = value as? [Any] { gradientLayer._colors = v }
         case "locations":
-            if let gradientLayer = layer as? CAGradientLayer, let v = value as? [Float] { gradientLayer._locations = v }
+            if let gradientLayer = layer as? CAGradientLayer, let v = value as? [CGFloat] { gradientLayer._locations = v }
 
         default:
             break
@@ -2028,11 +2028,11 @@ open class CALayer: CAMediaTiming, Hashable {
             }
         case "locations":
             if let gradientLayer = layer as? CAGradientLayer,
-               let fromLocations = fromValue as? [Float], let toLocations = toValue as? [Float] {
+               let fromLocations = fromValue as? [CGFloat], let toLocations = toValue as? [CGFloat] {
                 let count = min(fromLocations.count, toLocations.count)
-                var interpolatedLocations: [Float] = []
+                var interpolatedLocations: [CGFloat] = []
                 for i in 0..<count {
-                    interpolatedLocations.append(fromLocations[i] + Float(progress) * (toLocations[i] - fromLocations[i]))
+                    interpolatedLocations.append(fromLocations[i] + CGFloat(progress) * (toLocations[i] - fromLocations[i]))
                 }
                 gradientLayer._locations = interpolatedLocations
             }

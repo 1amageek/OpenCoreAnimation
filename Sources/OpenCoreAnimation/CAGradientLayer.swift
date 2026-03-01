@@ -43,10 +43,10 @@ open class CAGradientLayer: CALayer {
         }
     }
 
-    internal var _locations: [Float]?
+    internal var _locations: [CGFloat]?
     /// An optional array of numbers defining the location of each gradient stop. Animatable.
     /// Values should be in the range [0, 1] and monotonically increasing.
-    open var locations: [Float]? {
+    open var locations: [CGFloat]? {
         get { return _locations }
         set {
             let oldValue = _locations

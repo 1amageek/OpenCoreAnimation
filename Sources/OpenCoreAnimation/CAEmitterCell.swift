@@ -68,10 +68,10 @@ open class CAEmitterCell: CAMediaTiming {
     // MARK: - Geometry
 
     /// The initial velocity of the cell.
-    open var velocity: Float = 0
+    open var velocity: CGFloat = 0
 
     /// The amount by which the velocity of the cell can vary.
-    open var velocityRange: Float = 0
+    open var velocityRange: CGFloat = 0
 
     /// The x-component of the acceleration vector applied to emitted objects.
     open var xAcceleration: CGFloat = 0
@@ -83,19 +83,19 @@ open class CAEmitterCell: CAMediaTiming {
     open var zAcceleration: CGFloat = 0
 
     /// The initial scale factor applied to the cell.
-    open var scale: Float = 1
+    open var scale: CGFloat = 1
 
     /// The amount by which the scale of the cell can vary.
-    open var scaleRange: Float = 0
+    open var scaleRange: CGFloat = 0
 
     /// The speed at which the scale changes over the lifetime of the cell.
-    open var scaleSpeed: Float = 0
+    open var scaleSpeed: CGFloat = 0
 
     /// The rotational velocity, measured in radians per second, to apply to the cell.
-    open var spin: Float = 0
+    open var spin: CGFloat = 0
 
     /// The amount by which the spin of the cell can vary.
-    open var spinRange: Float = 0
+    open var spinRange: CGFloat = 0
 
     /// The orientation of the emission angle.
     open var emissionLatitude: CGFloat = 0
@@ -155,21 +155,21 @@ open class CAEmitterCell: CAMediaTiming {
 
         // Geometry
         case "velocity":
-            return Float(0)
+            return CGFloat(0)
         case "velocityRange":
-            return Float(0)
+            return CGFloat(0)
         case "xAcceleration", "yAcceleration", "zAcceleration":
             return CGFloat(0)
         case "scale":
-            return Float(1)
+            return CGFloat(1)
         case "scaleRange":
-            return Float(0)
+            return CGFloat(0)
         case "scaleSpeed":
-            return Float(0)
+            return CGFloat(0)
         case "spin":
-            return Float(0)
+            return CGFloat(0)
         case "spinRange":
-            return Float(0)
+            return CGFloat(0)
         case "emissionLatitude", "emissionLongitude", "emissionRange":
             return CGFloat(0)
 
