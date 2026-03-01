@@ -1806,3 +1806,866 @@ struct IntegrationTests {
         #expect(spring.totalDuration == spring.settlingDuration)
     }
 }
+
+// MARK: - CAAnimationGroup Time Window Tests
+
+@Suite("CAAnimationGroup Time Window Tests")
+struct CAAnimationGroupTimeWindowTests {
+
+    /// Helper: adds an animation group to a layer with a specific elapsed time.
+    /// Returns the layer so callers can query `presentation()`.
+    private func layerWithGroup(
+        groupDuration: CFTimeInterval,
+        groupFillMode: CAMediaTimingFillMode,
+        children: [CAAnimation],
+        elapsed: CFTimeInterval
+    ) -> CALayer {
+        let layer = CALayer()
+        layer.opacity = 1.0
+        layer.position = CGPoint(x: 0, y: 0)
+        layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+
+        let group = CAAnimationGroup()
+        group.duration = groupDuration
+        group.fillMode = groupFillMode
+        group.animations = children
+        layer.add(group, forKey: "group")
+
+        // Rewrite addedTime to simulate specific elapsed time
+        group.addedTime = CACurrentMediaTime() - elapsed
+        return layer
+    }
+
+    @Test("Group duration caps child that has longer duration")
+    func groupCapsLongerChild() {
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.fromValue = Float(1.0)
+        child.toValue = Float(0.0)
+        child.duration = 2.0
+        child.fillMode = .forwards
+
+        let layer = layerWithGroup(
+            groupDuration: 0.5,
+            groupFillMode: .forwards,
+            children: [child],
+            elapsed: 1.0
+        )
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Group ends at 0.5s. Child progress at group end = 0.5/2.0 = 0.25.
+        // opacity = 1.0 + 0.25 * (0.0 - 1.0) = 0.75
+        #expect(abs(pres.opacity - 0.75) < 0.05)
+    }
+
+    @Test("Group fillMode.removed reverts to model value after completion")
+    func groupFillModeRemovedReverts() {
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.fromValue = Float(0.0)
+        child.toValue = Float(1.0)
+        child.duration = 0.5
+        child.fillMode = .forwards
+
+        let layer = layerWithGroup(
+            groupDuration: 0.5,
+            groupFillMode: .removed,
+            children: [child],
+            elapsed: 1.0
+        )
+        layer.opacity = 0.8
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Group completed with fillMode.removed → model value preserved
+        #expect(pres.opacity == 0.8)
+    }
+
+    @Test("Group with multiple children caps all of them")
+    func groupCapsMultipleChildren() {
+        let opacityChild = CABasicAnimation(keyPath: "opacity")
+        opacityChild.fromValue = Float(1.0)
+        opacityChild.toValue = Float(0.0)
+        opacityChild.duration = 2.0
+        opacityChild.fillMode = .forwards
+
+        let posChild = CABasicAnimation(keyPath: "position.x")
+        posChild.fromValue = CGFloat(0)
+        posChild.toValue = CGFloat(100)
+        posChild.duration = 4.0
+        posChild.fillMode = .forwards
+
+        let layer = layerWithGroup(
+            groupDuration: 0.5,
+            groupFillMode: .forwards,
+            children: [opacityChild, posChild],
+            elapsed: 2.0
+        )
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Group stopped at 0.5s:
+        // opacity: progress = 0.5/2.0 = 0.25 → 1.0 - 0.25 = 0.75
+        // position.x: progress = 0.5/4.0 = 0.125 → 0 + 12.5 = 12.5
+        #expect(abs(pres.opacity - 0.75) < 0.05)
+        #expect(abs(pres.position.x - 12.5) < 1.0)
+    }
+
+    @Test("Child with shorter duration than group completes independently")
+    func childShorterThanGroupCompletes() {
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.fromValue = Float(1.0)
+        child.toValue = Float(0.0)
+        child.duration = 0.3
+        child.fillMode = .forwards
+
+        let layer = layerWithGroup(
+            groupDuration: 1.0,
+            groupFillMode: .forwards,
+            children: [child],
+            elapsed: 2.0
+        )
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Group ends at 1.0s. Child duration is 0.3s, so child is fully complete
+        // at group end time. Child fillMode.forwards → toValue = 0.0
+        #expect(abs(pres.opacity - 0.0) < 0.05)
+    }
+
+    @Test("Child inherits group duration when child duration is 0")
+    func childInheritsGroupDuration() {
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.fromValue = Float(1.0)
+        child.toValue = Float(0.0)
+        child.duration = 0  // Should inherit group's duration
+        child.fillMode = .forwards
+
+        let layer = layerWithGroup(
+            groupDuration: 1.0,
+            groupFillMode: .forwards,
+            children: [child],
+            elapsed: 2.0
+        )
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Child inherits group duration of 1.0s.
+        // At group end (1.0s), child progress = 1.0/1.0 = 1.0 → toValue = 0.0
+        #expect(abs(pres.opacity - 0.0) < 0.05)
+    }
+
+    @Test("Active group applies children at current time")
+    func activeGroupAppliesChildren() {
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.fromValue = Float(1.0)
+        child.toValue = Float(0.0)
+        child.duration = 1.0
+        child.fillMode = .forwards
+
+        let layer = layerWithGroup(
+            groupDuration: 2.0,
+            groupFillMode: .forwards,
+            children: [child],
+            elapsed: 0.5  // Group still active (0.5 < 2.0)
+        )
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Group is active. Child at 0.5s: progress = 0.5/1.0 = 0.5
+        // opacity = 1.0 + 0.5 * (0.0 - 1.0) = 0.5
+        #expect(abs(pres.opacity - 0.5) < 0.1)
+    }
+}
+
+// MARK: - isAdditive Animation Tests
+
+@Suite("isAdditive Animation Tests")
+struct IsAdditiveAnimationTests {
+
+    @Test("Additive animation adds interpolated value to model value")
+    func additiveAddsToModel() {
+        let layer = CALayer()
+        layer.opacity = 0.5
+
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = Float(0.0)
+        anim.toValue = Float(0.3)
+        anim.duration = 1.0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Additive: model(0.5) + animated(0.3) = 0.8
+        #expect(abs(pres.opacity - 0.8) < 0.05)
+    }
+
+    @Test("Non-additive animation replaces model value")
+    func nonAdditiveReplacesModel() {
+        let layer = CALayer()
+        layer.opacity = 0.5
+
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = Float(0.0)
+        anim.toValue = Float(0.3)
+        anim.duration = 1.0
+        anim.isAdditive = false
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Non-additive: replaces → 0.3
+        #expect(abs(pres.opacity - 0.3) < 0.05)
+    }
+
+    @Test("Two additive animations on same property accumulate")
+    func twoAdditivesAccumulate() {
+        let layer = CALayer()
+        layer.opacity = 0.2
+
+        let anim1 = CABasicAnimation(keyPath: "opacity")
+        anim1.fromValue = Float(0.0)
+        anim1.toValue = Float(0.3)
+        anim1.duration = 1.0
+        anim1.isAdditive = true
+        anim1.fillMode = .forwards
+        layer.add(anim1, forKey: "anim1")
+        anim1.addedTime = CACurrentMediaTime() - 2.0
+
+        let anim2 = CABasicAnimation(keyPath: "opacity")
+        anim2.fromValue = Float(0.0)
+        anim2.toValue = Float(0.1)
+        anim2.duration = 1.0
+        anim2.isAdditive = true
+        anim2.fillMode = .forwards
+        layer.add(anim2, forKey: "anim2")
+        anim2.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // model(0.2) + anim1(0.3) + anim2(0.1) = 0.6
+        #expect(abs(pres.opacity - 0.6) < 0.05)
+    }
+
+    @Test("Non-additive is applied before additive")
+    func orderingNonAdditiveBeforeAdditive() {
+        let layer = CALayer()
+        layer.opacity = 0.0
+
+        // Non-additive: sets to 0.5
+        let nonAdd = CABasicAnimation(keyPath: "opacity")
+        nonAdd.fromValue = Float(0.0)
+        nonAdd.toValue = Float(0.5)
+        nonAdd.duration = 1.0
+        nonAdd.isAdditive = false
+        nonAdd.fillMode = .forwards
+        layer.add(nonAdd, forKey: "nonAdd")
+        nonAdd.addedTime = CACurrentMediaTime() - 2.0
+
+        // Additive: adds 0.2
+        let add = CABasicAnimation(keyPath: "opacity")
+        add.fromValue = Float(0.0)
+        add.toValue = Float(0.2)
+        add.duration = 1.0
+        add.isAdditive = true
+        add.fillMode = .forwards
+        layer.add(add, forKey: "add")
+        add.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Non-additive sets to 0.5, then additive adds 0.2 → 0.7
+        #expect(abs(pres.opacity - 0.7) < 0.05)
+    }
+
+    @Test("Additive position animation adds to model position")
+    func additivePositionAddsToModel() {
+        let layer = CALayer()
+        layer.position = CGPoint(x: 100, y: 200)
+
+        let anim = CABasicAnimation(keyPath: "position")
+        anim.fromValue = CGPoint(x: 0, y: 0)
+        anim.toValue = CGPoint(x: 50, y: -30)
+        anim.duration = 1.0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // model(100,200) + animated(50,-30) = (150, 170)
+        #expect(abs(pres.position.x - 150) < 1.0)
+        #expect(abs(pres.position.y - 170) < 1.0)
+    }
+
+    @Test("Additive transform is concatenated with base transform")
+    func additiveTransformConcatenation() {
+        let layer = CALayer()
+        layer.transform = CATransform3DMakeScale(2, 2, 1)
+
+        let anim = CABasicAnimation(keyPath: "transform")
+        anim.fromValue = CATransform3DIdentity
+        anim.toValue = CATransform3DMakeTranslation(10, 0, 0)
+        anim.duration = 1.0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Additive: CATransform3DConcat(translation(10,0,0), scale(2,2,1))
+        // = scale * translation, so m41 = 2*10 = 20
+        #expect(pres.transform.m11 == 2.0)
+        #expect(pres.transform.m22 == 2.0)
+        #expect(abs(pres.transform.m41 - 20.0) < 0.1)
+    }
+
+    @Test("Additive bounds.size animation")
+    func additiveBoundsSize() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 80)
+
+        let anim = CABasicAnimation(keyPath: "bounds.size")
+        anim.fromValue = CGSize(width: 0, height: 0)
+        anim.toValue = CGSize(width: 20, height: 10)
+        anim.duration = 1.0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // model(100,80) + animated(20,10) = (120, 90)
+        #expect(abs(pres.bounds.size.width - 120) < 1.0)
+        #expect(abs(pres.bounds.size.height - 90) < 1.0)
+    }
+
+    @Test("Additive with byValue does not double-count model value")
+    func additiveByValueNoDoubleCount() {
+        let layer = CALayer()
+        layer.opacity = 0.5
+
+        // byValue only: should add 0.2 delta, not double-count the base
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.byValue = Float(0.2)
+        anim.duration = 1.0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Additive with byValue=0.2: resolves to from=0, to=0.2 (zero base for additive)
+        // animated value at completion = 0.2
+        // result = model(0.5) + 0.2 = 0.7 (NOT 0.5 + 0.7 = 1.2)
+        #expect(abs(pres.opacity - 0.7) < 0.05)
+    }
+
+    @Test("Additive with only toValue does not double-count")
+    func additiveToValueNoDoubleCount() {
+        let layer = CALayer()
+        layer.opacity = 0.5
+
+        // Only toValue set: implicit from should be 0 (not model value) for additive
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.toValue = Float(0.3)
+        anim.duration = 1.0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Additive: from=0 (zero base), to=0.3
+        // animated value at completion = 0.3
+        // result = model(0.5) + 0.3 = 0.8 (NOT 0.5 + 0.3 + base double-count)
+        #expect(abs(pres.opacity - 0.8) < 0.05)
+    }
+
+    @Test("Additive at progress=0 does not jump from model value")
+    func additiveProgressZeroNoJump() {
+        let layer = CALayer()
+        layer.opacity = 0.5
+
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = Float(0.0)
+        anim.toValue = Float(0.2)
+        anim.duration = 10.0  // Long duration so we're near progress 0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        // Elapsed ~0, so progress ~0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // At progress ~0: animated value ~= from(0.0)
+        // result ~= model(0.5) + 0.0 = 0.5 (should NOT jump to 1.0)
+        #expect(abs(pres.opacity - 0.5) < 0.1)
+    }
+}
+
+// MARK: - isDoubleSided Tests
+
+@Suite("isDoubleSided Tests")
+struct IsDoubleSidedTests {
+
+    @Test("Default isDoubleSided is true")
+    func defaultIsDoubleSidedTrue() {
+        let layer = CALayer()
+        #expect(layer.isDoubleSided == true)
+    }
+
+    @Test("isDoubleSided can be set to false")
+    func setIsDoubleSidedFalse() {
+        let layer = CALayer()
+        layer.isDoubleSided = false
+        #expect(layer.isDoubleSided == false)
+    }
+
+    @Test("isDoubleSided is preserved on presentation layer")
+    func isDoubleSidedOnPresentation() {
+        let layer = CALayer()
+        layer.isDoubleSided = false
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(pres.isDoubleSided == false)
+    }
+}
+
+// MARK: - contentsScale Tests
+
+@Suite("contentsScale Tests")
+struct ContentsScaleTests {
+
+    @Test("Default contentsScale is 1.0")
+    func defaultContentsScale() {
+        let layer = CALayer()
+        #expect(layer.contentsScale == 1.0)
+    }
+
+    @Test("contentsScale can be set to 2.0")
+    func setContentsScale() {
+        let layer = CALayer()
+        layer.contentsScale = 2.0
+        #expect(layer.contentsScale == 2.0)
+    }
+
+    @Test("contentsScale is preserved on presentation layer")
+    func contentsScaleOnPresentation() {
+        let layer = CALayer()
+        layer.contentsScale = 3.0
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(pres.contentsScale == 3.0)
+    }
+
+    @Test("contentsScale can be animated")
+    func contentsScaleAnimated() {
+        let layer = CALayer()
+        layer.contentsScale = 1.0
+
+        let anim = CABasicAnimation(keyPath: "contentsScale")
+        anim.fromValue = CGFloat(1.0)
+        anim.toValue = CGFloat(3.0)
+        anim.duration = 1.0
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Completed: toValue = 3.0
+        #expect(abs(pres.contentsScale - 3.0) < 0.05)
+    }
+}
+
+// MARK: - masksToBounds + cornerRadius Interaction Tests
+
+@Suite("masksToBounds cornerRadius Tests")
+struct MasksToBoundsCornerRadiusTests {
+
+    @Test("masksToBounds and cornerRadius are independent properties")
+    func propertiesIndependent() {
+        let layer = CALayer()
+        layer.masksToBounds = true
+        layer.cornerRadius = 20
+        #expect(layer.masksToBounds == true)
+        #expect(layer.cornerRadius == 20)
+    }
+
+    @Test("masksToBounds preserved on presentation layer")
+    func masksToBoundsOnPresentation() {
+        let layer = CALayer()
+        layer.masksToBounds = true
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(pres.masksToBounds == true)
+    }
+
+    @Test("cornerRadius and masksToBounds combined on presentation layer")
+    func combinedOnPresentation() {
+        let layer = CALayer()
+        layer.masksToBounds = true
+        layer.cornerRadius = 15
+        layer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(pres.masksToBounds == true)
+        #expect(pres.cornerRadius == 15)
+        #expect(pres.bounds.width == 100)
+    }
+
+    @Test("Sublayers exist under masksToBounds parent")
+    func sublayersUnderMasksToBoundsParent() {
+        let parent = CALayer()
+        parent.masksToBounds = true
+        parent.cornerRadius = 20
+        parent.bounds = CGRect(x: 0, y: 0, width: 200, height: 200)
+
+        let child = CALayer()
+        child.bounds = CGRect(x: 0, y: 0, width: 300, height: 300)
+        child.position = CGPoint(x: 100, y: 100)
+        parent.addSublayer(child)
+
+        #expect(parent.sublayers?.count == 1)
+        #expect(child.superlayer === parent)
+    }
+}
+
+// MARK: - Shadow Property Tests
+
+@Suite("Shadow Property Tests")
+struct ShadowPropertyTests {
+
+    @Test("Shadow offset default and assignment")
+    func shadowOffsetDefault() {
+        let layer = CALayer()
+        #expect(layer.shadowOffset == CGSize(width: 0, height: -3))
+        layer.shadowOffset = CGSize(width: 5, height: 10)
+        #expect(layer.shadowOffset == CGSize(width: 5, height: 10))
+    }
+
+    @Test("Shadow color default is nil and can be assigned")
+    func shadowColorDefault() {
+        let layer = CALayer()
+        // Default shadowColor is nil (unlike CoreAnimation which defaults to black)
+        #expect(layer.shadowColor == nil)
+        // After setting, it should be non-nil
+        layer.shadowColor = layer.backgroundColor
+    }
+
+    @Test("Shadow properties are preserved on presentation layer")
+    func shadowOnPresentation() {
+        let layer = CALayer()
+        layer.shadowOpacity = 0.7
+        layer.shadowRadius = 5.0
+        layer.shadowOffset = CGSize(width: 3, height: -3)
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(pres.shadowOpacity == 0.7)
+        #expect(pres.shadowRadius == 5.0)
+        #expect(pres.shadowOffset == CGSize(width: 3, height: -3))
+    }
+
+    @Test("Shadow opacity animation")
+    func shadowOpacityAnimation() {
+        let layer = CALayer()
+        layer.shadowOpacity = 0.0
+
+        let anim = CABasicAnimation(keyPath: "shadowOpacity")
+        anim.fromValue = Float(0.0)
+        anim.toValue = Float(0.8)
+        anim.duration = 1.0
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(abs(pres.shadowOpacity - 0.8) < 0.05)
+    }
+
+    @Test("Shadow radius animation")
+    func shadowRadiusAnimation() {
+        let layer = CALayer()
+        layer.shadowRadius = 0
+
+        let anim = CABasicAnimation(keyPath: "shadowRadius")
+        anim.fromValue = CGFloat(0)
+        anim.toValue = CGFloat(10)
+        anim.duration = 1.0
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(abs(pres.shadowRadius - 10.0) < 0.1)
+    }
+
+    @Test("Additive shadow opacity animation")
+    func additiveShadowOpacity() {
+        let layer = CALayer()
+        layer.shadowOpacity = 0.3
+
+        let anim = CABasicAnimation(keyPath: "shadowOpacity")
+        anim.fromValue = Float(0.0)
+        anim.toValue = Float(0.2)
+        anim.duration = 1.0
+        anim.isAdditive = true
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // model(0.3) + animated(0.2) = 0.5
+        #expect(abs(pres.shadowOpacity - 0.5) < 0.05)
+    }
+}
+
+// MARK: - Animation Evaluation Precision Tests
+
+@Suite("Animation Evaluation Tests")
+struct AnimationEvaluationTests {
+
+    @Test("Animation at midpoint produces correct value")
+    func animationMidpoint() {
+        let layer = CALayer()
+        layer.opacity = 1.0
+
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = Float(0.0)
+        anim.toValue = Float(1.0)
+        anim.duration = 2.0
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        // Set elapsed to exactly 1.0s (midpoint of 2.0s)
+        anim.addedTime = CACurrentMediaTime() - 1.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // At t=1.0s of 2.0s duration: progress ~= 0.5, value ~= 0.5
+        #expect(abs(pres.opacity - 0.5) < 0.1)
+    }
+
+    @Test("Completed animation with fillMode.forwards holds toValue")
+    func completedForwardsHoldsValue() {
+        let layer = CALayer()
+        layer.opacity = 1.0
+
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = Float(1.0)
+        anim.toValue = Float(0.0)
+        anim.duration = 0.5
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 5.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Completed: toValue = 0.0
+        #expect(abs(pres.opacity - 0.0) < 0.05)
+    }
+
+    @Test("Completed animation with fillMode.removed reverts to model")
+    func completedRemovedRevertsToModel() {
+        let layer = CALayer()
+        layer.opacity = 0.7
+
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = Float(0.0)
+        anim.toValue = Float(1.0)
+        anim.duration = 0.5
+        anim.fillMode = .removed
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 5.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // fillMode.removed: model value = 0.7
+        #expect(pres.opacity == 0.7)
+    }
+
+    @Test("cornerRadius animation interpolates correctly")
+    func cornerRadiusAnimationInterpolation() {
+        let layer = CALayer()
+        layer.cornerRadius = 0
+
+        let anim = CABasicAnimation(keyPath: "cornerRadius")
+        anim.fromValue = CGFloat(0)
+        anim.toValue = CGFloat(20)
+        anim.duration = 1.0
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        // Completed: toValue = 20
+        #expect(abs(pres.cornerRadius - 20.0) < 0.1)
+    }
+
+    @Test("Position animation interpolates correctly")
+    func positionAnimationInterpolation() {
+        let layer = CALayer()
+        layer.position = CGPoint(x: 0, y: 0)
+
+        let anim = CABasicAnimation(keyPath: "position")
+        anim.fromValue = CGPoint(x: 0, y: 0)
+        anim.toValue = CGPoint(x: 200, y: 100)
+        anim.duration = 1.0
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(abs(pres.position.x - 200) < 1.0)
+        #expect(abs(pres.position.y - 100) < 1.0)
+    }
+
+    @Test("Bounds animation interpolates correctly")
+    func boundsAnimationInterpolation() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 50, height: 50)
+
+        let anim = CABasicAnimation(keyPath: "bounds")
+        anim.fromValue = CGRect(x: 0, y: 0, width: 50, height: 50)
+        anim.toValue = CGRect(x: 0, y: 0, width: 200, height: 100)
+        anim.duration = 1.0
+        anim.fillMode = .forwards
+        layer.add(anim, forKey: "test")
+        anim.addedTime = CACurrentMediaTime() - 2.0
+
+        guard let pres = layer.presentation() else {
+            Issue.record("Presentation layer should exist")
+            return
+        }
+        #expect(abs(pres.bounds.width - 200) < 1.0)
+        #expect(abs(pres.bounds.height - 100) < 1.0)
+    }
+}
+
+// MARK: - CAAnimation totalDuration Edge Cases
+
+@Suite("CAAnimation totalDuration Tests")
+struct CAAnimationTotalDurationTests {
+
+    @Test("totalDuration with speed = 2.0 halves wall-clock time")
+    func speedDoublesRate() {
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.duration = 1.0
+        anim.speed = 2.0
+        // totalDuration = duration / |speed| = 1.0 / 2.0 = 0.5
+        #expect(abs(anim.totalDuration - 0.5) < 0.001)
+    }
+
+    @Test("totalDuration with speed = 0 is infinite")
+    func speedZeroIsInfinite() {
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.duration = 1.0
+        anim.speed = 0.0
+        #expect(anim.totalDuration == .infinity)
+    }
+
+    @Test("totalDuration with repeatCount multiplies duration")
+    func repeatCountMultiplies() {
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.duration = 1.0
+        anim.repeatCount = 3
+        // totalDuration = 1.0 * 3 = 3.0
+        #expect(abs(anim.totalDuration - 3.0) < 0.001)
+    }
+
+    @Test("totalDuration with autoreverses doubles duration")
+    func autoreversesDoubles() {
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.duration = 1.0
+        anim.autoreverses = true
+        // totalDuration = 1.0 * 2 = 2.0
+        #expect(abs(anim.totalDuration - 2.0) < 0.001)
+    }
+
+    @Test("totalDuration with repeatCount and autoreverses")
+    func repeatCountAndAutoreverses() {
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.duration = 1.0
+        anim.repeatCount = 2
+        anim.autoreverses = true
+        // totalDuration = 1.0 * 2 * 2 = 4.0
+        #expect(abs(anim.totalDuration - 4.0) < 0.001)
+    }
+
+    @Test("Group totalDuration respects group-level timing")
+    func groupTotalDuration() {
+        let group = CAAnimationGroup()
+        group.duration = 2.0
+        group.speed = 2.0
+        // totalDuration = 2.0 / 2.0 = 1.0
+        #expect(abs(group.totalDuration - 1.0) < 0.001)
+    }
+}

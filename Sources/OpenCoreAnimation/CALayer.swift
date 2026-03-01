@@ -202,6 +202,11 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._shadowOpacity = _shadowOpacity
         presentation._shadowOffset = _shadowOffset
         presentation._shadowRadius = _shadowRadius
+        presentation._anchorPointZ = _anchorPointZ
+        presentation._sublayerTransform = _sublayerTransform
+        presentation._contentsScale = _contentsScale
+        presentation._masksToBounds = _masksToBounds
+        presentation.rasterizationScale = rasterizationScale
 
         // Copy contents-related properties (critical for texture animation)
         presentation.contents = contents
@@ -244,8 +249,17 @@ open class CALayer: CAMediaTiming, Hashable {
             gradientPresentation._endPoint = gradientSelf._endPoint
         }
 
-        // Apply active animations
-        for (_, animation) in _animations {
+        // Apply active animations: non-additive first, then additive.
+        // Additive animations accumulate deltas on top of the current value.
+        var additiveAnimations: [(String, CAAnimation)] = []
+        for (key, animation) in _animations {
+            if let propAnim = animation as? CAPropertyAnimation, propAnim.isAdditive {
+                additiveAnimations.append((key, animation))
+            } else {
+                applyAnimation(animation, to: presentation, at: currentTime)
+            }
+        }
+        for (_, animation) in additiveAnimations {
             applyAnimation(animation, to: presentation, at: currentTime)
         }
     }
@@ -492,16 +506,47 @@ open class CALayer: CAMediaTiming, Hashable {
     private func applyAnimationGroup(_ group: CAAnimationGroup, to layer: CALayer, at time: CFTimeInterval) {
         guard let animations = group.animations else { return }
 
-        for animation in animations {
-            // Create a context with inherited timing properties
-            // Note: We don't modify the animation object directly to avoid side effects
-            let effectiveDuration = animation.duration > 0 ? animation.duration : group.duration
-            let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : group.addedTime
+        let groupAddedTime = group.addedTime
+        let rawGroupElapsed = time - groupAddedTime - group.beginTime
+        let groupElapsed = rawGroupElapsed * CFTimeInterval(group.speed) + group.timeOffset
+        let groupBaseDuration = group.duration > 0 ? group.duration : CATransaction.animationDuration()
+        let groupTotalDuration = group.totalDuration
 
-            // Apply each child animation with effective timing
+        // Group completed: apply final state if fillMode allows, otherwise skip
+        if groupElapsed >= groupTotalDuration {
+            if group.fillMode == .forwards || group.fillMode == .both {
+                // Evaluate children at group end time
+                let absSpeed = max(abs(Double(group.speed)), 0.0001)
+                let endTime = groupAddedTime + group.beginTime + groupTotalDuration / absSpeed
+                for animation in animations {
+                    let effectiveDuration = animation.duration > 0 ? animation.duration : groupBaseDuration
+                    let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : groupAddedTime
+                    applyAnimationWithContext(animation, to: layer, at: endTime,
+                        effectiveDuration: effectiveDuration, effectiveAddedTime: effectiveAddedTime)
+                }
+            }
+            return
+        }
+
+        // Group not started: apply initial state if fillMode allows, otherwise skip
+        if groupElapsed < 0 {
+            if group.fillMode == .backwards || group.fillMode == .both {
+                for animation in animations {
+                    let effectiveDuration = animation.duration > 0 ? animation.duration : groupBaseDuration
+                    let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : groupAddedTime
+                    applyAnimationWithContext(animation, to: layer, at: groupAddedTime,
+                        effectiveDuration: effectiveDuration, effectiveAddedTime: effectiveAddedTime)
+                }
+            }
+            return
+        }
+
+        // Group active: apply children normally
+        for animation in animations {
+            let effectiveDuration = animation.duration > 0 ? animation.duration : groupBaseDuration
+            let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : groupAddedTime
             applyAnimationWithContext(animation, to: layer, at: time,
-                                      effectiveDuration: effectiveDuration,
-                                      effectiveAddedTime: effectiveAddedTime)
+                effectiveDuration: effectiveDuration, effectiveAddedTime: effectiveAddedTime)
         }
     }
 
@@ -574,20 +619,21 @@ open class CALayer: CAMediaTiming, Hashable {
         switch keyPath {
         // Float/CGFloat properties
         case "opacity", "cornerRadius", "borderWidth", "shadowRadius", "shadowOpacity",
-             "zPosition", "strokeStart", "strokeEnd", "lineWidth", "lineDashPhase", "miterLimit":
+             "zPosition", "anchorPointZ", "contentsScale", "rasterizationScale",
+             "strokeStart", "strokeEnd", "lineWidth", "lineDashPhase", "miterLimit":
             applyFloatAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Point/Size properties
-        case "position", "position.x", "position.y", "anchorPoint", "shadowOffset",
-             "startPoint", "endPoint":
+        case "position", "position.x", "position.y", "anchorPoint", "bounds.origin",
+             "shadowOffset", "startPoint", "endPoint":
             applyPointAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Rect properties
-        case "bounds", "bounds.size":
+        case "bounds", "bounds.size", "contentsRect", "contentsCenter":
             applyRectAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Transform properties
-        case _ where keyPath == "transform" || keyPath.hasPrefix("transform."):
+        case _ where keyPath == "transform" || keyPath.hasPrefix("transform.") || keyPath == "sublayerTransform":
             applyTransformAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Color properties
@@ -643,8 +689,9 @@ open class CALayer: CAMediaTiming, Hashable {
         let transform = valueFunction.interpolate(from: fromValue, to: toValue, progress: CGFloat(progress))
 
         // Apply the transform to the layer
-        // If the layer already has a transform, concatenate with it
-        let baseTransform = _transform
+        // Read from presentation layer so value function animations compose
+        // with other transform animations applied earlier in the same frame.
+        let baseTransform = layer._transform
         if CATransform3DIsIdentity(baseTransform) {
             layer._transform = transform
         } else {
@@ -767,52 +814,78 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func applyFloatAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        // When isAdditive, pass zero as currentValue to resolveFromTo* so that
+        // implicit from/to values don't include the model value (which would be double-counted).
+        let additive = animation.isAdditive
         switch keyPath {
         case "opacity":
-            guard let resolved = resolveFromToFloat(animation, currentValue: _opacity) else { return }
-            layer._opacity = resolved.from + Float(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromToFloat(animation, currentValue: additive ? 0 : _opacity) else { return }
+            let value = resolved.from + Float(progress) * (resolved.to - resolved.from)
+            layer._opacity = additive ? layer._opacity + value : value
         case "cornerRadius":
-            guard let resolved = resolveFromTo(animation, currentValue: _cornerRadius) else { return }
-            layer._cornerRadius = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _cornerRadius) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._cornerRadius = additive ? layer._cornerRadius + value : value
         case "borderWidth":
-            guard let resolved = resolveFromTo(animation, currentValue: _borderWidth) else { return }
-            layer._borderWidth = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _borderWidth) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._borderWidth = additive ? layer._borderWidth + value : value
         case "shadowRadius":
-            guard let resolved = resolveFromTo(animation, currentValue: _shadowRadius) else { return }
-            layer._shadowRadius = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _shadowRadius) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._shadowRadius = additive ? layer._shadowRadius + value : value
         case "shadowOpacity":
-            guard let resolved = resolveFromToFloat(animation, currentValue: _shadowOpacity) else { return }
-            layer._shadowOpacity = resolved.from + Float(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromToFloat(animation, currentValue: additive ? 0 : _shadowOpacity) else { return }
+            let value = resolved.from + Float(progress) * (resolved.to - resolved.from)
+            layer._shadowOpacity = additive ? layer._shadowOpacity + value : value
         case "zPosition":
-            guard let resolved = resolveFromTo(animation, currentValue: _zPosition) else { return }
-            layer._zPosition = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _zPosition) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._zPosition = additive ? layer._zPosition + value : value
+        case "anchorPointZ":
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _anchorPointZ) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._anchorPointZ = additive ? layer._anchorPointZ + value : value
+        case "contentsScale":
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _contentsScale) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._contentsScale = additive ? layer._contentsScale + value : value
+        case "rasterizationScale":
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : rasterizationScale) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer.rasterizationScale = additive ? layer.rasterizationScale + value : value
 
         // CAShapeLayer properties
         case "strokeStart":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._strokeStart) else { return }
-            shapeLayer._strokeStart = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : modelShapeLayer._strokeStart) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            shapeLayer._strokeStart = additive ? shapeLayer._strokeStart + value : value
         case "strokeEnd":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._strokeEnd) else { return }
-            shapeLayer._strokeEnd = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : modelShapeLayer._strokeEnd) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            shapeLayer._strokeEnd = additive ? shapeLayer._strokeEnd + value : value
         case "lineWidth":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._lineWidth) else { return }
-            shapeLayer._lineWidth = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : modelShapeLayer._lineWidth) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            shapeLayer._lineWidth = additive ? shapeLayer._lineWidth + value : value
         case "lineDashPhase":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._lineDashPhase) else { return }
-            shapeLayer._lineDashPhase = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : modelShapeLayer._lineDashPhase) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            shapeLayer._lineDashPhase = additive ? shapeLayer._lineDashPhase + value : value
         case "miterLimit":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            guard let resolved = resolveFromTo(animation, currentValue: modelShapeLayer._miterLimit) else { return }
-            shapeLayer._miterLimit = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : modelShapeLayer._miterLimit) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            shapeLayer._miterLimit = additive ? shapeLayer._miterLimit + value : value
 
         default:
             break
@@ -820,49 +893,94 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func applyPointAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        let additive = animation.isAdditive
         switch keyPath {
         case "position":
-            guard let resolved = resolveFromToPoint(animation, currentValue: _position) else { return }
-            layer._position = CGPoint(
+            guard let resolved = resolveFromToPoint(animation, currentValue: additive ? .zero : _position) else { return }
+            let value = CGPoint(
                 x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
                 y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
+            if additive {
+                layer._position.x += value.x
+                layer._position.y += value.y
+            } else {
+                layer._position = value
+            }
         case "position.x":
-            guard let resolved = resolveFromTo(animation, currentValue: _position.x) else { return }
-            layer._position.x = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _position.x) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._position.x = additive ? layer._position.x + value : value
         case "position.y":
-            guard let resolved = resolveFromTo(animation, currentValue: _position.y) else { return }
-            layer._position.y = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : _position.y) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            layer._position.y = additive ? layer._position.y + value : value
         case "anchorPoint":
-            guard let resolved = resolveFromToPoint(animation, currentValue: _anchorPoint) else { return }
-            layer._anchorPoint = CGPoint(
+            guard let resolved = resolveFromToPoint(animation, currentValue: additive ? .zero : _anchorPoint) else { return }
+            let value = CGPoint(
                 x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
                 y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
+            if additive {
+                layer._anchorPoint.x += value.x
+                layer._anchorPoint.y += value.y
+            } else {
+                layer._anchorPoint = value
+            }
+        case "bounds.origin":
+            guard let resolved = resolveFromToPoint(animation, currentValue: additive ? .zero : _bounds.origin) else { return }
+            let value = CGPoint(
+                x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
+                y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
+            )
+            if additive {
+                layer._bounds.origin.x += value.x
+                layer._bounds.origin.y += value.y
+            } else {
+                layer._bounds.origin = value
+            }
         case "shadowOffset":
-            guard let resolved = resolveFromToSize(animation, currentValue: _shadowOffset) else { return }
-            layer._shadowOffset = CGSize(
+            guard let resolved = resolveFromToSize(animation, currentValue: additive ? .zero : _shadowOffset) else { return }
+            let value = CGSize(
                 width: resolved.from.width + CGFloat(progress) * (resolved.to.width - resolved.from.width),
                 height: resolved.from.height + CGFloat(progress) * (resolved.to.height - resolved.from.height)
             )
+            if additive {
+                layer._shadowOffset.width += value.width
+                layer._shadowOffset.height += value.height
+            } else {
+                layer._shadowOffset = value
+            }
 
         // CAGradientLayer properties
         case "startPoint":
             guard let gradientLayer = layer as? CAGradientLayer,
                   let modelGradientLayer = self as? CAGradientLayer else { return }
-            guard let resolved = resolveFromToPoint(animation, currentValue: modelGradientLayer._startPoint) else { return }
-            gradientLayer._startPoint = CGPoint(
+            guard let resolved = resolveFromToPoint(animation, currentValue: additive ? .zero : modelGradientLayer._startPoint) else { return }
+            let value = CGPoint(
                 x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
                 y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
+            if additive {
+                gradientLayer._startPoint.x += value.x
+                gradientLayer._startPoint.y += value.y
+            } else {
+                gradientLayer._startPoint = value
+            }
         case "endPoint":
             guard let gradientLayer = layer as? CAGradientLayer,
                   let modelGradientLayer = self as? CAGradientLayer else { return }
-            guard let resolved = resolveFromToPoint(animation, currentValue: modelGradientLayer._endPoint) else { return }
-            gradientLayer._endPoint = CGPoint(
+            guard let resolved = resolveFromToPoint(animation, currentValue: additive ? .zero : modelGradientLayer._endPoint) else { return }
+            let value = CGPoint(
                 x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
                 y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
             )
+            if additive {
+                gradientLayer._endPoint.x += value.x
+                gradientLayer._endPoint.y += value.y
+            } else {
+                gradientLayer._endPoint = value
+            }
 
         default:
             break
@@ -870,39 +988,107 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func applyRectAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        let additive = animation.isAdditive
         switch keyPath {
         case "bounds":
             let fromVal = animation.fromValue as? CGRect
             let toVal = animation.toValue as? CGRect
-            let from = fromVal ?? _bounds
-            let to = toVal ?? _bounds
-            layer._bounds = CGRect(
+            let fallback = additive ? CGRect.zero : _bounds
+            let from = fromVal ?? fallback
+            let to = toVal ?? fallback
+            let value = CGRect(
                 x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
                 y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
                 width: from.size.width + CGFloat(progress) * (to.size.width - from.size.width),
                 height: from.size.height + CGFloat(progress) * (to.size.height - from.size.height)
             )
+            if additive {
+                layer._bounds.origin.x += value.origin.x
+                layer._bounds.origin.y += value.origin.y
+                layer._bounds.size.width += value.size.width
+                layer._bounds.size.height += value.size.height
+            } else {
+                layer._bounds = value
+            }
         case "bounds.size":
-            guard let resolved = resolveFromToSize(animation, currentValue: _bounds.size) else { return }
-            layer._bounds.size = CGSize(
+            guard let resolved = resolveFromToSize(animation, currentValue: additive ? .zero : _bounds.size) else { return }
+            let value = CGSize(
                 width: resolved.from.width + CGFloat(progress) * (resolved.to.width - resolved.from.width),
                 height: resolved.from.height + CGFloat(progress) * (resolved.to.height - resolved.from.height)
             )
+            if additive {
+                layer._bounds.size.width += value.width
+                layer._bounds.size.height += value.height
+            } else {
+                layer._bounds.size = value
+            }
+        case "contentsRect":
+            let fromVal = animation.fromValue as? CGRect
+            let toVal = animation.toValue as? CGRect
+            let crFallback = additive ? CGRect.zero : contentsRect
+            let from = fromVal ?? crFallback
+            let to = toVal ?? crFallback
+            let value = CGRect(
+                x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
+                y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
+                width: from.size.width + CGFloat(progress) * (to.size.width - from.size.width),
+                height: from.size.height + CGFloat(progress) * (to.size.height - from.size.height)
+            )
+            if additive {
+                let cur = layer.contentsRect
+                layer.contentsRect = CGRect(
+                    x: cur.origin.x + value.origin.x,
+                    y: cur.origin.y + value.origin.y,
+                    width: cur.size.width + value.size.width,
+                    height: cur.size.height + value.size.height
+                )
+            } else {
+                layer.contentsRect = value
+            }
+        case "contentsCenter":
+            let fromVal = animation.fromValue as? CGRect
+            let toVal = animation.toValue as? CGRect
+            let ccFallback = additive ? CGRect.zero : contentsCenter
+            let from = fromVal ?? ccFallback
+            let to = toVal ?? ccFallback
+            let value = CGRect(
+                x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
+                y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
+                width: from.size.width + CGFloat(progress) * (to.size.width - from.size.width),
+                height: from.size.height + CGFloat(progress) * (to.size.height - from.size.height)
+            )
+            if additive {
+                let cur = layer.contentsCenter
+                layer.contentsCenter = CGRect(
+                    x: cur.origin.x + value.origin.x,
+                    y: cur.origin.y + value.origin.y,
+                    width: cur.size.width + value.size.width,
+                    height: cur.size.height + value.size.height
+                )
+            } else {
+                layer.contentsCenter = value
+            }
         default:
             break
         }
     }
 
     private func applyTransformAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
-        // Get the model layer's base transform (self is the model layer)
-        let baseTransform = _transform
+        // Read from the presentation layer's accumulated transform so that
+        // multiple transform.* animations compose (e.g., scale + rotation).
+        let baseTransform = layer._transform
 
         switch keyPath {
         case "transform":
             // Full transform animation: interpolate between from and to values
             guard let from = (animation.fromValue as? CATransform3D) ?? _transform as CATransform3D?,
                   let to = (animation.toValue as? CATransform3D) ?? _transform as CATransform3D? else { return }
-            layer._transform = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
+            let value = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
+            if animation.isAdditive {
+                layer._transform = CATransform3DConcat(value, baseTransform)
+            } else {
+                layer._transform = value
+            }
 
         case "transform.scale":
             // Scale animation: apply scale to the base transform
@@ -987,6 +1173,17 @@ open class CALayer: CAMediaTiming, Hashable {
             let tz = from + CGFloat(progress) * (to - from)
             layer._transform = CATransform3DTranslate(baseTransform, 0, 0, tz)
 
+        case "sublayerTransform":
+            // Full sublayerTransform animation: interpolate between from and to values
+            guard let from = (animation.fromValue as? CATransform3D) ?? _sublayerTransform as CATransform3D?,
+                  let to = (animation.toValue as? CATransform3D) ?? _sublayerTransform as CATransform3D? else { return }
+            let value = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
+            if animation.isAdditive {
+                layer._sublayerTransform = CATransform3DConcat(value, layer._sublayerTransform)
+            } else {
+                layer._sublayerTransform = value
+            }
+
         default:
             break
         }
@@ -1022,19 +1219,23 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func applyColorAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        let additive = animation.isAdditive
         switch keyPath {
         case "backgroundColor":
             guard let from = extractColor(animation.fromValue) ?? _backgroundColor,
                   let to = extractColor(animation.toValue) ?? _backgroundColor else { return }
-            layer._backgroundColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            layer._backgroundColor = additive ? addColor(value, to: layer._backgroundColor) : value
         case "borderColor":
             guard let from = extractColor(animation.fromValue) ?? _borderColor,
                   let to = extractColor(animation.toValue) ?? _borderColor else { return }
-            layer._borderColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            layer._borderColor = additive ? addColor(value, to: layer._borderColor) : value
         case "shadowColor":
             guard let from = extractColor(animation.fromValue) ?? _shadowColor,
                   let to = extractColor(animation.toValue) ?? _shadowColor else { return }
-            layer._shadowColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            layer._shadowColor = additive ? addColor(value, to: layer._shadowColor) : value
 
         // CAShapeLayer color properties
         case "fillColor":
@@ -1042,13 +1243,15 @@ open class CALayer: CAMediaTiming, Hashable {
                   let modelShapeLayer = self as? CAShapeLayer else { return }
             guard let from = extractColor(animation.fromValue) ?? modelShapeLayer._fillColor,
                   let to = extractColor(animation.toValue) ?? modelShapeLayer._fillColor else { return }
-            shapeLayer._fillColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            shapeLayer._fillColor = additive ? addColor(value, to: shapeLayer._fillColor) : value
         case "strokeColor":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
             guard let from = extractColor(animation.fromValue) ?? modelShapeLayer._strokeColor,
                   let to = extractColor(animation.toValue) ?? modelShapeLayer._strokeColor else { return }
-            shapeLayer._strokeColor = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            shapeLayer._strokeColor = additive ? addColor(value, to: shapeLayer._strokeColor) : value
 
         default:
             break
@@ -1058,6 +1261,14 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Safely extracts a CGColor from an Any value.
     private func extractColor(_ value: Any?) -> CGColor? {
         return value as? CGColor
+    }
+
+    /// Adds RGBA components of two colors (for additive animation).
+    private func addColor(_ value: CGColor, to base: CGColor?) -> CGColor {
+        guard let base = base else { return value }
+        let (vR, vG, vB, vA) = extractRGBA(from: value)
+        let (bR, bG, bB, bA) = extractRGBA(from: base)
+        return CGColor(red: bR + vR, green: bG + vG, blue: bB + vB, alpha: bA + vA)
     }
 
     /// Safely extracts a CGPath from an Any value.
@@ -1584,6 +1795,44 @@ open class CALayer: CAMediaTiming, Hashable {
         case "path":
             if let shapeLayer = layer as? CAShapeLayer, let v = extractPath(value) { shapeLayer._path = v }
 
+        // Additional CGFloat properties
+        case "anchorPointZ":
+            if let v = value as? CGFloat { layer._anchorPointZ = v }
+        case "contentsScale":
+            if let v = value as? CGFloat { layer._contentsScale = v }
+        case "rasterizationScale":
+            if let v = value as? CGFloat { layer.rasterizationScale = v }
+
+        // Additional Float properties
+        case "shadowOpacity":
+            if let v = value as? Float { layer._shadowOpacity = v }
+
+        // Additional CGFloat properties (via shadowRadius already handled above)
+        case "shadowRadius":
+            if let v = value as? CGFloat { layer._shadowRadius = v }
+
+        // CGPoint properties
+        case "bounds.origin":
+            if let v = value as? CGPoint { layer._bounds.origin = v }
+        case "anchorPoint":
+            if let v = value as? CGPoint { layer._anchorPoint = v }
+
+        // CGSize properties
+        case "shadowOffset":
+            if let v = value as? CGSize { layer._shadowOffset = v }
+        case "bounds.size":
+            if let v = value as? CGSize { layer._bounds.size = v }
+
+        // CGRect properties
+        case "contentsRect":
+            if let v = value as? CGRect { layer.contentsRect = v }
+        case "contentsCenter":
+            if let v = value as? CGRect { layer.contentsCenter = v }
+
+        // CATransform3D properties
+        case "sublayerTransform":
+            if let v = value as? CATransform3D { layer._sublayerTransform = v }
+
         // CAGradientLayer properties
         case "startPoint":
             if let gradientLayer = layer as? CAGradientLayer, let v = value as? CGPoint { gradientLayer._startPoint = v }
@@ -1622,7 +1871,8 @@ open class CALayer: CAMediaTiming, Hashable {
                     height: f.size.height + CGFloat(progress) * (t.size.height - f.size.height)
                 )
             }
-        case "cornerRadius", "borderWidth", "shadowRadius", "zPosition":
+        case "cornerRadius", "borderWidth", "shadowRadius", "zPosition",
+             "anchorPointZ", "contentsScale", "rasterizationScale":
             if let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
                 let value = f + CGFloat(progress) * (t - f)
                 switch keyPath {
@@ -1630,12 +1880,65 @@ open class CALayer: CAMediaTiming, Hashable {
                 case "borderWidth": layer._borderWidth = value
                 case "shadowRadius": layer._shadowRadius = value
                 case "zPosition": layer._zPosition = value
+                case "anchorPointZ": layer._anchorPointZ = value
+                case "contentsScale": layer._contentsScale = value
+                case "rasterizationScale": layer.rasterizationScale = value
+                default: break
+                }
+            }
+        case "shadowOpacity":
+            if let f = fromValue as? Float, let t = toValue as? Float {
+                layer._shadowOpacity = f + Float(progress) * (t - f)
+            }
+        case "anchorPoint":
+            if let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
+                layer._anchorPoint = CGPoint(
+                    x: f.x + CGFloat(progress) * (t.x - f.x),
+                    y: f.y + CGFloat(progress) * (t.y - f.y)
+                )
+            }
+        case "bounds.origin":
+            if let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
+                layer._bounds.origin = CGPoint(
+                    x: f.x + CGFloat(progress) * (t.x - f.x),
+                    y: f.y + CGFloat(progress) * (t.y - f.y)
+                )
+            }
+        case "shadowOffset":
+            if let f = fromValue as? CGSize, let t = toValue as? CGSize {
+                layer._shadowOffset = CGSize(
+                    width: f.width + CGFloat(progress) * (t.width - f.width),
+                    height: f.height + CGFloat(progress) * (t.height - f.height)
+                )
+            }
+        case "bounds.size":
+            if let f = fromValue as? CGSize, let t = toValue as? CGSize {
+                layer._bounds.size = CGSize(
+                    width: f.width + CGFloat(progress) * (t.width - f.width),
+                    height: f.height + CGFloat(progress) * (t.height - f.height)
+                )
+            }
+        case "contentsRect", "contentsCenter":
+            if let f = fromValue as? CGRect, let t = toValue as? CGRect {
+                let value = CGRect(
+                    x: f.origin.x + CGFloat(progress) * (t.origin.x - f.origin.x),
+                    y: f.origin.y + CGFloat(progress) * (t.origin.y - f.origin.y),
+                    width: f.size.width + CGFloat(progress) * (t.size.width - f.size.width),
+                    height: f.size.height + CGFloat(progress) * (t.size.height - f.size.height)
+                )
+                switch keyPath {
+                case "contentsRect": layer.contentsRect = value
+                case "contentsCenter": layer.contentsCenter = value
                 default: break
                 }
             }
         case "transform":
             if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
                 layer._transform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
+            }
+        case "sublayerTransform":
+            if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
+                layer._sublayerTransform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
             }
 
         // Color properties

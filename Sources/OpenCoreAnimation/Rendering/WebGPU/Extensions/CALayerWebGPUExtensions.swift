@@ -64,19 +64,17 @@ extension CALayer {
 
     /// Calculates the model matrix for this layer.
     ///
-    /// The z-coordinate is negated to match CoreAnimation's convention where
-    /// higher zPosition values appear "in front" (closer to the viewer).
-    /// With WebGPU's depth range [0, 1] and lessEqual comparison:
-    /// - Lower z in eye space → lower clip z → passes depth test → in front
-    /// - So we negate zPosition: higher zPosition → lower z_eye → in front
+    /// Uses painter's algorithm (back-to-front draw order) for z-ordering.
+    /// zPosition is handled by sorting sublayers before rendering, not by
+    /// depth buffer values. All z-coordinates are zero in the transform.
     internal func modelMatrix(parentMatrix: Matrix4x4 = .identity) -> Matrix4x4 {
         var matrix = parentMatrix
 
-        // Negate zPosition so higher values appear in front (CoreAnimation convention)
+        // zPosition handled by painter's algorithm sorting, not depth buffer
         let translation = Matrix4x4(translation: SIMD3<Float>(
             Float(position.x),
             Float(position.y),
-            Float(-zPosition)  // Negated for correct z-ordering
+            0
         ))
         matrix = matrix * translation
 
@@ -85,11 +83,11 @@ extension CALayer {
             matrix = matrix * layerTransform
         }
 
-        // Negate anchorPointZ to match the z-coordinate convention
+        // Anchor point offset (z=0, anchorPointZ unused in painter's algorithm)
         let anchorOffset = Matrix4x4(translation: SIMD3<Float>(
             Float(-bounds.width * anchorPoint.x),
             Float(-bounds.height * anchorPoint.y),
-            Float(anchorPointZ)  // Negated (double negation with the minus sign)
+            0
         ))
         matrix = matrix * anchorOffset
 

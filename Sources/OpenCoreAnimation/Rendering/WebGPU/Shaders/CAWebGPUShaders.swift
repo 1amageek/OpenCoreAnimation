@@ -298,6 +298,24 @@ public enum CAWebGPUShaders {
 
         return vec4<f32>(input.color.rgb, input.color.a * alpha);
     }
+
+    // Stencil clip fragment shader: discards fragments outside the rounded rectangle
+    // so that the stencil buffer is only written within the rounded rect bounds.
+    // Used by masksToBounds + cornerRadius clipping.
+    @fragment
+    fn stencilClipFragment(input: VertexOutput) -> @location(0) vec4<f32> {
+        if (uniforms.layerSize.x <= 0.0 || uniforms.layerSize.y <= 0.0) {
+            return vec4<f32>(1.0);
+        }
+        let pixelCoord = (input.texCoord - 0.5) * uniforms.layerSize;
+        let halfSize = uniforms.layerSize * 0.5;
+        let radii = getEffectiveRadii();
+        let dist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
+        if (dist > 0.0) {
+            discard;
+        }
+        return vec4<f32>(1.0);
+    }
     """
 
     // MARK: - Textured Layer Shader

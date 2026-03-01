@@ -46,23 +46,21 @@ open class CASpringAnimation: CABasicAnimation {
         // Calculate damping ratio: ζ = c / (2 * sqrt(k * m))
         let dampingRatio = safeDamping / (2 * sqrt(safeStiffness * safeMass))
 
-        if dampingRatio >= 1 {
-            // Natural frequency: ω_n = sqrt(k / m)
-            let naturalFrequency = sqrt(safeStiffness / safeMass)
-            if dampingRatio == 1 {
-                // Critically damped: settling time ≈ 4 / ω_n
-                return 4 / naturalFrequency
-            } else {
-                // Overdamped: settling time ≈ 4 / (ω_n * (ζ - sqrt(ζ² - 1)))
-                // Uses the slower eigenvalue for accurate settling
-                let slowEigenvalue = naturalFrequency * (dampingRatio - sqrt(dampingRatio * dampingRatio - 1))
-                return 4 / slowEigenvalue
-            }
+        // Use tolerance for damping regime classification to avoid
+        // floating-point boundary issues (e.g., dampingRatio = 0.9999999).
+        let criticalDampingTolerance = 1e-6
+        let naturalFrequency = sqrt(safeStiffness / safeMass)
+
+        if abs(dampingRatio - 1) < criticalDampingTolerance {
+            // Critically damped: settling time ≈ 4 / ω_n
+            return 4 / naturalFrequency
+        } else if dampingRatio > 1 {
+            // Overdamped: settling time ≈ 4 / (ω_n * (ζ - sqrt(ζ² - 1)))
+            // Uses the slower eigenvalue for accurate settling
+            let slowEigenvalue = naturalFrequency * (dampingRatio - sqrt(dampingRatio * dampingRatio - 1))
+            return 4 / slowEigenvalue
         } else {
-            // Underdamped
-            // Natural frequency: ω_n = sqrt(k / m)
-            // Settling time ≈ 4 / (ζ * ω_n)
-            let naturalFrequency = sqrt(safeStiffness / safeMass)
+            // Underdamped: settling time ≈ 4 / (ζ * ω_n)
             return 4 / (dampingRatio * naturalFrequency)
         }
     }
@@ -102,7 +100,8 @@ open class CASpringAnimation: CABasicAnimation {
 
         let t = CGFloat(time)
 
-        if zeta < 1 {
+        // Use tolerance for damping regime classification (consistent with settlingDuration)
+        if zeta < 1 - 1e-6 {
             // Underdamped: oscillates
             // x(t) = 1 - e^(-ζω_n*t) * (cos(ω_d*t) + ((ζω_n - v0) / ω_d) * sin(ω_d*t))
             let omega_d = omega_n * sqrt(1 - zeta * zeta)  // Damped frequency
@@ -112,13 +111,13 @@ open class CASpringAnimation: CABasicAnimation {
             let sinComponent = sinCoefficient * sin(omega_d * t)
 
             return 1 - decay * (cosComponent + sinComponent)
-        } else if zeta == 1 {
+        } else if abs(zeta - 1) < 1e-6 {
             // Critically damped: fastest return without oscillation
             // x(t) = 1 - e^(-ω_n*t) * (1 + (ω_n - v0) * t)
             let decay = exp(-omega_n * t)
             return 1 - decay * (1 + (omega_n - initialVelocity) * t)
         } else {
-            // Overdamped: slow return without oscillation
+            // Overdamped (zeta > 1): slow return without oscillation
             // x(t) = 1 - A*e^(r1*t) - B*e^(r2*t)
             // where r1, r2 = -ω_n * (ζ ± sqrt(ζ² - 1))
             let sqrtTerm = sqrt(zeta * zeta - 1)
