@@ -6,6 +6,14 @@
 import Foundation
 import OpenCoreGraphics
 
+internal enum CAFilterOperation: Equatable {
+    case gaussianBlur(radius: CGFloat)
+    case brightness(amount: CGFloat)
+    case contrast(amount: CGFloat)
+    case saturation(amount: CGFloat)
+    case colorInvert
+}
+
 
 /// A filter effect that can be applied to layer content.
 ///
@@ -32,6 +40,14 @@ import OpenCoreGraphics
 /// ]
 /// ```
 public struct CAFilter: Hashable {
+
+    private enum ParameterValue: Hashable {
+        case bool(Bool)
+        case int(Int)
+        case double(Double)
+        case string(String)
+        case unsupported(String)
+    }
 
     /// The type of filter effect.
     public enum FilterType: String, Hashable, Sendable {
@@ -126,13 +142,50 @@ public struct CAFilter: Hashable {
 
     // MARK: - Hashable
 
+    private static func normalizedParameterValue(_ value: Any) -> ParameterValue {
+        switch value {
+        case let value as Bool:
+            return .bool(value)
+        case let value as Int:
+            return .int(value)
+        case let value as CGFloat:
+            return .double(Double(value))
+        case let value as Double:
+            return .double(value)
+        case let value as Float:
+            return .double(Double(value))
+        case let value as String:
+            return .string(value)
+        default:
+            return .unsupported(String(describing: value))
+        }
+    }
+
     public func hash(into hasher: inout Hasher) {
         hasher.combine(type)
-        // Note: parameters are not included in hash for simplicity
+        for key in parameters.keys.sorted() {
+            hasher.combine(key)
+            if let value = parameters[key] {
+                hasher.combine(Self.normalizedParameterValue(value))
+            }
+        }
     }
 
     public static func == (lhs: CAFilter, rhs: CAFilter) -> Bool {
-        return lhs.type == rhs.type
+        guard lhs.type == rhs.type, lhs.parameters.count == rhs.parameters.count else {
+            return false
+        }
+
+        for key in lhs.parameters.keys {
+            guard let lhsValue = lhs.parameters[key], let rhsValue = rhs.parameters[key] else {
+                return false
+            }
+            guard normalizedParameterValue(lhsValue) == normalizedParameterValue(rhsValue) else {
+                return false
+            }
+        }
+
+        return true
     }
 
     // MARK: - Parameter Access
@@ -174,6 +227,23 @@ public struct CAFilter: Hashable {
         guard type == .saturation else { return nil }
         return floatValue(forKey: "inputSaturation") ?? 1
     }
+
+    internal var operation: CAFilterOperation? {
+        switch type {
+        case .gaussianBlur:
+            return .gaussianBlur(radius: blurRadius ?? 0)
+        case .brightness:
+            return .brightness(amount: brightnessAmount ?? 0)
+        case .contrast:
+            return .contrast(amount: contrastAmount ?? 1)
+        case .saturation:
+            return .saturation(amount: saturationAmount ?? 1)
+        case .colorInvert:
+            return .colorInvert
+        case .sepiaTone, .vignette:
+            return nil
+        }
+    }
 }
 
 // MARK: - CALayer Filter Extensions
@@ -189,16 +259,28 @@ extension CALayer {
         return filters.compactMap { $0 as? CAFilter }
     }
 
+    /// Returns supported GPU filter operations in the order they should be applied.
+    internal var supportedFilterOperations: [CAFilterOperation] {
+        activeFilters.compactMap(\.operation)
+    }
+
     /// Checks if the layer has any blur filters.
     internal var hasBlurFilter: Bool {
-        return activeFilters.contains { $0.type == .gaussianBlur }
+        return supportedFilterOperations.contains {
+            if case .gaussianBlur = $0 {
+                return true
+            }
+            return false
+        }
     }
 
     /// Gets the total blur radius from all blur filters.
     internal var totalBlurRadius: CGFloat {
-        return activeFilters
-            .filter { $0.type == .gaussianBlur }
-            .compactMap { $0.blurRadius }
-            .reduce(0, +)
+        supportedFilterOperations.reduce(0) { partialResult, operation in
+            guard case let .gaussianBlur(radius) = operation else {
+                return partialResult
+            }
+            return partialResult + radius
+        }
     }
 }

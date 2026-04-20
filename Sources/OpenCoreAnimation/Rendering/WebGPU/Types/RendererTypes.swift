@@ -94,4 +94,24 @@ public struct TexturedUniforms {
     }
 }
 
+/// Uniform data for single-pass filter compositing.
+public struct FilterCompositeUniforms {
+    public var opacity: Float
+    public var filterType: Float
+    public var parameter0: Float
+    public var parameter1: Float
+
+    public init(
+        opacity: Float = 1.0,
+        filterType: Float = 0.0,
+        parameter0: Float = 0.0,
+        parameter1: Float = 0.0
+    ) {
+        self.opacity = opacity
+        self.filterType = filterType
+        self.parameter0 = parameter0
+        self.parameter1 = parameter1
+    }
+}
+
 #endif

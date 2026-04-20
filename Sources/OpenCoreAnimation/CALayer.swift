@@ -161,7 +161,7 @@ open class CALayer: CAMediaTiming, Hashable {
     /// - Parameter timeOffset: The time offset to subtract from the current time when evaluating animations.
     ///                         Positive values make the animation appear earlier (as if more time has passed).
     /// - Returns: A new presentation layer with animations evaluated at the offset time.
-    public func presentationAtTimeOffset(_ timeOffset: CFTimeInterval) -> Self {
+    internal func presentationAtTimeOffset(_ timeOffset: CFTimeInterval) -> Self {
         // Create a new presentation layer copy
         let presentationClass = type(of: self)
         let presentation = presentationClass.init(layer: self)
@@ -1189,33 +1189,15 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    /// Interpolates between two transforms using naive element-wise linear interpolation.
+    /// Interpolates between two transforms by decomposing each into translation,
+    /// rotation (as a quaternion), scale, skew, and perspective components,
+    /// interpolating each independently, and recomposing.
     ///
-    /// - Note: This approach does not correctly interpolate rotations or combined transforms.
-    ///   A proper implementation should decompose each matrix into translation, rotation, scale,
-    ///   and skew components, interpolate each independently (using slerp for rotation),
-    ///   and recompose. This is a known limitation.
-    ///
-    /// - TODO: Implement matrix decomposition for correct transform interpolation.
+    /// Naive element-wise interpolation of the 16 matrix entries produces
+    /// invalid intermediate matrices whenever a rotation is involved. The
+    /// actual work lives in `CATransform3DInterpolation`.
     private func interpolateTransform(from: CATransform3D, to: CATransform3D, progress: CGFloat) -> CATransform3D {
-        return CATransform3D(
-            m11: from.m11 + progress * (to.m11 - from.m11),
-            m12: from.m12 + progress * (to.m12 - from.m12),
-            m13: from.m13 + progress * (to.m13 - from.m13),
-            m14: from.m14 + progress * (to.m14 - from.m14),
-            m21: from.m21 + progress * (to.m21 - from.m21),
-            m22: from.m22 + progress * (to.m22 - from.m22),
-            m23: from.m23 + progress * (to.m23 - from.m23),
-            m24: from.m24 + progress * (to.m24 - from.m24),
-            m31: from.m31 + progress * (to.m31 - from.m31),
-            m32: from.m32 + progress * (to.m32 - from.m32),
-            m33: from.m33 + progress * (to.m33 - from.m33),
-            m34: from.m34 + progress * (to.m34 - from.m34),
-            m41: from.m41 + progress * (to.m41 - from.m41),
-            m42: from.m42 + progress * (to.m42 - from.m42),
-            m43: from.m43 + progress * (to.m43 - from.m43),
-            m44: from.m44 + progress * (to.m44 - from.m44)
-        )
+        return CATransform3DInterpolation.interpolate(from: from, to: to, progress: progress)
     }
 
     private func applyColorAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
@@ -2424,7 +2406,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // Set up clipping if masksToBounds is true
         if masksToBounds {
-            let clipPath = CGPath(roundedRect: bounds, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+            let clipPath = layerShapePath(in: bounds)
             ctx.addPath(clipPath)
             ctx.clip()
         }
@@ -2438,11 +2420,16 @@ open class CALayer: CAMediaTiming, Hashable {
             )
         }
 
+        let maskLayer = mask
+        if maskLayer != nil {
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        }
+
         // Draw background color
         if let bgColor = backgroundColor {
             ctx.setFillColor(bgColor)
             if cornerRadius > 0 {
-                let path = CGPath(roundedRect: bounds, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+                let path = layerShapePath(in: bounds)
                 ctx.addPath(path)
                 ctx.fillPath()
             } else {
@@ -2463,8 +2450,7 @@ open class CALayer: CAMediaTiming, Hashable {
             ctx.setStrokeColor(borderColor)
             ctx.setLineWidth(borderWidth)
             if cornerRadius > 0 {
-                let path = CGPath(roundedRect: bounds.insetBy(dx: borderWidth / 2, dy: borderWidth / 2),
-                                  cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
+                let path = layerShapePath(in: bounds.insetBy(dx: borderWidth / 2, dy: borderWidth / 2))
                 ctx.addPath(path)
                 ctx.strokePath()
             } else {
@@ -2494,12 +2480,114 @@ open class CALayer: CAMediaTiming, Hashable {
                 ctx.restoreGState()
             }
         }
+
+        if let maskLayer {
+            applyMask(maskLayer, in: ctx)
+            ctx.endTransparencyLayer()
+        }
+    }
+
+    private func layerShapePath(in rect: CGRect) -> CGPath {
+        guard rect.width > 0, rect.height > 0 else {
+            return CGPath(rect: .zero, transform: nil)
+        }
+
+        let radius = min(cornerRadius, min(rect.width, rect.height) / 2)
+        guard radius > 0 else {
+            return CGPath(rect: rect, transform: nil)
+        }
+
+        let topLeft = maskedCorners.contains(.layerMinXMinYCorner) ? radius : 0
+        let topRight = maskedCorners.contains(.layerMaxXMinYCorner) ? radius : 0
+        let bottomLeft = maskedCorners.contains(.layerMinXMaxYCorner) ? radius : 0
+        let bottomRight = maskedCorners.contains(.layerMaxXMaxYCorner) ? radius : 0
+
+        if topLeft == radius, topRight == radius, bottomLeft == radius, bottomRight == radius {
+            return CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        }
+
+        if topLeft == 0, topRight == 0, bottomLeft == 0, bottomRight == 0 {
+            return CGPath(rect: rect, transform: nil)
+        }
+
+        let path = CGMutablePath()
+        let kappa = CGFloat(0.5522847498)
+
+        path.move(to: CGPoint(x: rect.minX + topLeft, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX - topRight, y: rect.minY))
+        if topRight > 0 {
+            let offset = topRight * kappa
+            path.addCurve(
+                to: CGPoint(x: rect.maxX, y: rect.minY + topRight),
+                control1: CGPoint(x: rect.maxX - topRight + offset, y: rect.minY),
+                control2: CGPoint(x: rect.maxX, y: rect.minY + topRight - offset)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        }
+
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - bottomRight))
+        if bottomRight > 0 {
+            let offset = bottomRight * kappa
+            path.addCurve(
+                to: CGPoint(x: rect.maxX - bottomRight, y: rect.maxY),
+                control1: CGPoint(x: rect.maxX, y: rect.maxY - bottomRight + offset),
+                control2: CGPoint(x: rect.maxX - bottomRight + offset, y: rect.maxY)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        }
+
+        path.addLine(to: CGPoint(x: rect.minX + bottomLeft, y: rect.maxY))
+        if bottomLeft > 0 {
+            let offset = bottomLeft * kappa
+            path.addCurve(
+                to: CGPoint(x: rect.minX, y: rect.maxY - bottomLeft),
+                control1: CGPoint(x: rect.minX + bottomLeft - offset, y: rect.maxY),
+                control2: CGPoint(x: rect.minX, y: rect.maxY - bottomLeft + offset)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        }
+
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + topLeft))
+        if topLeft > 0 {
+            let offset = topLeft * kappa
+            path.addCurve(
+                to: CGPoint(x: rect.minX + topLeft, y: rect.minY),
+                control1: CGPoint(x: rect.minX, y: rect.minY + topLeft - offset),
+                control2: CGPoint(x: rect.minX + topLeft - offset, y: rect.minY)
+            )
+        } else {
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        }
+
+        path.closeSubpath()
+        return path
+    }
+
+    private func applyMask(_ maskLayer: CALayer, in ctx: CGContext) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+
+        let maskOrigin = CGPoint(
+            x: maskLayer.position.x - maskLayer.bounds.width * maskLayer.anchorPoint.x,
+            y: maskLayer.position.y - maskLayer.bounds.height * maskLayer.anchorPoint.y
+        )
+        ctx.translateBy(x: maskOrigin.x, y: maskOrigin.y)
+        ctx.setBlendMode(.destinationIn)
+        maskLayer.render(in: ctx)
     }
 
     /// Draws the contents image into the context.
     private func drawContents(_ image: CGImage, in ctx: CGContext) {
-        let destRect = calculateContentsRect(for: image)
-        ctx.draw(image, in: destRect)
+        let sourceImage = applyContentsRect(to: image)
+        if shouldUseNineSliceScaling, contentsCenter != CGRect(x: 0, y: 0, width: 1, height: 1) {
+            drawNineSliceContents(sourceImage, in: ctx)
+        } else {
+            let destRect = calculateContentsRect(for: sourceImage)
+            ctx.draw(sourceImage, in: destRect)
+        }
     }
 
     /// Calculates the destination rectangle for drawing contents based on contentsGravity.
@@ -2554,6 +2642,132 @@ open class CALayer: CAMediaTiming, Hashable {
         default:
             return bounds
         }
+    }
+
+    private var shouldUseNineSliceScaling: Bool {
+        switch contentsGravity {
+        case .resize, .resizeAspect, .resizeAspectFill:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func applyContentsRect(to image: CGImage) -> CGImage {
+        let unitRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+        guard contentsRect != unitRect else { return image }
+
+        let minX = Int((contentsRect.minX * CGFloat(image.width)).rounded(.down))
+        let minY = Int((contentsRect.minY * CGFloat(image.height)).rounded(.down))
+        let maxX = Int((contentsRect.maxX * CGFloat(image.width)).rounded(.up))
+        let maxY = Int((contentsRect.maxY * CGFloat(image.height)).rounded(.up))
+        let cropRect = CGRect(
+            x: CGFloat(minX),
+            y: CGFloat(minY),
+            width: CGFloat(maxX - minX),
+            height: CGFloat(maxY - minY)
+        )
+
+        return image.cropping(to: cropRect) ?? image
+    }
+
+    private func drawNineSliceContents(_ image: CGImage, in ctx: CGContext) {
+        let destinationRect = calculateContentsRect(for: image)
+        let centerRect = resolvedContentsCenter(in: image)
+
+        let leftSourceWidth = centerRect.minX
+        let centerSourceWidth = centerRect.width
+        let rightSourceWidth = CGFloat(image.width) - centerRect.maxX
+        let topSourceHeight = centerRect.minY
+        let centerSourceHeight = centerRect.height
+        let bottomSourceHeight = CGFloat(image.height) - centerRect.maxY
+
+        var leftDestinationWidth = leftSourceWidth
+        var rightDestinationWidth = rightSourceWidth
+        let fixedHorizontalWidth = leftDestinationWidth + rightDestinationWidth
+        if fixedHorizontalWidth > destinationRect.width, fixedHorizontalWidth > 0 {
+            let scale = destinationRect.width / fixedHorizontalWidth
+            leftDestinationWidth *= scale
+            rightDestinationWidth *= scale
+        }
+        let centerDestinationWidth = max(0, destinationRect.width - leftDestinationWidth - rightDestinationWidth)
+
+        var topDestinationHeight = topSourceHeight
+        var bottomDestinationHeight = bottomSourceHeight
+        let fixedVerticalHeight = topDestinationHeight + bottomDestinationHeight
+        if fixedVerticalHeight > destinationRect.height, fixedVerticalHeight > 0 {
+            let scale = destinationRect.height / fixedVerticalHeight
+            topDestinationHeight *= scale
+            bottomDestinationHeight *= scale
+        }
+        let centerDestinationHeight = max(0, destinationRect.height - topDestinationHeight - bottomDestinationHeight)
+
+        let sourceColumns = [
+            (origin: CGFloat(0), size: leftSourceWidth),
+            (origin: centerRect.minX, size: centerSourceWidth),
+            (origin: centerRect.maxX, size: rightSourceWidth)
+        ]
+        let sourceRows = [
+            (origin: CGFloat(0), size: topSourceHeight),
+            (origin: centerRect.minY, size: centerSourceHeight),
+            (origin: centerRect.maxY, size: bottomSourceHeight)
+        ]
+        let destinationColumns = [
+            (origin: destinationRect.minX, size: leftDestinationWidth),
+            (origin: destinationRect.minX + leftDestinationWidth, size: centerDestinationWidth),
+            (origin: destinationRect.maxX - rightDestinationWidth, size: rightDestinationWidth)
+        ]
+        let destinationRows = [
+            (origin: destinationRect.minY, size: topDestinationHeight),
+            (origin: destinationRect.minY + topDestinationHeight, size: centerDestinationHeight),
+            (origin: destinationRect.maxY - bottomDestinationHeight, size: bottomDestinationHeight)
+        ]
+
+        for row in 0..<3 {
+            for column in 0..<3 {
+                let sourceRect = CGRect(
+                    x: sourceColumns[column].origin,
+                    y: sourceRows[row].origin,
+                    width: sourceColumns[column].size,
+                    height: sourceRows[row].size
+                )
+                let destinationRect = CGRect(
+                    x: destinationColumns[column].origin,
+                    y: destinationRows[row].origin,
+                    width: destinationColumns[column].size,
+                    height: destinationRows[row].size
+                )
+
+                guard sourceRect.width > 0,
+                      sourceRect.height > 0,
+                      destinationRect.width > 0,
+                      destinationRect.height > 0,
+                      let sliceImage = image.cropping(to: sourceRect) else {
+                    continue
+                }
+
+                ctx.draw(sliceImage, in: destinationRect)
+            }
+        }
+    }
+
+    private func resolvedContentsCenter(in image: CGImage) -> CGRect {
+        let minX = Int((contentsCenter.minX * CGFloat(image.width)).rounded(.down))
+        let minY = Int((contentsCenter.minY * CGFloat(image.height)).rounded(.down))
+        let maxX = Int((contentsCenter.maxX * CGFloat(image.width)).rounded(.up))
+        let maxY = Int((contentsCenter.maxY * CGFloat(image.height)).rounded(.up))
+
+        let clampedMinX = max(0, min(image.width, minX))
+        let clampedMinY = max(0, min(image.height, minY))
+        let clampedMaxX = max(clampedMinX, min(image.width, maxX))
+        let clampedMaxY = max(clampedMinY, min(image.height, maxY))
+
+        return CGRect(
+            x: CGFloat(clampedMinX),
+            y: CGFloat(clampedMinY),
+            width: CGFloat(clampedMaxX - clampedMinX),
+            height: CGFloat(clampedMaxY - clampedMinY)
+        )
     }
 
     // MARK: - Modifying the Layer Geometry
@@ -2627,6 +2841,9 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _bounds
             _bounds = newValue
+            if needsDisplayOnBoundsChange, oldValue != newValue {
+                setNeedsDisplay()
+            }
             CATransaction.registerChange(layer: self, keyPath: "bounds", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -3276,33 +3493,51 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Converts the time interval from the specified layer's time space to the receiver's time space.
     open func convertTime(_ t: CFTimeInterval, from l: CALayer?) -> CFTimeInterval {
-        guard let sourceLayer = l else { return t }
+        guard let sourceLayer = l else {
+            return convertGlobalTimeToLocal(t)
+        }
         if sourceLayer === self { return t }
 
-        // Convert time considering speed and timeOffset along the layer chain
-        var time = t
+        let selfChain = ancestorChain()
+        var sourceAncestors = Set<ObjectIdentifier>()
         var current: CALayer? = sourceLayer
-
-        // Convert from source up to root
         while let layer = current {
-            if layer === self { break }
-            // Apply layer's time mapping: parentTime = (localTime - timeOffset) * speed + beginTime
-            time = (time - layer.timeOffset) * CFTimeInterval(layer.speed) + layer.beginTime
+            sourceAncestors.insert(ObjectIdentifier(layer))
             current = layer._superlayer
         }
 
-        if current === self {
+        let commonAncestor = selfChain.first { sourceAncestors.contains(ObjectIdentifier($0)) }
+
+        var time = t
+        current = sourceLayer
+
+        while let layer = current, layer !== commonAncestor {
+            let speed = CFTimeInterval(layer.speed)
+            if speed != 0 {
+                time = (time - layer.timeOffset) / speed + layer.beginTime
+            } else {
+                time = 0
+            }
+            current = layer._superlayer
+        }
+
+        guard let commonAncestor else {
+            return convertGlobalTimeToLocal(time)
+        }
+
+        if commonAncestor === self {
             return time
         }
 
-        // Convert from root down to self (inverse time mapping)
-        let selfChain = ancestorChain()
-        for layer in selfChain.reversed() {
-            if layer === self { continue }
-            // Inverse: localTime = (parentTime - beginTime) / speed + timeOffset
-            if layer.speed != 0 {
-                time = (time - layer.beginTime) / CFTimeInterval(layer.speed) + layer.timeOffset
+        guard let commonIndex = selfChain.firstIndex(where: { $0 === commonAncestor }) else {
+            return convertGlobalTimeToLocal(time)
+        }
+
+        for layer in selfChain[..<commonIndex].reversed() {
+            if time < layer.beginTime {
+                return 0
             }
+            time = (time - layer.beginTime) * CFTimeInterval(layer.speed) + layer.timeOffset
         }
 
         return time
@@ -3310,10 +3545,40 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Converts the time interval from the receiver's time space to the specified layer's time space.
     open func convertTime(_ t: CFTimeInterval, to l: CALayer?) -> CFTimeInterval {
-        guard let targetLayer = l else { return t }
+        guard let targetLayer = l else {
+            return convertLocalTimeToGlobal(t)
+        }
         if targetLayer === self { return t }
 
         return targetLayer.convertTime(t, from: self)
+    }
+
+    private func convertLocalTimeToGlobal(_ t: CFTimeInterval) -> CFTimeInterval {
+        var time = t
+        var current: CALayer? = self
+
+        while let layer = current {
+            let speed = CFTimeInterval(layer.speed)
+            if speed != 0 {
+                time = (time - layer.timeOffset) / speed + layer.beginTime
+            } else {
+                time = 0
+            }
+            current = layer._superlayer
+        }
+
+        return time
+    }
+
+    private func convertGlobalTimeToLocal(_ t: CFTimeInterval) -> CFTimeInterval {
+        var time = t
+        for layer in ancestorChain().reversed() {
+            if time < layer.beginTime {
+                return 0
+            }
+            time = (time - layer.beginTime) * CFTimeInterval(layer.speed) + layer.timeOffset
+        }
+        return time
     }
 
     // MARK: - Hit Testing

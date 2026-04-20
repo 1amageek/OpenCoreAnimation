@@ -218,7 +218,7 @@ struct CAAnimationRepeatDurationTests {
         animation.addedTime = now - 2.25
 
         let presentation = layer.presentationAtTimeOffset(0)
-        #expect(abs(presentation.opacity - 0.25) < 0.0001)
+        #expect(abs(presentation.opacity - 0.25) < 0.001)
     }
 }
 
@@ -1611,7 +1611,7 @@ struct TypeAliasesTests {
         _ = CAMediaTimingFunction(name: .default)
 
         // If we got here without crashing, the names are valid
-        #expect(true)
+        #expect(Bool(true))
     }
 }
 

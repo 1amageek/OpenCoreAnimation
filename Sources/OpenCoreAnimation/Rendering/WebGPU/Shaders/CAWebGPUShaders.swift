@@ -621,6 +621,80 @@ public enum CAWebGPUShaders {
     }
     """
 
+    // MARK: - Filter Composite Shader
+
+    /// Shader code for filter compositing and color adjustments.
+    public static let filterComposite = """
+    struct FilterUniforms {
+        opacity: f32,
+        filterType: f32,
+        parameter0: f32,
+        parameter1: f32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: FilterUniforms;
+    @group(0) @binding(1) var inputTexture: texture_2d<f32>;
+    @group(0) @binding(2) var texSampler: sampler;
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) texCoord: vec2<f32>,
+    }
+
+    @vertex
+    fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+        let positions = array<vec2<f32>, 6>(
+            vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+            vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+        );
+        let texCoords = array<vec2<f32>, 6>(
+            vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+            vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
+        );
+
+        var output: VertexOutput;
+        output.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+        output.texCoord = texCoords[vertexIndex];
+        return output;
+    }
+
+    fn applyBrightness(color: vec3<f32>, amount: f32) -> vec3<f32> {
+        return clamp(color + vec3<f32>(amount), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
+    fn applyContrast(color: vec3<f32>, amount: f32) -> vec3<f32> {
+        return clamp((color - vec3<f32>(0.5)) * amount + vec3<f32>(0.5), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
+    fn applySaturation(color: vec3<f32>, amount: f32) -> vec3<f32> {
+        let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let grayscale = vec3<f32>(luminance);
+        return clamp(mix(grayscale, color, amount), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
+    fn applyColorInvert(color: vec3<f32>) -> vec3<f32> {
+        return vec3<f32>(1.0) - color;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        var color = textureSample(inputTexture, texSampler, input.texCoord);
+
+        if (uniforms.filterType == 1.0) {
+            color.rgb = applyBrightness(color.rgb, uniforms.parameter0);
+        } else if (uniforms.filterType == 2.0) {
+            color.rgb = applyContrast(color.rgb, uniforms.parameter0);
+        } else if (uniforms.filterType == 3.0) {
+            color.rgb = applySaturation(color.rgb, uniforms.parameter0);
+        } else if (uniforms.filterType == 4.0) {
+            color.rgb = applyColorInvert(color.rgb);
+        }
+
+        color.a *= uniforms.opacity;
+        return color;
+    }
+    """
+
     // MARK: - Masked Rendering Shader
 
     /// Shader code for masked rendering.
