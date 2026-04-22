@@ -58,4 +58,19 @@ open class CATransition: CAAnimation {
 
     /// An optional Core Image filter object that provides the transition.
     open var filter: Any?
+
+    public required init() {
+        super.init()
+    }
+
+    public required init(animation: CAAnimation) {
+        super.init(animation: animation)
+        if let source = animation as? CATransition {
+            self.type = source.type
+            self.subtype = source.subtype
+            self.startProgress = source.startProgress
+            self.endProgress = source.endProgress
+            self.filter = source.filter
+        }
+    }
 }

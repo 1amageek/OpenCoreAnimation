@@ -9,7 +9,42 @@ open class CAAnimation: CAMediaTiming, CAAction {
     // MARK: - Initialization
 
     /// Creates a new animation object.
-    public init() {}
+    public required init() {}
+
+    /// Creates a new animation initialized from the given animation.
+    ///
+    /// Subclasses override this initializer to copy their own properties.
+    /// The initializer is used by `copy()` to implement Apple's documented
+    /// "the animation is copied" contract for `CALayer.add(_:forKey:)`.
+    public required init(animation: CAAnimation) {
+        self.beginTime = animation.beginTime
+        self.timeOffset = animation.timeOffset
+        self.repeatCount = animation.repeatCount
+        self.repeatDuration = animation.repeatDuration
+        self.duration = animation.duration
+        self.speed = animation.speed
+        self.autoreverses = animation.autoreverses
+        self.fillMode = animation.fillMode
+        self.timingFunction = animation.timingFunction
+        self.delegate = animation.delegate
+        self.isRemovedOnCompletion = animation.isRemovedOnCompletion
+        // Runtime state (addedTime / isFinished / attachedLayer / animationKey)
+        // is intentionally NOT copied — a fresh copy represents a new, unstarted
+        // animation that has not yet been attached to a layer.
+    }
+
+    /// Returns a copy of the receiver.
+    ///
+    /// The returned animation is a brand-new instance with all timing and
+    /// configuration properties duplicated. Mutating the original after calling
+    /// `copy()` must not affect the returned instance.
+    ///
+    /// Subclasses should not need to override this — the `required init(animation:)`
+    /// initializer is invoked via `type(of: self)`, so subclass state is preserved
+    /// as long as the subclass overrides `init(animation:)`.
+    open func copy() -> Self {
+        return Self.init(animation: self)
+    }
 
     // MARK: - CAMediaTiming
 

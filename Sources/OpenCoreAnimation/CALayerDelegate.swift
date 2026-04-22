@@ -4,7 +4,6 @@
 // Full API compatibility with Apple's CoreAnimation framework
 
 import Foundation
-import OpenCoreGraphics
 
 /// Methods your app can implement to respond to layer-related events.
 ///

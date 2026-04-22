@@ -1,10 +1,8 @@
 import Testing
-#if canImport(CoreGraphics)
-import CoreGraphics
-#else
-import OpenCoreGraphics
-#endif
 @testable import OpenCoreAnimation
+// OpenCoreAnimation's umbrella `@_exported import`s OpenCoreGraphics. Importing
+// CoreGraphics here in addition would collide with OpenCoreGraphics' retroactive
+// conformances (CGPoint ==, CGSize ==, CGRect ==, CGAffineTransform init, etc.).
 
 // MARK: - CATransform3D Tests
 

@@ -1,6 +1,5 @@
 #if arch(wasm32)
 import Foundation
-import OpenCoreGraphics
 
 // MARK: - Geometry Cache Types
 

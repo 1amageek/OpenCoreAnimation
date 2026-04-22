@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 
 /// An animation that applies a spring-like force to a layer's properties.
@@ -32,6 +31,20 @@ open class CASpringAnimation: CABasicAnimation {
 
     /// The initial velocity of the object attached to the spring.
     open var initialVelocity: CGFloat = 0
+
+    public required init() {
+        super.init()
+    }
+
+    public required init(animation: CAAnimation) {
+        super.init(animation: animation)
+        if let source = animation as? CASpringAnimation {
+            self.mass = source.mass
+            self.stiffness = source.stiffness
+            self.damping = source.damping
+            self.initialVelocity = source.initialVelocity
+        }
+    }
 
     /// The estimated duration required for the spring system to be considered at rest.
     ///

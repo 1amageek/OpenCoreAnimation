@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 /// Decomposition-based interpolation for `CATransform3D`, adapted from the
 /// W3C CSS Transforms Level 2 algorithm for CATransform3D's row-vector

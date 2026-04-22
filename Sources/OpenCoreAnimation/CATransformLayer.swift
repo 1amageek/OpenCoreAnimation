@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 
 /// Objects used to create true 3D layer hierarchies, rather than the flattened hierarchy

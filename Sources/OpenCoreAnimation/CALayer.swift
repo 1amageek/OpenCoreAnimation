@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 
 /// An object that manages image-based content and allows you to perform animations on that content.
@@ -3070,6 +3069,10 @@ open class CALayer: CAMediaTiming, Hashable {
     /// If an animation with the same key already exists, it is replaced.
     /// The replaced animation's delegate receives `animationDidStop(_:finished:)`
     /// with `finished: false` before the new animation starts.
+    ///
+    /// Matching Apple's documented behavior, the animation is copied on add —
+    /// mutating the original after insertion does not affect the in-flight
+    /// animation, and the same template may safely be reused.
     open func add(_ anim: CAAnimation, forKey key: String?) {
         let animKey: String
         if let key = key {
@@ -3086,16 +3089,20 @@ open class CALayer: CAMediaTiming, Hashable {
             }
         }
 
-        // Set up animation internal state
-        anim.addedTime = CACurrentMediaTime()
-        anim.isFinished = false
-        anim.attachedLayer = self
-        anim.animationKey = animKey
+        // Copy per Apple's contract: "the animation is copied".
+        let copied = anim.copy()
 
-        _animations[animKey] = anim
+        // Set up animation internal state on the copy
+        copied.addedTime = CACurrentMediaTime()
+        copied.isFinished = false
+        copied.attachedLayer = self
+        copied.animationKey = animKey
 
-        // Notify delegate that animation started
-        anim.delegate?.animationDidStart(anim)
+        _animations[animKey] = copied
+
+        // Notify delegate that animation started (using the copy — its delegate
+        // was duplicated from the original during copy()).
+        copied.delegate?.animationDidStart(copied)
     }
 
     /// Returns the animation object with the specified identifier.
@@ -3310,15 +3317,16 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Returns the default action for the current class.
     ///
     /// For animatable properties, this returns a `CABasicAnimation` configured
-    /// with the current transaction's duration and timing function.
+    /// with the current transaction's duration and timing function. When the
+    /// transaction does not specify a timing function, `.default` is used so
+    /// implicit animations are eased rather than linear — matching Apple.
     open class func defaultAction(forKey event: String) -> (any CAAction)? {
         guard animatableKeys.contains(event) else { return nil }
 
         let animation = CABasicAnimation(keyPath: event)
         animation.duration = CATransaction.animationDuration()
-        if let timingFunction = CATransaction.animationTimingFunction() {
-            animation.timingFunction = timingFunction
-        }
+        animation.timingFunction = CATransaction.animationTimingFunction()
+            ?? CAMediaTimingFunction(name: .default)
         return animation
     }
 

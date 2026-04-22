@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 
 /// An object that provides a flexible method of defining animated transformations.

@@ -4,7 +4,6 @@
 // Full API compatibility with Apple's CoreAnimation framework
 
 import Foundation
-import OpenCoreGraphics
 
 /// The definition of a particle emitted by a particle layer.
 open class CAEmitterCell: CAMediaTiming {

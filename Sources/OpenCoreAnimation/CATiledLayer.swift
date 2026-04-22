@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 /// A layer that provides a way to asynchronously provide tiles of the layer's content,
 /// potentially cached at multiple levels of detail.

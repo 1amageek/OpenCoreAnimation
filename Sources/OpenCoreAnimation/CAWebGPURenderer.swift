@@ -1,6 +1,5 @@
 #if arch(wasm32)
 import Foundation
-import OpenCoreGraphics
 import JavaScriptKit
 import SwiftWebGPU
 
@@ -3275,8 +3274,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        // Create cache key based on text content and properties
-        let cacheKey = "\(text)_\(width)x\(height)_\(textLayer.fontSize)_\(textLayer.alignmentMode.rawValue)"
+        // Create cache key based on text content and properties.
+        // Includes font fingerprint and foreground color so that two layers
+        // with the same text but different font / color do not collide.
+        let cacheKey = textCacheKey(
+            text: text,
+            width: width,
+            height: height,
+            layer: textLayer
+        )
 
         // Check cache first
         let gpuTexture: GPUTexture
@@ -3486,24 +3492,180 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass.setPipeline(pipeline)
     }
 
-    /// Draws wrapped text on a Canvas2D context.
+    /// Builds a cache key for a CATextLayer's rendered text texture.
+    ///
+    /// The key must vary on anything that changes the rendered pixels:
+    /// text content, layer size, font (family / size), alignment, and
+    /// foreground color. Earlier versions omitted font and color, so two
+    /// layers with the same string but different styling silently shared
+    /// the same texture.
+    private func textCacheKey(
+        text: String,
+        width: Int,
+        height: Int,
+        layer: CATextLayer
+    ) -> String {
+        let fontFingerprint: String
+        if let fontString = layer.font as? String {
+            fontFingerprint = fontString
+        } else if let anyFont = layer.font {
+            // Any other font representation — rely on its reflection / description.
+            // This is deterministic for the same object reference during a frame.
+            fontFingerprint = String(describing: anyFont)
+        } else {
+            fontFingerprint = "sans-serif"
+        }
+
+        let colorHex: String
+        if let fg = layer.foregroundColor, let components = fg.components {
+            let r = Int((components.indices.contains(0) ? components[0] : 0) * 255) & 0xFF
+            let g = Int((components.indices.contains(1) ? components[1] : 0) * 255) & 0xFF
+            let b = Int((components.indices.contains(2) ? components[2] : 0) * 255) & 0xFF
+            let a = Int((components.indices.contains(3) ? components[3] : 1) * 255) & 0xFF
+            colorHex = String(format: "%02X%02X%02X%02X", r, g, b, a)
+        } else {
+            colorHex = "FFFFFFFF"
+        }
+
+        return "\(text)_\(width)x\(height)_\(layer.fontSize)_\(layer.alignmentMode.rawValue)_\(fontFingerprint)_\(colorHex)_\(layer.isWrapped ? "w" : "n")"
+    }
+
+    /// Returns `true` if the given Unicode scalar is in a CJK script range where
+    /// a line break is permitted between any two adjacent characters.
+    ///
+    /// This is a deliberately narrow approximation of UAX #14 — only the
+    /// ranges that cover the vast majority of the text that OpenSpriteKit /
+    /// megaman will encounter (Japanese, Simplified / Traditional Chinese,
+    /// Korean). It does not attempt prohibited-break rules (line-start
+    /// brackets, line-end punctuation), so the result is "break-friendly".
+    private static func isCJKLineBreakable(_ scalar: Unicode.Scalar) -> Bool {
+        let v = scalar.value
+        // CJK Unified Ideographs
+        if v >= 0x4E00 && v <= 0x9FFF { return true }
+        // CJK Unified Ideographs Extension A
+        if v >= 0x3400 && v <= 0x4DBF { return true }
+        // Hiragana
+        if v >= 0x3040 && v <= 0x309F { return true }
+        // Katakana
+        if v >= 0x30A0 && v <= 0x30FF { return true }
+        // Hangul Syllables
+        if v >= 0xAC00 && v <= 0xD7AF { return true }
+        return false
+    }
+
+    /// Splits a string into "line break tokens" — atomic substrings between
+    /// break opportunities. ASCII whitespace separators are dropped; soft
+    /// hyphens and CJK characters each produce a one-character token.
+    ///
+    /// Example:
+    ///   "hello world"       → ["hello", "world"]
+    ///   "これはテスト"       → ["こ","れ","は","テ","ス","ト"]
+    ///   "hello 世界 text"   → ["hello","世","界","text"]
+    private static func lineBreakTokens(in text: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+
+        func flush() {
+            if !current.isEmpty {
+                tokens.append(current)
+                current = ""
+            }
+        }
+
+        for scalar in text.unicodeScalars {
+            // ASCII whitespace → break before next token
+            if scalar == " " || scalar == "\t" || scalar == "\n" || scalar == "\r" {
+                flush()
+                continue
+            }
+            // Soft hyphen → break after
+            if scalar.value == 0x00AD {
+                current.unicodeScalars.append(scalar)
+                flush()
+                continue
+            }
+            // CJK character → break before AND after (each is its own token)
+            if isCJKLineBreakable(scalar) {
+                flush()
+                current.unicodeScalars.append(scalar)
+                flush()
+                continue
+            }
+            // Otherwise accumulate
+            current.unicodeScalars.append(scalar)
+        }
+        flush()
+
+        return tokens
+    }
+
+    /// Canvas2D text width for a string.
+    private func measureWidth(ctx: JSObject, _ s: String) -> Double {
+        let metrics = ctx.measureText!(s)
+        return metrics.width.number ?? 0
+    }
+
+    /// Breaks an overlong token into per-character chunks that each fit in
+    /// `maxWidth`. Used as a fallback when a single token is wider than the
+    /// wrap limit (e.g. a very long URL).
+    private func breakOversizedToken(
+        ctx: JSObject,
+        token: String,
+        maxWidth: Double
+    ) -> [String] {
+        var out: [String] = []
+        var buffer = ""
+        for char in token {
+            let candidate = buffer + String(char)
+            if !buffer.isEmpty && measureWidth(ctx: ctx, candidate) > maxWidth {
+                out.append(buffer)
+                buffer = String(char)
+            } else {
+                buffer = candidate
+            }
+        }
+        if !buffer.isEmpty { out.append(buffer) }
+        return out
+    }
+
+    /// Draws wrapped text on a Canvas2D context using script-aware line breaks.
     private func drawWrappedText(ctx: JSObject, text: String, x: Double, y: Double,
                                  maxWidth: Double, lineHeight: CGFloat) {
-        let words = text.split(separator: " ")
+        let tokens = Self.lineBreakTokens(in: text)
         var line = ""
         var currentY = y
 
-        for word in words {
-            let testLine = line.isEmpty ? String(word) : line + " " + String(word)
-            let metrics = ctx.measureText!(testLine)
-            let testWidth = metrics.width.number ?? 0
+        for token in tokens {
+            let candidate = line.isEmpty ? token : line + " " + token
+            let candidateWidth = measureWidth(ctx: ctx, candidate)
 
-            if testWidth > maxWidth && !line.isEmpty {
+            if candidateWidth > maxWidth && !line.isEmpty {
+                // Commit the current line and try to place this token on a new one.
                 _ = ctx.fillText!(line, x, currentY)
-                line = String(word)
                 currentY += Double(lineHeight)
+
+                // Does the token itself fit on an empty line?
+                if measureWidth(ctx: ctx, token) > maxWidth {
+                    let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: maxWidth)
+                    // All but the last chunk each become their own line.
+                    for chunk in chunks.dropLast() {
+                        _ = ctx.fillText!(chunk, x, currentY)
+                        currentY += Double(lineHeight)
+                    }
+                    line = chunks.last ?? ""
+                } else {
+                    line = token
+                }
+            } else if line.isEmpty && candidateWidth > maxWidth {
+                // First token on the line is already too wide — break per-character.
+                let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: maxWidth)
+                for chunk in chunks.dropLast() {
+                    _ = ctx.fillText!(chunk, x, currentY)
+                    currentY += Double(lineHeight)
+                }
+                line = chunks.last ?? ""
             } else {
-                line = testLine
+                line = candidate
             }
         }
 
@@ -3551,22 +3713,39 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let lineHeight = ascent + descent
 
         if isWrapped, let maxWidth = maxWidth, CGFloat(measuredWidth) > maxWidth {
-            // Calculate wrapped text height using the same algorithm as drawWrappedText
-            // This ensures consistency between size calculation and actual rendering
-            let words = text.split(separator: " ")
+            // Calculate wrapped text height using the same tokenization + oversized-token
+            // fallback as drawWrappedText. Using identical logic ensures that the
+            // measured size matches the rendered output line-for-line (otherwise the
+            // caller's texture would clip or leave blank rows).
+            let tokens = Self.lineBreakTokens(in: text)
             var lineCount = 1
             var line = ""
 
-            for word in words {
-                let testLine = line.isEmpty ? String(word) : line + " " + String(word)
-                let testMetrics = ctx.measureText!(testLine)
-                let testWidth = testMetrics.width.number ?? 0
+            for token in tokens {
+                let candidate = line.isEmpty ? token : line + " " + token
+                let candidateWidth = measureWidth(ctx: ctx, candidate)
 
-                if testWidth > Double(maxWidth) && !line.isEmpty {
+                if candidateWidth > Double(maxWidth) && !line.isEmpty {
+                    // Commit the current line.
                     lineCount += 1
-                    line = String(word)
+
+                    // Does the token itself fit on an empty line?
+                    if measureWidth(ctx: ctx, token) > Double(maxWidth) {
+                        let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: Double(maxWidth))
+                        // All but the last chunk each become their own line.
+                        lineCount += max(0, chunks.count - 1)
+                        line = chunks.last ?? ""
+                    } else {
+                        line = token
+                    }
+                } else if line.isEmpty && candidateWidth > Double(maxWidth) {
+                    // First token on the line is already too wide — break per-character.
+                    let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: Double(maxWidth))
+                    // lineCount already starts at 1 for the first chunk; add the rest.
+                    lineCount += max(0, chunks.count - 1)
+                    line = chunks.last ?? ""
                 } else {
-                    line = testLine
+                    line = candidate
                 }
             }
 

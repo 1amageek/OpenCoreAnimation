@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 #if arch(wasm32)
 import JavaScriptKit
 #endif

@@ -1,6 +1,5 @@
 #if arch(wasm32)
 import Foundation
-import OpenCoreGraphics
 
 // MARK: - WASM Helper Extensions
 

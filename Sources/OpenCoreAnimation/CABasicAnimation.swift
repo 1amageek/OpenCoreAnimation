@@ -10,4 +10,17 @@ open class CABasicAnimation: CAPropertyAnimation {
 
     /// The value at which the animation will interpolate between.
     open var byValue: Any?
+
+    public required init() {
+        super.init()
+    }
+
+    public required init(animation: CAAnimation) {
+        super.init(animation: animation)
+        if let source = animation as? CABasicAnimation {
+            self.fromValue = source.fromValue
+            self.toValue = source.toValue
+            self.byValue = source.byValue
+        }
+    }
 }

@@ -4,7 +4,6 @@
 // Full API compatibility with Apple's CoreAnimation framework
 
 import Foundation
-import OpenCoreGraphics
 
 internal enum CAFilterOperation: Equatable {
     case gaussianBlur(radius: CGFloat)

@@ -69,9 +69,23 @@ open class CADisplayLink: @unchecked Sendable {
     }
 
     /// The preferred frame rate for the display link callback.
-    open var preferredFrameRateRange: CAFrameRateRange = CAFrameRateRange()
+    ///
+    /// Unlike the native implementation, we do not stop/start the rAF loop
+    /// when this changes — the next browser frame picks up the new throttling
+    /// interval automatically. We simply reset the last-dispatched timestamp
+    /// so the new interval applies cleanly.
+    open var preferredFrameRateRange: CAFrameRateRange = CAFrameRateRange() {
+        didSet {
+            if isRunning {
+                lastDispatchedTimestamp = 0
+            }
+        }
+    }
 
     /// The preferred frame rate in frames per second.
+    ///
+    /// Setting this to 0 (Apple: "use the native refresh rate") clears any
+    /// throttling that was set by a previous non-zero value.
     open var preferredFramesPerSecond: Int = 0 {
         didSet {
             if preferredFramesPerSecond > 0 {
@@ -80,6 +94,10 @@ open class CADisplayLink: @unchecked Sendable {
                     maximum: Float(preferredFramesPerSecond),
                     preferred: Float(preferredFramesPerSecond)
                 )
+            } else {
+                // Reset to the default (all zeros) so minimumFrameInterval
+                // evaluates to "no throttling" and every rAF tick fires.
+                preferredFrameRateRange = .default
             }
         }
     }

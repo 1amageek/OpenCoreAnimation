@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 /// Constants that specify text truncation.
 public struct CATextLayerTruncationMode: Hashable, Equatable, RawRepresentable, Sendable {

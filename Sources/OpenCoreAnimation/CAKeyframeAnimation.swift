@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenCoreGraphics
 
 /// An object that provides keyframe animation capabilities for a layer object.
 open class CAKeyframeAnimation: CAPropertyAnimation {
@@ -41,4 +40,23 @@ open class CAKeyframeAnimation: CAPropertyAnimation {
 
     /// Determines whether objects animating along the path rotate to match the path tangent.
     open var rotationMode: CAAnimationRotationMode?
+
+    public required init() {
+        super.init()
+    }
+
+    public required init(animation: CAAnimation) {
+        super.init(animation: animation)
+        if let source = animation as? CAKeyframeAnimation {
+            self.values = source.values
+            self.path = source.path
+            self.keyTimes = source.keyTimes
+            self.timingFunctions = source.timingFunctions
+            self.calculationMode = source.calculationMode
+            self.tensionValues = source.tensionValues
+            self.continuityValues = source.continuityValues
+            self.biasValues = source.biasValues
+            self.rotationMode = source.rotationMode
+        }
+    }
 }

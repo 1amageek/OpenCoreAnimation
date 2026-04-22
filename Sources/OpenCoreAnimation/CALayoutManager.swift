@@ -4,7 +4,6 @@
 // Full API compatibility with Apple's CoreAnimation framework
 
 import Foundation
-import OpenCoreGraphics
 
 
 /// Methods that allow an object to manage the layout of a layer and its sublayers.

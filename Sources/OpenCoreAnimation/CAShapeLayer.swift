@@ -4,7 +4,6 @@
 // Full API compatibility with Apple's CoreAnimation framework
 
 import Foundation
-import OpenCoreGraphics
 
 
 /// A layer that draws a cubic Bezier spline in its coordinate space.
@@ -127,22 +126,28 @@ open class CAShapeLayer: CALayer {
 
     internal var _strokeStart: CGFloat = 0
     /// The relative location at which to begin stroking the path. Animatable.
+    ///
+    /// The raw value is stored without clamping so that spring animations can
+    /// overshoot [0, 1]. Tessellation is expected to clamp at use-site.
     open var strokeStart: CGFloat {
         get { return _strokeStart }
         set {
             let oldValue = _strokeStart
-            _strokeStart = max(0, min(1, newValue))
+            _strokeStart = newValue
             CATransaction.registerChange(layer: self, keyPath: "strokeStart", oldValue: oldValue, newValue: _strokeStart)
         }
     }
 
     internal var _strokeEnd: CGFloat = 1
     /// The relative location at which to stop stroking the path. Animatable.
+    ///
+    /// The raw value is stored without clamping so that spring animations can
+    /// overshoot [0, 1]. Tessellation is expected to clamp at use-site.
     open var strokeEnd: CGFloat {
         get { return _strokeEnd }
         set {
             let oldValue = _strokeEnd
-            _strokeEnd = max(0, min(1, newValue))
+            _strokeEnd = newValue
             CATransaction.registerChange(layer: self, keyPath: "strokeEnd", oldValue: oldValue, newValue: _strokeEnd)
         }
     }
@@ -167,9 +172,8 @@ open class CAShapeLayer: CALayer {
         if shapeLayerAnimatableKeys.contains(event) {
             let animation = CABasicAnimation(keyPath: event)
             animation.duration = CATransaction.animationDuration()
-            if let timingFunction = CATransaction.animationTimingFunction() {
-                animation.timingFunction = timingFunction
-            }
+            animation.timingFunction = CATransaction.animationTimingFunction()
+                ?? CAMediaTimingFunction(name: .default)
             return animation
         }
         // Fall back to parent class
