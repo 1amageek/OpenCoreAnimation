@@ -1,0 +1,17 @@
+{
+  "name": "opencoreanimation-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Browser end-to-end tests for the OpenCoreAnimation smoke-test WASM app. Validates CALayer → CAWebGPURenderer boot + render in headless Chromium.",
+  "type": "module",
+  "scripts": {
+    "build": "./build.sh",
+    "serve": "node server.mjs",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
