@@ -1754,6 +1754,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         blurHorizontalBindGroup = nil
         blurVerticalBindGroup = nil
         blurredShadowCache.removeAll()
+        textTextureCache.removeAll()
+        textTextureAccessOrder.removeAll()
 
         // Pre-render buffers
         preRenderVertexBuffer = nil
@@ -3210,12 +3212,36 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Clears all cached textures.
     public func clearTextureCache() {
         textureManager?.clearAll()
+        blurredShadowCache.removeAll()
+        textTextureCache.removeAll()
+        textTextureAccessOrder.removeAll()
     }
 
     // MARK: - Text Layer Rendering
 
     /// Cache for text textures to avoid recreating them every frame.
     private var textTextureCache: [String: GPUTexture] = [:]
+
+    /// LRU order for text textures. Dynamic labels can otherwise create one
+    /// GPU texture per distinct string for the lifetime of the renderer.
+    private var textTextureAccessOrder: [String] = []
+
+    private let maxTextTextureCacheEntries = 128
+
+    private func touchTextTexture(_ key: String) {
+        textTextureAccessOrder.removeAll { $0 == key }
+        textTextureAccessOrder.append(key)
+    }
+
+    private func cacheTextTexture(_ texture: GPUTexture, for key: String) {
+        textTextureCache[key] = texture
+        touchTextTexture(key)
+        while textTextureCache.count > maxTextTextureCacheEntries,
+              let oldest = textTextureAccessOrder.first {
+            textTextureAccessOrder.removeFirst()
+            textTextureCache.removeValue(forKey: oldest)
+        }
+    }
 
     /// Renders a CATextLayer using Canvas2D for text rasterization and texture-based rendering.
     ///
@@ -3287,6 +3313,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Check cache first
         let gpuTexture: GPUTexture
         if let cached = textTextureCache[cacheKey] {
+            touchTextTexture(cacheKey)
             gpuTexture = cached
         } else {
             // Create offscreen canvas for text rendering
@@ -3393,8 +3420,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 size: GPUExtent3D(width: UInt32(width), height: UInt32(height))
             )
 
-            // Cache the texture
-            textTextureCache[cacheKey] = texture
+            cacheTextTexture(texture, for: cacheKey)
             gpuTexture = texture
         }
 
