@@ -478,6 +478,28 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// consumed by `renderLayer`, cleared after submit.
     private var prerasterizedTextures: [ObjectIdentifier: GPUTexture] = [:]
 
+    /// Persistent cache of `GPUTextureView`s keyed by their backing `GPUTexture`.
+    ///
+    /// `gpuTexture.createView()` is a JS round-trip to allocate a fresh
+    /// `GPUTextureView`. The view is invariant for a given texture, so we
+    /// keep it across frames and only invalidate when the texture itself
+    /// is dropped (see `removeTextureView`/`clearTextureViewCache`).
+    private var texturedTextureViewCache: [ObjectIdentifier: GPUTextureView] = [:]
+
+    /// Per-frame cache of textured-content bind groups keyed by their
+    /// backing `GPUTexture`.
+    ///
+    /// The bind group binds (uniformBuffer, textureSampler, textureView).
+    /// `uniformBuffer` rotates through the pool every frame, so the bind
+    /// group cannot survive across frames — but it is constant within a
+    /// single frame for any layer drawing the same texture. The wall
+    /// shrapnel burst spawns ~24 sprites sharing one atlas in a single
+    /// frame; without this cache we paid 24 `device.createBindGroup` JS
+    /// round-trips on that frame alone, which empirically lined up with
+    /// the 25 ms rAF jank measured in `_frame_drop_probe.spec.ts`.
+    /// Cleared at the start of each `render(layer:)` call.
+    private var perFrameTexturedBindGroupCache: [ObjectIdentifier: GPUBindGroup] = [:]
+
     /// While set, the named layer is being rendered into its rasterization
     /// capture texture. The renderer must (a) skip its own re-composition
     /// at the matching cache-hit branch in `renderLayer`, and (b) treat
@@ -1811,6 +1833,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerasterizedTextures.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
 
+        // Drop the previous frame's textured bind groups: the buffer pool has
+        // already rotated `uniformBuffer` so any cached bind group from frame
+        // N-1 references a stale buffer. The persistent texture-view cache
+        // does not need clearing here — views remain valid until the texture
+        // is evicted.
+        perFrameTexturedBindGroupCache.removeAll(keepingCapacity: true)
+
         // Get current texture
         // The swap-chain texture is recreated every frame, so its view must be
         // freshly created. The depth texture only changes on resize and its
@@ -2058,6 +2087,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         particlePipeline = nil
         activeParticles.removeAll()
 
+        // Textured bind group / view caches (release JS-side handles)
+        perFrameTexturedBindGroupCache.removeAll(keepingCapacity: false)
+        texturedTextureViewCache.removeAll(keepingCapacity: false)
+
         context = nil
         device = nil
     }
@@ -2065,30 +2098,31 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     // MARK: - Private Methods
 
     /// Converts Swift data to a JavaScript Float32Array for WebGPU buffer writes.
+    ///
+    /// Uses `JSTypedArray<Float32>(buffer:)` which lowers to a single
+    /// `swjs_create_typed_array` C call that bulk-copies WASM memory into the
+    /// JS Float32Array. The previous per-element `array[i] = .number(...)`
+    /// loop crossed the JS bridge once per float — for a render frame with N
+    /// textured layers that was N × ~24 round-trips for uniforms plus
+    /// N × ~48 for vertices. Bulk-copy collapses those to 1 round-trip per
+    /// buffer.
     private func createFloat32Array<T>(from data: inout T) -> JSObject {
-        let byteCount = MemoryLayout<T>.stride
-        let floatCount = byteCount / 4
-        let float32Array = JSObject.global.Float32Array.function!.new(floatCount)
-        withUnsafeBytes(of: &data) { bytes in
-            for i in 0..<floatCount {
-                let value = bytes.load(fromByteOffset: i * 4, as: Float.self)
-                float32Array[i] = .number(Double(value))
-            }
+        let floatCount = MemoryLayout<T>.stride / 4
+        return withUnsafeBytes(of: &data) { rawBytes -> JSObject in
+            let typed = rawBytes.bindMemory(to: Float32.self)
+            let buffer = UnsafeBufferPointer<Float32>(start: typed.baseAddress, count: floatCount)
+            return JSTypedArray<Float32>(buffer: buffer).jsObject
         }
-        return float32Array
     }
 
     /// Converts an array of vertices to a JavaScript Float32Array.
     private func createFloat32Array(from vertices: inout [CARendererVertex]) -> JSObject {
         let floatCount = vertices.count * (MemoryLayout<CARendererVertex>.stride / 4)
-        let float32Array = JSObject.global.Float32Array.function!.new(floatCount)
-        vertices.withUnsafeBytes { bytes in
-            for i in 0..<floatCount {
-                let value = bytes.load(fromByteOffset: i * 4, as: Float.self)
-                float32Array[i] = .number(Double(value))
-            }
+        return vertices.withUnsafeBytes { rawBytes -> JSObject in
+            let typed = rawBytes.bindMemory(to: Float32.self)
+            let buffer = UnsafeBufferPointer<Float32>(start: typed.baseAddress, count: floatCount)
+            return JSTypedArray<Float32>(buffer: buffer).jsObject
         }
-        return float32Array
     }
 
     private func renderLayer(
@@ -3241,27 +3275,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 data: vertexData
             )
 
-            // Create bind group with texture
-            let texturedBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            // Create bind group with texture (per-frame cached)
+            let texturedBindGroup = cachedTexturedBindGroup(
+                for: gpuTexture,
+                device: device,
                 layout: texturedBindGroupLayout,
-                entries: [
-                    GPUBindGroupEntry(
-                        binding: 0,
-                        resource: .bufferBinding(GPUBufferBinding(
-                            buffer: uniformBuffer,
-                            size: UInt64(MemoryLayout<TexturedUniforms>.stride)
-                        ))
-                    ),
-                    GPUBindGroupEntry(
-                        binding: 1,
-                        resource: .sampler(textureSampler)
-                    ),
-                    GPUBindGroupEntry(
-                        binding: 2,
-                        resource: .textureView(gpuTexture.createView())
-                    )
-                ]
-            ))
+                sampler: textureSampler,
+                uniformBuffer: uniformBuffer,
+                uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
+            )
 
             // Render this patch
             if let selected = selectTexturedPipeline(for: layer) {
@@ -3416,27 +3438,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             data: vertexData
         )
 
-        // Create bind group with texture
-        let texturedBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+        // Create bind group with texture (per-frame cached)
+        let texturedBindGroup = cachedTexturedBindGroup(
+            for: gpuTexture,
+            device: device,
             layout: texturedBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(
-                    binding: 0,
-                    resource: .bufferBinding(GPUBufferBinding(
-                        buffer: uniformBuffer,
-                        size: UInt64(MemoryLayout<TexturedUniforms>.stride)
-                    ))
-                ),
-                GPUBindGroupEntry(
-                    binding: 1,
-                    resource: .sampler(textureSampler)
-                ),
-                GPUBindGroupEntry(
-                    binding: 2,
-                    resource: .textureView(gpuTexture.createView())
-                )
-            ]
-        ))
+            sampler: textureSampler,
+            uniformBuffer: uniformBuffer,
+            uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
+        )
 
         // Switch to textured pipeline and render
         if let selected = selectTexturedPipeline(for: layer) {
@@ -3450,6 +3460,58 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if let pipeline = pipeline {
             renderPass.setPipeline(pipeline)
         }
+    }
+
+    /// Returns a textured-content bind group for the given texture, reusing
+    /// one from the per-frame cache if possible.
+    ///
+    /// The bind group binds (uniformBuffer @ stride, textureSampler, textureView).
+    /// `uniformBuffer` rotates per frame so the bind group itself cannot live
+    /// past a frame, but every layer drawing the same texture in the same frame
+    /// can share the same bind group. The texture view is invariant for the
+    /// life of the texture and is cached across frames in
+    /// `texturedTextureViewCache`.
+    private func cachedTexturedBindGroup(
+        for gpuTexture: GPUTexture,
+        device: GPUDevice,
+        layout: GPUBindGroupLayout,
+        sampler: GPUSampler,
+        uniformBuffer: GPUBuffer,
+        uniformStride: UInt64
+    ) -> GPUBindGroup {
+        let key = ObjectIdentifier(gpuTexture)
+        if let cached = perFrameTexturedBindGroupCache[key] {
+            return cached
+        }
+        let view: GPUTextureView
+        if let cachedView = texturedTextureViewCache[key] {
+            view = cachedView
+        } else {
+            view = gpuTexture.createView()
+            texturedTextureViewCache[key] = view
+        }
+        let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: layout,
+            entries: [
+                GPUBindGroupEntry(
+                    binding: 0,
+                    resource: .bufferBinding(GPUBufferBinding(
+                        buffer: uniformBuffer,
+                        size: uniformStride
+                    ))
+                ),
+                GPUBindGroupEntry(
+                    binding: 1,
+                    resource: .sampler(sampler)
+                ),
+                GPUBindGroupEntry(
+                    binding: 2,
+                    resource: .textureView(view)
+                )
+            ]
+        ))
+        perFrameTexturedBindGroupCache[key] = bindGroup
+        return bindGroup
     }
 
     /// Creates a GPU texture from a CGImage.
@@ -3570,20 +3632,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     }
 
     /// Creates a JavaScript Uint8Array from Data.
+    ///
+    /// Bulk-copies via `JSTypedArray<UInt8>(buffer:)` so a 32×32 RGBA texture
+    /// upload is one JS round-trip rather than 4096.
     private func createUint8Array(from data: Data) -> JSObject {
-        let uint8Array = JSObject.global.Uint8Array.function!.new(data.count)
-        data.withUnsafeBytes { bytes in
-            for i in 0..<data.count {
-                uint8Array[i] = .number(Double(bytes.load(fromByteOffset: i, as: UInt8.self)))
-            }
+        return data.withUnsafeBytes { rawBytes -> JSObject in
+            let typed = rawBytes.bindMemory(to: UInt8.self)
+            let buffer = UnsafeBufferPointer<UInt8>(start: typed.baseAddress, count: data.count)
+            return JSTypedArray<UInt8>(buffer: buffer).jsObject
         }
-        return uint8Array
     }
 
     /// Clears the texture cache for a specific CGImage.
     public func removeTexture(for cgImage: CGImage) {
         let key = ObjectIdentifier(cgImage)
         textureManager?.removeTexture(for: key)
+        // The view cache is keyed by GPUTexture identity; we don't know the
+        // exact GPUTexture that was bound to this CGImage, so wipe the whole
+        // view cache. Views are cheap to recreate on the next frame.
+        texturedTextureViewCache.removeAll(keepingCapacity: true)
     }
 
     /// Clears all cached textures.
@@ -3592,6 +3659,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         blurredShadowCache.removeAll()
         textTextureCache.removeAll()
         textTextureAccessOrder.removeAll()
+        texturedTextureViewCache.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Text Layer Rendering
@@ -5465,26 +5533,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             data: vertexData
         )
 
-        let texturedBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+        let texturedBindGroup = cachedTexturedBindGroup(
+            for: texture,
+            device: device,
             layout: texturedBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(
-                    binding: 0,
-                    resource: .bufferBinding(GPUBufferBinding(
-                        buffer: uniformBuffer,
-                        size: UInt64(MemoryLayout<TexturedUniforms>.stride)
-                    ))
-                ),
-                GPUBindGroupEntry(
-                    binding: 1,
-                    resource: .sampler(textureSampler)
-                ),
-                GPUBindGroupEntry(
-                    binding: 2,
-                    resource: .textureView(texture.createView())
-                )
-            ]
-        ))
+            sampler: textureSampler,
+            uniformBuffer: uniformBuffer,
+            uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
+        )
 
         // R3.5 / mask-stencil aware pipeline selection.
         if let selected = selectTexturedPipeline(for: presentationLayer) {
