@@ -255,3 +255,145 @@ struct CAFilterTests {
         #expect(Set([blur3, blur4]).count == 2)
     }
 }
+
+@Suite("CALayer Subtree Render-Effect Counters")
+struct CALayerSubtreeCounterTests {
+    @Test("Setting shadow on a leaf bumps every ancestor")
+    func shadowOnLeafPropagatesToRoot() {
+        let root = CALayer()
+        let mid = CALayer()
+        let leaf = CALayer()
+        root.addSublayer(mid)
+        mid.addSublayer(leaf)
+
+        #expect(root._subtreeShadowCount == 0)
+
+        leaf.shadowOpacity = 0.5
+        leaf.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+        #expect(leaf._subtreeShadowCount == 1)
+        #expect(mid._subtreeShadowCount == 1)
+        #expect(root._subtreeShadowCount == 1)
+    }
+
+    @Test("Clearing shadowColor decrements ancestors")
+    func clearingShadowColorDecrementsAncestors() {
+        let root = CALayer()
+        let leaf = CALayer()
+        root.addSublayer(leaf)
+        leaf.shadowOpacity = 0.5
+        leaf.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        #expect(root._subtreeShadowCount == 1)
+
+        leaf.shadowColor = nil
+
+        #expect(leaf._subtreeShadowCount == 0)
+        #expect(root._subtreeShadowCount == 0)
+    }
+
+    @Test("Removing a shadow-bearing subtree decrements ancestors")
+    func removingShadowSubtreeDecrementsAncestors() {
+        let root = CALayer()
+        let mid = CALayer()
+        let leaf = CALayer()
+        root.addSublayer(mid)
+        mid.addSublayer(leaf)
+        leaf.shadowOpacity = 1
+        leaf.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        #expect(root._subtreeShadowCount == 1)
+
+        mid.removeFromSuperlayer()
+
+        #expect(root._subtreeShadowCount == 0)
+        #expect(mid._subtreeShadowCount == 1)  // mid still owns leaf
+        #expect(leaf._subtreeShadowCount == 1)
+    }
+
+    @Test("insertSublayer(at:) propagates child counts up")
+    func insertSublayerAtIndexPropagates() {
+        let root = CALayer()
+        let donor = CALayer()
+        let leaf = CALayer()
+        donor.addSublayer(leaf)
+        leaf.shadowOpacity = 0.5
+        leaf.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        #expect(donor._subtreeShadowCount == 1)
+        #expect(root._subtreeShadowCount == 0)
+
+        // Re-parent the entire `donor` (which carries the shadow) under root.
+        root.insertSublayer(donor, at: 0)
+
+        #expect(root._subtreeShadowCount == 1)
+        #expect(donor._subtreeShadowCount == 1)
+    }
+
+    @Test("replaceSublayer swaps subtree contributions")
+    func replaceSublayerSwapsContributions() {
+        let root = CALayer()
+        let oldChild = CALayer()
+        let newChild = CALayer()
+        root.addSublayer(oldChild)
+        oldChild.shadowOpacity = 1
+        oldChild.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        let newGrandchild = CALayer()
+        newChild.addSublayer(newGrandchild)
+        newGrandchild.filters = [CAFilter.blur(radius: 5)]
+        #expect(root._subtreeShadowCount == 1)
+        #expect(root._subtreeFilterCount == 0)
+
+        root.replaceSublayer(oldChild, with: newChild)
+
+        #expect(root._subtreeShadowCount == 0)
+        #expect(root._subtreeFilterCount == 1)
+        #expect(oldChild.superlayer == nil)
+    }
+
+    @Test("Setting sublayers array updates counters for both old and new")
+    func sublayersSetterRebalancesCounters() {
+        let root = CALayer()
+        let withShadow = CALayer()
+        withShadow.shadowOpacity = 1
+        withShadow.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        root.sublayers = [withShadow]
+        #expect(root._subtreeShadowCount == 1)
+
+        let withFilter = CALayer()
+        withFilter.filters = [CAFilter.blur(radius: 3)]
+
+        root.sublayers = [withFilter]
+
+        #expect(root._subtreeShadowCount == 0)
+        #expect(root._subtreeFilterCount == 1)
+        #expect(withShadow.superlayer == nil)
+    }
+
+    @Test("Setting filters propagates to ancestors")
+    func filtersSetterPropagates() {
+        let root = CALayer()
+        let leaf = CALayer()
+        root.addSublayer(leaf)
+        #expect(root._subtreeFilterCount == 0)
+
+        leaf.filters = [CAFilter.blur(radius: 4), CAFilter.brightness(0.1)]
+        #expect(root._subtreeFilterCount == 1)
+
+        leaf.filters = nil
+        #expect(root._subtreeFilterCount == 0)
+
+        leaf.filters = []
+        #expect(root._subtreeFilterCount == 0)
+    }
+
+    @Test("init(layer:) seeds counters from copied state")
+    func copyConstructorSeedsCounters() {
+        let original = CALayer()
+        original.shadowOpacity = 1
+        original.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        original.filters = [CAFilter.blur(radius: 2)]
+
+        let copy = CALayer(layer: original)
+
+        #expect(copy._subtreeShadowCount == 1)
+        #expect(copy._subtreeFilterCount == 1)
+    }
+}

@@ -8,13 +8,13 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
         let image: CGImage
         let rect: CGRect
         let blendMode: CGBlendMode
-        let clipPaths: [CGClipPath]
+        let clipPaths: [CGPath]
     }
 
     struct FillCall {
         let path: CGPath
         let color: CGColor
-        let clipPaths: [CGClipPath]
+        let clipPaths: [CGPath]
     }
 
     var imageDrawCalls: [ImageDrawCall] = []
@@ -255,7 +255,7 @@ struct CALayerRenderingTests {
         layer.render(in: context)
 
         #expect(renderer.fillCalls.count == 1)
-        guard let clipPath = renderer.fillCalls.first?.clipPaths.first?.path else { return }
+        guard let clipPath = renderer.fillCalls.first?.clipPaths.first else { return }
         #expect(curveElementCount(in: clipPath) == 1)
     }
 

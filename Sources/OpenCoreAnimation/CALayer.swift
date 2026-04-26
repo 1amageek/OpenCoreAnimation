@@ -52,19 +52,20 @@ open class CALayer: CAMediaTiming, Hashable {
             self._shadowColor = otherLayer._shadowColor
             self._shadowPath = otherLayer._shadowPath
 
-            // Copy content properties
+            // Copy content properties — use backing storage to bypass
+            // markDirty during init (we reset dirty state below).
             self.contents = otherLayer.contents
-            self.contentsRect = otherLayer.contentsRect
+            self._contentsRect = otherLayer._contentsRect
             self.contentsCenter = otherLayer.contentsCenter
             self.contentsGravity = otherLayer.contentsGravity
             self.contentsFormat = otherLayer.contentsFormat
 
-            // Copy rendering properties
-            self.isOpaque = otherLayer.isOpaque
+            // Copy rendering properties — backing storage as above.
+            self._isOpaque = otherLayer._isOpaque
             self.isGeometryFlipped = otherLayer.isGeometryFlipped
             self.drawsAsynchronously = otherLayer.drawsAsynchronously
-            self.shouldRasterize = otherLayer.shouldRasterize
-            self.rasterizationScale = otherLayer.rasterizationScale
+            self._shouldRasterize = otherLayer._shouldRasterize
+            self._rasterizationScale = otherLayer._rasterizationScale
             self.allowsEdgeAntialiasing = otherLayer.allowsEdgeAntialiasing
             self.allowsGroupOpacity = otherLayer.allowsGroupOpacity
             self.edgeAntialiasingMask = otherLayer.edgeAntialiasingMask
@@ -104,6 +105,13 @@ open class CALayer: CAMediaTiming, Hashable {
             // - layoutManager (typically shared)
             // - actions (typically defined at class level)
             // - animations (presentation layer specific)
+
+            // Seed subtree counters from copied state. Shadow fields above are
+            // assigned via direct backing-store writes (to mirror the original
+            // values without re-clamping); `filters` goes through its setter
+            // and updates `_subtreeFilterCount` as a side effect, but the
+            // shadow contribution must be seeded explicitly.
+            self._subtreeShadowCount = self.selfShadowContribution
         }
     }
 
@@ -132,6 +140,15 @@ open class CALayer: CAMediaTiming, Hashable {
             return self
         }
 
+        // R2.1 cache hit (PERFORMANCE_DESIGN.md §4.1): repeat calls within
+        // a single frame must return the same instance. The token is reset
+        // to 0 by `markDirty(_:)` so any presentation-affecting mutation
+        // forces a recompute on the next call.
+        if _presentationCacheToken == Self._currentFrameToken,
+           let cached = _presentationLayer {
+            return cached as? Self
+        }
+
         // Create or update presentation layer
         if _presentationLayer == nil {
             _presentationLayer = createPresentationLayer()
@@ -139,8 +156,53 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // Update presentation layer with current animated values
         updatePresentationLayer()
+        _presentationCacheToken = Self._currentFrameToken
 
         return _presentationLayer as? Self
+    }
+
+    /// Renderer-internal presentation lookup. Implements the R2.2 self-return
+    /// fast path (PERFORMANCE_DESIGN.md §4.1 / §4.2): when no animation is
+    /// live AND no presentation-affecting bit is dirty, the model values
+    /// **are** the presentation values, so the renderer can read this layer
+    /// directly and skip the per-frame allocation.
+    ///
+    /// Public callers (user code) must keep using `presentation()` to
+    /// preserve Apple's documented "distinct copy" semantics — this fast
+    /// path is invisible at the public surface.
+    internal func _renderTimePresentation() -> CALayer {
+        if _isPresentation { return self }
+
+        let allFinished = _animations.allSatisfy { $0.value.isFinished }
+        if allFinished
+            && _dirtyMask.isDisjoint(with: DirtyFlags.presentationAffecting) {
+            return self
+        }
+
+        return presentation() ?? self
+    }
+
+    /// Returns the receiver's `_sublayers` sorted by `zPosition` (then by
+    /// original insertion index for stability). Cached per-frame and
+    /// invalidated by `.sublayerHierarchy` / `.sublayerOrdering` so the
+    /// renderer skips the O(N log N) sort on clean trees
+    /// (PERFORMANCE_DESIGN.md §4.3 / R2.3).
+    internal func sortedSublayers() -> [CALayer] {
+        guard let subs = _sublayers, !subs.isEmpty else { return [] }
+        if _dirtyMask.isDisjoint(with: [.sublayerHierarchy, .sublayerOrdering]),
+           _sortedSublayersToken == Self._currentFrameToken,
+           _sortedSublayers.count == subs.count {
+            return _sortedSublayers
+        }
+        let sorted = subs.enumerated().sorted { a, b in
+            let zA = a.element._renderTimePresentation().zPosition
+            let zB = b.element._renderTimePresentation().zPosition
+            if zA != zB { return zA < zB }
+            return a.offset < b.offset
+        }.map(\.element)
+        _sortedSublayers = sorted
+        _sortedSublayersToken = Self._currentFrameToken
+        return sorted
     }
 
     /// Creates a new presentation layer as a copy of this layer.
@@ -149,6 +211,12 @@ open class CALayer: CAMediaTiming, Hashable {
         let presentation = presentationClass.init(layer: self)
         presentation._isPresentation = true
         presentation._modelLayer = self
+        // Presentation layers are read-only consumers and must not
+        // contribute to any ancestor's dirty count (PERFORMANCE_DESIGN.md
+        // §3.5). init(layer:) seeded the standard initial state; reset it.
+        presentation._dirtyMask = []
+        presentation._subtreeDirtyCount = 0
+        presentation._presentationCacheToken = 0
         return presentation
     }
 
@@ -166,6 +234,11 @@ open class CALayer: CAMediaTiming, Hashable {
         let presentation = presentationClass.init(layer: self)
         presentation._isPresentation = true
         presentation._modelLayer = self
+        // See createPresentationLayer() — presentation layers don't
+        // contribute to dirty propagation.
+        presentation._dirtyMask = []
+        presentation._subtreeDirtyCount = 0
+        presentation._presentationCacheToken = 0
 
         // Update with animations at the offset time
         let evaluationTime = CACurrentMediaTime() - timeOffset
@@ -2143,9 +2216,18 @@ open class CALayer: CAMediaTiming, Hashable {
     /// An object that provides the contents of the layer. Animatable.
     open var contents: CGImage?
 
+    private var _contentsRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     /// The rectangle, in the unit coordinate space, that defines the portion of the layer's
     /// contents that should be used. Animatable.
-    open var contentsRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    open var contentsRect: CGRect {
+        get { return _contentsRect }
+        set {
+            guard _contentsRect != newValue else { return }
+            _contentsRect = newValue
+            markDirty(.contents)
+            if Self.needsDisplay(forKey: "contentsRect") { setNeedsDisplay() }
+        }
+    }
 
     /// The rectangle that defines how the layer contents are scaled if the layer's contents
     /// are resized. Animatable.
@@ -2173,7 +2255,10 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _opacity
             let clampedValue = max(0, min(1, newValue))
+            guard oldValue != clampedValue else { return }
             _opacity = clampedValue
+            markDirty(.appearance)
+            if Self.needsDisplay(forKey: "opacity") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "opacity", oldValue: oldValue, newValue: clampedValue)
         }
     }
@@ -2184,7 +2269,10 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _isHidden }
         set {
             let oldValue = _isHidden
+            guard oldValue != newValue else { return }
             _isHidden = newValue
+            markDirty(.appearance)
+            if Self.needsDisplay(forKey: "isHidden") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "isHidden", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2221,7 +2309,10 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _cornerRadius
             let clampedValue = max(0, newValue)
+            guard oldValue != clampedValue else { return }
             _cornerRadius = clampedValue
+            markDirty(.appearance)
+            if Self.needsDisplay(forKey: "cornerRadius") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "cornerRadius", oldValue: oldValue, newValue: clampedValue)
         }
     }
@@ -2273,7 +2364,12 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _shadowOpacity
             let clampedValue = max(0, min(1, newValue))
+            guard oldValue != clampedValue else { return }
+            let oldContribution = selfShadowContribution
             _shadowOpacity = clampedValue
+            CALayer.propagateShadowDelta(selfShadowContribution - oldContribution, startingAt: self)
+            markDirty(.shadow)
+            if Self.needsDisplay(forKey: "shadowOpacity") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "shadowOpacity", oldValue: oldValue, newValue: clampedValue)
         }
     }
@@ -2285,7 +2381,10 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _shadowRadius
             let clampedValue = max(0, newValue)
+            guard oldValue != clampedValue else { return }
             _shadowRadius = clampedValue
+            markDirty(.shadow)
+            if Self.needsDisplay(forKey: "shadowRadius") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "shadowRadius", oldValue: oldValue, newValue: clampedValue)
         }
     }
@@ -2307,7 +2406,9 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _shadowColor }
         set {
             let oldValue = _shadowColor
+            let oldContribution = selfShadowContribution
             _shadowColor = newValue
+            CALayer.propagateShadowDelta(selfShadowContribution - oldContribution, startingAt: self)
             CATransaction.registerChange(layer: self, keyPath: "shadowColor", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2334,8 +2435,16 @@ open class CALayer: CAMediaTiming, Hashable {
 
     // MARK: - Layer Filters
 
+    fileprivate var _filters: [Any]?
     /// An array of Core Image filters to apply to the contents of the layer and its sublayers. Animatable.
-    open var filters: [Any]?
+    open var filters: [Any]? {
+        get { return _filters }
+        set {
+            let oldContribution = selfFilterContribution
+            _filters = newValue
+            CALayer.propagateFilterDelta(selfFilterContribution - oldContribution, startingAt: self)
+        }
+    }
 
     /// A CoreImage filter used to composite the layer and the content behind it. Animatable.
     open var compositingFilter: Any?
@@ -2354,8 +2463,17 @@ open class CALayer: CAMediaTiming, Hashable {
 
     // MARK: - Configuring the Layer's Rendering Behavior
 
+    private var _isOpaque: Bool = false
     /// A Boolean value indicating whether the layer contains completely opaque content.
-    open var isOpaque: Bool = false
+    open var isOpaque: Bool {
+        get { return _isOpaque }
+        set {
+            guard _isOpaque != newValue else { return }
+            _isOpaque = newValue
+            markDirty(.rasterization)
+            if Self.needsDisplay(forKey: "isOpaque") { setNeedsDisplay() }
+        }
+    }
 
     /// A bitmask defining how the edges of the receiver are rasterized.
     open var edgeAntialiasingMask: CAEdgeAntialiasingMask = [.layerLeftEdge, .layerRightEdge, .layerBottomEdge, .layerTopEdge]
@@ -2371,11 +2489,27 @@ open class CALayer: CAMediaTiming, Hashable {
     /// A Boolean indicating whether drawing commands are deferred and processed asynchronously in a background thread.
     open var drawsAsynchronously: Bool = false
 
+    private var _shouldRasterize: Bool = false
     /// A Boolean that indicates whether the layer is rendered as a bitmap before compositing. Animatable.
-    open var shouldRasterize: Bool = false
+    open var shouldRasterize: Bool {
+        get { return _shouldRasterize }
+        set {
+            guard _shouldRasterize != newValue else { return }
+            _shouldRasterize = newValue
+            markDirty(.rasterization)
+        }
+    }
 
+    private var _rasterizationScale: CGFloat = 1.0
     /// The scale at which to rasterize content, relative to the coordinate space of the layer. Animatable.
-    open var rasterizationScale: CGFloat = 1.0
+    open var rasterizationScale: CGFloat {
+        get { return _rasterizationScale }
+        set {
+            guard _rasterizationScale != newValue else { return }
+            _rasterizationScale = newValue
+            markDirty(.rasterization)
+        }
+    }
 
     /// A hint for the desired storage format of the layer contents.
     open var contentsFormat: CALayerContentsFormat = .RGBA8Uint
@@ -2839,8 +2973,12 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _bounds }
         set {
             let oldValue = _bounds
+            guard oldValue != newValue else { return }
             _bounds = newValue
-            if needsDisplayOnBoundsChange, oldValue != newValue {
+            markDirty(.geometry)
+            if needsDisplayOnBoundsChange {
+                setNeedsDisplay()
+            } else if Self.needsDisplay(forKey: "bounds") {
                 setNeedsDisplay()
             }
             CATransaction.registerChange(layer: self, keyPath: "bounds", oldValue: oldValue, newValue: newValue)
@@ -2864,7 +3002,14 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _zPosition }
         set {
             let oldValue = _zPosition
+            guard oldValue != newValue else { return }
             _zPosition = newValue
+            markDirty(.geometry)
+            // The painter's-algorithm sort lives on the parent — mark the
+            // parent's sublayer-ordering bit so its sortedSublayers cache
+            // (Phase 2) invalidates.
+            _superlayer?.markDirty(.sublayerOrdering)
+            if Self.needsDisplay(forKey: "zPosition") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "zPosition", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2898,7 +3043,10 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _contentsScale
             let clampedValue = max(0, newValue)
+            guard oldValue != clampedValue else { return }
             _contentsScale = clampedValue
+            markDirty(.contents)
+            if Self.needsDisplay(forKey: "contentsScale") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "contentsScale", oldValue: oldValue, newValue: clampedValue)
         }
     }
@@ -2944,11 +3092,31 @@ open class CALayer: CAMediaTiming, Hashable {
     open var sublayers: [CALayer]? {
         get { return _sublayers }
         set {
-            // Remove old sublayers
-            _sublayers?.forEach { $0._superlayer = nil }
-            // Set new sublayers
+            // Remove old sublayers (propagate -counts up from self before detaching)
+            if let old = _sublayers {
+                var shadowDelta = 0
+                var filterDelta = 0
+                for child in old {
+                    shadowDelta += child._subtreeShadowCount
+                    filterDelta += child._subtreeFilterCount
+                    child._superlayer = nil
+                }
+                CALayer.propagateShadowDelta(-shadowDelta, startingAt: self)
+                CALayer.propagateFilterDelta(-filterDelta, startingAt: self)
+            }
+            // Set new sublayers (propagate +counts up from self after attaching)
             _sublayers = newValue
-            _sublayers?.forEach { $0._superlayer = self }
+            if let new = newValue {
+                var shadowDelta = 0
+                var filterDelta = 0
+                for child in new {
+                    child._superlayer = self
+                    shadowDelta += child._subtreeShadowCount
+                    filterDelta += child._subtreeFilterCount
+                }
+                CALayer.propagateShadowDelta(shadowDelta, startingAt: self)
+                CALayer.propagateFilterDelta(filterDelta, startingAt: self)
+            }
         }
     }
 
@@ -2956,6 +3124,86 @@ open class CALayer: CAMediaTiming, Hashable {
     /// The superlayer of the layer.
     open var superlayer: CALayer? {
         return _superlayer
+    }
+
+    // MARK: - Subtree Render-Effect Counters
+    //
+    // `_subtreeShadowCount` / `_subtreeFilterCount` track how many descendants
+    // (including self) have a shadow or supported filter contribution. The
+    // renderer uses these counters to skip the recursive `findFirstShadowLayer`
+    // / `findFirstFilteredLayer` walks when no descendant could possibly need
+    // pre-rendering.
+    //
+    // Limitation: counters reflect MODEL state only. Animations that drive
+    // `shadowOpacity` from a model value of 0 (so the model contribution is 0
+    // but the presentation value is > 0 mid-animation) are not detected.
+    // SpriteKit-style users typically set static shadow values, so the model
+    // count is accurate for them.
+
+    internal fileprivate(set) var _subtreeShadowCount: Int = 0
+    internal fileprivate(set) var _subtreeFilterCount: Int = 0
+
+    // MARK: - Phase 1 dirty propagation (PERFORMANCE_DESIGN.md §3)
+    //
+    // `_dirtyMask` records which categories of state changed on THIS layer
+    // since the last `recursivelyClearDirtyAfterCommit()`. `_subtreeDirtyCount`
+    // tracks how many descendants (incl. self) have a non-empty mask, so the
+    // renderer can early-return at any depth.
+    //
+    // The fields live here (not in CALayer+Dirty.swift) because Swift does
+    // not allow stored properties in extensions on classes.
+
+    internal var _dirtyMask: DirtyFlags = CALayer._initialDirtyMask
+    internal var _subtreeDirtyCount: Int = 1
+    internal var _presentationCacheToken: UInt64 = 0
+
+    // Phase 2 sublayer ordering cache (PERFORMANCE_DESIGN.md §4.3 / R2.3).
+    // `_sortedSublayers` holds the painter's-algorithm sort of `_sublayers`
+    // for the frame identified by `_sortedSublayersToken`. Invalidated by
+    // `.sublayerHierarchy` (membership change) or `.sublayerOrdering`
+    // (any child's `zPosition` change), and by frame-token mismatch.
+    internal var _sortedSublayersToken: UInt64 = 0
+    internal var _sortedSublayers: [CALayer] = []
+
+    /// Bridge accessor — the extension in CALayer+Dirty.swift cannot see
+    /// `_isPresentation` directly (it is `private`).
+    internal var _isPresentationLayer: Bool { _isPresentation }
+
+    /// Bridge accessor — the extension in CALayer+Dirty.swift cannot see
+    /// `_superlayer` directly (it is `private weak`).
+    internal var _superlayerForDirty: CALayer? { _superlayer }
+
+    /// Bridge accessor — the extension in CALayer+Dirty.swift cannot see
+    /// `_sublayers` directly (it is `private`).
+    internal var _sublayersForDirty: [CALayer]? { _sublayers }
+
+    /// Test-only accessor for the `_needsDisplay` boolean axis (B7).
+    internal var _needsDisplayForTest: Bool { _needsDisplay }
+
+    fileprivate var selfShadowContribution: Int {
+        (_shadowOpacity > 0 && _shadowColor != nil) ? 1 : 0
+    }
+
+    fileprivate var selfFilterContribution: Int {
+        (_filters?.isEmpty == false) ? 1 : 0
+    }
+
+    fileprivate static func propagateShadowDelta(_ delta: Int, startingAt layer: CALayer?) {
+        guard delta != 0 else { return }
+        var node = layer
+        while let n = node {
+            n._subtreeShadowCount += delta
+            node = n._superlayer
+        }
+    }
+
+    fileprivate static func propagateFilterDelta(_ delta: Int, startingAt layer: CALayer?) {
+        guard delta != 0 else { return }
+        var node = layer
+        while let n = node {
+            n._subtreeFilterCount += delta
+            node = n._superlayer
+        }
     }
 
     /// Appends the layer to the layer's list of sublayers.
@@ -2966,11 +3214,24 @@ open class CALayer: CAMediaTiming, Hashable {
         }
         _sublayers?.append(layer)
         layer._superlayer = self
+        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
+        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
+        // Phase 1: parent receives the moving subtree's dirty contribution
+        // and a fresh `.sublayerHierarchy` bit. Mirrors propagateShadowDelta.
+        CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
+        markDirty(.sublayerHierarchy)
     }
 
     /// Detaches the layer from its parent layer.
     open func removeFromSuperlayer() {
         guard let superlayer = _superlayer else { return }
+        CALayer.propagateShadowDelta(-_subtreeShadowCount, startingAt: superlayer)
+        CALayer.propagateFilterDelta(-_subtreeFilterCount, startingAt: superlayer)
+        // Phase 1: subtract the leaving subtree's dirty contribution from
+        // the OLD ancestor chain BEFORE clearing _superlayer. The parent
+        // also receives `.sublayerHierarchy` (its child set just changed).
+        CALayer.propagateDirtyDeltaPublic(-_subtreeDirtyCount, startingAt: superlayer)
+        superlayer.markDirty(.sublayerHierarchy)
         superlayer._sublayers?.removeAll { $0 === self }
         _superlayer = nil
     }
@@ -2984,6 +3245,10 @@ open class CALayer: CAMediaTiming, Hashable {
         let index = min(Int(idx), _sublayers?.count ?? 0)
         _sublayers?.insert(layer, at: index)
         layer._superlayer = self
+        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
+        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
+        CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
+        markDirty(.sublayerHierarchy)
     }
 
     /// Inserts the specified sublayer below a different sublayer that already belongs to the receiver.
@@ -2998,6 +3263,10 @@ open class CALayer: CAMediaTiming, Hashable {
             _sublayers?.insert(layer, at: 0)
         }
         layer._superlayer = self
+        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
+        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
+        CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
+        markDirty(.sublayerHierarchy)
     }
 
     /// Inserts the specified sublayer above a different sublayer that already belongs to the receiver.
@@ -3012,15 +3281,26 @@ open class CALayer: CAMediaTiming, Hashable {
             _sublayers?.append(layer)
         }
         layer._superlayer = self
+        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
+        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
+        CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
+        markDirty(.sublayerHierarchy)
     }
 
     /// Replaces the specified sublayer with a different layer object.
     open func replaceSublayer(_ oldLayer: CALayer, with newLayer: CALayer) {
         guard let index = _sublayers?.firstIndex(where: { $0 === oldLayer }) else { return }
         newLayer.removeFromSuperlayer()
+        CALayer.propagateShadowDelta(-oldLayer._subtreeShadowCount, startingAt: self)
+        CALayer.propagateFilterDelta(-oldLayer._subtreeFilterCount, startingAt: self)
+        CALayer.propagateDirtyDeltaPublic(-oldLayer._subtreeDirtyCount, startingAt: self)
         oldLayer._superlayer = nil
         _sublayers?[index] = newLayer
         newLayer._superlayer = self
+        CALayer.propagateShadowDelta(newLayer._subtreeShadowCount, startingAt: self)
+        CALayer.propagateFilterDelta(newLayer._subtreeFilterCount, startingAt: self)
+        CALayer.propagateDirtyDeltaPublic(+newLayer._subtreeDirtyCount, startingAt: self)
+        markDirty(.sublayerHierarchy)
     }
 
     // MARK: - Updating Layer Display
@@ -3030,11 +3310,13 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Marks the layer's contents as needing to be updated.
     open func setNeedsDisplay() {
         _needsDisplay = true
+        markDirty(.contentsRedraw)
     }
 
     /// Marks the region within the specified rectangle as needing to be updated.
     open func setNeedsDisplay(_ r: CGRect) {
         _needsDisplay = true
+        markDirty(.contentsRedraw)
     }
 
     /// A Boolean indicating whether the layer contents must be updated when its bounds rectangle changes.

@@ -120,6 +120,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// The depth texture.
     private var depthTexture: GPUTexture?
 
+    /// Cached view for `depthTexture`.
+    ///
+    /// `createView()` crosses the JS bridge and allocates a fresh `GPUTextureView`
+    /// every call. The depth texture changes only on `resize`, so we cache the
+    /// view alongside it and invalidate together with the texture.
+    private var depthTextureView: GPUTextureView?
+
     /// The current size.
     public private(set) var size: CGSize = CGSize(width: 0, height: 0)
 
@@ -173,22 +180,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentLayerIndex += 1
 
         return result
-    }
-
-    // MARK: - Sublayer Sorting (Painter's Algorithm)
-
-    /// Returns sublayers sorted by zPosition, preserving array order for equal values.
-    /// CoreAnimation renders sublayers back-to-front, sorted by zPosition.
-    /// Uses enumerated index as tie-breaker to guarantee stable ordering.
-    private func sortedByZPosition(_ sublayers: [CALayer]) -> [CALayer] {
-        sublayers.enumerated()
-            .sorted { a, b in
-                let zA = (a.element.presentation() ?? a.element).zPosition
-                let zB = (b.element.presentation() ?? b.element).zPosition
-                if zA != zB { return zA < zB }
-                return a.offset < b.offset
-            }
-            .map(\.element)
     }
 
     // MARK: - Clipping (masksToBounds)
@@ -345,8 +336,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Shadow mask texture for blur operations.
     private var shadowMaskTexture: GPUTexture?
 
+    /// Cached view for `shadowMaskTexture` (reset when the texture is recreated).
+    private var shadowMaskTextureView: GPUTextureView?
+
     /// Intermediate texture for blur ping-pong.
     private var shadowBlurTexture: GPUTexture?
+
+    /// Cached view for `shadowBlurTexture` (reset when the texture is recreated).
+    private var shadowBlurTextureView: GPUTextureView?
 
     /// Shadow blur pipeline (horizontal pass).
     private var shadowBlurHorizontalPipeline: GPURenderPipeline?
@@ -383,17 +380,42 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Filter source texture - layer content is rendered here before blur.
     private var filterSourceTexture: GPUTexture?
 
+    /// Cached view for `filterSourceTexture`.
+    private var filterSourceTextureView: GPUTextureView?
+
     /// Filter blur intermediate texture for ping-pong blurring.
     private var filterBlurTexture: GPUTexture?
 
+    /// Cached view for `filterBlurTexture`.
+    private var filterBlurTextureView: GPUTextureView?
+
     /// Filter result texture - stores the final filter pass result.
     private var filterResultTexture: GPUTexture?
+
+    /// Cached view for `filterResultTexture`.
+    private var filterResultTextureView: GPUTextureView?
 
     /// Bind group for filter horizontal blur (samples from filterSourceTexture).
     private var filterBlurHorizontalBindGroup: GPUBindGroup?
 
     /// Bind group for filter vertical blur (samples from filterBlurTexture).
     private var filterBlurVerticalBindGroup: GPUBindGroup?
+
+    /// applyBlurFilter horizontal-pass bind group reading `filterSourceTexture`.
+    ///
+    /// applyBlurFilter is called once per CIFilter operation per filtered layer.
+    /// Each call previously did two `device.createBindGroup` round-trips to JS
+    /// even though the bind groups only depend on which persistent texture
+    /// (filterSourceTexture / filterBlurTexture / filterResultTexture) they
+    /// sample from. Cache them keyed by texture identity; recreated alongside
+    /// the textures in `createFilterTextures`.
+    private var applyBlurFromSourceBindGroup: GPUBindGroup?
+
+    /// applyBlurFilter horizontal-pass bind group reading `filterResultTexture`.
+    private var applyBlurFromResultBindGroup: GPUBindGroup?
+
+    /// applyBlurFilter vertical-pass bind group reading `filterBlurTexture`.
+    private var applyBlurFromBlurBindGroup: GPUBindGroup?
 
     // MARK: - Pre-Render Dedicated Buffers
 
@@ -443,6 +465,26 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// While set, filter compositing is suppressed so the subtree can be captured raw.
     private weak var filterPrerenderRootLayer: CALayer?
 
+    // MARK: - Rasterization Cache (R3.2 / R3.4)
+
+    /// LRU + byte-budget cache of captured `shouldRasterize` subtrees.
+    /// Allocated on first `resize` once the viewport size is known so the
+    /// budget can be sized to `viewport × 4 × 2.5` per WWDC 2014 #419.
+    private var rasterizationCache: RasterizationCache<GPUTexture>?
+
+    /// Per-frame scratch storage: layers whose subtree has been captured
+    /// (or had a fresh cache hit) this frame, mapped to the texture used
+    /// for compositing. Populated by `prerenderRasterizedLayers`,
+    /// consumed by `renderLayer`, cleared after submit.
+    private var prerasterizedTextures: [ObjectIdentifier: GPUTexture] = [:]
+
+    /// While set, the named layer is being rendered into its rasterization
+    /// capture texture. The renderer must (a) skip its own re-composition
+    /// at the matching cache-hit branch in `renderLayer`, and (b) treat
+    /// the layer as "root" for opacity (clear-α 1.0 per R3.3, layer.opacity
+    /// applied at composite, not at capture).
+    private weak var rasterizePrerenderRootLayer: CALayer?
+
     // MARK: - Mask Rendering (Stencil-based)
 
     /// Mask texture for layer masking (texture-based approach).
@@ -477,6 +519,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Stencil-aware textured pipeline (tests stencil buffer for mask).
     private var texturedStencilPipeline: GPURenderPipeline?
+
+    /// Opaque textured pipeline (no alpha blend). R3.5 — selected when
+    /// `RasterizationDecisions.blendEnabled(for:)` returns false.
+    private var texturedOpaquePipeline: GPURenderPipeline?
+
+    /// Opaque stencil-aware textured pipeline (R3.5 + mask).
+    private var texturedStencilOpaquePipeline: GPURenderPipeline?
 
     /// Stencil-aware shadow composite pipeline (tests stencil buffer for mask).
     private var shadowCompositeStencilPipeline: GPURenderPipeline?
@@ -1057,6 +1106,115 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(pipelineLayout)
         ))
+
+        // R3.5 (PERFORMANCE_DESIGN.md §5.3): opaque variants — `blend: nil`
+        // means the fragment output replaces the destination instead of being
+        // alpha-composited. Selected via `selectTexturedPipeline(for:)` when
+        // `RasterizationDecisions.blendEnabled(for:)` returns false (i.e.
+        // layer.isOpaque && layer.opacity >= 1.0). This skips ROP blending,
+        // saving bandwidth on opaque images covering most of the layer.
+        texturedOpaquePipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: shaderModule,
+                entryPoint: "vertexMain",
+                buffers: [
+                    GPUVertexBufferLayout(
+                        arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                        attributes: [
+                            GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                            GPUVertexAttribute(format: .float32x2, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride), shaderLocation: 1),
+                            GPUVertexAttribute(format: .float32x4, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2), shaderLocation: 2)
+                        ]
+                    )
+                ]
+            ),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plusStencil8,
+                depthWriteEnabled: false,
+                depthCompare: .always,
+                stencilFront: GPUStencilFaceState(
+                    compare: .always,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                ),
+                stencilBack: GPUStencilFaceState(
+                    compare: .always,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                )
+            ),
+            fragment: GPUFragmentState(
+                module: shaderModule,
+                entryPoint: "fragmentMain",
+                targets: [
+                    GPUColorTargetState(
+                        format: preferredFormat,
+                        blend: nil
+                    )
+                ]
+            ),
+            layout: .layout(pipelineLayout)
+        ))
+
+        texturedStencilOpaquePipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: shaderModule,
+                entryPoint: "vertexMain",
+                buffers: [
+                    GPUVertexBufferLayout(
+                        arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                        attributes: [
+                            GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                            GPUVertexAttribute(format: .float32x2, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride), shaderLocation: 1),
+                            GPUVertexAttribute(format: .float32x4, offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2), shaderLocation: 2)
+                        ]
+                    )
+                ]
+            ),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plusStencil8,
+                depthWriteEnabled: false,
+                depthCompare: .always,
+                stencilFront: GPUStencilFaceState(
+                    compare: .equal,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                ),
+                stencilBack: GPUStencilFaceState(
+                    compare: .equal,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                )
+            ),
+            fragment: GPUFragmentState(
+                module: shaderModule,
+                entryPoint: "fragmentMain",
+                targets: [
+                    GPUColorTargetState(
+                        format: preferredFormat,
+                        blend: nil
+                    )
+                ]
+            ),
+            layout: .layout(pipelineLayout)
+        ))
+    }
+
+    /// R3.5: pick the textured pipeline based on stencil state and the
+    /// `blendEnabled` decision for the layer. Falls back to the alpha-blended
+    /// variant when an opaque pipeline isn't created (test fallback).
+    private func selectTexturedPipeline(for layer: CALayer) -> GPURenderPipeline? {
+        let blendOff = !RasterizationDecisions.blendEnabled(for: layer)
+        if maskNestingDepth > 0 {
+            if blendOff, let opaque = texturedStencilOpaquePipeline { return opaque }
+            return texturedStencilPipeline ?? texturedPipeline
+        }
+        if blendOff, let opaque = texturedOpaquePipeline { return opaque }
+        return texturedPipeline
     }
 
     /// Creates shadow and blur pipelines.
@@ -1419,12 +1577,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let blurSampler = blurSampler,
               width > 0, height > 0 else { return }
 
+        // R3.7: the cache references the previous `shadowMaskTexture` handle;
+        // recreating it invalidates every entry.
+        blurredShadowCache.removeAll(keepingCapacity: true)
+
         // Shadow mask texture (stores layer shape)
         shadowMaskTexture = device.createTexture(descriptor: GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
             format: .rgba8unorm,
             usage: [.renderAttachment, .textureBinding]
         ))
+        shadowMaskTextureView = shadowMaskTexture?.createView()
 
         // Shadow blur texture (for ping-pong blur)
         shadowBlurTexture = device.createTexture(descriptor: GPUTextureDescriptor(
@@ -1432,6 +1595,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             format: .rgba8unorm,
             usage: [.renderAttachment, .textureBinding]
         ))
+        shadowBlurTextureView = shadowBlurTexture?.createView()
 
         // Create blur uniform buffer
         blurUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
@@ -1479,6 +1643,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             format: .rgba8unorm,
             usage: [.renderAttachment, .textureBinding]
         ))
+        filterSourceTextureView = filterSourceTexture?.createView()
 
         // Filter blur texture (for ping-pong blur)
         filterBlurTexture = device.createTexture(descriptor: GPUTextureDescriptor(
@@ -1486,6 +1651,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             format: .rgba8unorm,
             usage: [.renderAttachment, .textureBinding]
         ))
+        filterBlurTextureView = filterBlurTexture?.createView()
 
         // Filter result texture (stores final blurred result)
         filterResultTexture = device.createTexture(descriptor: GPUTextureDescriptor(
@@ -1493,6 +1659,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             format: .rgba8unorm,
             usage: [.renderAttachment, .textureBinding]
         ))
+        filterResultTextureView = filterResultTexture?.createView()
 
         // Create bind groups for filter blur passes
         guard let filterSourceTexture = filterSourceTexture,
@@ -1517,6 +1684,38 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
         ))
+
+        // Pre-build the per-input bind groups consumed by `applyBlurFilter`.
+        // The chain in prerenderFilteredLayers ping-pongs `currentTexture`
+        // between filterSourceTexture and filterResultTexture as the horizontal
+        // input, with filterBlurTexture always serving as the vertical input.
+        // Caching these three avoids creating two bind groups per CIFilter
+        // operation per frame.
+        guard let filterResultTexture = filterResultTexture else { return }
+        applyBlurFromSourceBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(filterSourceTextureView!)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+        applyBlurFromResultBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(filterResultTexture.createView())),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+        applyBlurFromBlurBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(filterBlurTextureView!)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
     }
 
     /// Creates or recreates the depth texture for the given size.
@@ -1529,6 +1728,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             format: .depth24plusStencil8,
             usage: .renderAttachment
         ))
+        depthTextureView = depthTexture?.createView()
     }
 
     public func resize(width: Int, height: Int) {
@@ -1554,6 +1754,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Recreate filter textures
         createFilterTextures(width: width, height: height)
+
+        // R3.2/R3.4: size the rasterization cache to viewport × 4 × 2.5
+        // per PERFORMANCE_DESIGN.md §5.2 (WWDC 2014 #419 budget).
+        // Recreating the cache on resize drops every entry — the
+        // captured textures are canvas-sized and would render at the
+        // wrong dimensions otherwise.
+        let budget = max(0, Int((Double(width) * Double(height) * 4.0 * 2.5).rounded()))
+        rasterizationCache = RasterizationCache<GPUTexture>(maxBytes: budget)
+        prerasterizedTextures.removeAll(keepingCapacity: true)
+        rasterizePrerenderRootLayer = nil
     }
 
     /// Tracks whether shadow pre-rendering has been done for this frame.
@@ -1569,6 +1779,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let pipeline = pipeline,
               bindGroup != nil,
               let depthTexture = depthTexture else { return }
+
+        // Phase 1 (PERFORMANCE_DESIGN.md §3.6): bump the per-frame token
+        // before any presentation cache lookup so this frame is distinct
+        // from the previous one. Single-threaded by construction; see the
+        // `nonisolated(unsafe)` declaration on the storage.
+        CALayer._currentFrameToken &+= 1
 
         // Reset per-frame state
         currentLayerIndex = 0
@@ -1591,10 +1807,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerenderredFilterTexture = nil
         prerenderredFilterBlurRadius = 0
 
+        // Reset rasterization pre-rendering state (R3.2)
+        prerasterizedTextures.removeAll(keepingCapacity: true)
+        rasterizePrerenderRootLayer = nil
+
         // Get current texture
+        // The swap-chain texture is recreated every frame, so its view must be
+        // freshly created. The depth texture only changes on resize and its
+        // view is cached in `depthTextureView`.
         let currentTexture = context.getCurrentTexture()
         let textureView = currentTexture.createView()
-        let depthTextureView = depthTexture.createView()
+        guard let depthTextureView = depthTextureView else { return }
 
         // Create command encoder
         let encoder = device.createCommandEncoder()
@@ -1633,10 +1856,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Pre-render layers with blur filters
         prerenderFilteredLayers(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
 
+        // Pre-render shouldRasterize subtrees (R3.2 / R3.3)
+        prerenderRasterizedLayers(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
+
         // Use root layer's backgroundColor as clear color (for SKScene background)
         // This prevents SKScene's backgroundColor from rendering at zPosition=0
         // which would occlude child layers with negative zPosition (like backgroundLayer)
-        let rootPresentation = rootLayer.presentation() ?? rootLayer
+        let rootPresentation = rootLayer._renderTimePresentation()
         let clearColor: GPUColor
         if rootPresentation.cornerRadius > 0 {
             // When root layer has cornerRadius, use transparent clear color.
@@ -1708,6 +1934,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Submit command buffer
         device.queue.submit([encoder.finish()])
 
+        // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
+        // Order is mandated: submit → clear → user-visible completion blocks.
+        // Clearing here means subsequent setters that reach this layer in the
+        // SAME frame will mark it dirty for the NEXT frame, never for the one
+        // that just left the renderer.
+        rootLayer.recursivelyClearDirtyAfterCommit()
+
         // Advance buffer pools, texture manager, and geometry cache to the next frame
         vertexBufferPool?.advanceFrame()
         uniformBufferPool?.advanceFrame()
@@ -1717,6 +1950,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Periodically evict stale resources (not used in last 300 frames = ~5 seconds at 60fps)
         textureManager?.evictStale(olderThan: 300)
         geometryCache?.evictStale(olderThan: 300)
+
+        // R3.4: drop rasterization entries that have sat idle longer
+        // than 6 frames (~100 ms @ 60 Hz) and any overflow above the
+        // viewport-derived byte budget. Idle eviction first so the
+        // budget pass operates on the trimmed live set.
+        if let cache = rasterizationCache {
+            cache.evictIdle(currentFrame: CALayer._currentFrameToken, olderThan: 6)
+            cache.evictToBudget()
+        }
+        prerasterizedTextures.removeAll(keepingCapacity: true)
     }
 
     public func invalidate() {
@@ -1738,12 +1981,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         depthTexture = nil
         pipeline = nil
         texturedPipeline = nil
+        texturedOpaquePipeline = nil
         texturedBindGroupLayout = nil
         textureSampler = nil
 
         // Shadow resources
         shadowMaskTexture = nil
+        shadowMaskTextureView = nil
         shadowBlurTexture = nil
+        shadowBlurTextureView = nil
+        depthTextureView = nil
         shadowBlurHorizontalPipeline = nil
         shadowBlurVerticalPipeline = nil
         shadowCompositePipeline = nil
@@ -1768,16 +2015,28 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Filter resources
         filterSourceTexture = nil
+        filterSourceTextureView = nil
         filterBlurTexture = nil
+        filterBlurTextureView = nil
         filterResultTexture = nil
+        filterResultTextureView = nil
         filterBlurHorizontalBindGroup = nil
         filterBlurVerticalBindGroup = nil
+        applyBlurFromSourceBindGroup = nil
+        applyBlurFromResultBindGroup = nil
+        applyBlurFromBlurBindGroup = nil
         filterCompositePipeline = nil
         filterCompositeStencilPipeline = nil
         hasPrerenderredFilter = false
         prerenderredFilterLayer = nil
         prerenderredFilterTexture = nil
         prerenderredFilterBlurRadius = 0
+
+        // Rasterization cache (R3.2 / R3.4)
+        rasterizationCache?.removeAll()
+        rasterizationCache = nil
+        prerasterizedTextures.removeAll(keepingCapacity: false)
+        rasterizePrerenderRootLayer = nil
 
         // Mask resources
         maskTexture = nil
@@ -1789,6 +2048,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         stencilWriteRoundedPipeline = nil
         stencilTestPipeline = nil
         texturedStencilPipeline = nil
+        texturedStencilOpaquePipeline = nil
         shadowCompositeStencilPipeline = nil
         maskNestingDepth = 0
         currentStencilValue = 0
@@ -1844,19 +2104,39 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Get the presentation layer for animated values, fall back to model layer
         // This is critical for animations to be visible - the presentation layer
         // reflects the current animated state of all properties
-        let presentationLayer = layer.presentation() ?? layer
+        let presentationLayer = layer._renderTimePresentation()
 
         // Skip hidden layers (using presentation layer values)
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
 
-        // Push effective opacity (parent * layer) for this subtree
-        let opacityMultiplier: Float = filterPrerenderRootLayer === layer ? 1 : presentationLayer.opacity
+        // Push effective opacity (parent * layer) for this subtree.
+        // R3.3: when capturing into a rasterization texture or filter
+        // source texture, force the root's contribution to 1.0 so the
+        // captured pixels are fully opaque; layer.opacity is reapplied
+        // at composite time.
+        let isCaptureRoot =
+            filterPrerenderRootLayer === layer
+            || rasterizePrerenderRootLayer === layer
+        let opacityMultiplier: Float = isCaptureRoot ? 1 : presentationLayer.opacity
         let effectiveOpacity = currentEffectiveOpacity * opacityMultiplier
         opacityStack.append(effectiveOpacity)
         defer { _ = opacityStack.popLast() }
 
-        // Calculate model matrix using presentation layer values
-        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+        // Calculate model matrix using presentation layer values.
+        //
+        // Capture-root shortcut (R3.2 / §5.2): when this very layer is
+        // the root of an in-flight rasterization capture, `parentMatrix`
+        // is already the bounds-local capture projection set up by
+        // `captureRasterizedLayer`. Using the regular `modelMatrix`
+        // would re-apply position/transform/anchor and shift the
+        // captured pixels out of the texture. Those transforms belong
+        // at composite time, not in the bake.
+        let modelMatrix: Matrix4x4
+        if rasterizePrerenderRootLayer === layer {
+            modelMatrix = parentMatrix
+        } else {
+            modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+        }
 
         // Backface culling: skip rendering when layer faces away from camera
         if !presentationLayer.isDoubleSided {
@@ -1907,6 +2187,28 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
         }
 
+        // R3.2 cache-hit composite: when this layer was pre-rendered
+        // into a rasterization texture this frame and the renderer is
+        // now walking the tree for the main pass (i.e. we are NOT
+        // inside the capture pass for this same layer), draw the cached
+        // pixelSize texture as a quad placed at the layer's transform
+        // with the layer's current opacity. The capture pass itself
+        // reaches this layer with `rasterizePrerenderRootLayer === layer`,
+        // so we must let it through to render the actual content into
+        // the texture.
+        if rasterizePrerenderRootLayer !== layer,
+           let cachedTexture = prerasterizedTextures[ObjectIdentifier(layer)] {
+            renderRasterizedLayerComposite(
+                layer,
+                presentationLayer: presentationLayer,
+                texture: cachedTexture,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+            return
+        }
+
         // CATransformLayer: Only render sublayers, skip own properties
         if presentationLayer is CATransformLayer {
             renderTransformLayerSublayers(layer, renderPass: renderPass, parentMatrix: modelMatrix)
@@ -1918,10 +2220,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             renderEmitterLayer(emitterLayer, device: device, renderPass: renderPass,
                              modelMatrix: modelMatrix, bindGroup: bindGroup)
             // Render sublayers after particles
-            if let sublayers = layer.sublayers {
+            if let sublayers = layer.sublayers, !sublayers.isEmpty {
                 // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
                 let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-                for sublayer in sortedByZPosition(sublayers) {
+                for sublayer in layer.sortedSublayers() {
                     self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
                 }
             }
@@ -1935,150 +2237,48 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        // Check if this is a text layer
+        // Apple's CoreAnimation draw order for a single layer:
+        //   1. shadow (already drawn above)
+        //   2. backgroundColor
+        //   3. contents / text / shape / gradient (foreground)
+        //   4. sublayers
+        //   5. border (topmost, drawn over sublayers)
+        //
+        // Render background color unconditionally (coexists with contents per Apple spec).
+        // Skip root layer - its backgroundColor is rendered via clear color to avoid z-fighting,
+        // unless cornerRadius > 0 (rounded root must be drawn as a rounded rect).
+        if presentationLayer.backgroundColor != nil
+            && presentationLayer.bounds.width > 0
+            && presentationLayer.bounds.height > 0
+            && (layer !== currentRootLayer || presentationLayer.cornerRadius > 0) {
+            renderLayerBackgroundColor(
+                presentationLayer,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup
+            )
+        }
+
+        // Foreground — mutually exclusive subclass branches.
+        // backgroundColor is drawn separately above, so it coexists with foreground per Apple spec.
         if let textLayer = presentationLayer as? CATextLayer {
             if textLayer.string != nil {
                 renderTextLayer(textLayer, device: device, renderPass: renderPass,
                                modelMatrix: modelMatrix, bindGroup: bindGroup)
             }
-        }
-        // Check if this is a shape layer
-        else if let shapeLayer = presentationLayer as? CAShapeLayer {
+        } else if let shapeLayer = presentationLayer as? CAShapeLayer {
             if shapeLayer.path != nil {
                 renderShapeLayer(shapeLayer, device: device, renderPass: renderPass,
                                 modelMatrix: modelMatrix, bindGroup: bindGroup)
             }
-        }
-        // Check if this is a gradient layer
-        else if let gradientLayer = presentationLayer as? CAGradientLayer,
-           let colors = gradientLayer.colors, !colors.isEmpty {
+        } else if let gradientLayer = presentationLayer as? CAGradientLayer,
+                  let colors = gradientLayer.colors, !colors.isEmpty {
             renderGradientLayer(gradientLayer, device: device, renderPass: renderPass,
                               modelMatrix: modelMatrix, bindGroup: bindGroup)
-        }
-        // Check if layer has contents (CGImage)
-        else if let contents = presentationLayer.contents {
+        } else if let contents = presentationLayer.contents {
             renderContentsLayer(presentationLayer, contents: contents, device: device,
                                renderPass: renderPass, modelMatrix: modelMatrix)
-        }
-        // Render background color if set (for color-only layers like SKSpriteNode(color:size:))
-        // Skip root layer - its backgroundColor is rendered via clear color to avoid z-fighting
-        else if presentationLayer.backgroundColor != nil && presentationLayer.bounds.width > 0 && presentationLayer.bounds.height > 0 && (layer !== currentRootLayer || presentationLayer.cornerRadius > 0) {
-            // Create vertices using presentation layer color
-            let color = presentationLayer.backgroundColorComponents
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-            ]
-
-            // Allocate vertices dynamically
-            guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
-                return  // Buffer full
-            }
-
-            // Create scale matrix for layer bounds (column-major order)
-            let scaleMatrix = Matrix4x4(columns: (
-                SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
-                SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
-                SIMD4<Float>(0, 0, 1, 0),
-                SIMD4<Float>(0, 0, 0, 1)
-            ))
-
-            let finalMatrix = modelMatrix * scaleMatrix
-
-            // Update uniforms at the correct offset
-            var uniforms = CARendererUniforms(
-                mvpMatrix: finalMatrix,
-                opacity: currentEffectiveOpacity,
-                cornerRadius: Float(presentationLayer.cornerRadius),
-                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
-                cornerRadii: presentationLayer.cornerRadiiComponents
-            )
-
-            let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
-            let uniformData = createFloat32Array(from: &uniforms)
-            device.queue.writeBuffer(
-                uniformBuffer,
-                bufferOffset: uniformOffset,
-                data: uniformData
-            )
-
-            // Write vertices at dynamically allocated offset
-            let vertexData = createFloat32Array(from: &vertices)
-            device.queue.writeBuffer(
-                vertexBuffer,
-                bufferOffset: vertexOffset,
-                data: vertexData
-            )
-
-            // Set bind group with dynamic offset for this layer's uniforms
-            renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-            renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-            renderPass.draw(vertexCount: 6)
-        }
-
-        // Render border if set
-        if presentationLayer.borderWidth > 0 && presentationLayer.borderColor != nil {
-            // Create vertices using border color
-            let color = presentationLayer.borderColorComponents
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-            ]
-
-            // Allocate vertices dynamically
-            guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
-                return  // Buffer full
-            }
-
-            // Create scale matrix for layer bounds (column-major order)
-            let scaleMatrix = Matrix4x4(columns: (
-                SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
-                SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
-                SIMD4<Float>(0, 0, 1, 0),
-                SIMD4<Float>(0, 0, 0, 1)
-            ))
-
-            let finalMatrix = modelMatrix * scaleMatrix
-
-            // Update uniforms with border mode (renderMode = 1)
-            var uniforms = CARendererUniforms(
-                mvpMatrix: finalMatrix,
-                opacity: currentEffectiveOpacity,
-                cornerRadius: Float(presentationLayer.cornerRadius),
-                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
-                borderWidth: Float(presentationLayer.borderWidth),
-                renderMode: 1.0,  // Border mode
-                cornerRadii: presentationLayer.cornerRadiiComponents
-            )
-
-            let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
-            let uniformData = createFloat32Array(from: &uniforms)
-            device.queue.writeBuffer(
-                uniformBuffer,
-                bufferOffset: uniformOffset,
-                data: uniformData
-            )
-
-            // Write vertices at dynamically allocated offset
-            let vertexData = createFloat32Array(from: &vertices)
-            device.queue.writeBuffer(
-                vertexBuffer,
-                bufferOffset: vertexOffset,
-                data: vertexData
-            )
-
-            // Set bind group with dynamic offset for this layer's uniforms
-            renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-            renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-            renderPass.draw(vertexCount: 6)
         }
 
         // Render sublayers (use model layer hierarchy, but presentation layer's sublayerTransform)
@@ -2104,15 +2304,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
 
             // Check if this is a replicator layer
+            // `sortedSublayers()` is cached on the model parent (`layer`); a
+            // CAReplicatorLayer's presentation copy has no sublayers of its
+            // own, so the cache must be read off the model side.
+            let sortedSubs = layer.sortedSublayers()
             if let replicatorLayer = presentationLayer as? CAReplicatorLayer {
                 renderReplicatorSublayers(
                     replicatorLayer: replicatorLayer,
-                    sublayers: sublayers,
+                    sublayers: sortedSubs,
                     renderPass: renderPass,
                     parentMatrix: sublayerMatrix
                 )
             } else {
-                for sublayer in sortedByZPosition(sublayers) {
+                for sublayer in sortedSubs {
                     self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
                 }
             }
@@ -2127,10 +2331,167 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
         }
 
+        // Render border AFTER sublayers so it sits on top (Apple spec).
+        // Border is part of the layer itself, so it draws in the parent's scissor rect
+        // (masksToBounds clipping for sublayers has already been restored above).
+        if presentationLayer.borderWidth > 0 && presentationLayer.borderColor != nil {
+            renderLayerBorder(
+                presentationLayer,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup
+            )
+        }
+
         // Clear stencil mask if we used one
         if hasMask {
             clearStencilMask(renderPass: renderPass)
         }
+    }
+
+    /// Renders the layer's backgroundColor as a rounded-rect quad.
+    /// Drawn BEFORE contents per Apple's CoreAnimation spec (backgroundColor coexists with contents).
+    private func renderLayerBackgroundColor(
+        _ presentationLayer: CALayer,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        bindGroup: GPUBindGroup
+    ) {
+        guard let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer else { return }
+
+        let color = presentationLayer.backgroundColorComponents
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+        ]
+
+        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+            return
+        }
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+
+        let finalMatrix = modelMatrix * scaleMatrix
+
+        var uniforms = CARendererUniforms(
+            mvpMatrix: finalMatrix,
+            opacity: currentEffectiveOpacity,
+            cornerRadius: Float(presentationLayer.cornerRadius),
+            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+            cornerRadii: presentationLayer.cornerRadiiComponents
+        )
+
+        let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: uniformData
+        )
+
+        let vertexData = createFloat32Array(from: &vertices)
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: vertexData
+        )
+
+        // Stencil-aware pipeline selection: if a mask or rounded-corner stencil is active,
+        // use the stencil-testing variant so the bg respects the mask shape.
+        renderPass.setPipeline(stencilAwarePipeline())
+        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.draw(vertexCount: 6)
+    }
+
+    /// Renders the layer's border as a rounded-rect stroke quad (renderMode = 1).
+    /// Drawn AFTER sublayers per Apple's CoreAnimation spec (border is topmost).
+    private func renderLayerBorder(
+        _ presentationLayer: CALayer,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        bindGroup: GPUBindGroup
+    ) {
+        guard let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer else { return }
+
+        let color = presentationLayer.borderColorComponents
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+        ]
+
+        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+            return
+        }
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+
+        let finalMatrix = modelMatrix * scaleMatrix
+
+        var uniforms = CARendererUniforms(
+            mvpMatrix: finalMatrix,
+            opacity: currentEffectiveOpacity,
+            cornerRadius: Float(presentationLayer.cornerRadius),
+            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+            borderWidth: Float(presentationLayer.borderWidth),
+            renderMode: 1.0,  // Border mode
+            cornerRadii: presentationLayer.cornerRadiiComponents
+        )
+
+        let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: uniformData
+        )
+
+        let vertexData = createFloat32Array(from: &vertices)
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: vertexData
+        )
+
+        // Stencil-aware pipeline selection so border respects any active mask/rounded clip.
+        renderPass.setPipeline(stencilAwarePipeline())
+        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.draw(vertexCount: 6)
+    }
+
+    /// Returns the stencil-testing variant when a mask/clip stencil is active,
+    /// otherwise the default pipeline with stencil compare == .always.
+    /// Used by background and border rendering so solid-colored quads respect CALayer.mask
+    /// and rounded-corner masksToBounds clipping.
+    private func stencilAwarePipeline() -> GPURenderPipeline {
+        if maskNestingDepth > 0, let stencilTestPipeline = stencilTestPipeline {
+            return stencilTestPipeline
+        }
+        return pipeline!
     }
 
     // MARK: - Mask Rendering (Stencil)
@@ -2158,7 +2519,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass.setStencilReference(currentStencilValue)
 
         // Render the mask layer (this writes to stencil buffer)
-        let maskPresentationLayer = maskLayer.presentation() ?? maskLayer
+        let maskPresentationLayer = maskLayer._renderTimePresentation()
         let maskModelMatrix = maskPresentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
         // Render mask layer content to stencil - use dynamic vertex allocation
@@ -2366,7 +2727,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let timeOffset = CFTimeInterval(instanceIndex) * instanceDelay
 
             // Render all sublayers with this instance's transform, color, and time offset
-            for sublayer in sortedByZPosition(sublayers) {
+            // (caller is responsible for passing `sublayers` already sorted by zPosition).
+            for sublayer in sublayers {
                 renderLayerWithColorMultiplierAndTimeOffset(
                     sublayer,
                     renderPass: renderPass,
@@ -2393,7 +2755,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let uniformBuffer = uniformBuffer,
               let bindGroup = bindGroup else { return }
 
-        let presentationLayer = layer.presentation() ?? layer
+        let presentationLayer = layer._renderTimePresentation()
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
 
         // Push effective opacity for this replicator instance subtree
@@ -2466,7 +2828,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
-            for sublayer in sortedByZPosition(sublayers) {
+            for sublayer in layer.sortedSublayers() {
                 renderLayerWithColorMultiplier(
                     sublayer,
                     renderPass: renderPass,
@@ -2498,7 +2860,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if timeOffset != 0 {
             presentationLayer = layer.presentationAtTimeOffset(timeOffset)
         } else {
-            presentationLayer = layer.presentation() ?? layer
+            presentationLayer = layer._renderTimePresentation()
         }
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
@@ -2573,7 +2935,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
-            for sublayer in sortedByZPosition(sublayers) {
+            for sublayer in layer.sortedSublayers() {
                 renderLayerWithColorMultiplierAndTimeOffset(
                     sublayer,
                     renderPass: renderPass,
@@ -2802,12 +3164,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
         let finalMatrix = modelMatrix * scaleMatrix
 
+        // Apple's spec: contents are only clipped to cornerRadius when masksToBounds == true.
+        let effectiveCornerRadius: Float = layer.masksToBounds ? Float(layer.cornerRadius) : 0
+        let effectiveCornerRadii: SIMD4<Float> = layer.masksToBounds ? layer.cornerRadiiComponents : .zero
+
         // Create uniforms (shared for all 9 patches)
         var uniforms = TexturedUniforms(
             mvpMatrix: finalMatrix,
             opacity: currentEffectiveOpacity,
-            cornerRadius: Float(layer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight))
+            cornerRadius: effectiveCornerRadius,
+            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
+            cornerRadii: effectiveCornerRadii
         )
 
         let white = SIMD4<Float>(1, 1, 1, 1)
@@ -2897,7 +3264,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ))
 
             // Render this patch
-            renderPass.setPipeline(maskNestingDepth > 0 ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
+            if let selected = selectTexturedPipeline(for: layer) {
+                renderPass.setPipeline(selected)
+            }
             renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
             renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
             renderPass.draw(vertexCount: 6)
@@ -3018,12 +3387,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let finalMatrix = modelMatrix * scaleMatrix
 
+        // Apple's spec: contents are only clipped to cornerRadius when masksToBounds == true.
+        // Without this gate, images would always be corner-clipped, diverging from CoreAnimation.
+        let effectiveCornerRadius: Float = layer.masksToBounds ? Float(layer.cornerRadius) : 0
+        let effectiveCornerRadii: SIMD4<Float> = layer.masksToBounds ? layer.cornerRadiiComponents : .zero
+
         // Create uniforms for textured rendering
         var uniforms = TexturedUniforms(
             mvpMatrix: finalMatrix,
             opacity: currentEffectiveOpacity,
-            cornerRadius: Float(layer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight))
+            cornerRadius: effectiveCornerRadius,
+            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
+            cornerRadii: effectiveCornerRadii
         )
 
         // Write uniforms
@@ -3064,7 +3439,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         // Switch to textured pipeline and render
-        renderPass.setPipeline(maskNestingDepth > 0 ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
+        if let selected = selectTexturedPipeline(for: layer) {
+            renderPass.setPipeline(selected)
+        }
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -3485,13 +3862,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let finalMatrix = modelMatrix * scaleMatrix
 
+        // Apple's spec: text contents are only clipped to cornerRadius when masksToBounds == true.
+        let effectiveCornerRadius: Float = textLayer.masksToBounds ? Float(textLayer.cornerRadius) : 0
+        let effectiveCornerRadii: SIMD4<Float> = textLayer.masksToBounds ? textLayer.cornerRadiiComponents : .zero
+
         // Update uniforms
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
             opacity: currentEffectiveOpacity,
-            cornerRadius: Float(textLayer.cornerRadius),
+            cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(width), Float(height)),
-            cornerRadii: textLayer.cornerRadiiComponents
+            cornerRadii: effectiveCornerRadii
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -3509,7 +3890,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         // Switch to textured pipeline and draw
-        renderPass.setPipeline(maskNestingDepth > 0 ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
+        if let selected = selectTexturedPipeline(for: textLayer) {
+            renderPass.setPipeline(selected)
+        }
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -4483,6 +4866,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
+        // Fast-path: skip the recursive `findFirstShadowLayer` walk when no
+        // descendant carries a shadow contribution. The counter mirrors model
+        // state (see CALayer's subtree counters), so animations that animate
+        // shadowOpacity from a model value of 0 are not detected here.
+        guard rootLayer._subtreeShadowCount > 0 else { return }
+
         guard let device = device,
               let pipeline = pipeline,
               let preRenderVertexBuffer = preRenderVertexBuffer,
@@ -4501,7 +4890,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        let presentationLayer = shadowLayer.presentation() ?? shadowLayer
+        // R3.7 (PERFORMANCE_DESIGN.md §5.5): when the contributor's subtree
+        // is clean and we already have a blurred texture cached, skip the
+        // mask-extraction + 2-pass blur. `shadowMaskTexture` still holds
+        // last frame's blurred result because nothing else writes to it.
+        let shadowLayerID = ObjectIdentifier(shadowLayer)
+        if RasterizationDecisions.canReusePrerenderCache(
+            contributorLayer: shadowLayer,
+            hasCachedTexture: blurredShadowCache[shadowLayerID] != nil
+        ) {
+            hasPrerenderredShadow = true
+            shadowsPrerendered = true
+            return
+        }
+
+        let presentationLayer = shadowLayer._renderTimePresentation()
         let shadowRadius = presentationLayer.shadowRadius
         let shadowOffset = presentationLayer.shadowOffset
 
@@ -4510,10 +4913,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let expandedHeight = presentationLayer.bounds.height + shadowRadius * 4
 
         // Step 1: Render layer shape to shadow mask texture
+        guard let shadowMaskTextureView = shadowMaskTextureView,
+              let shadowBlurTextureView = shadowBlurTextureView else { return }
         let maskRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: shadowMaskTexture.createView(),
+                    view: shadowMaskTextureView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
@@ -4540,17 +4945,42 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let maskUniformData = createFloat32Array(from: &maskUniforms)
         device.queue.writeBuffer(preRenderUniformBuffer, bufferOffset: 0, data: maskUniformData)
 
-        // Create white vertices for the mask
+        // R3.6 (PERFORMANCE_DESIGN.md §5.4): when `shadowPath` is set, replace
+        // the bounds-rect silhouette with a tessellated path. The mvp matrix
+        // is unchanged because both rect and path coordinates live in
+        // layer-local space.
         let whiteColor = SIMD4<Float>(1, 1, 1, 1)
-        var maskVertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: whiteColor),
-            CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: whiteColor),
-            CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: whiteColor),
-            CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: whiteColor),
-            CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)), texCoord: SIMD2(1, 1), color: whiteColor),
-            CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: whiteColor),
-        ]
+        var maskVertices: [CARendererVertex] = []
+        if RasterizationDecisions.useShadowPathFastPath(for: presentationLayer),
+           let shadowPath = presentationLayer.shadowPath {
+            let polylines = flattenPath(shadowPath)
+            for polyline in polylines {
+                guard polyline.count >= 3 else { continue }
+                let indices = triangulatePolygon(polyline)
+                for idx in indices {
+                    let point = polyline[idx]
+                    maskVertices.append(CARendererVertex(
+                        position: SIMD2(Float(point.x), Float(point.y)),
+                        texCoord: SIMD2(0, 0),
+                        color: whiteColor
+                    ))
+                }
+            }
+        }
 
+        if maskVertices.isEmpty {
+            // Bounds-rect silhouette fallback (R3.6 disabled or empty path).
+            maskVertices = [
+                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: whiteColor),
+                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: whiteColor),
+                CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: whiteColor),
+                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: whiteColor),
+                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)), texCoord: SIMD2(1, 1), color: whiteColor),
+                CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: whiteColor),
+            ]
+        }
+
+        let maskVertexCount = UInt32(maskVertices.count)
         let maskVertexData = createFloat32Array(from: &maskVertices)
         device.queue.writeBuffer(preRenderVertexBuffer, bufferOffset: 0, data: maskVertexData)
 
@@ -4558,7 +4988,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         maskRenderPass.setPipeline(shadowMaskPipeline ?? pipeline)
         maskRenderPass.setBindGroup(0, bindGroup: preRenderBindGroup, dynamicOffsets: [0])
         maskRenderPass.setVertexBuffer(0, buffer: preRenderVertexBuffer, offset: 0)
-        maskRenderPass.draw(vertexCount: 6)
+        maskRenderPass.draw(vertexCount: maskVertexCount)
         maskRenderPass.end()
 
         // Step 2: Horizontal blur (shadowMaskTexture → shadowBlurTexture)
@@ -4572,7 +5002,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let hBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: shadowBlurTexture.createView(),
+                    view: shadowBlurTextureView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
@@ -4589,7 +5019,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let vBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: shadowMaskTexture.createView(),
+                    view: shadowMaskTextureView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
@@ -4605,6 +5035,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Mark that shadow was pre-rendered
         hasPrerenderredShadow = true
         shadowsPrerendered = true
+
+        // R3.7: remember which contributor produced the pixels currently
+        // sitting in `shadowMaskTexture`. Next frame's reuse check looks
+        // for this entry. The texture handle is shared/recreated on
+        // `createShadowTextures` (resize); cache is cleared there.
+        blurredShadowCache.removeAll(keepingCapacity: true)
+        blurredShadowCache[shadowLayerID] = shadowMaskTexture
     }
 
     /// Pre-renders layers with supported filters into an offscreen texture.
@@ -4615,6 +5052,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
+        // Fast-path: skip the recursive `findFirstFilteredLayer` walk when no
+        // descendant has a non-empty `filters` array. The counter checks for
+        // non-empty content; unsupported filter types are still filtered later
+        // by `supportedFilterOperations`.
+        guard rootLayer._subtreeFilterCount > 0 else { return }
+
         guard let pipeline = pipeline,
               let depthTexture = depthTexture,
               let filterSourceTexture = filterSourceTexture,
@@ -4626,17 +5069,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        let presentationLayer = filteredLayer.presentation() ?? filteredLayer
+        let presentationLayer = filteredLayer._renderTimePresentation()
         let operations = presentationLayer.supportedFilterOperations
         guard !operations.isEmpty else { return }
-        let depthTextureView = depthTexture.createView()
+        guard let depthTextureView = depthTextureView,
+              let filterSourceTextureView = filterSourceTextureView else { return }
 
         // Step 1: Render the filtered layer subtree into the source texture without applying
         // the layer's own filter. The composite pass will apply the root opacity later.
         let contentRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: filterSourceTexture.createView(),
+                    view: filterSourceTextureView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
@@ -4704,6 +5148,359 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerenderredFilterBlurRadius = presentationLayer.totalBlurRadius
     }
 
+    // MARK: - Rasterized Layer Pre-render (R3.2 / R3.3)
+
+    /// Walks the tree and captures every `shouldRasterize` subtree into
+    /// its own offscreen texture, populating `prerasterizedTextures` so
+    /// the main pass can composite the captured pixels as a quad.
+    ///
+    /// On a cache hit the existing texture is reused — no GPU work — and
+    /// `lookup` updates the entry's `lastUsedFrame` to keep the idle
+    /// eviction pass honest. On a miss the renderer allocates a fresh
+    /// canvas-sized texture, redirects `renderLayer` into it with
+    /// `rasterizePrerenderRootLayer` set so this same layer's composite
+    /// branch in `renderLayer` is suppressed during the capture pass,
+    /// and inserts the new entry. Capture clears with α = 1.0 (R3.3).
+    private func prerenderRasterizedLayers(
+        _ rootLayer: CALayer,
+        encoder: GPUCommandEncoder,
+        projectionMatrix: Matrix4x4
+    ) {
+        guard let device = device,
+              let pipeline = pipeline,
+              let depthTextureView = depthTextureView,
+              let cache = rasterizationCache else { return }
+
+        // Frame token already bumped at the top of `render`; use it for
+        // both lookup `lastUsedFrame` updates and insert tagging.
+        let frameToken = CALayer._currentFrameToken
+
+        collectAndCaptureRasterizedLayers(
+            rootLayer,
+            parentMatrix: projectionMatrix,
+            device: device,
+            pipeline: pipeline,
+            depthTextureView: depthTextureView,
+            cache: cache,
+            encoder: encoder,
+            frameToken: frameToken
+        )
+    }
+
+    /// Recursive worker for `prerenderRasterizedLayers`. Walks the layer
+    /// tree, decides per-layer reuse via `RasterizationDecisions`, and
+    /// dispatches the capture pass on miss. Walks descendants of
+    /// `shouldRasterize` layers too — nested `shouldRasterize` layers
+    /// each get their own cache entry, just as CoreAnimation would.
+    private func collectAndCaptureRasterizedLayers(
+        _ layer: CALayer,
+        parentMatrix: Matrix4x4,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        depthTextureView: GPUTextureView,
+        cache: RasterizationCache<GPUTexture>,
+        encoder: GPUCommandEncoder,
+        frameToken: UInt64
+    ) {
+        let presentationLayer = layer._renderTimePresentation()
+        guard !presentationLayer.isHidden, presentationLayer.opacity > 0 else {
+            return
+        }
+
+        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+
+        if presentationLayer.shouldRasterize {
+            captureRasterizedLayer(
+                layer,
+                device: device,
+                pipeline: pipeline,
+                depthTextureView: depthTextureView,
+                cache: cache,
+                encoder: encoder,
+                frameToken: frameToken
+            )
+        }
+
+        if let sublayers = layer.sublayers, !sublayers.isEmpty {
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
+            for sublayer in sublayers {
+                collectAndCaptureRasterizedLayers(
+                    sublayer,
+                    parentMatrix: sublayerMatrix,
+                    device: device,
+                    pipeline: pipeline,
+                    depthTextureView: depthTextureView,
+                    cache: cache,
+                    encoder: encoder,
+                    frameToken: frameToken
+                )
+            }
+        }
+    }
+
+    /// Captures or reuses the rasterized texture for one
+    /// `shouldRasterize` layer.
+    ///
+    /// Per PERFORMANCE_DESIGN.md §5.2 the offscreen texture is sized to
+    /// `bounds.size × rasterizationScale` (the layer's own pixel grid),
+    /// not the canvas — so the composite path can place it as a partial
+    /// quad at the layer's transform without burning canvas-sized memory
+    /// per cached entry. The capture pass uses a bounds-local
+    /// orthographic projection so the layer's own `position`, `transform`
+    /// and `anchorPoint` are *excluded* from the bake — those land at
+    /// composite time. `renderLayer` recognises the capture root via
+    /// `rasterizePrerenderRootLayer` and skips its `modelMatrix`
+    /// computation accordingly.
+    private func captureRasterizedLayer(
+        _ layer: CALayer,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        depthTextureView: GPUTextureView,
+        cache: RasterizationCache<GPUTexture>,
+        encoder: GPUCommandEncoder,
+        frameToken: UInt64
+    ) {
+        let key = RasterizationCacheKey(ObjectIdentifier(layer))
+        let contentBoundsHash = rasterizationContentBoundsHash(for: layer)
+
+        // Cache lookup updates `lastUsedFrame` on a hit so the idle
+        // eviction pass treats it as live.
+        if let entry = cache.lookup(key, atFrame: frameToken),
+           RasterizationDecisions.canReuseRasterizedTexture(
+               layer: layer,
+               cached: entry,
+               currentContentBoundsHash: contentBoundsHash) {
+            prerasterizedTextures[ObjectIdentifier(layer)] = entry.texture
+            return
+        }
+
+        // Miss — allocate a layer-sized texture (`bounds × scale`) and
+        // render the subtree into it under a bounds-local projection.
+        let presentationLayer = layer._renderTimePresentation()
+        let bounds = presentationLayer.bounds
+        let scale = max(1.0, CGFloat(presentationLayer.rasterizationScale))
+        let pixelWidth = max(1, Int((bounds.width * scale).rounded(.up)))
+        let pixelHeight = max(1, Int((bounds.height * scale).rounded(.up)))
+        guard bounds.width > 0, bounds.height > 0 else { return }
+
+        let captureTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(pixelWidth), height: UInt32(pixelHeight)),
+            format: .rgba8unorm,
+            usage: [.renderAttachment, .textureBinding]
+        ))
+        let captureView = captureTexture.createView()
+
+        // R3.3 / R3.4a: clear α is 1.0 regardless of `layer.opacity`; the
+        // composite pass applies `layer.opacity` at draw time. With the
+        // texture now matching the layer's own bounds, the layer's
+        // backgroundColor / sublayers fill the texture and this clear
+        // value only shows through where the layer doesn't draw at all
+        // (a flat-rasterized `shouldRasterize` layer is treated as an
+        // opaque image, mirroring CoreAnimation's WWDC 2014 #419 model).
+        let clearAlpha = RasterizationDecisions.captureClearAlpha()
+        let capturePass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: captureView,
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: Double(clearAlpha)),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ],
+            depthStencilAttachment: GPURenderPassDepthStencilAttachment(
+                view: depthTextureView,
+                depthClearValue: 1.0,
+                depthLoadOp: .clear,
+                depthStoreOp: .store,
+                stencilClearValue: 0,
+                stencilLoadOp: .clear,
+                stencilStoreOp: .store
+            )
+        ))
+        capturePass.setPipeline(pipeline)
+        capturePass.setViewport(
+            x: 0,
+            y: 0,
+            width: Float(pixelWidth),
+            height: Float(pixelHeight),
+            minDepth: 0,
+            maxDepth: 1
+        )
+
+        // Bounds-local projection: maps `[bounds.minX, bounds.maxX]` ×
+        // `[bounds.minY, bounds.maxY]` to NDC. Combined with the
+        // capture-root `modelMatrix` shortcut in `renderLayer` (which
+        // bypasses position/transform/anchor for `rasterizePrerenderRootLayer`),
+        // this places the layer's bounds-local content directly into the
+        // texture's pixel grid.
+        let captureProjection = Matrix4x4.orthographic(
+            left: Float(bounds.minX),
+            right: Float(bounds.maxX),
+            bottom: Float(bounds.minY),
+            top: Float(bounds.maxY),
+            near: -1000,
+            far: 1000
+        )
+
+        rasterizePrerenderRootLayer = layer
+        renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
+        rasterizePrerenderRootLayer = nil
+
+        capturePass.end()
+
+        // Insert the entry. The cache enforces the byte budget only
+        // when `evictToBudget` is called (post-submit), so an oversized
+        // single insert is allowed to land here.
+        let pixelSize = CGSize(width: CGFloat(pixelWidth), height: CGFloat(pixelHeight))
+        cache.insert(
+            key,
+            texture: captureTexture,
+            pixelSize: pixelSize,
+            contentBoundsHash: contentBoundsHash,
+            atFrame: frameToken
+        )
+        prerasterizedTextures[ObjectIdentifier(layer)] = captureTexture
+    }
+
+    /// Hash of the inputs that determine the captured pixels. Used by
+    /// `RasterizationDecisions.canReuseRasterizedTexture` to detect
+    /// content invalidation independent of the dirty-bit pathway.
+    ///
+    /// Excludes `layer.transform` per PERFORMANCE_DESIGN.md §5.6: the
+    /// layer's own transform is a uniform applied at composite, not part
+    /// of the captured pixels — including it would force a recapture on
+    /// every transform-only change (e.g. scrolling), defeating the
+    /// cache. Internal layout is captured by `bounds` alone.
+    private func rasterizationContentBoundsHash(for layer: CALayer) -> Int {
+        var hasher = Hasher()
+        hasher.combine(layer.bounds.origin.x)
+        hasher.combine(layer.bounds.origin.y)
+        hasher.combine(layer.bounds.size.width)
+        hasher.combine(layer.bounds.size.height)
+        hasher.combine(layer.rasterizationScale)
+        return hasher.finalize()
+    }
+
+    /// Composites a captured rasterization texture as a quad placed at
+    /// the layer's transform, sized to the layer's bounds, with the
+    /// layer's *current* opacity (R3.3 composite path).
+    ///
+    /// Reuses the `texturedPipeline` (same shader path as `contents`
+    /// rendering) so that R3.5 `isOpaque` / blending and stencil-mask
+    /// state are honoured by `selectTexturedPipeline`. The quad
+    /// vertices are emitted in normalised layer-bounds coordinates
+    /// `[0, 1]`; the MVP matrix scales them by `bounds.size` and
+    /// applies the layer's `modelMatrix` to land at the right screen
+    /// position. Texture V is flipped to bridge Y-up world / Y-down
+    /// texture rows (mirrors `renderContentsLayer`).
+    private func renderRasterizedLayerComposite(
+        _ layer: CALayer,
+        presentationLayer: CALayer,
+        texture: GPUTexture,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) {
+        guard let texturedBindGroupLayout = texturedBindGroupLayout,
+              let textureSampler = textureSampler,
+              let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer else { return }
+
+        let boundsWidth = presentationLayer.bounds.width
+        let boundsHeight = presentationLayer.bounds.height
+        guard boundsWidth > 0, boundsHeight > 0 else { return }
+
+        // Composite opacity = parent-stack effective × this layer's
+        // current opacity. Capture deliberately baked the layer at 1.0
+        // (see `renderLayer`'s `isCaptureRoot` branch); reapply here.
+        let composite = currentEffectiveOpacity * RasterizationDecisions.compositeOpacity(for: presentationLayer)
+
+        // Quad in normalised layer-bounds space. UVs V-flip to convert
+        // between Y-up world coords and Y-down texture rows — same
+        // convention used by `renderContentsLayer`.
+        let white = SIMD4<Float>(1, 1, 1, 1)
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
+        ]
+
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        let (vertexOffset, layerIndex) = allocation
+
+        // Scale the [0, 1] quad to bounds.size, then apply the layer's
+        // own modelMatrix to position/rotate/scale it into the world.
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(boundsWidth), 0, 0, 0),
+            SIMD4<Float>(0, Float(boundsHeight), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = modelMatrix * scaleMatrix
+
+        // cornerRadius is already baked into the captured texture by
+        // the capture pass — passing 0 here avoids double-applying it.
+        var uniforms = TexturedUniforms(
+            mvpMatrix: finalMatrix,
+            opacity: composite,
+            cornerRadius: 0,
+            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
+            cornerRadii: .zero
+        )
+
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: uniformData
+        )
+        let vertexData = createFloat32Array(from: &vertices)
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: vertexData
+        )
+
+        let texturedBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: texturedBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(
+                    binding: 0,
+                    resource: .bufferBinding(GPUBufferBinding(
+                        buffer: uniformBuffer,
+                        size: UInt64(MemoryLayout<TexturedUniforms>.stride)
+                    ))
+                ),
+                GPUBindGroupEntry(
+                    binding: 1,
+                    resource: .sampler(textureSampler)
+                ),
+                GPUBindGroupEntry(
+                    binding: 2,
+                    resource: .textureView(texture.createView())
+                )
+            ]
+        ))
+
+        // R3.5 / mask-stencil aware pipeline selection.
+        if let selected = selectTexturedPipeline(for: presentationLayer) {
+            renderPass.setPipeline(selected)
+        }
+        renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.draw(vertexCount: 6)
+
+        // Restore the regular pipeline so subsequent per-layer draws in
+        // the main pass continue with the right state.
+        if let pipeline = pipeline {
+            renderPass.setPipeline(pipeline)
+        }
+    }
+
     private func applyBlurFilter(
         inputTexture: GPUTexture,
         intermediateTexture: GPUTexture,
@@ -4712,12 +5509,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder
     ) {
         guard let device = device,
-              let depthTexture = depthTexture,
-              let shadowBindGroupLayout = shadowBindGroupLayout,
               let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
               let shadowBlurVerticalPipeline = shadowBlurVerticalPipeline,
               let blurUniformBuffer = blurUniformBuffer,
-              let blurSampler = blurSampler else { return }
+              let depthTextureView = depthTextureView else { return }
+
+        // Resolve cached views and bind groups by texture identity. The
+        // ping-pong loop in `prerenderFilteredLayers` only ever passes the
+        // three persistent filter textures here, so no fallback path is
+        // needed — if the lookup misses we drop the operation rather than
+        // silently allocating a per-frame view (which would defeat the cache
+        // and hide a real wiring bug behind a slow path).
+        guard let inputBindGroup = applyBlurBindGroup(for: inputTexture),
+              let intermediateView = filterTextureView(for: intermediateTexture),
+              let intermediateBindGroup = applyBlurBindGroup(for: intermediateTexture),
+              let outputView = filterTextureView(for: outputTexture) else { return }
 
         var blurUniforms = BlurUniforms(
             texelSize: SIMD2<Float>(1.0 / Float(size.width), 1.0 / Float(size.height)),
@@ -4726,26 +5532,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let blurUniformData = createFloat32Array(from: &blurUniforms)
         device.queue.writeBuffer(blurUniformBuffer, bufferOffset: 0, data: blurUniformData)
 
-        let horizontalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(inputTexture.createView())),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-
         let hBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: intermediateTexture.createView(),
+                    view: intermediateView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
                 )
             ],
             depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTexture.createView(),
+                view: depthTextureView,
                 depthClearValue: 1.0,
                 depthLoadOp: .clear,
                 depthStoreOp: .store,
@@ -4756,30 +5553,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         hBlurPass.setPipeline(shadowBlurHorizontalPipeline)
-        hBlurPass.setBindGroup(0, bindGroup: horizontalBindGroup)
+        hBlurPass.setBindGroup(0, bindGroup: inputBindGroup)
         hBlurPass.draw(vertexCount: 6)
         hBlurPass.end()
-
-        let verticalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(intermediateTexture.createView())),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
 
         let vBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: outputTexture.createView(),
+                    view: outputView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
                 )
             ],
             depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTexture.createView(),
+                view: depthTextureView,
                 depthClearValue: 1.0,
                 depthLoadOp: .clear,
                 depthStoreOp: .store,
@@ -4790,9 +5578,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         vBlurPass.setPipeline(shadowBlurVerticalPipeline)
-        vBlurPass.setBindGroup(0, bindGroup: verticalBindGroup)
+        vBlurPass.setBindGroup(0, bindGroup: intermediateBindGroup)
         vBlurPass.draw(vertexCount: 6)
         vBlurPass.end()
+    }
+
+    /// Returns the cached view for one of the persistent filter textures.
+    /// Reference equality is used because `GPUTexture` is a class and the
+    /// caller always passes one of the three textures created in
+    /// `createFilterTextures`.
+    private func filterTextureView(for texture: GPUTexture) -> GPUTextureView? {
+        if texture === filterSourceTexture { return filterSourceTextureView }
+        if texture === filterBlurTexture { return filterBlurTextureView }
+        if texture === filterResultTexture { return filterResultTextureView }
+        return nil
+    }
+
+    /// Returns the cached blur-pass bind group for one of the persistent
+    /// filter textures. See `filterTextureView(for:)`.
+    private func applyBlurBindGroup(for texture: GPUTexture) -> GPUBindGroup? {
+        if texture === filterSourceTexture { return applyBlurFromSourceBindGroup }
+        if texture === filterBlurTexture { return applyBlurFromBlurBindGroup }
+        if texture === filterResultTexture { return applyBlurFromResultBindGroup }
+        return nil
     }
 
     private func applyColorFilter(
@@ -4802,11 +5610,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder
     ) {
         guard let device = device,
-              let depthTexture = depthTexture,
+              let depthTextureView = depthTextureView,
               let filterCompositePipeline = filterCompositePipeline,
               let filterCompositeUniformBuffer = filterCompositeUniformBuffer,
               let blurSampler = blurSampler,
               var uniforms = filterCompositeUniforms(for: operation) else { return }
+        // inputTexture / outputTexture are always one of the persistent
+        // filter textures (see prerenderFilteredLayers); use the cached views.
+        guard let inputView = filterTextureView(for: inputTexture),
+              let outputView = filterTextureView(for: outputTexture) else { return }
 
         let filterUniformData = createFloat32Array(from: &uniforms)
         device.queue.writeBuffer(filterCompositeUniformBuffer, bufferOffset: 0, data: filterUniformData)
@@ -4815,7 +5627,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: filterCompositePipeline.getBindGroupLayout(index: 0),
             entries: [
                 GPUBindGroupEntry(binding: 0, resource: .buffer(filterCompositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(inputTexture.createView())),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(inputView)),
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
         ))
@@ -4823,14 +5635,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: outputTexture.createView(),
+                    view: outputView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
                 )
             ],
             depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTexture.createView(),
+                view: depthTextureView,
                 depthClearValue: 1.0,
                 depthLoadOp: .clear,
                 depthStoreOp: .store,
@@ -4866,7 +5678,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         _ layer: CALayer,
         parentMatrix: Matrix4x4
     ) -> (layer: CALayer, parentMatrix: Matrix4x4)? {
-        let presentationLayer = layer.presentation() ?? layer
+        let presentationLayer = layer._renderTimePresentation()
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else {
             return nil
@@ -4883,7 +5695,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if let sublayers = layer.sublayers {
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
-            for sublayer in sortedByZPosition(sublayers) {
+            for sublayer in layer.sortedSublayers() {
                 if let result = findFirstFilteredLayer(sublayer, parentMatrix: sublayerMatrix) {
                     return result
                 }
@@ -4900,7 +5712,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         parentMatrix: Matrix4x4,
         parentOpacity: Float = 1.0
     ) -> (layer: CALayer, matrix: Matrix4x4, parentMatrix: Matrix4x4, effectiveOpacity: Float)? {
-        let presentationLayer = layer.presentation() ?? layer
+        let presentationLayer = layer._renderTimePresentation()
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else {
             return nil
@@ -4919,7 +5731,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if let sublayers = layer.sublayers {
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
-            for sublayer in sortedByZPosition(sublayers) {
+            for sublayer in layer.sortedSublayers() {
                 if let result = findFirstShadowLayer(sublayer, parentMatrix: sublayerMatrix, parentOpacity: effectiveOpacity) {
                     return result
                 }
@@ -4968,7 +5780,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // If shadow was pre-rendered with blur, use the textured composite pipeline
         if hasPrerenderredShadow,
-           let shadowMaskTexture = shadowMaskTexture,
+           let shadowMaskTextureView = shadowMaskTextureView,
            let shadowCompositePipeline = shadowCompositePipeline,
            let blurSampler = blurSampler {
 
@@ -4996,7 +5808,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
                 entries: [
                     GPUBindGroupEntry(binding: 0, resource: .buffer(shadowCompositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
-                    GPUBindGroupEntry(binding: 1, resource: .textureView(shadowMaskTexture.createView())),
+                    GPUBindGroupEntry(binding: 1, resource: .textureView(shadowMaskTextureView)),
                     GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
                 ]
             ))
@@ -5156,7 +5968,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
     ) {
-        let presentationLayer = layer.presentation() ?? layer
+        let presentationLayer = layer._renderTimePresentation()
 
         guard let sublayers = layer.sublayers else { return }
 
@@ -5169,7 +5981,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Render sublayers in array order.
         // The depth buffer handles z-ordering correctly - no pre-sorting needed.
         // Sublayers sorted by zPosition (painter's algorithm, back-to-front).
-        for sublayer in sortedByZPosition(sublayers) {
+        for sublayer in layer.sortedSublayers() {
             self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
         }
     }
@@ -5486,6 +6298,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     // Render cached tile as texture
                     renderTileWithImage(
                         cachedImage,
+                        layer: tiledLayer,
                         device: device,
                         renderPass: renderPass,
                         tileMatrix: tileMatrix,
@@ -5519,10 +6332,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // Render sublayers
-        if let sublayers = tiledLayer.sublayers {
+        if let sublayers = tiledLayer.sublayers, !sublayers.isEmpty {
             // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
             let sublayerMatrix = tiledLayer.sublayerMatrix(modelMatrix: modelMatrix)
-            for sublayer in sortedByZPosition(sublayers) {
+            for sublayer in tiledLayer.sortedSublayers() {
                 self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
             }
         }
@@ -5531,6 +6344,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Renders a tile with a cached image texture.
     private func renderTileWithImage(
         _ image: CGImage,
+        layer: CALayer,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
         tileMatrix: Matrix4x4,
@@ -5601,7 +6415,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ]
         ))
 
-        renderPass.setPipeline(maskNestingDepth > 0 ? (texturedStencilPipeline ?? texturedPipeline) : texturedPipeline)
+        if let selected = selectTexturedPipeline(for: layer) {
+            renderPass.setPipeline(selected)
+        }
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)

@@ -12,6 +12,7 @@
     "test:ui": "playwright test --ui"
   },
   "devDependencies": {
-    "@playwright/test": "^1.49.0"
+    "@playwright/test": "^1.49.0",
+    "swift-wasm-testing": "github:1amageek/swift-wasm-testing"
   }
 }

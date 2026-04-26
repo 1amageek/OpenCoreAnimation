@@ -91,6 +91,10 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate, @unchecked S
               let pipelineState = pipelineState,
               let targetTexture = targetTexture else { return }
 
+        // Phase 1 (PERFORMANCE_DESIGN.md §3.6): mirror CAWebGPURenderer
+        // and bump the per-frame token before any presentation cache lookup.
+        CALayer._currentFrameToken &+= 1
+
         // Create command buffer
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
 
@@ -125,6 +129,11 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate, @unchecked S
 
         encoder.endEncoding()
         commandBuffer.commit()
+
+        // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
+        // Mirror CAWebGPURenderer: clear after submit so any setter that
+        // runs in the same tick re-marks for the NEXT frame, not this one.
+        rootLayer.recursivelyClearDirtyAfterCommit()
     }
 
     public func invalidate() {

@@ -1,9 +1,8 @@
 // swift-tools-version: 6.0
 //
 // OpenCoreAnimation WASM smoke-test executable. Built with the same toolchain
-// and runtime layout as OpenCoreGraphics/SmokeTest and megaman
-// (`swift-wasmport`) so Playwright can exercise the CALayer →
-// CAWebGPURenderer pipeline in headless Chromium.
+// and runtime layout as the other Open* smoke tests so Playwright can
+// exercise the CALayer → CAWebGPURenderer pipeline in headless Chromium.
 //
 // Builds with:
 //   swift build --product OCASmoke --swift-sdk swift-6.3.1-RELEASE_wasm -c release
@@ -19,22 +18,20 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../.."),
-        .package(url: "https://github.com/swiftwasm/JavaScriptKit", from: "0.50.2"),
+        .package(url: "https://github.com/1amageek/swift-wasm-testing", branch: "main"),
     ],
     targets: [
         .executableTarget(
             name: "OCASmoke",
             dependencies: [
                 .product(name: "OpenCoreAnimation", package: "OpenCoreAnimation"),
-                .product(name: "JavaScriptKit", package: "JavaScriptKit"),
-                .product(name: "JavaScriptEventLoop", package: "JavaScriptKit"),
+                .product(name: "WasmTesting", package: "swift-wasm-testing"),
             ],
             linkerSettings: [
                 .unsafeFlags([
                     // JavaScriptKit only binds against WASI-reactor modules.
                     // Encode the flag here so plain `swift build` produces a
-                    // JavaScriptKit-compatible artifact (the CLI wrapper is
-                    // not in the loop for this target).
+                    // JavaScriptKit-compatible artifact.
                     "-Xclang-linker", "-mexec-model=reactor",
                     "-Xlinker", "--export=setup",
                 ])
