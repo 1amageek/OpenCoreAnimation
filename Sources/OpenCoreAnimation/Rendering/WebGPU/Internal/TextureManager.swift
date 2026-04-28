@@ -5,7 +5,15 @@ import SwiftWebGPU
 // MARK: - Texture Manager (LRU Cache)
 
 /// A texture cache entry with access tracking for LRU eviction.
+///
+/// The entry holds a strong reference to the source `CGImage` so the
+/// `ObjectIdentifier(cgImage)` used as the dictionary key remains unique
+/// for the lifetime of the cache entry. Without this strong reference the
+/// CGImage may be deallocated by ARC, its heap address reused by a fresh
+/// allocation, and a subsequent lookup would return the wrong cached
+/// `GPUTexture` (cross-image identity collision).
 private struct TextureCacheEntry {
+    let cgImage: CGImage
     let texture: GPUTexture
     let width: Int
     let height: Int
@@ -24,14 +32,29 @@ private struct TextureCacheEntry {
 /// When the cache exceeds its capacity, the least recently used textures
 /// are evicted to make room for new ones.
 ///
+/// ## Identity & Ownership
+///
+/// The cache is keyed by `ObjectIdentifier(CGImage)`, but a raw pointer
+/// identifier is only stable while the underlying object is alive. To
+/// guarantee key uniqueness, every cache entry holds a strong reference
+/// to its `CGImage`; downstream caches keyed by the same identity (e.g.
+/// `GPUTextureView` / `GPUBindGroup` caches in the renderer) are kept in
+/// sync via the `onEvict` callback, which fires for every entry the
+/// manager removes.
+///
 /// ## Usage
 ///
 /// ```swift
 /// let manager = GPUTextureManager(device: device, maxTextures: 256, maxMemory: 256 * 1024 * 1024)
 ///
-/// // Get or create a texture
-/// let texture = manager.getOrCreateTexture(for: imageId) { device in
-///     return createTextureFromImage(image, device: device)
+/// // Get or create a texture (manager retains the CGImage while cached).
+/// let texture = manager.getOrCreateTexture(for: cgImage, width: w, height: h) {
+///     return createTextureFromImage(cgImage, device: device)
+/// }
+///
+/// // Receive eviction notifications so downstream caches stay in sync.
+/// manager.onEvict = { evictedImage in
+///     downstreamCache.removeValue(forKey: ObjectIdentifier(evictedImage))
 /// }
 ///
 /// // At end of frame, update frame counter
@@ -44,7 +67,10 @@ public final class GPUTextureManager {
     /// The GPU device for creating textures.
     private weak var device: GPUDevice?
 
-    /// Cache of textures keyed by ObjectIdentifier.
+    /// Cache of textures keyed by `ObjectIdentifier(CGImage)`.
+    ///
+    /// Each entry retains its `CGImage` (see `TextureCacheEntry.cgImage`)
+    /// so the identifier remains unique for the cached lifetime.
     private var cache: [ObjectIdentifier: TextureCacheEntry] = [:]
 
     /// Current frame number for LRU tracking.
@@ -76,6 +102,14 @@ public final class GPUTextureManager {
         return total > 0 ? Double(cacheHits) / Double(total) : 0.0
     }
 
+    /// Called for each `CGImage` whose cached texture is removed.
+    ///
+    /// Downstream caches keyed by the same `ObjectIdentifier(CGImage)`
+    /// (texture views, bind groups) MUST drop their entries here,
+    /// otherwise they may end up serving stale `GPUTextureView`s for a
+    /// future image whose heap address happens to alias the evicted one.
+    public var onEvict: ((CGImage) -> Void)?
+
     // MARK: - Initialization
 
     /// Creates a new texture manager.
@@ -94,18 +128,24 @@ public final class GPUTextureManager {
 
     /// Gets a cached texture or creates a new one using the provided factory.
     ///
+    /// The manager retains `cgImage` for as long as the texture stays in
+    /// the cache so that `ObjectIdentifier(cgImage)` remains a unique key.
+    ///
     /// - Parameters:
-    ///   - key: The unique identifier for the texture (typically ObjectIdentifier of source image).
+    ///   - cgImage: The source image. Used both as the cache key
+    ///     (`ObjectIdentifier(cgImage)`) and as the retained owner.
     ///   - width: Width of the texture (used for memory tracking).
     ///   - height: Height of the texture (used for memory tracking).
     ///   - factory: A closure that creates the texture if not cached.
     /// - Returns: The cached or newly created texture.
     public func getOrCreateTexture(
-        for key: ObjectIdentifier,
+        for cgImage: CGImage,
         width: Int,
         height: Int,
         factory: () -> GPUTexture?
     ) -> GPUTexture? {
+        let key = ObjectIdentifier(cgImage)
+
         // Check cache first
         if var entry = cache[key] {
             // Update access tracking
@@ -128,8 +168,9 @@ public final class GPUTextureManager {
         // Evict if necessary
         evictIfNeeded(forNewMemory: memorySize)
 
-        // Add to cache
+        // Add to cache (entry retains cgImage)
         let entry = TextureCacheEntry(
+            cgImage: cgImage,
             texture: texture,
             width: width,
             height: height,
@@ -144,9 +185,10 @@ public final class GPUTextureManager {
 
     /// Gets a cached texture if it exists.
     ///
-    /// - Parameter key: The unique identifier for the texture.
+    /// - Parameter cgImage: The source image identifying the cached texture.
     /// - Returns: The cached texture, or nil if not found.
-    public func getCachedTexture(for key: ObjectIdentifier) -> GPUTexture? {
+    public func getCachedTexture(for cgImage: CGImage) -> GPUTexture? {
+        let key = ObjectIdentifier(cgImage)
         guard var entry = cache[key] else {
             return nil
         }
@@ -164,19 +206,24 @@ public final class GPUTextureManager {
     ///
     /// - Parameters:
     ///   - texture: The texture to cache.
-    ///   - key: The unique identifier for the texture.
+    ///   - cgImage: The source image. Used as the cache key
+    ///     (`ObjectIdentifier(cgImage)`) and retained by the entry.
     ///   - width: Width of the texture.
     ///   - height: Height of the texture.
-    public func cacheTexture(_ texture: GPUTexture, for key: ObjectIdentifier, width: Int, height: Int) {
-        // Remove existing entry if present
-        if let existing = cache[key] {
+    public func cacheTexture(_ texture: GPUTexture, for cgImage: CGImage, width: Int, height: Int) {
+        let key = ObjectIdentifier(cgImage)
+
+        // Remove existing entry if present (notify downstream caches)
+        if let existing = cache.removeValue(forKey: key) {
             currentMemoryBytes -= existing.memorySize
+            onEvict?(existing.cgImage)
         }
 
         let memorySize = UInt64(width * height * 4)
         evictIfNeeded(forNewMemory: memorySize)
 
         let entry = TextureCacheEntry(
+            cgImage: cgImage,
             texture: texture,
             width: width,
             height: height,
@@ -189,10 +236,13 @@ public final class GPUTextureManager {
 
     /// Removes a specific texture from the cache.
     ///
-    /// - Parameter key: The unique identifier of the texture to remove.
-    public func removeTexture(for key: ObjectIdentifier) {
+    /// - Parameter cgImage: The source image whose cached texture should
+    ///   be removed.
+    public func removeTexture(for cgImage: CGImage) {
+        let key = ObjectIdentifier(cgImage)
         if let entry = cache.removeValue(forKey: key) {
             currentMemoryBytes -= entry.memorySize
+            onEvict?(entry.cgImage)
         }
     }
 
@@ -205,8 +255,19 @@ public final class GPUTextureManager {
 
     /// Clears all cached textures.
     public func clearAll() {
+        // Snapshot the entries we are about to drop so the eviction
+        // callback can run *after* the dictionary is empty. This avoids
+        // iteration-during-mutation if the callback indirectly inserts
+        // back into the cache.
+        let evicted = cache.values.map { $0.cgImage }
         cache.removeAll()
         currentMemoryBytes = 0
+
+        if let onEvict = onEvict {
+            for cgImage in evicted {
+                onEvict(cgImage)
+            }
+        }
     }
 
     /// Invalidates the texture manager.
@@ -221,6 +282,7 @@ public final class GPUTextureManager {
     public func evictStale(olderThan frameThreshold: UInt64) {
         let cutoffFrame = currentFrame > frameThreshold ? currentFrame - frameThreshold : 0
 
+        // Two-phase: collect victim keys, drop them, then fire callbacks.
         var keysToRemove: [ObjectIdentifier] = []
         for (key, entry) in cache {
             if entry.lastAccessFrame < cutoffFrame {
@@ -228,9 +290,18 @@ public final class GPUTextureManager {
             }
         }
 
+        var evictedImages: [CGImage] = []
+        evictedImages.reserveCapacity(keysToRemove.count)
         for key in keysToRemove {
             if let entry = cache.removeValue(forKey: key) {
                 currentMemoryBytes -= entry.memorySize
+                evictedImages.append(entry.cgImage)
+            }
+        }
+
+        if let onEvict = onEvict {
+            for cgImage in evictedImages {
+                onEvict(cgImage)
             }
         }
     }
@@ -267,6 +338,7 @@ public final class GPUTextureManager {
 
         if let key = oldestKey, let entry = cache.removeValue(forKey: key) {
             currentMemoryBytes -= entry.memorySize
+            onEvict?(entry.cgImage)
         }
     }
 }
