@@ -45,8 +45,8 @@ open class CADisplayLink: @unchecked Sendable {
 
     /// The time interval between screen refresh updates.
     open var duration: CFTimeInterval {
-        if preferredFrameRateRange.preferred > 0 {
-            return 1.0 / CFTimeInterval(preferredFrameRateRange.preferred)
+        if let preferred = preferredFrameRateRange.preferred, preferred > 0 {
+            return 1.0 / CFTimeInterval(preferred)
         }
         return 1.0 / 60.0
     }
@@ -117,8 +117,8 @@ open class CADisplayLink: @unchecked Sendable {
     private var minimumFrameInterval: CFTimeInterval {
         if preferredFrameRateRange.maximum > 0 {
             return 1.0 / CFTimeInterval(preferredFrameRateRange.maximum)
-        } else if preferredFrameRateRange.preferred > 0 {
-            return 1.0 / CFTimeInterval(preferredFrameRateRange.preferred)
+        } else if let preferred = preferredFrameRateRange.preferred, preferred > 0 {
+            return 1.0 / CFTimeInterval(preferred)
         } else if preferredFramesPerSecond > 0 {
             return 1.0 / CFTimeInterval(preferredFramesPerSecond)
         }

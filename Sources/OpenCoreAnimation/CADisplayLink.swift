@@ -19,17 +19,17 @@ public struct CAFrameRateRange: Sendable {
     public var maximum: Float
 
     /// The preferred frame rate.
-    public var preferred: Float
+    public var preferred: Float?
 
     /// Creates a default frame rate range.
     public init() {
         self.minimum = 0
         self.maximum = 0
-        self.preferred = 0
+        self.preferred = nil
     }
 
     /// Creates a frame rate range with the specified values.
-    public init(minimum: Float, maximum: Float, preferred: Float) {
+    public init(minimum: Float, maximum: Float, preferred: Float?) {
         self.minimum = minimum
         self.maximum = maximum
         self.preferred = preferred

@@ -2214,7 +2214,13 @@ open class CALayer: CAMediaTiming, Hashable {
     // MARK: - Providing the Layer's Content
 
     /// An object that provides the contents of the layer. Animatable.
-    open var contents: CGImage?
+    open var contents: Any? {
+        didSet {
+            markDirty(.contents)
+            if Self.needsDisplay(forKey: "contents") { setNeedsDisplay() }
+            CATransaction.registerChange(layer: self, keyPath: "contents", oldValue: oldValue, newValue: contents)
+        }
+    }
 
     private var _contentsRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     /// The rectangle, in the unit coordinate space, that defines the portion of the layer's
@@ -2231,7 +2237,14 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// The rectangle that defines how the layer contents are scaled if the layer's contents
     /// are resized. Animatable.
-    open var contentsCenter: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    open var contentsCenter: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1) {
+        didSet {
+            guard oldValue != contentsCenter else { return }
+            markDirty(.contents)
+            if Self.needsDisplay(forKey: "contentsCenter") { setNeedsDisplay() }
+            CATransaction.registerChange(layer: self, keyPath: "contentsCenter", oldValue: oldValue, newValue: contentsCenter)
+        }
+    }
 
     /// Reloads the content of this layer.
     open func display() {
@@ -2246,7 +2259,14 @@ open class CALayer: CAMediaTiming, Hashable {
     // MARK: - Modifying the Layer's Appearance
 
     /// A constant that specifies how the layer's contents are positioned or scaled within its bounds.
-    open var contentsGravity: CALayerContentsGravity = .resize
+    open var contentsGravity: CALayerContentsGravity = .resize {
+        didSet {
+            guard oldValue != contentsGravity else { return }
+            markDirty(.contents)
+            if Self.needsDisplay(forKey: "contentsGravity") { setNeedsDisplay() }
+            CATransaction.registerChange(layer: self, keyPath: "contentsGravity", oldValue: oldValue, newValue: contentsGravity)
+        }
+    }
 
     private var _opacity: Float = 1.0
     /// The opacity of the receiver. Animatable.
@@ -2283,7 +2303,9 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _masksToBounds }
         set {
             let oldValue = _masksToBounds
+            guard oldValue != newValue else { return }
             _masksToBounds = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "masksToBounds", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2330,7 +2352,9 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _borderWidth
             let clampedValue = max(0, newValue)
+            guard oldValue != clampedValue else { return }
             _borderWidth = clampedValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "borderWidth", oldValue: oldValue, newValue: clampedValue)
         }
     }
@@ -2342,6 +2366,7 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _borderColor
             _borderColor = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "borderColor", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2353,6 +2378,7 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _backgroundColor
             _backgroundColor = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "backgroundColor", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2395,7 +2421,9 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _shadowOffset }
         set {
             let oldValue = _shadowOffset
+            guard oldValue != newValue else { return }
             _shadowOffset = newValue
+            markDirty(.shadow)
             CATransaction.registerChange(layer: self, keyPath: "shadowOffset", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2409,6 +2437,7 @@ open class CALayer: CAMediaTiming, Hashable {
             let oldContribution = selfShadowContribution
             _shadowColor = newValue
             CALayer.propagateShadowDelta(selfShadowContribution - oldContribution, startingAt: self)
+            markDirty(.shadow)
             CATransaction.registerChange(layer: self, keyPath: "shadowColor", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2420,6 +2449,7 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _shadowPath
             _shadowPath = newValue
+            markDirty(.shadow)
             CATransaction.registerChange(layer: self, keyPath: "shadowPath", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2571,7 +2601,7 @@ open class CALayer: CAMediaTiming, Hashable {
         }
 
         // Draw contents
-        if let contents = contents {
+        if let contents = contents as? CGImage {
             drawContents(contents, in: ctx)
         }
 
@@ -2991,7 +3021,9 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _position }
         set {
             let oldValue = _position
+            guard oldValue != newValue else { return }
             _position = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "position", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -3020,7 +3052,9 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _anchorPointZ }
         set {
             let oldValue = _anchorPointZ
+            guard oldValue != newValue else { return }
             _anchorPointZ = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "anchorPointZ", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -3031,7 +3065,9 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _anchorPoint }
         set {
             let oldValue = _anchorPoint
+            guard oldValue != newValue else { return }
             _anchorPoint = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "anchorPoint", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -3060,6 +3096,7 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _transform
             _transform = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "transform", oldValue: oldValue, newValue: newValue)
         }
     }

@@ -59,6 +59,20 @@ import SwiftWebGPU
 
 // MARK: - WebGPU Renderer
 
+/// Typed cache key for the renderer's textured-content view / bind group caches.
+///
+/// `ObjectIdentifier` alone is just a heap address. The same renderer caches
+/// textured draws keyed by both `CGImage` identity (regular content layers)
+/// and `CALayer` identity (rasterized composites of `shouldRasterize`
+/// subtrees). Using a raw `ObjectIdentifier` would let those two namespaces
+/// alias whenever a freed layer's address was reused by a fresh CGImage
+/// (or vice versa), returning a stale `GPUTextureView` for the new object.
+/// Tagging the kind keeps the namespaces disjoint.
+fileprivate enum TexturedCacheKey: Hashable {
+    case image(ObjectIdentifier)
+    case layer(ObjectIdentifier)
+}
+
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
 ///
 /// This is the primary renderer for OpenCoreAnimation in production.
@@ -478,22 +492,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// consumed by `renderLayer`, cleared after submit.
     private var prerasterizedTextures: [ObjectIdentifier: GPUTexture] = [:]
 
-    /// Persistent cache of `GPUTextureView`s keyed by `ObjectIdentifier(CGImage)`.
+    /// Persistent cache of `GPUTextureView`s keyed by `TexturedCacheKey`.
     ///
     /// `gpuTexture.createView()` is a JS round-trip to allocate a fresh
     /// `GPUTextureView`. The view is invariant for a given texture, so we
     /// keep it across frames.
     ///
-    /// **Identity contract**: this cache is keyed by the CGImage rather
-    /// than the GPUTexture so eviction can be wired directly to
-    /// `GPUTextureManager.onEvict`. Pointer-keying by GPUTexture would
-    /// alias across textures whenever the manager dropped a texture and
-    /// its address was reused — see the `TextureManager.swift` header
-    /// for the identity-ownership contract.
-    private var texturedTextureViewCache: [ObjectIdentifier: GPUTextureView] = [:]
+    /// **Identity contract**: keyed by either `.image(OID(cgImage))` for
+    /// regular content layers (eviction wired to `GPUTextureManager.onEvict`)
+    /// or `.layer(OID(layer))` for rasterized composites of
+    /// `shouldRasterize` subtrees. Tagging the kind keeps the two
+    /// namespaces disjoint — a raw `ObjectIdentifier` would let a freed
+    /// layer's address be reused by a fresh `CGImage` (or vice versa) and
+    /// return a stale view. See `TextureManager.swift` for the broader
+    /// identity-ownership contract.
+    private var texturedTextureViewCache: [TexturedCacheKey: GPUTextureView] = [:]
 
     /// Per-frame cache of textured-content bind groups keyed by
-    /// `ObjectIdentifier(CGImage)`.
+    /// `TexturedCacheKey`.
     ///
     /// The bind group binds (uniformBuffer, textureSampler, textureView).
     /// `uniformBuffer` rotates through the pool every frame, so the bind
@@ -505,9 +521,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// the 25 ms rAF jank measured in `_frame_drop_probe.spec.ts`.
     /// Cleared at the start of each `render(layer:)` call.
     ///
-    /// **Identity contract**: keyed by CGImage identity for the same
-    /// reason as `texturedTextureViewCache` above.
-    private var perFrameTexturedBindGroupCache: [ObjectIdentifier: GPUBindGroup] = [:]
+    /// **Identity contract**: same disjoint-namespace tagging as
+    /// `texturedTextureViewCache` above.
+    private var perFrameTexturedBindGroupCache: [TexturedCacheKey: GPUBindGroup] = [:]
 
     /// Persistent pool of JS `Float32Array`s keyed by element count.
     ///
@@ -746,7 +762,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // inherit the stale view/bind group.
         manager.onEvict = { [weak self] cgImage in
             guard let self = self else { return }
-            let key = ObjectIdentifier(cgImage)
+            let key = TexturedCacheKey.image(ObjectIdentifier(cgImage))
             self.texturedTextureViewCache.removeValue(forKey: key)
             self.perFrameTexturedBindGroupCache.removeValue(forKey: key)
         }
@@ -2376,7 +2392,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                   let colors = gradientLayer.colors, !colors.isEmpty {
             renderGradientLayer(gradientLayer, device: device, renderPass: renderPass,
                               modelMatrix: modelMatrix, bindGroup: bindGroup)
-        } else if let contents = presentationLayer.contents {
+        } else if let contents = presentationLayer.contents as? CGImage {
             renderContentsLayer(presentationLayer, contents: contents, device: device,
                                renderPass: renderPass, modelMatrix: modelMatrix)
         }
@@ -3346,7 +3362,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // CGImage identity — the texture manager retains `contents`
             // for the cached lifetime so the key stays unique).
             let texturedBindGroup = cachedTexturedBindGroup(
-                cacheKey: ObjectIdentifier(contents),
+                cacheKey: .image(ObjectIdentifier(contents)),
                 gpuTexture: gpuTexture,
                 device: device,
                 layout: texturedBindGroupLayout,
@@ -3515,7 +3531,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // CGImage identity — the texture manager owns `contents` for the
         // cached lifetime so the key stays unique).
         let texturedBindGroup = cachedTexturedBindGroup(
-            cacheKey: ObjectIdentifier(contents),
+            cacheKey: .image(ObjectIdentifier(contents)),
             gpuTexture: gpuTexture,
             device: device,
             layout: texturedBindGroupLayout,
@@ -3548,18 +3564,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// life of the texture and is cached across frames in
     /// `texturedTextureViewCache`.
     ///
-    /// - Parameter cacheKey: The identity used to key both the persistent
-    ///   `GPUTextureView` cache and the per-frame `GPUBindGroup` cache.
-    ///   Callers must choose a key that has a *stable owner* covering at
-    ///   least the lifetime of the cache entry — typically
-    ///   `ObjectIdentifier(cgImage)` for content textures (the
-    ///   `GPUTextureManager` retains the CGImage and notifies eviction
-    ///   via `onEvict`), or `ObjectIdentifier(layer)` for layer-owned
-    ///   textures. Passing `ObjectIdentifier(gpuTexture)` directly is
-    ///   unsafe whenever the texture's lifetime is not pinned by another
-    ///   strong reference.
+    /// - Parameter cacheKey: The typed identity used to key both the
+    ///   persistent `GPUTextureView` cache and the per-frame
+    ///   `GPUBindGroup` cache. Use `.image(OID(cgImage))` for content
+    ///   textures (the `GPUTextureManager` retains the CGImage and
+    ///   notifies eviction via `onEvict`), or `.layer(OID(layer))` for
+    ///   layer-owned rasterization composites. The case discriminator
+    ///   keeps the two identity namespaces disjoint so a freed layer's
+    ///   reused address cannot alias a fresh CGImage.
     private func cachedTexturedBindGroup(
-        cacheKey: ObjectIdentifier,
+        cacheKey: TexturedCacheKey,
         gpuTexture: GPUTexture,
         device: GPUDevice,
         layout: GPUBindGroupLayout,
@@ -5630,10 +5644,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Rasterized textures are owned by the layer's entry in
         // `prerasterizedTextures`/`rasterizationCache`, so key the bind
         // group cache by the layer's identity rather than the texture's.
-        // The layer is retained by its parent; using the texture as key
-        // would risk identity collision if the rasterization cache evicts.
+        // The `.layer(...)` tag keeps this entry from aliasing a CGImage
+        // entry whose `ObjectIdentifier` happens to match this layer's
+        // (post-dealloc) heap address.
         let texturedBindGroup = cachedTexturedBindGroup(
-            cacheKey: ObjectIdentifier(layer),
+            cacheKey: .layer(ObjectIdentifier(layer)),
             gpuTexture: texture,
             device: device,
             layout: texturedBindGroupLayout,
