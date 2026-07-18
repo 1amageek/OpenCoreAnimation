@@ -11,7 +11,7 @@ public protocol CADisplayLinkDelegate: AnyObject {
 }
 
 /// A structure that represents a range of frame rates.
-public struct CAFrameRateRange: Sendable {
+public struct CAFrameRateRange: Equatable, Sendable {
     /// The minimum frame rate.
     public var minimum: Float
 
@@ -37,4 +37,14 @@ public struct CAFrameRateRange: Sendable {
 
     /// The default frame rate range.
     public static let `default` = CAFrameRateRange()
+
+    internal var effectiveFrameRate: Float? {
+        if let preferred, preferred > 0 {
+            return preferred
+        }
+        if maximum > 0 {
+            return maximum
+        }
+        return nil
+    }
 }

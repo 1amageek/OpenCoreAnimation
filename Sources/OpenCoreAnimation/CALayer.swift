@@ -2228,10 +2228,12 @@ open class CALayer: CAMediaTiming, Hashable {
     open var contentsRect: CGRect {
         get { return _contentsRect }
         set {
-            guard _contentsRect != newValue else { return }
+            let oldValue = _contentsRect
+            guard oldValue != newValue else { return }
             _contentsRect = newValue
             markDirty(.contents)
             if Self.needsDisplay(forKey: "contentsRect") { setNeedsDisplay() }
+            CATransaction.registerChange(layer: self, keyPath: "contentsRect", oldValue: oldValue, newValue: newValue)
         }
     }
 

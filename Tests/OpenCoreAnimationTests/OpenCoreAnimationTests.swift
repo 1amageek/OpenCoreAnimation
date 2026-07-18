@@ -213,7 +213,7 @@ struct CAAnimationRepeatDurationTests {
         layer.add(animation, forKey: "opacity")
 
         let now = CACurrentMediaTime()
-        animation.addedTime = now - 2.25
+        setStoredAnimationAddedTime(now - 2.25, on: layer, forKey: "opacity")
 
         let presentation = layer.presentationAtTimeOffset(0)
         #expect(abs(presentation.opacity - 0.25) < 0.001)
@@ -1830,7 +1830,7 @@ struct CAAnimationGroupTimeWindowTests {
         layer.add(group, forKey: "group")
 
         // Rewrite addedTime to simulate specific elapsed time
-        group.addedTime = CACurrentMediaTime() - elapsed
+        setStoredAnimationAddedTime(CACurrentMediaTime() - elapsed, on: layer, forKey: "group")
         return layer
     }
 
@@ -1998,7 +1998,7 @@ struct IsAdditiveAnimationTests {
         anim.isAdditive = true
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2020,7 +2020,7 @@ struct IsAdditiveAnimationTests {
         anim.isAdditive = false
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2042,7 +2042,7 @@ struct IsAdditiveAnimationTests {
         anim1.isAdditive = true
         anim1.fillMode = .forwards
         layer.add(anim1, forKey: "anim1")
-        anim1.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "anim1")
 
         let anim2 = CABasicAnimation(keyPath: "opacity")
         anim2.fromValue = Float(0.0)
@@ -2051,7 +2051,7 @@ struct IsAdditiveAnimationTests {
         anim2.isAdditive = true
         anim2.fillMode = .forwards
         layer.add(anim2, forKey: "anim2")
-        anim2.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "anim2")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2074,7 +2074,7 @@ struct IsAdditiveAnimationTests {
         nonAdd.isAdditive = false
         nonAdd.fillMode = .forwards
         layer.add(nonAdd, forKey: "nonAdd")
-        nonAdd.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "nonAdd")
 
         // Additive: adds 0.2
         let add = CABasicAnimation(keyPath: "opacity")
@@ -2084,7 +2084,7 @@ struct IsAdditiveAnimationTests {
         add.isAdditive = true
         add.fillMode = .forwards
         layer.add(add, forKey: "add")
-        add.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "add")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2106,7 +2106,7 @@ struct IsAdditiveAnimationTests {
         anim.isAdditive = true
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2129,7 +2129,7 @@ struct IsAdditiveAnimationTests {
         anim.isAdditive = true
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2154,7 +2154,7 @@ struct IsAdditiveAnimationTests {
         anim.isAdditive = true
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2177,7 +2177,7 @@ struct IsAdditiveAnimationTests {
         anim.isAdditive = true
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2201,7 +2201,7 @@ struct IsAdditiveAnimationTests {
         anim.isAdditive = true
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2307,7 +2307,7 @@ struct ContentsScaleTests {
         anim.duration = 1.0
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2423,7 +2423,7 @@ struct ShadowPropertyTests {
         anim.duration = 1.0
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2443,7 +2443,7 @@ struct ShadowPropertyTests {
         anim.duration = 1.0
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2464,7 +2464,7 @@ struct ShadowPropertyTests {
         anim.isAdditive = true
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2492,7 +2492,7 @@ struct AnimationEvaluationTests {
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
         // Set elapsed to exactly 1.0s (midpoint of 2.0s)
-        anim.addedTime = CACurrentMediaTime() - 1.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 1.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2513,7 +2513,7 @@ struct AnimationEvaluationTests {
         anim.duration = 0.5
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 5.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 5.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2534,7 +2534,7 @@ struct AnimationEvaluationTests {
         anim.duration = 0.5
         anim.fillMode = .removed
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 5.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 5.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2555,7 +2555,7 @@ struct AnimationEvaluationTests {
         anim.duration = 1.0
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2576,7 +2576,7 @@ struct AnimationEvaluationTests {
         anim.duration = 1.0
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")
@@ -2597,7 +2597,7 @@ struct AnimationEvaluationTests {
         anim.duration = 1.0
         anim.fillMode = .forwards
         layer.add(anim, forKey: "test")
-        anim.addedTime = CACurrentMediaTime() - 2.0
+        setStoredAnimationAddedTime(CACurrentMediaTime() - 2.0, on: layer, forKey: "test")
 
         guard let pres = layer.presentation() else {
             Issue.record("Presentation layer should exist")

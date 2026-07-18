@@ -174,7 +174,7 @@ internal final class MockCARenderer: CARenderer {
         // Backing-store path (R3.1). The mock only models the contents
         // texture — flat-colour layers do not exercise the upload path
         // we want to assert on.
-        if let image = layer.contents {
+        if let image = layer.contents as? CGImage {
             emitContentsCommands(for: layer, image: image)
         }
 

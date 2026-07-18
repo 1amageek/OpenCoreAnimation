@@ -8,13 +8,13 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
         let image: CGImage
         let rect: CGRect
         let blendMode: CGBlendMode
-        let clipPaths: [CGPath]
+        let clipPaths: [CGClipPath]
     }
 
     struct FillCall {
         let path: CGPath
         let color: CGColor
-        let clipPaths: [CGPath]
+        let clipPaths: [CGClipPath]
     }
 
     var imageDrawCalls: [ImageDrawCall] = []
@@ -256,7 +256,8 @@ struct CALayerRenderingTests {
 
         #expect(renderer.fillCalls.count == 1)
         guard let clipPath = renderer.fillCalls.first?.clipPaths.first else { return }
-        #expect(curveElementCount(in: clipPath) == 1)
+        #expect(curveElementCount(in: clipPath.path) == 1)
+        #expect(clipPath.rule == .winding)
     }
 
     @Test("mask renders through a transparency layer using destinationIn blending")

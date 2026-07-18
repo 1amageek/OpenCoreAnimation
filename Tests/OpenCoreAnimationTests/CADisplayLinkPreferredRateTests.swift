@@ -62,23 +62,12 @@ struct CADisplayLinkPreferredRateTests {
         link.preferredFramesPerSecond = 30
         #expect(link.preferredFrameRateRange.preferred == 30)
 
-        // ...then reset. On WASM the didSet explicitly assigns `.default`.
-        // On the native fallback, the didSet currently only writes when the
-        // value is positive, so after setting back to 0 the range still reads
-        // the previously-written values. We assert only the platform behavior
-        // that matches the user-visible contract on the target platform (WASM).
+        // ...then reset to the native-refresh-rate contract on every platform.
         link.preferredFramesPerSecond = 0
 
-        #if arch(wasm32)
-        // WASM path explicitly resets — this is the fix under test.
         #expect(link.preferredFrameRateRange.minimum == CAFrameRateRange.default.minimum)
         #expect(link.preferredFrameRateRange.maximum == CAFrameRateRange.default.maximum)
         #expect(link.preferredFrameRateRange.preferred == CAFrameRateRange.default.preferred)
-        #else
-        // Native fallback's didSet is a no-op on zero — the fix is WASM-only.
-        // Record current behavior so a future sync is easy to spot.
-        #expect(link.preferredFrameRateRange.preferred == 30)
-        #endif
     }
 
     @Test("Default preferredFrameRateRange starts zeroed (.default)")
@@ -88,7 +77,7 @@ struct CADisplayLinkPreferredRateTests {
 
         #expect(link.preferredFrameRateRange.minimum == 0)
         #expect(link.preferredFrameRateRange.maximum == 0)
-        #expect(link.preferredFrameRateRange.preferred == 0)
+        #expect(link.preferredFrameRateRange.preferred == nil)
     }
 
     @Test("CAFrameRateRange.default has all-zero fields")
@@ -96,6 +85,32 @@ struct CADisplayLinkPreferredRateTests {
         let value = CAFrameRateRange.default
         #expect(value.minimum == 0)
         #expect(value.maximum == 0)
-        #expect(value.preferred == 0)
+        #expect(value.preferred == nil)
+    }
+
+    @Test("Duration uses preferred rate before maximum rate")
+    func durationUsesPreferredRate() {
+        let target = NoopTarget()
+        let link = CADisplayLink(target: target, selector: Selector(""))
+        link.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 30,
+            maximum: 120,
+            preferred: 60
+        )
+
+        #expect(link.duration == 1.0 / 60.0)
+    }
+
+    @Test("Duration uses maximum when preferred is absent")
+    func durationUsesMaximumFallback() {
+        let target = NoopTarget()
+        let link = CADisplayLink(target: target, selector: Selector(""))
+        link.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 30,
+            maximum: 120,
+            preferred: nil
+        )
+
+        #expect(link.duration == 1.0 / 120.0)
     }
 }

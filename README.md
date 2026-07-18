@@ -4,7 +4,15 @@ A Swift library providing CoreAnimation (QuartzCore) API compatibility for WebAs
 
 ## Overview
 
-OpenCoreAnimation enables you to write CoreAnimation code that runs in the browser via WebAssembly. The API is designed to be **100% compatible** with Apple's CoreAnimation framework, allowing existing code to work without modification.
+OpenCoreAnimation enables CoreAnimation-style code to run in the browser via WebAssembly. Full compatibility is the target; current completion is established by tests of specific API and renderer paths.
+
+## Verified Status
+
+| Evidence | Result |
+|---|---|
+| Native package | 304 tests passed |
+| Browser | Layer rendering through WebGPU passed |
+| Remaining boundary | Complete QuartzCore semantic and rendering parity is not claimed |
 
 ```swift
 #if canImport(QuartzCore)
@@ -304,13 +312,16 @@ struct MyApp {
 
 ```bash
 swift build
-swift test
+perl -e 'alarm 30; exec @ARGV' -- \
+  xcodebuild test -scheme OpenCoreAnimation -destination 'platform=macOS' \
+  -only-testing:OpenCoreAnimationTests
 ```
 
 ### WASM
 
 ```bash
-swift build --triple wasm32-unknown-wasi
+swift build --swift-sdk swift-6.3.1-RELEASE_wasm
+cd Tests/e2e && npm test
 ```
 
 ## Platform Strategy

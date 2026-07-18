@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenCoreAnimation is a Swift library that provides **full API compatibility with Apple's CoreAnimation (QuartzCore) framework** for WebAssembly (WASM) environments.
+OpenCoreAnimation targets full CoreAnimation (QuartzCore) API compatibility for WebAssembly (WASM) environments. Current completion is measured per API and renderer path.
 
 ### Core Principle: Full Compatibility
 
-**The API must be 100% compatible with CoreAnimation.** This means:
+**The target API must be 100% compatible with CoreAnimation.** This means:
 - Identical type names, method signatures, and property names
-- Same behavior and semantics as CoreAnimation
-- Code written for CoreAnimation should compile and work without modification when using OpenCoreAnimation
+- Implemented behavior and semantics must be independently validated against CoreAnimation
+- Compatibility claims must identify the exercised surface and evidence
 - **Property types must exactly match Apple's Swift interface** — Do NOT guess types based on property names or similar APIs. Always verify against Apple's documentation. A type mismatch (`Float` vs `CGFloat`) is a compile error for users.
 - **Foundation types unavailable on WASM** (`NSNumber`, `NSValue`, etc.) must be replaced with the equivalent Swift numeric type that preserves the same precision and semantics (e.g., `[NSNumber]?` → `[CGFloat]?`)
 
@@ -41,10 +41,12 @@ layer.frame = CGRect(x: 0, y: 0, width: 100, height: 100)
 ## Build Commands
 
 ```bash
-swift build              # Build the package
-swift test               # Run all tests
-swift test --filter <TestName>  # Run a specific test
-swift build --triple wasm32-unknown-wasi  # Build for WASM
+swift build
+perl -e 'alarm 30; exec @ARGV' -- \
+  xcodebuild test -scheme OpenCoreAnimation -destination 'platform=macOS' \
+  -only-testing:OpenCoreAnimationTests
+swift build --swift-sdk swift-6.3.1-RELEASE_wasm
+cd Tests/e2e && npm test
 ```
 
 ## Platform Strategy
@@ -58,7 +60,7 @@ swift build --triple wasm32-unknown-wasi  # Build for WASM
 
 ### Native Test Support
 
-To enable `swift test` on macOS/Linux, the library includes fallback implementations:
+To enable focused native tests on macOS/Linux, the library includes fallback implementations:
 
 | Component | WASM Implementation | Native (Test) Implementation |
 |-----------|---------------------|------------------------------|

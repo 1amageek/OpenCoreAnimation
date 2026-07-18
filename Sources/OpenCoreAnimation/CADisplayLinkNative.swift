@@ -28,8 +28,8 @@ open class CADisplayLink: @unchecked Sendable {
 
     /// The time interval between screen refresh updates.
     open var duration: CFTimeInterval {
-        if preferredFrameRateRange.preferred > 0 {
-            return 1.0 / CFTimeInterval(preferredFrameRateRange.preferred)
+        if let frameRate = preferredFrameRateRange.effectiveFrameRate {
+            return 1.0 / CFTimeInterval(frameRate)
         }
         return 1.0 / 60.0
     }
@@ -70,6 +70,8 @@ open class CADisplayLink: @unchecked Sendable {
                     maximum: Float(preferredFramesPerSecond),
                     preferred: Float(preferredFramesPerSecond)
                 )
+            } else {
+                preferredFrameRateRange = .default
             }
         }
     }
