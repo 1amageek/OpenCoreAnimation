@@ -335,13 +335,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Texture manager with LRU cache for efficient texture memory management.
     private var textureManager: GPUTextureManager?
 
-    /// Legacy texture cache access for compatibility.
-    /// - Note: This is a bridge to the texture manager for existing code.
-    private var textureCache: [ObjectIdentifier: GPUTexture] {
-        get { [:] }  // Not used for reading - use textureManager instead
-        set { }  // Not used for writing - use textureManager instead
-    }
-
     /// Geometry cache for tessellated path data.
     private var geometryCache: GeometryCache?
 
