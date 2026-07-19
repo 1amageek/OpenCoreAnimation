@@ -10,8 +10,8 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 
 | Evidence | Result |
 |---|---|
-| Native package | 304 tests passed |
-| Browser | Layer rendering through WebGPU passed |
+| Native package | 307 tests passed |
+| Browser | 3 checks passed, including CALayer colors read back from the WebGPU texture |
 | Remaining boundary | Complete QuartzCore semantic and rendering parity is not claimed |
 
 ```swift
@@ -320,7 +320,7 @@ perl -e 'alarm 30; exec @ARGV' -- \
 ### WASM
 
 ```bash
-swift build --swift-sdk swift-6.3.1-RELEASE_wasm
+swiftly run swift build --swift-sdk swift-6.3.1-RELEASE_wasm
 cd Tests/e2e && npm test
 ```
 

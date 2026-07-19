@@ -41,12 +41,6 @@ private final class CATransactionStack: @unchecked Sendable {
 
     init() {}
 
-    deinit {
-        #if arch(wasm32)
-        // Release the closure when the stack is deallocated
-        implicitCommitClosure?.release()
-        #endif
-    }
 }
 
 #if arch(wasm32)
@@ -295,9 +289,6 @@ public class CATransaction {
         stack.implicitCommitScheduled = true
 
         #if arch(wasm32)
-        // Release any previously held closure
-        stack.implicitCommitClosure?.release()
-
         // In WASM, use setTimeout to schedule commit at end of current event loop
         let callback = JSClosure { _ in
             CATransaction.commitImplicit()
@@ -323,9 +314,6 @@ public class CATransaction {
         stack.implicitCommitScheduled = false
 
         #if arch(wasm32)
-        // Release the closure now that the callback has fired
-        // This prevents memory leaks from holding onto completed closures
-        stack.implicitCommitClosure?.release()
         stack.implicitCommitClosure = nil
         #endif
 

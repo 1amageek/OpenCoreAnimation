@@ -152,31 +152,4 @@ open class CAShapeLayer: CALayer {
         }
     }
 
-    // MARK: - Animatable Keys
-
-    /// The list of animatable property keys for CAShapeLayer.
-    private static let shapeLayerAnimatableKeys: Set<String> = [
-        "path",
-        "fillColor",
-        "strokeColor",
-        "strokeStart",
-        "strokeEnd",
-        "lineWidth",
-        "lineDashPhase",
-        "miterLimit"
-    ]
-
-    /// Returns the default action for the specified key.
-    open override class func defaultAction(forKey event: String) -> (any CAAction)? {
-        // First check CAShapeLayer-specific keys
-        if shapeLayerAnimatableKeys.contains(event) {
-            let animation = CABasicAnimation(keyPath: event)
-            animation.duration = CATransaction.animationDuration()
-            animation.timingFunction = CATransaction.animationTimingFunction()
-                ?? CAMediaTimingFunction(name: .default)
-            return animation
-        }
-        // Fall back to parent class
-        return super.defaultAction(forKey: event)
-    }
 }

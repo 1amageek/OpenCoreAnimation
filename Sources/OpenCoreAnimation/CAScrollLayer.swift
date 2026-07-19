@@ -48,12 +48,11 @@ open class CAScrollLayer: CALayer {
         case .none:
             return
         case .horizontally:
-            newOrigin.x = constrainScrollOffset(p.x, contentSize: contentSize.width, visibleSize: bounds.width)
+            newOrigin.x = p.x
         case .vertically:
-            newOrigin.y = constrainScrollOffset(p.y, contentSize: contentSize.height, visibleSize: bounds.height)
+            newOrigin.y = p.y
         case .both:
-            newOrigin.x = constrainScrollOffset(p.x, contentSize: contentSize.width, visibleSize: bounds.width)
-            newOrigin.y = constrainScrollOffset(p.y, contentSize: contentSize.height, visibleSize: bounds.height)
+            newOrigin = p
         default:
             newOrigin = p
         }
@@ -81,7 +80,6 @@ open class CAScrollLayer: CALayer {
                 targetMax: r.maxX,
                 visibleMin: visibleRect.minX,
                 visibleMax: visibleRect.maxX,
-                contentSize: contentSize.width,
                 visibleSize: bounds.width
             )
         case .vertically:
@@ -90,7 +88,6 @@ open class CAScrollLayer: CALayer {
                 targetMax: r.maxY,
                 visibleMin: visibleRect.minY,
                 visibleMax: visibleRect.maxY,
-                contentSize: contentSize.height,
                 visibleSize: bounds.height
             )
         case .both:
@@ -99,7 +96,6 @@ open class CAScrollLayer: CALayer {
                 targetMax: r.maxX,
                 visibleMin: visibleRect.minX,
                 visibleMax: visibleRect.maxX,
-                contentSize: contentSize.width,
                 visibleSize: bounds.width
             )
             newOrigin.y = calculateScrollToMakeVisible(
@@ -107,7 +103,6 @@ open class CAScrollLayer: CALayer {
                 targetMax: r.maxY,
                 visibleMin: visibleRect.minY,
                 visibleMax: visibleRect.maxY,
-                contentSize: contentSize.height,
                 visibleSize: bounds.height
             )
         default:
@@ -119,35 +114,12 @@ open class CAScrollLayer: CALayer {
 
     // MARK: - Private
 
-    /// The total content size based on sublayers.
-    private var contentSize: CGSize {
-        guard let sublayers = sublayers else { return bounds.size }
-
-        var maxX: CGFloat = 0
-        var maxY: CGFloat = 0
-
-        for sublayer in sublayers {
-            let frame = sublayer.frame
-            maxX = max(maxX, frame.maxX)
-            maxY = max(maxY, frame.maxY)
-        }
-
-        return CGSize(width: max(maxX, bounds.width), height: max(maxY, bounds.height))
-    }
-
-    /// Constrains a scroll offset to valid bounds.
-    private func constrainScrollOffset(_ offset: CGFloat, contentSize: CGFloat, visibleSize: CGFloat) -> CGFloat {
-        let maxOffset = max(0, contentSize - visibleSize)
-        return max(0, min(offset, maxOffset))
-    }
-
     /// Calculates the scroll offset needed to make a target range visible.
     private func calculateScrollToMakeVisible(
         targetMin: CGFloat,
         targetMax: CGFloat,
         visibleMin: CGFloat,
         visibleMax: CGFloat,
-        contentSize: CGFloat,
         visibleSize: CGFloat
     ) -> CGFloat {
         var newOffset = visibleMin
@@ -170,6 +142,6 @@ open class CAScrollLayer: CALayer {
             newOffset = targetMax - visibleSize
         }
 
-        return constrainScrollOffset(newOffset, contentSize: contentSize, visibleSize: visibleSize)
+        return newOffset
     }
 }

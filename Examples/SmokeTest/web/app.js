@@ -83,6 +83,9 @@ async function main() {
             swift_js_push_f64: (v) => { f64Stack.push(v); },
             swift_js_push_string: (ptr, len) => { stringStack.push(decodeString(ptr, len)); },
             swift_js_push_pointer: (pointer) => { pointerStack.push(pointer); },
+            swift_js_push_typed_array: () => {
+                throw new Error("Unexpected BridgeJS typed-array call");
+            },
             swift_js_pop_i32: () => i32Stack.pop(),
             swift_js_pop_i64: () => i64Stack.pop(),
             swift_js_pop_f32: () => f32Stack.pop(),
@@ -139,6 +142,9 @@ async function main() {
                 const pointer = tmpRetOptionalHeapObject;
                 tmpRetOptionalHeapObject = undefined;
                 return pointer || 0;
+            },
+            swift_js_make_promise: () => {
+                throw new Error("Unexpected BridgeJS promise call");
             },
             swift_js_closure_unregister: () => {},
         };

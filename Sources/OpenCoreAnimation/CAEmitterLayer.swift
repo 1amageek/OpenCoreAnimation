@@ -159,31 +159,4 @@ open class CAEmitterLayer: CALayer {
     /// Specifies the seed used to initialize the random number generator.
     open var seed: UInt32 = 0
 
-    // MARK: - Animatable Keys
-
-    /// The list of animatable property keys for CAEmitterLayer.
-    private static let emitterLayerAnimatableKeys: Set<String> = [
-        "emitterPosition",
-        "emitterZPosition",
-        "emitterSize",
-        "emitterDepth",
-        "birthRate",
-        "lifetime",
-        "velocity",
-        "scale",
-        "spin"
-    ]
-
-    /// Returns the default action for the specified key.
-    open override class func defaultAction(forKey event: String) -> (any CAAction)? {
-        if emitterLayerAnimatableKeys.contains(event) {
-            let animation = CABasicAnimation(keyPath: event)
-            animation.duration = CATransaction.animationDuration()
-            if let timingFunction = CATransaction.animationTimingFunction() {
-                animation.timingFunction = timingFunction
-            }
-            return animation
-        }
-        return super.defaultAction(forKey: event)
-    }
 }

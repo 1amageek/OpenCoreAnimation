@@ -3,9 +3,8 @@
 // Boots a `CAAnimationEngine` against a freshly created <canvas>, attaches a
 // minimal `CALayer` tree (3 solid-color sublayers on a dark root), and runs
 // the display link for a few frames. Success is asserted from JS through
-// `window.__oca_test`, which reads Swift-side state rather than trying to
-// pixel-read a WebGPU canvas (swap textures are destroyed on present, so
-// `drawImage` into a 2D context is unreliable in most browsers).
+// `window.__oca_test`, including direct readback of the submitted WebGPU
+// texture so an empty render pass cannot satisfy the smoke test.
 //
 // The harness / reactor-ABI boot / global-init race defenses come from
 // `swift-wasm-testing` — this file only contains what is specific to the
@@ -26,6 +25,7 @@ nonisolated(unsafe) var canvasHeight: Int = 0
 nonisolated(unsafe) var sublayerCount: Int = 0
 nonisolated(unsafe) var rootLayerRef: CALayer?
 nonisolated(unsafe) var rasterizedGroupRef: CALayer?
+nonisolated(unsafe) var pixelReadbackResult: String = "pending"
 
 // MARK: - WASM entry point
 
@@ -41,6 +41,7 @@ public func setup() {
             canvasHeight = 0
             sublayerCount = 0
             rootLayerRef = nil
+            pixelReadbackResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -144,6 +145,34 @@ func installHarness() {
         })
         h.expose("isRasterizedGroupEnabled", returning: {
             .boolean(rasterizedGroupRef?.shouldRasterize ?? false)
+        })
+        h.expose("getPixelReadback", returning: {
+            .string(pixelReadbackResult)
+        })
+        h.expose("beginPixelReadback", action: {
+            let engine = CAAnimationEngine.shared
+            engine.pause()
+            engine.renderFrame()
+
+            guard let renderer = engine.renderer as? CAWebGPURenderer else {
+                pixelReadbackResult = "error: renderer unavailable"
+                return
+            }
+
+            Task { @MainActor in
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 80, y: 220),
+                        CGPoint(x: 200, y: 220),
+                        CGPoint(x: 10, y: 10),
+                    ])
+                    pixelReadbackResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                } catch {
+                    pixelReadbackResult = "error: \(error)"
+                }
+            }
         })
     }
 }

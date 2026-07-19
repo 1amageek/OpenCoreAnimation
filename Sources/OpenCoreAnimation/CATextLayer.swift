@@ -120,24 +120,4 @@ open class CATextLayer: CALayer {
     /// Determines whether font smoothing is allowed.
     open var allowsFontSubpixelQuantization: Bool = false
 
-    // MARK: - Animatable Keys
-
-    /// The list of animatable property keys for CATextLayer.
-    private static let textLayerAnimatableKeys: Set<String> = [
-        "fontSize",
-        "foregroundColor"
-    ]
-
-    /// Returns the default action for the specified key.
-    open override class func defaultAction(forKey event: String) -> (any CAAction)? {
-        if textLayerAnimatableKeys.contains(event) {
-            let animation = CABasicAnimation(keyPath: event)
-            animation.duration = CATransaction.animationDuration()
-            if let timingFunction = CATransaction.animationTimingFunction() {
-                animation.timingFunction = timingFunction
-            }
-            return animation
-        }
-        return super.defaultAction(forKey: event)
-    }
 }

@@ -235,8 +235,6 @@ open class CADisplayLink: @unchecked Sendable {
             _ = JSObject.global.cancelAnimationFrame!(animationFrameId)
             animationFrameId = 0
         }
-        // Release the closure to prevent memory leaks
-        animationFrameCallback?.release()
         animationFrameCallback = nil
     }
 }

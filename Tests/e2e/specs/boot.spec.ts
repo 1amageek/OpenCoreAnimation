@@ -5,10 +5,9 @@
 //   3. engine.renderFrame() runs once without trapping
 //   4. engine.start() schedules rAF and isRunning stays true
 //
-// Assertions go through the Swift-side harness (`window.__oca_test`) via the
-// typed proxy from `swift-wasm-testing`. Pixel-reading the WebGPU canvas is
-// unreliable because swap textures are destroyed on present; the harness
-// reads state Swift already owns, which is deterministic by construction.
+// State assertions go through the Swift-side harness (`window.__oca_test`).
+// The final assertion captures the compositor output so a command submission
+// that renders no pixels cannot satisfy the smoke test.
 
 import { test as base, expect, type Harness } from "swift-wasm-testing";
 
@@ -18,6 +17,8 @@ interface OCA extends Harness {
     getCanvasHeight: () => number;
     getSublayerCount: () => number;
     isEngineRunning: () => boolean;
+    getPixelReadback: () => string;
+    beginPixelReadback: () => void;
 }
 
 const test = base;
@@ -43,5 +44,18 @@ test.describe("OpenCoreAnimation smoke", () => {
         // isRunning stays true until stop()/deinit — asserting it proves the
         // start() call landed without trapping.
         expect(await h.isEngineRunning(), "CAAnimationEngine.isRunning after start()").toBe(true);
+    });
+
+    test("rendering: WebGPU readback contains layer colors", async ({ harness }) => {
+        const h = harness as unknown as {
+            [K in keyof OCA]: (...a: Parameters<OCA[K]>) => Promise<ReturnType<OCA[K]>>;
+        };
+        expect(await h.getStatus()).toBe("ready");
+        await h.beginPixelReadback();
+
+        await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
+        expect(await h.getPixelReadback()).toBe(
+            "255,0,0,255;0,255,0,255;26,26,38,255"
+        );
     });
 });

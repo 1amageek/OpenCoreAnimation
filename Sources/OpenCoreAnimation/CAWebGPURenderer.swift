@@ -147,6 +147,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// The preferred texture format.
     private var preferredFormat: GPUTextureFormat = .bgra8unorm
 
+    /// The swap-chain texture most recently submitted for presentation.
+    private var lastRenderedTexture: GPUTexture?
+
     /// The canvas element (JavaScript object).
     private let canvas: JSObject
 
@@ -617,7 +620,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // Request adapter
-        guard let adapter = try await gpu.requestAdapter() else {
+        guard let adapter = await gpu.requestAdapter() else {
             throw CARendererError.deviceNotAvailable
         }
 
@@ -637,7 +640,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         context?.configure(GPUCanvasConfiguration(
             device: device,
-            format: preferredFormat
+            format: preferredFormat,
+            usage: [.renderAttachment, .copySrc]
         ))
 
         // Create shader module
@@ -1809,7 +1813,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if let device = device {
             context?.configure(GPUCanvasConfiguration(
                 device: device,
-                format: preferredFormat
+                format: preferredFormat,
+                usage: [.renderAttachment, .copySrc]
             ))
         }
 
@@ -2007,6 +2012,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Submit command buffer
         device.queue.submit([encoder.finish()])
+        lastRenderedTexture = currentTexture
 
         // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
         // Order is mandated: submit → clear → user-visible completion blocks.
@@ -2034,6 +2040,86 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cache.evictToBudget()
         }
         prerasterizedTextures.removeAll(keepingCapacity: true)
+    }
+
+    /// Reads one pixel from the most recently submitted canvas texture.
+    ///
+    /// This is primarily useful for rendering conformance tests and diagnostics.
+    /// The returned components are normalized to RGBA regardless of the canvas
+    /// texture's native channel order.
+    @MainActor
+    public func readbackPixel(x: Int, y: Int) async throws -> [UInt8] {
+        try await readbackPixels(at: [CGPoint(x: x, y: y)])[0]
+    }
+
+    /// Reads pixels from the most recently submitted canvas texture in one copy.
+    ///
+    /// A browser canvas texture is presentation-scoped. Copying the complete
+    /// texture once keeps multi-point diagnostics deterministic after present.
+    @MainActor
+    public func readbackPixels(at points: [CGPoint]) async throws -> [[UInt8]] {
+        guard let device, let texture = lastRenderedTexture else {
+            throw CARendererError.renderingFailed("No rendered texture is available for readback")
+        }
+        guard !points.isEmpty else { return [] }
+        guard points.allSatisfy({
+            $0.x >= 0 && $0.y >= 0
+                && $0.x < CGFloat(texture.width) && $0.y < CGFloat(texture.height)
+        }) else {
+            throw CARendererError.renderingFailed("Readback coordinate is outside the render target")
+        }
+
+        let unalignedBytesPerRow = UInt32(texture.width) * 4
+        let bytesPerRow = ((unalignedBytesPerRow + 255) / 256) * 256
+        let bufferSize = UInt64(bytesPerRow) * UInt64(texture.height)
+        let stagingBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: bufferSize,
+            usage: [.mapRead, .copyDst],
+            label: "CAWebGPU Texture Readback"
+        ))
+        let encoder = device.createCommandEncoder()
+        encoder.copyTextureToBuffer(
+            source: GPUImageCopyTexture(
+                texture: texture,
+                origin: GPUOrigin3D(x: 0, y: 0, z: 0)
+            ),
+            destination: GPUImageCopyBuffer(
+                buffer: stagingBuffer,
+                offset: 0,
+                bytesPerRow: bytesPerRow,
+                rowsPerImage: UInt32(texture.height)
+            ),
+            copySize: GPUExtent3D(
+                width: UInt32(texture.width),
+                height: UInt32(texture.height),
+                depthOrArrayLayers: 1
+            )
+        )
+        device.queue.submit([encoder.finish()])
+
+        do {
+            try await stagingBuffer.mapAsync(mode: .read)
+        } catch {
+            stagingBuffer.destroy()
+            throw CARendererError.renderingFailed("WebGPU pixel readback failed: \(error)")
+        }
+
+        let mappedRange = stagingBuffer.getMappedRange()
+        let bytes = JSObject.global.Uint8Array.function!.new(mappedRange)
+        let pixels = points.map { point -> [UInt8] in
+            let offset = Int(point.y) * Int(bytesPerRow) + Int(point.x) * 4
+            let first = UInt8(bytes[offset].number ?? 0)
+            let second = UInt8(bytes[offset + 1].number ?? 0)
+            let third = UInt8(bytes[offset + 2].number ?? 0)
+            let alpha = UInt8(bytes[offset + 3].number ?? 0)
+            if preferredFormat == .bgra8unorm {
+                return [third, second, first, alpha]
+            }
+            return [first, second, third, alpha]
+        }
+        stagingBuffer.unmap()
+        stagingBuffer.destroy()
+        return pixels
     }
 
     public func invalidate() {
@@ -2065,6 +2151,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         shadowBlurTexture = nil
         shadowBlurTextureView = nil
         depthTextureView = nil
+        lastRenderedTexture = nil
         shadowBlurHorizontalPipeline = nil
         shadowBlurVerticalPipeline = nil
         shadowCompositePipeline = nil

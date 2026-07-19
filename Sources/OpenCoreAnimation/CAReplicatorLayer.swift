@@ -120,29 +120,4 @@ open class CAReplicatorLayer: CALayer {
         }
     }
 
-    // MARK: - Animatable Keys
-
-    /// The list of animatable property keys for CAReplicatorLayer.
-    private static let replicatorLayerAnimatableKeys: Set<String> = [
-        "instanceDelay",
-        "instanceTransform",
-        "instanceColor",
-        "instanceRedOffset",
-        "instanceGreenOffset",
-        "instanceBlueOffset",
-        "instanceAlphaOffset"
-    ]
-
-    /// Returns the default action for the specified key.
-    open override class func defaultAction(forKey event: String) -> (any CAAction)? {
-        if replicatorLayerAnimatableKeys.contains(event) {
-            let animation = CABasicAnimation(keyPath: event)
-            animation.duration = CATransaction.animationDuration()
-            if let timingFunction = CATransaction.animationTimingFunction() {
-                animation.timingFunction = timingFunction
-            }
-            return animation
-        }
-        return super.defaultAction(forKey: event)
-    }
 }

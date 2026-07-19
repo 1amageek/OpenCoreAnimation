@@ -392,25 +392,25 @@ struct CALayerTests {
 
     // MARK: - Opacity
 
-    @Test("Opacity is clamped to valid range")
-    func opacityClamping() {
+    @Test("Opacity preserves values outside the rendering range")
+    func opacityStorage() {
         let layer = CALayer()
 
         layer.opacity = 1.5
-        #expect(layer.opacity == 1.0)
+        #expect(layer.opacity == 1.5)
 
         layer.opacity = -0.5
-        #expect(layer.opacity == 0.0)
+        #expect(layer.opacity == -0.5)
     }
 
     // MARK: - Corner Radius
 
-    @Test("Corner radius cannot be negative")
-    func cornerRadiusClamping() {
+    @Test("Corner radius preserves the assigned value")
+    func cornerRadiusStorage() {
         let layer = CALayer()
 
         layer.cornerRadius = -10
-        #expect(layer.cornerRadius == 0)
+        #expect(layer.cornerRadius == -10)
 
         layer.cornerRadius = 10
         #expect(layer.cornerRadius == 10)
@@ -418,12 +418,12 @@ struct CALayerTests {
 
     // MARK: - Border Width
 
-    @Test("Border width cannot be negative")
-    func borderWidthClamping() {
+    @Test("Border width preserves the assigned value")
+    func borderWidthStorage() {
         let layer = CALayer()
 
         layer.borderWidth = -5
-        #expect(layer.borderWidth == 0)
+        #expect(layer.borderWidth == -5)
 
         layer.borderWidth = 5
         #expect(layer.borderWidth == 5)
@@ -431,23 +431,23 @@ struct CALayerTests {
 
     // MARK: - Shadow Properties
 
-    @Test("Shadow opacity is clamped")
-    func shadowOpacityClamping() {
+    @Test("Shadow opacity preserves values outside the rendering range")
+    func shadowOpacityStorage() {
         let layer = CALayer()
 
         layer.shadowOpacity = 1.5
-        #expect(layer.shadowOpacity == 1.0)
+        #expect(layer.shadowOpacity == 1.5)
 
         layer.shadowOpacity = -0.5
-        #expect(layer.shadowOpacity == 0.0)
+        #expect(layer.shadowOpacity == -0.5)
     }
 
-    @Test("Shadow radius cannot be negative")
-    func shadowRadiusClamping() {
+    @Test("Shadow radius preserves the assigned value")
+    func shadowRadiusStorage() {
         let layer = CALayer()
 
         layer.shadowRadius = -10
-        #expect(layer.shadowRadius == 0)
+        #expect(layer.shadowRadius == -10)
     }
 
     // MARK: - Layer Hierarchy
@@ -1040,18 +1040,22 @@ struct CASpringAnimationTests {
         #expect(spring.initialVelocity == 0)
     }
 
-    @Test("Spring parameters are clamped to positive values")
-    func springParametersClamping() {
+    @Test("Spring parameters reject invalid values")
+    func springParameterValidation() {
         let spring = CASpringAnimation()
 
         spring.mass = -1
-        #expect(spring.mass > 0)
+        #expect(spring.mass == 1)
 
         spring.stiffness = -1
-        #expect(spring.stiffness > 0)
+        #expect(spring.stiffness == 100)
 
         spring.damping = -1
-        #expect(spring.damping > 0)
+        #expect(spring.damping == 10)
+
+        spring.damping = 0
+        #expect(spring.damping == 0)
+        #expect(spring.settlingDuration == CFTimeInterval(Float.greatestFiniteMagnitude))
     }
 
     @Test("Settling duration is calculated correctly")
@@ -1400,7 +1404,7 @@ struct CATransactionTests {
         CATransaction.commit()
     }
 
-    @Test("Default action uses transaction duration")
+    @Test("Default action is nil for a standalone layer")
     func defaultActionUsesTransactionDuration() {
         let layer = CALayer()
 
@@ -1408,16 +1412,12 @@ struct CATransactionTests {
         CATransaction.setAnimationDuration(0.5)
 
         let action = layer.action(forKey: "opacity")
-        #expect(action != nil)
-
-        if let animation = action as? CABasicAnimation {
-            #expect(animation.duration == 0.5)
-        }
+        #expect(action == nil)
 
         CATransaction.commit()
     }
 
-    @Test("Default action uses transaction timing function")
+    @Test("Transaction timing does not synthesize a layer action")
     func defaultActionUsesTransactionTimingFunction() {
         let layer = CALayer()
 
@@ -1426,11 +1426,7 @@ struct CATransactionTests {
         CATransaction.setAnimationTimingFunction(timingFunc)
 
         let action = layer.action(forKey: "opacity")
-        #expect(action != nil)
-
-        if let animation = action as? CABasicAnimation {
-            #expect(animation.timingFunction != nil)
-        }
+        #expect(action == nil)
 
         CATransaction.commit()
     }
@@ -1441,18 +1437,12 @@ struct CATransactionTests {
 @Suite("CAAction Tests")
 struct CAActionTests {
 
-    @Test("Layer action for animatable key returns default animation")
+    @Test("Layer action for animatable key is nil by default")
     func layerActionForAnimatableKey() {
         let layer = CALayer()
 
-        // Animatable properties return a default CABasicAnimation
         let action = layer.action(forKey: "opacity")
-        #expect(action != nil)
-        #expect(action is CABasicAnimation)
-
-        if let basicAnimation = action as? CABasicAnimation {
-            #expect(basicAnimation.keyPath == "opacity")
-        }
+        #expect(action == nil)
     }
 
     @Test("Layer action for non-animatable key returns nil")
@@ -2283,6 +2273,9 @@ struct ContentsScaleTests {
         let layer = CALayer()
         layer.contentsScale = 2.0
         #expect(layer.contentsScale == 2.0)
+
+        layer.contentsScale = -2.0
+        #expect(layer.contentsScale == -2.0)
     }
 
     @Test("contentsScale is preserved on presentation layer")
@@ -2388,13 +2381,10 @@ struct ShadowPropertyTests {
         #expect(layer.shadowOffset == CGSize(width: 5, height: 10))
     }
 
-    @Test("Shadow color default is nil and can be assigned")
+    @Test("Shadow color defaults to opaque black")
     func shadowColorDefault() {
         let layer = CALayer()
-        // Default shadowColor is nil (unlike CoreAnimation which defaults to black)
-        #expect(layer.shadowColor == nil)
-        // After setting, it should be non-nil
-        layer.shadowColor = layer.backgroundColor
+        #expect(layer.shadowColor?.components == [0, 0, 0, 1])
     }
 
     @Test("Shadow properties are preserved on presentation layer")

@@ -79,28 +79,4 @@ open class CAGradientLayer: CALayer {
     /// Style of gradient drawn by the layer.
     open var type: CAGradientLayerType = .axial
 
-    // MARK: - Animatable Keys
-
-    /// The list of animatable property keys for CAGradientLayer.
-    private static let gradientLayerAnimatableKeys: Set<String> = [
-        "colors",
-        "locations",
-        "startPoint",
-        "endPoint"
-    ]
-
-    /// Returns the default action for the specified key.
-    open override class func defaultAction(forKey event: String) -> (any CAAction)? {
-        // First check CAGradientLayer-specific keys
-        if gradientLayerAnimatableKeys.contains(event) {
-            let animation = CABasicAnimation(keyPath: event)
-            animation.duration = CATransaction.animationDuration()
-            if let timingFunction = CATransaction.animationTimingFunction() {
-                animation.timingFunction = timingFunction
-            }
-            return animation
-        }
-        // Fall back to parent class
-        return super.defaultAction(forKey: event)
-    }
 }

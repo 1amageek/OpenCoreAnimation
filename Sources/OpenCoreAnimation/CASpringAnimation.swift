@@ -13,20 +13,35 @@ open class CASpringAnimation: CABasicAnimation {
 
     /// The mass of the object attached to the end of the spring.
     /// Must be greater than 0. Default is 1.
-    open var mass: CGFloat = 1 {
-        didSet { mass = max(0.001, mass) }
+    private var _mass: CGFloat = 1
+    open var mass: CGFloat {
+        get { _mass }
+        set {
+            guard newValue > 0 else { return }
+            _mass = newValue
+        }
     }
 
     /// The spring stiffness coefficient.
     /// Must be greater than 0. Default is 100.
-    open var stiffness: CGFloat = 100 {
-        didSet { stiffness = max(0.001, stiffness) }
+    private var _stiffness: CGFloat = 100
+    open var stiffness: CGFloat {
+        get { _stiffness }
+        set {
+            guard newValue > 0 else { return }
+            _stiffness = newValue
+        }
     }
 
     /// The damping coefficient.
-    /// Must be greater than 0. Default is 10.
-    open var damping: CGFloat = 10 {
-        didSet { damping = max(0.001, damping) }
+    /// Must be greater than or equal to 0. Default is 10.
+    private var _damping: CGFloat = 10
+    open var damping: CGFloat {
+        get { _damping }
+        set {
+            guard newValue >= 0 else { return }
+            _damping = newValue
+        }
     }
 
     /// The initial velocity of the object attached to the spring.
@@ -51,10 +66,13 @@ open class CASpringAnimation: CABasicAnimation {
     /// This is calculated based on the spring parameters. The spring is considered
     /// at rest when oscillations have decayed to less than 0.1% of the initial displacement.
     open var settlingDuration: CFTimeInterval {
+        if damping == 0 {
+            return CFTimeInterval(Float.greatestFiniteMagnitude)
+        }
         // Ensure valid parameters to prevent division by zero
-        let safeMass = max(0.001, mass)
-        let safeStiffness = max(0.001, stiffness)
-        let safeDamping = max(0.001, damping)
+        let safeMass = mass
+        let safeStiffness = stiffness
+        let safeDamping = damping
 
         // Calculate damping ratio: ζ = c / (2 * sqrt(k * m))
         let dampingRatio = safeDamping / (2 * sqrt(safeStiffness * safeMass))

@@ -2276,12 +2276,11 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _opacity }
         set {
             let oldValue = _opacity
-            let clampedValue = max(0, min(1, newValue))
-            guard oldValue != clampedValue else { return }
-            _opacity = clampedValue
+            guard oldValue != newValue else { return }
+            _opacity = newValue
             markDirty(.appearance)
             if Self.needsDisplay(forKey: "opacity") { setNeedsDisplay() }
-            CATransaction.registerChange(layer: self, keyPath: "opacity", oldValue: oldValue, newValue: clampedValue)
+            CATransaction.registerChange(layer: self, keyPath: "opacity", oldValue: oldValue, newValue: newValue)
         }
     }
 
@@ -2332,12 +2331,11 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _cornerRadius }
         set {
             let oldValue = _cornerRadius
-            let clampedValue = max(0, newValue)
-            guard oldValue != clampedValue else { return }
-            _cornerRadius = clampedValue
+            guard oldValue != newValue else { return }
+            _cornerRadius = newValue
             markDirty(.appearance)
             if Self.needsDisplay(forKey: "cornerRadius") { setNeedsDisplay() }
-            CATransaction.registerChange(layer: self, keyPath: "cornerRadius", oldValue: oldValue, newValue: clampedValue)
+            CATransaction.registerChange(layer: self, keyPath: "cornerRadius", oldValue: oldValue, newValue: newValue)
         }
     }
 
@@ -2353,11 +2351,10 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _borderWidth }
         set {
             let oldValue = _borderWidth
-            let clampedValue = max(0, newValue)
-            guard oldValue != clampedValue else { return }
-            _borderWidth = clampedValue
+            guard oldValue != newValue else { return }
+            _borderWidth = newValue
             markDirty(.appearance)
-            CATransaction.registerChange(layer: self, keyPath: "borderWidth", oldValue: oldValue, newValue: clampedValue)
+            CATransaction.registerChange(layer: self, keyPath: "borderWidth", oldValue: oldValue, newValue: newValue)
         }
     }
 
@@ -2391,14 +2388,13 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _shadowOpacity }
         set {
             let oldValue = _shadowOpacity
-            let clampedValue = max(0, min(1, newValue))
-            guard oldValue != clampedValue else { return }
+            guard oldValue != newValue else { return }
             let oldContribution = selfShadowContribution
-            _shadowOpacity = clampedValue
+            _shadowOpacity = newValue
             CALayer.propagateShadowDelta(selfShadowContribution - oldContribution, startingAt: self)
             markDirty(.shadow)
             if Self.needsDisplay(forKey: "shadowOpacity") { setNeedsDisplay() }
-            CATransaction.registerChange(layer: self, keyPath: "shadowOpacity", oldValue: oldValue, newValue: clampedValue)
+            CATransaction.registerChange(layer: self, keyPath: "shadowOpacity", oldValue: oldValue, newValue: newValue)
         }
     }
 
@@ -2408,12 +2404,11 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _shadowRadius }
         set {
             let oldValue = _shadowRadius
-            let clampedValue = max(0, newValue)
-            guard oldValue != clampedValue else { return }
-            _shadowRadius = clampedValue
+            guard oldValue != newValue else { return }
+            _shadowRadius = newValue
             markDirty(.shadow)
             if Self.needsDisplay(forKey: "shadowRadius") { setNeedsDisplay() }
-            CATransaction.registerChange(layer: self, keyPath: "shadowRadius", oldValue: oldValue, newValue: clampedValue)
+            CATransaction.registerChange(layer: self, keyPath: "shadowRadius", oldValue: oldValue, newValue: newValue)
         }
     }
 
@@ -2430,7 +2425,7 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    private var _shadowColor: CGColor?
+    private var _shadowColor: CGColor? = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
     /// The color of the layer's shadow. Animatable.
     open var shadowColor: CGColor? {
         get { return _shadowColor }
@@ -3007,6 +3002,9 @@ open class CALayer: CAMediaTiming, Hashable {
             let oldValue = _bounds
             guard oldValue != newValue else { return }
             _bounds = newValue
+            if oldValue.size != newValue.size {
+                resizeSublayers(withOldSize: oldValue.size)
+            }
             markDirty(.geometry)
             if needsDisplayOnBoundsChange {
                 setNeedsDisplay()
@@ -3080,12 +3078,11 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _contentsScale }
         set {
             let oldValue = _contentsScale
-            let clampedValue = max(0, newValue)
-            guard oldValue != clampedValue else { return }
-            _contentsScale = clampedValue
+            guard oldValue != newValue else { return }
+            _contentsScale = newValue
             markDirty(.contents)
             if Self.needsDisplay(forKey: "contentsScale") { setNeedsDisplay() }
-            CATransaction.registerChange(layer: self, keyPath: "contentsScale", oldValue: oldValue, newValue: clampedValue)
+            CATransaction.registerChange(layer: self, keyPath: "contentsScale", oldValue: oldValue, newValue: newValue)
         }
     }
 
@@ -3535,7 +3532,47 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Informs the receiver that the size of its superlayer changed.
     open func resize(withOldSuperlayerSize size: CGSize) {
-        // Default implementation
+        guard let superlayer, !autoresizingMask.isEmpty else { return }
+
+        var resizedFrame = frame
+        let widthDelta = superlayer.bounds.width - size.width
+        let heightDelta = superlayer.bounds.height - size.height
+
+        let horizontalFlexibleCount = [
+            CAAutoresizingMask.layerMinXMargin,
+            .layerWidthSizable,
+            .layerMaxXMargin
+        ].reduce(into: 0) { count, option in
+            if autoresizingMask.contains(option) { count += 1 }
+        }
+        if horizontalFlexibleCount > 0 {
+            let share = widthDelta / CGFloat(horizontalFlexibleCount)
+            if autoresizingMask.contains(.layerMinXMargin) {
+                resizedFrame.origin.x += share
+            }
+            if autoresizingMask.contains(.layerWidthSizable) {
+                resizedFrame.size.width += share
+            }
+        }
+
+        let verticalFlexibleCount = [
+            CAAutoresizingMask.layerMinYMargin,
+            .layerHeightSizable,
+            .layerMaxYMargin
+        ].reduce(into: 0) { count, option in
+            if autoresizingMask.contains(option) { count += 1 }
+        }
+        if verticalFlexibleCount > 0 {
+            let share = heightDelta / CGFloat(verticalFlexibleCount)
+            if autoresizingMask.contains(.layerMinYMargin) {
+                resizedFrame.origin.y += share
+            }
+            if autoresizingMask.contains(.layerHeightSizable) {
+                resizedFrame.size.height += share
+            }
+        }
+
+        frame = resizedFrame.integral
     }
 
     /// Informs the receiver's sublayers that the receiver's size has changed.
@@ -3587,68 +3624,9 @@ open class CALayer: CAMediaTiming, Hashable {
     /// A dictionary containing layer actions.
     open var actions: [String: any CAAction]?
 
-    /// The list of animatable property keys.
-    ///
-    /// These properties support implicit animations when changed outside of a
-    /// `CATransaction.setDisableActions(true)` block.
-    private static let animatableKeys: Set<String> = [
-        "opacity",
-        "bounds",
-        "bounds.origin",
-        "bounds.size",
-        "position",
-        "position.x",
-        "position.y",
-        "zPosition",
-        "anchorPoint",
-        "anchorPointZ",
-        "transform",
-        "transform.scale",
-        "transform.scale.x",
-        "transform.scale.y",
-        "transform.scale.z",
-        "transform.rotation",
-        "transform.rotation.x",
-        "transform.rotation.y",
-        "transform.rotation.z",
-        "transform.translation",
-        "transform.translation.x",
-        "transform.translation.y",
-        "transform.translation.z",
-        "sublayerTransform",
-        "cornerRadius",
-        "borderWidth",
-        "borderColor",
-        "backgroundColor",
-        "shadowOpacity",
-        "shadowRadius",
-        "shadowOffset",
-        "shadowColor",
-        "shadowPath",
-        "contentsRect",
-        "contentsCenter",
-        "contentsScale",
-        "isHidden",
-        "masksToBounds",
-        "isDoubleSided",
-        "shouldRasterize",
-        "rasterizationScale"
-    ]
-
     /// Returns the default action for the current class.
-    ///
-    /// For animatable properties, this returns a `CABasicAnimation` configured
-    /// with the current transaction's duration and timing function. When the
-    /// transaction does not specify a timing function, `.default` is used so
-    /// implicit animations are eased rather than linear — matching Apple.
     open class func defaultAction(forKey event: String) -> (any CAAction)? {
-        guard animatableKeys.contains(event) else { return nil }
-
-        let animation = CABasicAnimation(keyPath: event)
-        animation.duration = CATransaction.animationDuration()
-        animation.timingFunction = CATransaction.animationTimingFunction()
-            ?? CAMediaTimingFunction(name: .default)
-        return animation
+        nil
     }
 
     // MARK: - Mapping Between Coordinate and Time Spaces
@@ -3946,19 +3924,40 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// The visible region of the layer in its own coordinate space.
     open var visibleRect: CGRect {
+        var ancestor = _superlayer
+        while let layer = ancestor {
+            if let scrollLayer = layer as? CAScrollLayer {
+                return bounds.intersection(convert(scrollLayer.bounds, from: scrollLayer))
+            }
+            ancestor = layer._superlayer
+        }
         return bounds
     }
 
     /// Initiates a scroll in the layer's closest ancestor scroll layer so that the specified point
     /// lies at the origin of the scroll layer.
     open func scroll(_ p: CGPoint) {
-        // Default implementation
+        var ancestor = _superlayer
+        while let layer = ancestor {
+            if let scrollLayer = layer as? CAScrollLayer {
+                scrollLayer.scroll(to: convert(p, to: scrollLayer))
+                return
+            }
+            ancestor = layer._superlayer
+        }
     }
 
     /// Initiates a scroll in the layer's closest ancestor scroll layer so that the specified rectangle
     /// becomes visible.
     open func scrollRectToVisible(_ r: CGRect) {
-        // Default implementation
+        var ancestor = _superlayer
+        while let layer = ancestor {
+            if let scrollLayer = layer as? CAScrollLayer {
+                scrollLayer.scroll(to: convert(r, to: scrollLayer))
+                return
+            }
+            ancestor = layer._superlayer
+        }
     }
 
     // MARK: - Identifying the Layer
