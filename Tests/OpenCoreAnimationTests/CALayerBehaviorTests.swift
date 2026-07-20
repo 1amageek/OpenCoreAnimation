@@ -162,7 +162,7 @@ struct CAValueFunctionAnimationTests {
         animation.toValue = CGFloat.pi
         animation.duration = 1
         layer.add(animation, forKey: "rotateY")
-        setStoredAnimationAddedTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "rotateY")
+        setStoredAnimationBeginTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "rotateY")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")
@@ -182,7 +182,7 @@ struct CAValueFunctionAnimationTests {
         animation.toValue = CGFloat(3)
         animation.duration = 1
         layer.add(animation, forKey: "scale")
-        setStoredAnimationAddedTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "scale")
+        setStoredAnimationBeginTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "scale")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")

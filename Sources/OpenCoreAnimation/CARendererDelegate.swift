@@ -53,7 +53,7 @@ import JavaScriptKit
 ///     }
 /// }
 /// ```
-internal protocol CARendererDelegate: AnyObject {
+@MainActor internal protocol CARendererDelegate: AnyObject {
 
     // MARK: - Properties
 
@@ -68,7 +68,7 @@ internal protocol CARendererDelegate: AnyObject {
     /// and prepares all resources needed for rendering.
     ///
     /// - Throws: `CARendererError` if initialization fails.
-    @MainActor func initialize() async throws
+    func initialize() async throws
 
     /// Releases all GPU resources.
     ///
@@ -140,7 +140,7 @@ internal enum CARendererDelegateFactory {
 ///
 /// This is a minimal implementation for testing on macOS/iOS.
 /// Production use on Apple platforms should use QuartzCore directly.
-internal final class CAMetalRendererDelegate: CARendererDelegate, @unchecked Sendable {
+internal final class CAMetalRendererDelegate: CARendererDelegate {
 
     var size: CGSize = .zero
 

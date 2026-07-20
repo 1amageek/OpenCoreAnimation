@@ -3,7 +3,7 @@
 ///
 /// On WASM, implement this protocol on your target object to receive display link updates.
 /// The selector parameter in `init(target:selector:)` is ignored; this protocol method is called instead.
-public protocol CADisplayLinkDelegate: AnyObject {
+@MainActor public protocol CADisplayLinkDelegate: AnyObject {
     /// Called when the display link fires.
     ///
     /// - Parameter displayLink: The display link that fired.

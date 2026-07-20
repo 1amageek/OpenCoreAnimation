@@ -20,18 +20,62 @@ private struct CATransactionLevel {
     /// Pending layer changes for this transaction level.
     /// Key is "layerObjectID:keyPath" to enable coalescing.
     var pendingChanges: [String: CATransactionChange] = [:]
+
+    /// Explicit animations added while this transaction level is active.
+    var pendingAnimations: [CAAnimation] = []
+
+    /// Completion coordinators created by nested transaction levels.
+    var deferredCompletionCoordinators: [CATransactionCompletionCoordinator] = []
+}
+
+/// Tracks the animations associated with one transaction completion block.
+internal final class CATransactionCompletionCoordinator {
+    private let block: () -> Void
+    private var remainingAnimationCount = 0
+    private var isSealed = false
+    private var didComplete = false
+
+    internal init(block: @escaping () -> Void) {
+        self.block = block
+    }
+
+    internal func registerAnimation() {
+        guard !isSealed, !didComplete else { return }
+        remainingAnimationCount += 1
+    }
+
+    internal func animationCompleted() {
+        guard !didComplete, remainingAnimationCount > 0 else { return }
+        remainingAnimationCount -= 1
+        completeIfReady()
+    }
+
+    internal func seal() {
+        guard !isSealed else { return }
+        isSealed = true
+        completeIfReady()
+    }
+
+    private func completeIfReady() {
+        guard isSealed, remainingAnimationCount == 0, !didComplete else { return }
+        didComplete = true
+        block()
+    }
 }
 
 /// Thread-local transaction stack storage.
 ///
 /// Each thread has its own transaction stack, following CoreAnimation's behavior.
 /// WASM is single-threaded, so only one stack exists in practice.
-private final class CATransactionStack: @unchecked Sendable {
+private final class CATransactionStack {
     /// Stack of transaction levels. The last element is the current (innermost) transaction.
     var levels: [CATransactionLevel] = []
 
     /// Whether an implicit commit has been scheduled for this thread
     var implicitCommitScheduled: Bool = false
+
+    /// Completion coordinators associated with the change currently being applied.
+    var applyingCompletionCoordinators: [CATransactionCompletionCoordinator] = []
 
     #if arch(wasm32)
     /// The JSClosure used for scheduling implicit commits.
@@ -84,10 +128,43 @@ private struct CATransactionChange {
 
     /// Whether actions were disabled at registration time.
     let capturedDisableActions: Bool
+
+    /// Transaction completion blocks waiting for this change's animation.
+    let completionCoordinators: [CATransactionCompletionCoordinator]
+}
+
+private extension CATransactionChange {
+    func addingCompletionCoordinator(
+        _ coordinator: CATransactionCompletionCoordinator
+    ) -> CATransactionChange {
+        CATransactionChange(
+            layer: layer,
+            keyPath: keyPath,
+            oldValue: oldValue,
+            newValue: newValue,
+            capturedDuration: capturedDuration,
+            capturedTimingFunction: capturedTimingFunction,
+            capturedDisableActions: capturedDisableActions,
+            completionCoordinators: completionCoordinators.merging([coordinator])
+        )
+    }
+}
+
+private extension Array where Element == CATransactionCompletionCoordinator {
+    func merging(_ other: [CATransactionCompletionCoordinator]) -> Self {
+        var result = self
+        for coordinator in other where !result.contains(where: { $0 === coordinator }) {
+            result.append(coordinator)
+        }
+        return result
+    }
 }
 
 /// A mechanism for grouping multiple layer-tree operations into atomic updates to the render tree.
 public class CATransaction {
+    #if !arch(wasm32)
+    private static let transactionLock = NSRecursiveLock()
+    #endif
 
     /// Begin a new transaction for the current thread.
     ///
@@ -124,7 +201,22 @@ public class CATransaction {
         guard !stack.levels.isEmpty else { return }
 
         // Pop the current level
-        let level = stack.levels.removeLast()
+        var level = stack.levels.removeLast()
+        let ownCoordinator = level.completionBlock.map(CATransactionCompletionCoordinator.init)
+
+        if let ownCoordinator {
+            for animation in level.pendingAnimations {
+                animation.attachCompletionCoordinator(ownCoordinator)
+            }
+            level.pendingChanges = level.pendingChanges.mapValues {
+                $0.addingCompletionCoordinator(ownCoordinator)
+            }
+        }
+
+        var coordinatorsToSeal = level.deferredCompletionCoordinators
+        if let ownCoordinator {
+            coordinatorsToSeal.append(ownCoordinator)
+        }
 
         if stack.levels.isEmpty {
             // This was the outermost transaction - apply all changes now
@@ -134,11 +226,17 @@ public class CATransaction {
             while !remainingChanges.isEmpty {
                 guard let (key, change) = remainingChanges.first else { break }
                 remainingChanges.removeValue(forKey: key)
+                stack.applyingCompletionCoordinators = change.completionCoordinators
                 applyChange(change)
+                stack.applyingCompletionCoordinators = []
             }
 
             // Reset the implicit commit flag
             stack.implicitCommitScheduled = false
+
+            for coordinator in coordinatorsToSeal {
+                coordinator.seal()
+            }
         } else {
             // This is a nested transaction - merge changes to the outer transaction
             // The outer level is now at stack.levels.count - 1
@@ -156,17 +254,19 @@ public class CATransaction {
                         newValue: change.newValue,
                         capturedDuration: change.capturedDuration,
                         capturedTimingFunction: change.capturedTimingFunction,
-                        capturedDisableActions: change.capturedDisableActions
+                        capturedDisableActions: change.capturedDisableActions,
+                        completionCoordinators: existingChange.completionCoordinators.merging(
+                            change.completionCoordinators
+                        )
                     )
                 } else {
                     // No existing change - just copy it to outer
                     stack.levels[outerIndex].pendingChanges[key] = change
                 }
             }
+            stack.levels[outerIndex].pendingAnimations.append(contentsOf: level.pendingAnimations)
+            stack.levels[outerIndex].deferredCompletionCoordinators.append(contentsOf: coordinatorsToSeal)
         }
-
-        // Execute this level's completion block
-        level.completionBlock?()
     }
 
     /// Commit all changes made during the current transaction while acquiring the appropriate locks.
@@ -223,6 +323,10 @@ public class CATransaction {
     /// Transaction settings (duration, timingFunction, disableActions) are captured
     /// at registration time and stored with the change, following CoreAnimation behavior.
     internal class func registerChange(layer: CALayer, keyPath: String, oldValue: Any?, newValue: Any?) {
+        // Presentation layers are render-time snapshots. Updating their
+        // backing values must never enqueue a model-tree transaction.
+        guard !layer._isPresentationLayer else { return }
+
         let stack = getCurrentTransactionStack()
 
         // Check if actions are disabled in current transaction
@@ -248,8 +352,9 @@ public class CATransaction {
         let changeKey = "\(layerID):\(keyPath)"
 
         // If there's already a change for this layer+keyPath, preserve the original oldValue
+        let existingChange = currentLevel.pendingChanges[changeKey]
         let effectiveOldValue: Any?
-        if let existingChange = currentLevel.pendingChanges[changeKey] {
+        if let existingChange {
             effectiveOldValue = existingChange.oldValue
         } else {
             effectiveOldValue = oldValue
@@ -263,8 +368,23 @@ public class CATransaction {
             newValue: newValue,
             capturedDuration: capturedDuration,
             capturedTimingFunction: capturedTimingFunction,
-            capturedDisableActions: capturedDisableActions
+            capturedDisableActions: capturedDisableActions,
+            completionCoordinators: existingChange?.completionCoordinators ?? []
         )
+    }
+
+    /// Associates an animation with the transaction that added it.
+    internal class func registerAnimation(_ animation: CAAnimation) {
+        let stack = getCurrentTransactionStack()
+        if !stack.applyingCompletionCoordinators.isEmpty {
+            for coordinator in stack.applyingCompletionCoordinators {
+                animation.attachCompletionCoordinator(coordinator)
+            }
+            return
+        }
+
+        guard !stack.levels.isEmpty else { return }
+        stack.levels[stack.levels.count - 1].pendingAnimations.append(animation)
     }
 
     /// Begins an implicit transaction.
@@ -299,8 +419,9 @@ public class CATransaction {
         stack.implicitCommitClosure = callback
         _ = JSObject.global.setTimeout!(callback, 0)
         #else
-        // For native platforms, use DispatchQueue
-        DispatchQueue.main.async {
+        // Schedule on the main actor so implicit transactions commit after
+        // the current synchronous mutation batch without using GCD.
+        Task { @MainActor in
             CATransaction.commitImplicit()
         }
         #endif
@@ -404,17 +525,22 @@ public class CATransaction {
     /// Attempts to acquire a recursive spin-lock lock, ensuring that returned
     /// layer values are valid until unlocked.
     ///
-    /// Note: In WASM (single-threaded) this is a no-op.
-    /// On native platforms, this could be implemented with a recursive lock if needed.
+    /// On WASM this is a no-op because the JavaScript host is single-threaded.
+    /// Native callers receive the recursive exclusion required by nested
+    /// Core Animation transaction operations.
     public class func lock() {
-        // No-op - WASM is single-threaded and for native testing we don't need locks
+        #if !arch(wasm32)
+        transactionLock.lock()
+        #endif
     }
 
     /// Relinquishes a previously acquired transaction lock.
     ///
-    /// Note: In WASM (single-threaded) this is a no-op.
+    /// On WASM this is a no-op because the JavaScript host is single-threaded.
     public class func unlock() {
-        // No-op - WASM is single-threaded and for native testing we don't need locks
+        #if !arch(wasm32)
+        transactionLock.unlock()
+        #endif
     }
 
     // MARK: - Value Access

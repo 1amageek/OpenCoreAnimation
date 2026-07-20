@@ -27,7 +27,7 @@ public typealias RunLoop = Foundation.RunLoop
 ///
 /// - Note: On WASM, the `RunLoop` and `RunLoop.Mode` parameters are ignored.
 ///   All display links use `requestAnimationFrame` regardless of the mode specified.
-public final class RunLoop: @unchecked Sendable {
+public final class RunLoop: Sendable {
 
     /// The run loop for the main thread.
     public static let main = RunLoop()

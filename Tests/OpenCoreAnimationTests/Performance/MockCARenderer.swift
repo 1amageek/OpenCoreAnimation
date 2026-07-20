@@ -131,8 +131,7 @@ internal final class MockCARenderer: CARenderer {
         // *before* any cache lookup, and clear the dirty subtree *after*
         // submit so setters that fire on the same tick re-mark for the
         // next frame.
-        CALayer._currentFrameToken &+= 1
-        let frameToken = CALayer._currentFrameToken
+        let frameToken = CALayer.advanceFrameToken()
 
         renderLayer(rootLayer)
 

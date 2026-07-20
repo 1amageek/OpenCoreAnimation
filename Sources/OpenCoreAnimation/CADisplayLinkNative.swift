@@ -22,7 +22,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
 ///
 /// This native implementation uses `Timer` for testing purposes.
 /// On Apple platforms in production, use `QuartzCore.CADisplayLink` directly.
-open class CADisplayLink: @unchecked Sendable {
+@MainActor open class CADisplayLink {
 
     // MARK: - Properties
 
@@ -95,8 +95,8 @@ open class CADisplayLink: @unchecked Sendable {
         self.selector = sel
     }
 
-    deinit {
-        invalidate()
+    isolated deinit {
+        timer?.invalidate()
     }
 
     /// The run loop to which the timer is attached.
@@ -145,14 +145,16 @@ open class CADisplayLink: @unchecked Sendable {
 
         let interval = duration
         let newTimer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            guard self.isRunning && !self.isPaused else { return }
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard self.isRunning && !self.isPaused else { return }
 
-            self.timestamp = CACurrentMediaTime()
-            self.targetTimestamp = self.timestamp + self.duration
+                self.timestamp = CACurrentMediaTime()
+                self.targetTimestamp = self.timestamp + self.duration
 
-            if let delegate = self.target as? CADisplayLinkDelegate {
-                delegate.displayLinkDidFire(self)
+                if let delegate = self.target as? CADisplayLinkDelegate {
+                    delegate.displayLinkDidFire(self)
+                }
             }
         }
         timer = newTimer

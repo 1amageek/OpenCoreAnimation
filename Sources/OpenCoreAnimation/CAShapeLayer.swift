@@ -50,6 +50,7 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _path
             _path = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "path", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -63,19 +64,35 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _fillColor
             _fillColor = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "fillColor", oldValue: oldValue, newValue: newValue)
         }
     }
 
     /// The fill rule used when filling the shape's path.
-    open var fillRule: CAShapeLayerFillRule = .nonZero
+    open var fillRule: CAShapeLayerFillRule = .nonZero {
+        didSet {
+            guard oldValue != fillRule else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// Specifies the line cap style for the shape's path.
-    open var lineCap: CAShapeLayerLineCap = .butt
+    open var lineCap: CAShapeLayerLineCap = .butt {
+        didSet {
+            guard oldValue != lineCap else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// The dash pattern applied to the shape's path when stroked.
     /// Each element specifies the length of a dash or gap in the pattern.
-    open var lineDashPattern: [CGFloat]?
+    open var lineDashPattern: [CGFloat]? {
+        didSet {
+            guard oldValue != lineDashPattern else { return }
+            markDirty(.contents)
+        }
+    }
 
     internal var _lineDashPhase: CGFloat = 0
     /// The dash phase applied to the shape's path when stroked. Animatable.
@@ -84,12 +101,18 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _lineDashPhase
             _lineDashPhase = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "lineDashPhase", oldValue: oldValue, newValue: newValue)
         }
     }
 
     /// Specifies the line join style for the shape's path.
-    open var lineJoin: CAShapeLayerLineJoin = .miter
+    open var lineJoin: CAShapeLayerLineJoin = .miter {
+        didSet {
+            guard oldValue != lineJoin else { return }
+            markDirty(.contents)
+        }
+    }
 
     internal var _lineWidth: CGFloat = 1
     /// Specifies the line width of the shape's path. Animatable.
@@ -98,6 +121,7 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _lineWidth
             _lineWidth = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "lineWidth", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -109,6 +133,7 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _miterLimit
             _miterLimit = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "miterLimit", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -120,6 +145,7 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _strokeColor
             _strokeColor = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "strokeColor", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -134,6 +160,7 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _strokeStart
             _strokeStart = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "strokeStart", oldValue: oldValue, newValue: _strokeStart)
         }
     }
@@ -148,6 +175,7 @@ open class CAShapeLayer: CALayer {
         set {
             let oldValue = _strokeEnd
             _strokeEnd = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "strokeEnd", oldValue: oldValue, newValue: _strokeEnd)
         }
     }

@@ -13,7 +13,8 @@ import Foundation
 
 #if canImport(Metal)
 
-@Suite(.serialized)
+extension PerformanceTests {
+@Suite
 @MainActor
 struct RasterizationTests {
 
@@ -362,6 +363,7 @@ struct RasterizationTests {
         #expect(frame2Labels.contains("shadow-composite"),
                 "cache hit must composite the cached texture")
     }
+}
 }
 
 #endif

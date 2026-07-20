@@ -12,33 +12,33 @@ import simd
 ///
 /// Conforms to both `CARenderer` (public API) and `CARendererDelegate` (internal).
 /// This allows it to be used both directly and through `CAAnimationEngine`.
-public final class CAMetalRenderer: CARenderer, CARendererDelegate, @unchecked Sendable {
+public final class CAMetalRenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Properties
 
     /// The Metal device.
-    private nonisolated(unsafe) var device: MTLDevice?
+    private var device: MTLDevice?
 
     /// The command queue.
-    private nonisolated(unsafe) var commandQueue: MTLCommandQueue?
+    private var commandQueue: MTLCommandQueue?
 
     /// The render pipeline state.
-    private nonisolated(unsafe) var pipelineState: MTLRenderPipelineState?
+    private var pipelineState: MTLRenderPipelineState?
 
     /// The vertex buffer for quad rendering.
-    private nonisolated(unsafe) var vertexBuffer: MTLBuffer?
+    private var vertexBuffer: MTLBuffer?
 
     /// The uniform buffer.
-    private nonisolated(unsafe) var uniformBuffer: MTLBuffer?
+    private var uniformBuffer: MTLBuffer?
 
     /// The current drawable size.
-    public nonisolated(unsafe) var size: CGSize = CGSize(width: 0, height: 0)
+    public var size: CGSize = CGSize(width: 0, height: 0)
 
     /// The pixel format for rendering.
     private let pixelFormat: MTLPixelFormat = .bgra8Unorm
 
     /// The target texture for offscreen rendering.
-    private nonisolated(unsafe) var targetTexture: MTLTexture?
+    private var targetTexture: MTLTexture?
 
     // MARK: - Initialization
 
@@ -93,7 +93,7 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate, @unchecked S
 
         // Phase 1 (PERFORMANCE_DESIGN.md §3.6): mirror CAWebGPURenderer
         // and bump the per-frame token before any presentation cache lookup.
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
 
         // Create command buffer
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }

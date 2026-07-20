@@ -14,7 +14,8 @@ import OpenCoreGraphics
 
 #if canImport(Metal)
 
-@Suite(.serialized)
+extension PerformanceTests {
+@Suite
 @MainActor
 struct RendererDirtyClearTests {
 
@@ -101,6 +102,7 @@ struct RendererDirtyClearTests {
         #expect(layer._dirtyMask.isEmpty)
         #expect(layer._needsDisplayForTest == true)
     }
+}
 }
 
 #endif

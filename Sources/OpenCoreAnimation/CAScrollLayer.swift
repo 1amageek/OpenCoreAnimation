@@ -33,7 +33,9 @@ open class CAScrollLayer: CALayer {
     /// The scroll mode.
     ///
     /// Determines which directions the layer can be scrolled.
-    open var scrollMode: CAScrollLayerScrollMode = .both
+    open var scrollMode: CAScrollLayerScrollMode = .both {
+        didSet { markDirty(.geometry) }
+    }
 
     /// Scroll to the specified point.
     ///

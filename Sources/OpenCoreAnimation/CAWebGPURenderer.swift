@@ -1854,9 +1854,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Phase 1 (PERFORMANCE_DESIGN.md §3.6): bump the per-frame token
         // before any presentation cache lookup so this frame is distinct
-        // from the previous one. Single-threaded by construction; see the
-        // `nonisolated(unsafe)` declaration on the storage.
-        CALayer._currentFrameToken &+= 1
+        // from the previous one. The process-wide token is synchronized.
+        CALayer.advanceFrameToken()
 
         // Reset per-frame state
         currentLayerIndex = 0
@@ -2427,9 +2426,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // CATiledLayer: Render tiled content
-        if let tiledLayer = presentationLayer as? CATiledLayer {
-            renderTiledLayer(tiledLayer, device: device, renderPass: renderPass,
-                           modelMatrix: modelMatrix, bindGroup: bindGroup)
+        if let tiledPresentation = presentationLayer as? CATiledLayer,
+           let tiledModel = layer as? CATiledLayer {
+            renderTiledLayer(
+                tiledModel,
+                presentation: tiledPresentation,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
             return
         }
 
@@ -6495,27 +6500,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Renders a CATiledLayer with tile-based rendering and LOD support.
     private func renderTiledLayer(
         _ tiledLayer: CATiledLayer,
+        presentation: CATiledLayer,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
-        modelMatrix: Matrix4x4,
-        bindGroup: GPUBindGroup
+        modelMatrix: Matrix4x4
     ) {
-        guard let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
-              let pipeline = pipeline else { return }
-
         // Calculate current LOD level
-        let lodLevel = calculateLODLevel(tiledLayer: tiledLayer, modelMatrix: modelMatrix)
+        let lodLevel = calculateLODLevel(tiledLayer: presentation, modelMatrix: modelMatrix)
 
         // Adjust tile size based on LOD level
         // Higher LOD = larger tiles (covering more area with less detail)
         let lodScale = pow(2.0, CGFloat(lodLevel))
         let adjustedTileSize = CGSize(
-            width: tiledLayer.tileSize.width * lodScale,
-            height: tiledLayer.tileSize.height * lodScale
+            width: presentation.tileSize.width * lodScale,
+            height: presentation.tileSize.height * lodScale
         )
 
-        let bounds = tiledLayer.bounds
+        let bounds = presentation.bounds
         let tilesX = Int(ceil(bounds.width / adjustedTileSize.width))
         let tilesY = Int(ceil(bounds.height / adjustedTileSize.height))
 
@@ -6549,7 +6550,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     // Render cached tile as texture
                     renderTileWithImage(
                         cachedImage,
-                        layer: tiledLayer,
+                        layer: presentation,
                         device: device,
                         renderPass: renderPass,
                         tileMatrix: tileMatrix,
@@ -6557,18 +6558,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         opacity: currentEffectiveOpacity
                     )
                 } else {
-                    // Render placeholder and request tile
-                    renderTilePlaceholder(
-                        device: device,
-                        renderPass: renderPass,
-                        bindGroup: bindGroup,
-                        tileMatrix: tileMatrix,
-                        tileSize: CGSize(width: tileW, height: tileH),
-                        tileKey: tileKey,
-                        opacity: currentEffectiveOpacity,
-                        lodLevel: lodLevel
-                    )
-
                     // Request tile from delegate if not already loading
                     if !tiledLayer.loadingTiles.contains(tileKey) {
                         requestTileFromDelegate(
@@ -6585,7 +6574,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Render sublayers
         if let sublayers = tiledLayer.sublayers, !sublayers.isEmpty {
             // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
-            let sublayerMatrix = tiledLayer.sublayerMatrix(modelMatrix: modelMatrix)
+            let sublayerMatrix = presentation.sublayerMatrix(modelMatrix: modelMatrix)
             for sublayer in tiledLayer.sortedSublayers() {
                 self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
             }
@@ -6676,58 +6665,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass.draw(vertexCount: 6)
     }
 
-    /// Renders a placeholder for a tile that hasn't been loaded yet.
-    private func renderTilePlaceholder(
-        device: GPUDevice,
-        renderPass: GPURenderPassEncoder,
-        bindGroup: GPUBindGroup,
-        tileMatrix: Matrix4x4,
-        tileSize: CGSize,
-        tileKey: CATiledLayer.TileKey,
-        opacity: Float,
-        lodLevel: Int
-    ) {
-        guard let pipeline = pipeline,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
-
-        // Generate placeholder color based on LOD level and position
-        let isEven = (tileKey.column + tileKey.row) % 2 == 0
-        let lodTint = 1.0 - Float(lodLevel) * 0.1
-        let baseGray: Float = isEven ? 0.85 : 0.75
-        let tileColor = SIMD4<Float>(baseGray * lodTint, baseGray * lodTint, baseGray, 1.0)
-
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: tileColor),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: tileColor),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: tileColor),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: tileColor),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: tileColor),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: tileColor),
-        ]
-
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
-        let (vertexOffset, layerIndex) = allocation
-
-        var uniforms = CARendererUniforms(
-            mvpMatrix: tileMatrix,
-            opacity: opacity,
-            cornerRadius: 0,
-            layerSize: SIMD2<Float>(Float(tileSize.width), Float(tileSize.height))
-        )
-
-        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-        let uniformData = createFloat32Array(from: &uniforms)
-        device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
-        let vertexData = createFloat32Array(from: &vertices)
-        device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
-
-        renderPass.setPipeline(pipeline)
-        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-        renderPass.draw(vertexCount: 6)
-    }
-
     /// Requests a tile from the layer's delegate.
     ///
     /// This method calls the delegate's draw(_:in:) method with a CGContext
@@ -6743,16 +6680,58 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Mark tile as loading
         tiledLayer.loadingTiles.insert(tileKey)
 
-        // In a full implementation, this would:
-        // 1. Create a CGContext for the tile
-        // 2. Set up the context transformation for the tile's position
-        // 3. Call delegate.draw(tiledLayer, in: context)
-        // 4. Convert the context to a CGImage
-        // 5. Cache the result with tiledLayer.cacheImage(image, for: tileKey)
-        //
-        // For now, we just mark it as loading. The actual implementation
-        // would require CGContext rendering to textures which depends on
-        // the OpenCoreGraphics context implementation.
+        let scale = max(tiledLayer.contentsScale / lodScale, 0.000_001)
+        let pixelWidth = max(1, Int(ceil(tileRect.width * scale)))
+        let pixelHeight = max(1, Int(ceil(tileRect.height * scale)))
+
+        let callback = JSOneshotClosure { _ in
+            Self.beginTileDraw(
+                tiledLayer: tiledLayer,
+                tileKey: tileKey,
+                tileRect: tileRect,
+                scale: scale,
+                pixelWidth: pixelWidth,
+                pixelHeight: pixelHeight
+            )
+            return .undefined
+        }
+        _ = JSObject.global.queueMicrotask.function!(callback)
+    }
+
+    private static func beginTileDraw(
+        tiledLayer: CATiledLayer,
+        tileKey: CATiledLayer.TileKey,
+        tileRect: CGRect,
+        scale: CGFloat,
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) {
+        guard let delegate = tiledLayer.delegate,
+              let context = CGContext(
+                data: nil,
+                width: pixelWidth,
+                height: pixelHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: .deviceRGB,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+              ) else {
+            tiledLayer.loadingTiles.remove(tileKey)
+            return
+        }
+
+        context.scaleBy(x: scale, y: scale)
+        context.translateBy(x: -tileRect.minX, y: -tileRect.minY)
+        delegate.draw(tiledLayer, in: context)
+
+        Task { @MainActor in
+            guard let image = await context.makeImageAsync() else {
+                tiledLayer.loadingTiles.remove(tileKey)
+                return
+            }
+            tiledLayer.cacheImage(image, for: tileKey)
+            tiledLayer.markDirty(.contents)
+        }
     }
 }
 

@@ -23,7 +23,7 @@ struct CATransitionTests {
         transition.type = .fade
         transition.duration = 1
         layer.add(transition, forKey: "fade")
-        setStoredAnimationAddedTime(CACurrentMediaTime() - 0.25, on: layer, forKey: "fade")
+        setStoredAnimationBeginTime(CACurrentMediaTime() - 0.25, on: layer, forKey: "fade")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")
@@ -44,7 +44,7 @@ struct CATransitionTests {
         transition.subtype = .fromRight
         transition.duration = 1
         layer.add(transition, forKey: "push")
-        setStoredAnimationAddedTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "push")
+        setStoredAnimationBeginTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "push")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")
@@ -66,7 +66,7 @@ struct CATransitionTests {
         transition.subtype = .fromLeft
         transition.duration = 1
         layer.add(transition, forKey: "moveIn")
-        setStoredAnimationAddedTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "moveIn")
+        setStoredAnimationBeginTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "moveIn")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")
@@ -90,7 +90,7 @@ struct CATransitionTests {
         transition.endProgress = 0.75
         transition.duration = 1
         layer.add(transition, forKey: "reveal")
-        setStoredAnimationAddedTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "reveal")
+        setStoredAnimationBeginTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "reveal")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")
@@ -109,10 +109,9 @@ struct CATransitionTests {
         let transition = CATransition()
         transition.type = .fade
         transition.duration = 1
-        transition.beginTime = 0.5
+        transition.beginTime = CACurrentMediaTime() + 0.5
         transition.fillMode = .backwards
         layer.add(transition, forKey: "fade")
-        setStoredAnimationAddedTime(CACurrentMediaTime(), on: layer, forKey: "fade")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")
@@ -130,10 +129,9 @@ struct CATransitionTests {
         let transition = CATransition()
         transition.type = .fade
         transition.duration = 1
-        transition.beginTime = 0.5
+        transition.beginTime = CACurrentMediaTime() + 0.5
         transition.fillMode = .removed
         layer.add(transition, forKey: "fade")
-        setStoredAnimationAddedTime(CACurrentMediaTime(), on: layer, forKey: "fade")
 
         guard let presentation = layer.presentation() else {
             Issue.record("Expected presentation layer")

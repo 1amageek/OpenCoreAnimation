@@ -31,14 +31,14 @@ import JavaScriptKit
 /// - **Internal**: Not exposed to external users
 /// - **Non-weak**: The engine owns the renderer
 /// - **Auto-configured**: Selected based on architecture at initialization
-public final class CAAnimationEngine: CADisplayLinkDelegate {
+@MainActor public final class CAAnimationEngine: CADisplayLinkDelegate {
 
     // MARK: - Singleton
 
     /// The shared animation engine instance.
     ///
     /// Use this shared instance for the main application animation loop.
-    public static nonisolated(unsafe) let shared = CAAnimationEngine()
+    public static let shared = CAAnimationEngine()
 
     // MARK: - Properties
 
@@ -93,10 +93,6 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
         // Native: auto-configure renderer for testing
         rendererDelegate = CARendererDelegateFactory.createRenderer()
         #endif
-    }
-
-    deinit {
-        stop()
     }
 
     #if arch(wasm32)

@@ -19,6 +19,7 @@ import Testing
 import OpenCoreAnimation
 
 @Suite("CADisplayLink preferredFramesPerSecond didSet")
+@MainActor
 struct CADisplayLinkPreferredRateTests {
 
     /// Minimal stub target — the native CADisplayLink stores a weak reference

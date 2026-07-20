@@ -144,7 +144,8 @@ open class CALayer: CAMediaTiming, Hashable {
         // a single frame must return the same instance. The token is reset
         // to 0 by `markDirty(_:)` so any presentation-affecting mutation
         // forces a recompute on the next call.
-        if _presentationCacheToken == Self._currentFrameToken,
+        if _presentationCacheIsValid,
+           _presentationCacheToken == Self._currentFrameToken,
            let cached = _presentationLayer {
             return cached as? Self
         }
@@ -157,6 +158,7 @@ open class CALayer: CAMediaTiming, Hashable {
         // Update presentation layer with current animated values
         updatePresentationLayer()
         _presentationCacheToken = Self._currentFrameToken
+        _presentationCacheIsValid = true
 
         return _presentationLayer as? Self
     }
@@ -217,6 +219,7 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._dirtyMask = []
         presentation._subtreeDirtyCount = 0
         presentation._presentationCacheToken = 0
+        presentation._presentationCacheIsValid = false
         return presentation
     }
 
@@ -239,6 +242,7 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._dirtyMask = []
         presentation._subtreeDirtyCount = 0
         presentation._presentationCacheToken = 0
+        presentation._presentationCacheIsValid = false
 
         // Update with animations at the offset time
         let evaluationTime = CACurrentMediaTime() - timeOffset
@@ -251,8 +255,7 @@ open class CALayer: CAMediaTiming, Hashable {
     private func updatePresentationLayer() {
         guard let presentation = _presentationLayer else { return }
 
-        let currentTime = CACurrentMediaTime()
-        updatePresentationLayer(presentation, at: currentTime)
+        updatePresentationLayer(presentation, at: CACurrentMediaTime())
     }
 
     /// Updates a presentation layer with animated values at a specific time.
@@ -278,13 +281,35 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._sublayerTransform = _sublayerTransform
         presentation._contentsScale = _contentsScale
         presentation._masksToBounds = _masksToBounds
-        presentation.rasterizationScale = rasterizationScale
+        presentation._isDoubleSided = _isDoubleSided
+        presentation.maskedCorners = maskedCorners
+        presentation.cornerCurve = cornerCurve
+        presentation._shadowPath = _shadowPath
 
         // Copy contents-related properties (critical for texture animation)
         presentation.contents = contents
-        presentation.contentsRect = contentsRect
+        presentation._contentsRect = _contentsRect
         presentation.contentsCenter = contentsCenter
         presentation.contentsGravity = contentsGravity
+        presentation.contentsFormat = contentsFormat
+
+        // Copy render configuration that may change after the presentation
+        // object was first allocated.
+        presentation.mask = mask
+        presentation._isOpaque = _isOpaque
+        presentation.isGeometryFlipped = isGeometryFlipped
+        presentation.drawsAsynchronously = drawsAsynchronously
+        presentation._shouldRasterize = _shouldRasterize
+        presentation._rasterizationScale = _rasterizationScale
+        presentation.allowsEdgeAntialiasing = allowsEdgeAntialiasing
+        presentation.allowsGroupOpacity = allowsGroupOpacity
+        presentation.edgeAntialiasingMask = edgeAntialiasingMask
+        presentation.filters = filters
+        presentation.compositingFilter = compositingFilter
+        presentation.backgroundFilters = backgroundFilters
+        presentation.minificationFilter = minificationFilter
+        presentation.minificationFilterBias = minificationFilterBias
+        presentation.magnificationFilter = magnificationFilter
 
         // Copy CAShapeLayer properties if applicable
         if let shapePresentation = presentation as? CAShapeLayer,
@@ -297,6 +322,10 @@ open class CALayer: CAMediaTiming, Hashable {
             shapePresentation._lineWidth = shapeSelf._lineWidth
             shapePresentation._lineDashPhase = shapeSelf._lineDashPhase
             shapePresentation._miterLimit = shapeSelf._miterLimit
+            shapePresentation.fillRule = shapeSelf.fillRule
+            shapePresentation.lineCap = shapeSelf.lineCap
+            shapePresentation.lineDashPattern = shapeSelf.lineDashPattern
+            shapePresentation.lineJoin = shapeSelf.lineJoin
         }
 
         // Copy CATextLayer properties if applicable
@@ -319,7 +348,55 @@ open class CALayer: CAMediaTiming, Hashable {
             gradientPresentation._locations = gradientSelf._locations
             gradientPresentation._startPoint = gradientSelf._startPoint
             gradientPresentation._endPoint = gradientSelf._endPoint
+            gradientPresentation.type = gradientSelf.type
         }
+
+        if let emitterPresentation = presentation as? CAEmitterLayer,
+           let emitterSelf = self as? CAEmitterLayer {
+            emitterPresentation.emitterCells = emitterSelf.emitterCells
+            emitterPresentation._emitterPosition = emitterSelf._emitterPosition
+            emitterPresentation._emitterZPosition = emitterSelf._emitterZPosition
+            emitterPresentation._emitterSize = emitterSelf._emitterSize
+            emitterPresentation._emitterDepth = emitterSelf._emitterDepth
+            emitterPresentation.emitterShape = emitterSelf.emitterShape
+            emitterPresentation.emitterMode = emitterSelf.emitterMode
+            emitterPresentation.renderMode = emitterSelf.renderMode
+            emitterPresentation.preservesDepth = emitterSelf.preservesDepth
+            emitterPresentation._birthRate = emitterSelf._birthRate
+            emitterPresentation._lifetime = emitterSelf._lifetime
+            emitterPresentation._velocity = emitterSelf._velocity
+            emitterPresentation._scale = emitterSelf._scale
+            emitterPresentation._spin = emitterSelf._spin
+            emitterPresentation.seed = emitterSelf.seed
+        }
+
+        if let replicatorPresentation = presentation as? CAReplicatorLayer,
+           let replicatorSelf = self as? CAReplicatorLayer {
+            replicatorPresentation.instanceCount = replicatorSelf.instanceCount
+            replicatorPresentation.preservesDepth = replicatorSelf.preservesDepth
+            replicatorPresentation._instanceDelay = replicatorSelf._instanceDelay
+            replicatorPresentation._instanceTransform = replicatorSelf._instanceTransform
+            replicatorPresentation._instanceColor = replicatorSelf._instanceColor
+            replicatorPresentation._instanceRedOffset = replicatorSelf._instanceRedOffset
+            replicatorPresentation._instanceGreenOffset = replicatorSelf._instanceGreenOffset
+            replicatorPresentation._instanceBlueOffset = replicatorSelf._instanceBlueOffset
+            replicatorPresentation._instanceAlphaOffset = replicatorSelf._instanceAlphaOffset
+        }
+
+        if let tiledPresentation = presentation as? CATiledLayer,
+           let tiledSelf = self as? CATiledLayer {
+            tiledPresentation.levelsOfDetail = tiledSelf.levelsOfDetail
+            tiledPresentation.levelsOfDetailBias = tiledSelf.levelsOfDetailBias
+            tiledPresentation.tileSize = tiledSelf.tileSize
+        }
+
+        if let scrollPresentation = presentation as? CAScrollLayer,
+           let scrollSelf = self as? CAScrollLayer {
+            scrollPresentation.scrollMode = scrollSelf.scrollMode
+        }
+
+        // Animation begin times live in the layer's local time space.
+        let layerLocalTime = convertTime(currentTime, from: nil)
 
         // Apply active animations: non-additive first, then additive.
         // Additive animations accumulate deltas on top of the current value.
@@ -328,65 +405,12 @@ open class CALayer: CAMediaTiming, Hashable {
             if let propAnim = animation as? CAPropertyAnimation, propAnim.isAdditive {
                 additiveAnimations.append((key, animation))
             } else {
-                applyAnimation(animation, to: presentation, at: currentTime)
+                applyAnimation(animation, to: presentation, at: layerLocalTime)
             }
         }
         for (_, animation) in additiveAnimations {
-            applyAnimation(animation, to: presentation, at: currentTime)
+            applyAnimation(animation, to: presentation, at: layerLocalTime)
         }
-    }
-
-    /// Calculates normalized animation progress (0-1) accounting for repeats, autoreverses, and fill modes.
-    private func normalizedProgress(
-        for animation: CAAnimation,
-        elapsed: CFTimeInterval,
-        singleCycleDuration: CFTimeInterval
-    ) -> CFTimeInterval? {
-        guard singleCycleDuration > 0 else { return nil }
-
-        if elapsed < 0 {
-            switch animation.fillMode {
-            case .backwards, .both:
-                return 0
-            default:
-                return nil
-            }
-        }
-
-        let baseCycles: CFTimeInterval
-        if animation.repeatDuration > 0 {
-            baseCycles = animation.repeatDuration / singleCycleDuration
-        } else if animation.repeatCount > 0 {
-            baseCycles = CFTimeInterval(animation.repeatCount)
-        } else {
-            baseCycles = 1
-        }
-
-        let totalCycles = baseCycles * (animation.autoreverses ? 2 : 1)
-        var progressCycles = elapsed / singleCycleDuration
-
-        if progressCycles >= totalCycles {
-            switch animation.fillMode {
-            case .forwards, .both:
-                progressCycles = totalCycles
-            default:
-                return nil
-            }
-        }
-
-        if animation.autoreverses {
-            let cycle = progressCycles.truncatingRemainder(dividingBy: 2)
-            if cycle <= 1 {
-                return cycle
-            }
-            return 2 - cycle
-        }
-
-        let fractional = progressCycles.truncatingRemainder(dividingBy: 1)
-        if abs(fractional) < 0.000_000_001 {
-            return progressCycles == 0 ? 0 : 1
-        }
-        return fractional
     }
 
     /// Applies an animation to the presentation layer at the given time.
@@ -406,13 +430,6 @@ open class CALayer: CAMediaTiming, Hashable {
         guard let propertyAnimation = animation as? CAPropertyAnimation,
               let keyPath = propertyAnimation.keyPath else { return }
 
-        // Calculate animation progress in local time space.
-        // Apply speed and timeOffset per CAMediaTiming specification:
-        // localTime = (parentTime - beginTime) * speed + timeOffset
-        let rawElapsed = time - animation.addedTime - animation.beginTime
-        let elapsed = rawElapsed * CFTimeInterval(animation.speed) + animation.timeOffset
-
-        // Get the effective duration for a single cycle
         let singleCycleDuration: CFTimeInterval
         if let springAnimation = animation as? CASpringAnimation {
             // For spring animations, use settlingDuration if duration is not explicitly set
@@ -421,11 +438,16 @@ open class CALayer: CAMediaTiming, Hashable {
             singleCycleDuration = animation.duration > 0 ? animation.duration : CATransaction.animationDuration()
         }
 
-        guard let progress = normalizedProgress(
-            for: animation,
-            elapsed: elapsed,
-            singleCycleDuration: singleCycleDuration
-        ) else { return }
+        let timing = CAMediaTimingEvaluator.evaluate(
+            animation,
+            parentTime: time,
+            duration: singleCycleDuration
+        )
+        if timing.phase != .before {
+            animation.markStarted()
+        }
+        guard timing.applies(fillMode: animation.fillMode) else { return }
+        let progress = timing.progress
 
         // Apply spring physics or timing function
         var adjustedProgress = progress
@@ -444,7 +466,13 @@ open class CALayer: CAMediaTiming, Hashable {
         }
 
         // Interpolate and apply value based on animation type
-        applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: adjustedProgress)
+        applyAnimationValue(
+            propertyAnimation,
+            to: layer,
+            keyPath: keyPath,
+            progress: adjustedProgress,
+            completedCycles: timing.completedCycles
+        )
     }
 
     /// Applies a transition animation to the presentation layer.
@@ -454,14 +482,13 @@ open class CALayer: CAMediaTiming, Hashable {
     /// of the layer during the transition period.
     private func applyTransition(_ transition: CATransition, to layer: CALayer, at time: CFTimeInterval) {
         // Calculate transition progress
-        let elapsed = time - transition.addedTime - transition.beginTime
         let duration = transition.duration > 0 ? transition.duration : CATransaction.animationDuration()
-
-        guard let progress = normalizedProgress(
-            for: transition,
-            elapsed: elapsed,
-            singleCycleDuration: duration
-        ) else { return }
+        let timing = CAMediaTimingEvaluator.evaluate(transition, parentTime: time, duration: duration)
+        if timing.phase != .before {
+            transition.markStarted()
+        }
+        guard timing.applies(fillMode: transition.fillMode) else { return }
+        let progress = timing.progress
 
         // Apply timing function if available
         var adjustedProgress = progress
@@ -519,7 +546,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
         case .reveal:
             // Reveal: content is gradually revealed from a direction
-            // This would typically use clipping, but we'll simulate with opacity/position
+            // Apply the directional reveal to the presentation snapshot.
             layer._opacity = Float(clampedProgress)
             let offset = calculateTransitionOffset(
                 transition: transition,
@@ -534,8 +561,8 @@ open class CALayer: CAMediaTiming, Hashable {
             )
 
         default:
-            // Default to fade for unknown transition types
-            layer._opacity = Float(clampedProgress)
+            // Custom transition identifiers have no defined built-in effect.
+            break
         }
     }
 
@@ -578,53 +605,33 @@ open class CALayer: CAMediaTiming, Hashable {
     private func applyAnimationGroup(_ group: CAAnimationGroup, to layer: CALayer, at time: CFTimeInterval) {
         guard let animations = group.animations else { return }
 
-        let groupAddedTime = group.addedTime
-        let rawGroupElapsed = time - groupAddedTime - group.beginTime
-        let groupElapsed = rawGroupElapsed * CFTimeInterval(group.speed) + group.timeOffset
         let groupBaseDuration = group.duration > 0 ? group.duration : CATransaction.animationDuration()
-        let groupTotalDuration = group.totalDuration
-
-        // Group completed: apply final state if fillMode allows, otherwise skip
-        if groupElapsed >= groupTotalDuration {
-            if group.fillMode == .forwards || group.fillMode == .both {
-                // Evaluate children at group end time
-                let absSpeed = max(abs(Double(group.speed)), 0.0001)
-                let endTime = groupAddedTime + group.beginTime + groupTotalDuration / absSpeed
-                for animation in animations {
-                    let effectiveDuration = animation.duration > 0 ? animation.duration : groupBaseDuration
-                    let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : groupAddedTime
-                    applyAnimationWithContext(animation, to: layer, at: endTime,
-                        effectiveDuration: effectiveDuration, effectiveAddedTime: effectiveAddedTime)
-                }
-            }
-            return
+        let timing = CAMediaTimingEvaluator.evaluate(group, parentTime: time, duration: groupBaseDuration)
+        if timing.phase != .before {
+            group.markStarted()
         }
+        guard timing.applies(fillMode: group.fillMode) else { return }
 
-        // Group not started: apply initial state if fillMode allows, otherwise skip
-        if groupElapsed < 0 {
-            if group.fillMode == .backwards || group.fillMode == .both {
-                for animation in animations {
-                    let effectiveDuration = animation.duration > 0 ? animation.duration : groupBaseDuration
-                    let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : groupAddedTime
-                    applyAnimationWithContext(animation, to: layer, at: groupAddedTime,
-                        effectiveDuration: effectiveDuration, effectiveAddedTime: effectiveAddedTime)
-                }
-            }
-            return
-        }
-
-        // Group active: apply children normally
+        // Children are evaluated in the group's repeating basic time space.
+        // The group's duration clips longer children without scaling them.
         for animation in animations {
             let effectiveDuration = animation.duration > 0 ? animation.duration : groupBaseDuration
-            let effectiveAddedTime = animation.addedTime > 0 ? animation.addedTime : groupAddedTime
-            applyAnimationWithContext(animation, to: layer, at: time,
-                effectiveDuration: effectiveDuration, effectiveAddedTime: effectiveAddedTime)
+            applyAnimationWithContext(
+                animation,
+                to: layer,
+                at: timing.basicTime,
+                effectiveDuration: effectiveDuration
+            )
         }
     }
 
     /// Applies an animation with explicit timing context (used by animation groups).
-    private func applyAnimationWithContext(_ animation: CAAnimation, to layer: CALayer, at time: CFTimeInterval,
-                                           effectiveDuration: CFTimeInterval, effectiveAddedTime: CFTimeInterval) {
+    private func applyAnimationWithContext(
+        _ animation: CAAnimation,
+        to layer: CALayer,
+        at time: CFTimeInterval,
+        effectiveDuration: CFTimeInterval
+    ) {
         // Handle nested animation groups
         if let animationGroup = animation as? CAAnimationGroup {
             applyAnimationGroup(animationGroup, to: layer, at: time)
@@ -633,11 +640,6 @@ open class CALayer: CAMediaTiming, Hashable {
 
         guard let propertyAnimation = animation as? CAPropertyAnimation,
               let keyPath = propertyAnimation.keyPath else { return }
-
-        // Calculate animation progress with effective timing.
-        // Apply speed and timeOffset per CAMediaTiming specification.
-        let rawElapsed = time - effectiveAddedTime - animation.beginTime
-        let elapsed = rawElapsed * CFTimeInterval(animation.speed) + animation.timeOffset
 
         // Get the effective duration for a single cycle
         let singleCycleDuration: CFTimeInterval
@@ -649,12 +651,16 @@ open class CALayer: CAMediaTiming, Hashable {
 
         guard singleCycleDuration > 0 else { return }
 
-        // Use normalizedProgress for consistent handling of repeatCount, autoreverses, and fillMode
-        guard var progress = normalizedProgress(
-            for: animation,
-            elapsed: elapsed,
-            singleCycleDuration: singleCycleDuration
-        ) else { return }
+        let timing = CAMediaTimingEvaluator.evaluate(
+            animation,
+            parentTime: time,
+            duration: singleCycleDuration
+        )
+        if timing.phase != .before {
+            animation.markStarted()
+        }
+        guard timing.applies(fillMode: animation.fillMode) else { return }
+        var progress = timing.progress
 
         // Apply spring physics or timing function
         if let springAnimation = animation as? CASpringAnimation {
@@ -667,15 +673,46 @@ open class CALayer: CAMediaTiming, Hashable {
             progress = max(0, min(1, progress))
         }
 
-        applyAnimationValue(propertyAnimation, to: layer, keyPath: keyPath, progress: progress)
+        applyAnimationValue(
+            propertyAnimation,
+            to: layer,
+            keyPath: keyPath,
+            progress: progress,
+            completedCycles: timing.completedCycles
+        )
     }
 
     /// Applies an animation value to a layer property.
-    private func applyAnimationValue(_ animation: CAPropertyAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+    private func applyAnimationValue(
+        _ animation: CAPropertyAnimation,
+        to layer: CALayer,
+        keyPath: String,
+        progress: CFTimeInterval,
+        completedCycles: Int
+    ) {
         if let keyframeAnimation = animation as? CAKeyframeAnimation {
             applyKeyframeAnimation(keyframeAnimation, to: layer, keyPath: keyPath, progress: progress)
         } else if let basicAnimation = animation as? CABasicAnimation {
             applyBasicAnimation(basicAnimation, to: layer, keyPath: keyPath, progress: progress)
+        }
+
+        guard animation.isCumulative, completedCycles > 0 else { return }
+        let terminalValue: Any?
+        if let basicAnimation = animation as? CABasicAnimation {
+            terminalValue = cumulativeTerminalValue(for: basicAnimation, keyPath: keyPath)
+        } else if let keyframeAnimation = animation as? CAKeyframeAnimation,
+                  let values = keyframeAnimation.values, !values.isEmpty {
+            terminalValue = keyframeAnimation.autoreverses ? values.first : values.last
+        } else {
+            terminalValue = nil
+        }
+        if let terminalValue {
+            applyCumulativeContribution(
+                terminalValue,
+                cycles: completedCycles,
+                to: layer,
+                keyPath: keyPath
+            )
         }
     }
 
@@ -692,12 +729,15 @@ open class CALayer: CAMediaTiming, Hashable {
         // Float/CGFloat properties
         case "opacity", "cornerRadius", "borderWidth", "shadowRadius", "shadowOpacity",
              "zPosition", "anchorPointZ", "contentsScale", "rasterizationScale",
-             "strokeStart", "strokeEnd", "lineWidth", "lineDashPhase", "miterLimit":
+             "strokeStart", "strokeEnd", "lineWidth", "lineDashPhase", "miterLimit",
+             "fontSize", "emitterZPosition", "emitterDepth", "birthRate", "lifetime",
+             "velocity", "scale", "spin", "instanceDelay", "instanceRedOffset",
+             "instanceGreenOffset", "instanceBlueOffset", "instanceAlphaOffset":
             applyFloatAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Point/Size properties
         case "position", "position.x", "position.y", "anchorPoint", "bounds.origin",
-             "shadowOffset", "startPoint", "endPoint":
+             "shadowOffset", "startPoint", "endPoint", "emitterPosition", "emitterSize":
             applyPointAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Rect properties
@@ -705,12 +745,16 @@ open class CALayer: CAMediaTiming, Hashable {
             applyRectAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Transform properties
-        case _ where keyPath == "transform" || keyPath.hasPrefix("transform.") || keyPath == "sublayerTransform":
+        case _ where keyPath == "transform" || keyPath.hasPrefix("transform.") || keyPath == "sublayerTransform" || keyPath == "instanceTransform":
             applyTransformAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Color properties
-        case "backgroundColor", "borderColor", "shadowColor", "fillColor", "strokeColor":
+        case "backgroundColor", "borderColor", "shadowColor", "fillColor", "strokeColor",
+             "foregroundColor", "instanceColor":
             applyColorAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+
+        case "path", "shadowPath":
+            applyPathAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
         // Array properties (locations, colors, etc.)
         default:
@@ -885,6 +929,289 @@ open class CALayer: CAMediaTiming, Hashable {
         return nil
     }
 
+    /// Resolves the value contributed by one completed repeat cycle.
+    private func cumulativeTerminalValue(
+        for animation: CABasicAnimation,
+        keyPath: String
+    ) -> Any? {
+        let currentValue = animation.isAdditive
+            ? zeroAnimationValue(matching: animation.fromValue ?? animation.toValue ?? animation.byValue)
+            : currentAnimationValue(for: keyPath)
+
+        if animation.autoreverses {
+            if let fromValue = animation.fromValue { return fromValue }
+            if let toValue = animation.toValue, let byValue = animation.byValue {
+                return combineAnimationValues(toValue, byValue, subtract: true)
+            }
+            return currentValue
+        }
+
+        if let toValue = animation.toValue { return toValue }
+        if let fromValue = animation.fromValue, let byValue = animation.byValue {
+            return combineAnimationValues(fromValue, byValue, subtract: false)
+        }
+        if let byValue = animation.byValue, let currentValue {
+            return combineAnimationValues(currentValue, byValue, subtract: false)
+        }
+        return currentValue
+    }
+
+    private func zeroAnimationValue(matching value: Any?) -> Any? {
+        switch value {
+        case is Float: return Float(0)
+        case is CGFloat, is Double: return CGFloat(0)
+        case is CGPoint: return CGPoint.zero
+        case is CGSize: return CGSize.zero
+        case is CGRect: return CGRect.zero
+        case is CGColor: return CGColor(red: 0, green: 0, blue: 0, alpha: 0)
+        case is CATransform3D: return CATransform3DIdentity
+        case let values as [CGFloat]: return Array(repeating: CGFloat(0), count: values.count)
+        default: return nil
+        }
+    }
+
+    private func combineAnimationValues(_ lhs: Any, _ rhs: Any, subtract: Bool) -> Any? {
+        let sign: CGFloat = subtract ? -1 : 1
+        if let lhs = lhs as? Float, let rhs = rhs as? Float {
+            return lhs + Float(sign) * rhs
+        }
+        if let lhs = lhs as? CGFloat, let rhs = rhs as? CGFloat {
+            return lhs + sign * rhs
+        }
+        if let lhs = lhs as? CGPoint, let rhs = rhs as? CGPoint {
+            return CGPoint(x: lhs.x + sign * rhs.x, y: lhs.y + sign * rhs.y)
+        }
+        if let lhs = lhs as? CGSize, let rhs = rhs as? CGSize {
+            return CGSize(width: lhs.width + sign * rhs.width, height: lhs.height + sign * rhs.height)
+        }
+        if let lhs = lhs as? CGRect, let rhs = rhs as? CGRect {
+            return CGRect(
+                x: lhs.origin.x + sign * rhs.origin.x,
+                y: lhs.origin.y + sign * rhs.origin.y,
+                width: lhs.size.width + sign * rhs.size.width,
+                height: lhs.size.height + sign * rhs.size.height
+            )
+        }
+        if let lhs = lhs as? CGColor, let rhs = rhs as? CGColor {
+            let (lr, lg, lb, la) = extractRGBA(from: lhs)
+            let (rr, rg, rb, ra) = extractRGBA(from: rhs)
+            return CGColor(
+                red: lr + sign * rr,
+                green: lg + sign * rg,
+                blue: lb + sign * rb,
+                alpha: la + sign * ra
+            )
+        }
+        if let lhs = lhs as? [CGFloat], let rhs = rhs as? [CGFloat], lhs.count == rhs.count {
+            return zip(lhs, rhs).map { $0 + sign * $1 }
+        }
+        if let lhs = lhs as? CATransform3D, let rhs = rhs as? CATransform3D, !subtract {
+            return CATransform3DConcat(lhs, rhs)
+        }
+        return nil
+    }
+
+    private func currentAnimationValue(for keyPath: String) -> Any? {
+        switch keyPath {
+        case "opacity": return _opacity
+        case "bounds": return _bounds
+        case "bounds.origin": return _bounds.origin
+        case "bounds.size": return _bounds.size
+        case "position": return _position
+        case "position.x": return _position.x
+        case "position.y": return _position.y
+        case "zPosition": return _zPosition
+        case "anchorPoint": return _anchorPoint
+        case "anchorPointZ": return _anchorPointZ
+        case "transform": return _transform
+        case "sublayerTransform": return _sublayerTransform
+        case "backgroundColor": return _backgroundColor
+        case "cornerRadius": return _cornerRadius
+        case "borderWidth": return _borderWidth
+        case "borderColor": return _borderColor
+        case "shadowColor": return _shadowColor
+        case "shadowOpacity": return _shadowOpacity
+        case "shadowOffset": return _shadowOffset
+        case "shadowRadius": return _shadowRadius
+        case "contentsRect": return _contentsRect
+        case "contentsCenter": return contentsCenter
+        case "contentsScale": return _contentsScale
+        case "rasterizationScale": return _rasterizationScale
+        case "strokeStart": return (self as? CAShapeLayer)?._strokeStart
+        case "strokeEnd": return (self as? CAShapeLayer)?._strokeEnd
+        case "lineWidth": return (self as? CAShapeLayer)?._lineWidth
+        case "lineDashPhase": return (self as? CAShapeLayer)?._lineDashPhase
+        case "miterLimit": return (self as? CAShapeLayer)?._miterLimit
+        case "fillColor": return (self as? CAShapeLayer)?._fillColor
+        case "strokeColor": return (self as? CAShapeLayer)?._strokeColor
+        case "startPoint": return (self as? CAGradientLayer)?._startPoint
+        case "endPoint": return (self as? CAGradientLayer)?._endPoint
+        case "locations": return (self as? CAGradientLayer)?._locations
+        case "fontSize": return (self as? CATextLayer)?._fontSize
+        case "foregroundColor": return (self as? CATextLayer)?._foregroundColor
+        case "emitterPosition": return (self as? CAEmitterLayer)?._emitterPosition
+        case "emitterSize": return (self as? CAEmitterLayer)?._emitterSize
+        case "emitterZPosition": return (self as? CAEmitterLayer)?._emitterZPosition
+        case "emitterDepth": return (self as? CAEmitterLayer)?._emitterDepth
+        case "birthRate": return (self as? CAEmitterLayer)?._birthRate
+        case "lifetime": return (self as? CAEmitterLayer)?._lifetime
+        case "velocity": return (self as? CAEmitterLayer)?._velocity
+        case "scale": return (self as? CAEmitterLayer)?._scale
+        case "spin": return (self as? CAEmitterLayer)?._spin
+        case "instanceDelay": return (self as? CAReplicatorLayer)?._instanceDelay
+        case "instanceTransform": return (self as? CAReplicatorLayer)?._instanceTransform
+        case "instanceColor": return (self as? CAReplicatorLayer)?._instanceColor
+        case "instanceRedOffset": return (self as? CAReplicatorLayer)?._instanceRedOffset
+        case "instanceGreenOffset": return (self as? CAReplicatorLayer)?._instanceGreenOffset
+        case "instanceBlueOffset": return (self as? CAReplicatorLayer)?._instanceBlueOffset
+        case "instanceAlphaOffset": return (self as? CAReplicatorLayer)?._instanceAlphaOffset
+        default: return nil
+        }
+    }
+
+    private func applyCumulativeContribution(
+        _ contribution: Any,
+        cycles: Int,
+        to layer: CALayer,
+        keyPath: String
+    ) {
+        let count = CGFloat(cycles)
+        let floatCount = Float(cycles)
+
+        switch keyPath {
+        case "opacity": if let value = contribution as? Float { layer._opacity += value * floatCount }
+        case "position.x": if let value = contribution as? CGFloat { layer._position.x += value * count }
+        case "position.y": if let value = contribution as? CGFloat { layer._position.y += value * count }
+        case "position": if let value = contribution as? CGPoint {
+            layer._position.x += value.x * count
+            layer._position.y += value.y * count
+        }
+        case "bounds": if let value = contribution as? CGRect {
+            layer._bounds.origin.x += value.origin.x * count
+            layer._bounds.origin.y += value.origin.y * count
+            layer._bounds.size.width += value.size.width * count
+            layer._bounds.size.height += value.size.height * count
+        }
+        case "bounds.origin": if let value = contribution as? CGPoint {
+            layer._bounds.origin.x += value.x * count
+            layer._bounds.origin.y += value.y * count
+        }
+        case "bounds.size": if let value = contribution as? CGSize {
+            layer._bounds.size.width += value.width * count
+            layer._bounds.size.height += value.height * count
+        }
+        case "anchorPoint": if let value = contribution as? CGPoint {
+            layer._anchorPoint.x += value.x * count
+            layer._anchorPoint.y += value.y * count
+        }
+        case "shadowOffset": if let value = contribution as? CGSize {
+            layer._shadowOffset.width += value.width * count
+            layer._shadowOffset.height += value.height * count
+        }
+        case "cornerRadius", "borderWidth", "shadowRadius", "zPosition", "anchorPointZ", "contentsScale", "rasterizationScale":
+            guard let value = contribution as? CGFloat else { return }
+            switch keyPath {
+            case "cornerRadius": layer._cornerRadius += value * count
+            case "borderWidth": layer._borderWidth += value * count
+            case "shadowRadius": layer._shadowRadius += value * count
+            case "zPosition": layer._zPosition += value * count
+            case "anchorPointZ": layer._anchorPointZ += value * count
+            case "contentsScale": layer._contentsScale += value * count
+            default: layer._rasterizationScale += value * count
+            }
+        case "shadowOpacity": if let value = contribution as? Float { layer._shadowOpacity += value * floatCount }
+        case "transform": if let value = contribution as? CATransform3D {
+            for _ in 0..<cycles { layer._transform = CATransform3DConcat(layer._transform, value) }
+        }
+        case "sublayerTransform": if let value = contribution as? CATransform3D {
+            for _ in 0..<cycles { layer._sublayerTransform = CATransform3DConcat(layer._sublayerTransform, value) }
+        }
+        case "backgroundColor": addCumulativeColor(contribution, cycles: count, to: &layer._backgroundColor)
+        case "borderColor": addCumulativeColor(contribution, cycles: count, to: &layer._borderColor)
+        case "shadowColor": addCumulativeColor(contribution, cycles: count, to: &layer._shadowColor)
+        default:
+            applySpecializedCumulativeContribution(contribution, cycles: cycles, to: layer, keyPath: keyPath)
+        }
+    }
+
+    private func addCumulativeColor(_ contribution: Any, cycles: CGFloat, to color: inout CGColor?) {
+        guard let contribution = contribution as? CGColor else { return }
+        let (r, g, b, a) = extractRGBA(from: contribution)
+        let (br, bg, bb, ba) = color.map(extractRGBA) ?? (0, 0, 0, 0)
+        color = CGColor(red: br + r * cycles, green: bg + g * cycles, blue: bb + b * cycles, alpha: ba + a * cycles)
+    }
+
+    private func applySpecializedCumulativeContribution(
+        _ contribution: Any,
+        cycles: Int,
+        to layer: CALayer,
+        keyPath: String
+    ) {
+        let count = CGFloat(cycles)
+        let floatCount = Float(cycles)
+        switch keyPath {
+        case "strokeStart", "strokeEnd", "lineWidth", "lineDashPhase", "miterLimit":
+            guard let shape = layer as? CAShapeLayer, let value = contribution as? CGFloat else { return }
+            switch keyPath {
+            case "strokeStart": shape._strokeStart += value * count
+            case "strokeEnd": shape._strokeEnd += value * count
+            case "lineWidth": shape._lineWidth += value * count
+            case "lineDashPhase": shape._lineDashPhase += value * count
+            default: shape._miterLimit += value * count
+            }
+        case "fillColor": if let shape = layer as? CAShapeLayer { addCumulativeColor(contribution, cycles: count, to: &shape._fillColor) }
+        case "strokeColor": if let shape = layer as? CAShapeLayer { addCumulativeColor(contribution, cycles: count, to: &shape._strokeColor) }
+        case "fontSize": if let text = layer as? CATextLayer, let value = contribution as? CGFloat { text._fontSize += value * count }
+        case "foregroundColor": if let text = layer as? CATextLayer { addCumulativeColor(contribution, cycles: count, to: &text._foregroundColor) }
+        case "startPoint", "endPoint":
+            guard let gradient = layer as? CAGradientLayer, let value = contribution as? CGPoint else { return }
+            if keyPath == "startPoint" {
+                gradient._startPoint.x += value.x * count; gradient._startPoint.y += value.y * count
+            } else {
+                gradient._endPoint.x += value.x * count; gradient._endPoint.y += value.y * count
+            }
+        case "locations":
+            guard let gradient = layer as? CAGradientLayer,
+                  let value = contribution as? [CGFloat],
+                  let locations = gradient._locations,
+                  locations.count == value.count else { return }
+            gradient._locations = zip(locations, value).map { $0 + $1 * count }
+        case "emitterPosition": if let emitter = layer as? CAEmitterLayer, let value = contribution as? CGPoint {
+            emitter._emitterPosition.x += value.x * count; emitter._emitterPosition.y += value.y * count
+        }
+        case "emitterSize": if let emitter = layer as? CAEmitterLayer, let value = contribution as? CGSize {
+            emitter._emitterSize.width += value.width * count; emitter._emitterSize.height += value.height * count
+        }
+        case "emitterZPosition", "emitterDepth":
+            guard let emitter = layer as? CAEmitterLayer, let value = contribution as? CGFloat else { return }
+            if keyPath == "emitterZPosition" { emitter._emitterZPosition += value * count }
+            else { emitter._emitterDepth += value * count }
+        case "birthRate", "lifetime", "velocity", "scale", "spin":
+            guard let emitter = layer as? CAEmitterLayer, let value = contribution as? Float else { return }
+            switch keyPath {
+            case "birthRate": emitter._birthRate += value * floatCount
+            case "lifetime": emitter._lifetime += value * floatCount
+            case "velocity": emitter._velocity += value * floatCount
+            case "scale": emitter._scale += value * floatCount
+            default: emitter._spin += value * floatCount
+            }
+        case "instanceDelay": if let replicator = layer as? CAReplicatorLayer, let value = contribution as? CGFloat { replicator._instanceDelay += value * count }
+        case "instanceTransform": if let replicator = layer as? CAReplicatorLayer, let value = contribution as? CATransform3D {
+            for _ in 0..<cycles { replicator._instanceTransform = CATransform3DConcat(replicator._instanceTransform, value) }
+        }
+        case "instanceColor": if let replicator = layer as? CAReplicatorLayer { addCumulativeColor(contribution, cycles: count, to: &replicator._instanceColor) }
+        case "instanceRedOffset", "instanceGreenOffset", "instanceBlueOffset", "instanceAlphaOffset":
+            guard let replicator = layer as? CAReplicatorLayer, let value = contribution as? Float else { return }
+            switch keyPath {
+            case "instanceRedOffset": replicator._instanceRedOffset += value * floatCount
+            case "instanceGreenOffset": replicator._instanceGreenOffset += value * floatCount
+            case "instanceBlueOffset": replicator._instanceBlueOffset += value * floatCount
+            default: replicator._instanceAlphaOffset += value * floatCount
+            }
+        default: break
+        }
+    }
+
     private func applyFloatAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
         // When isAdditive, pass zero as currentValue to resolveFromTo* so that
         // implicit from/to values don't include the model value (which would be double-counted).
@@ -958,6 +1285,72 @@ open class CALayer: CAMediaTiming, Hashable {
             guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : modelShapeLayer._miterLimit) else { return }
             let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
             shapeLayer._miterLimit = additive ? shapeLayer._miterLimit + value : value
+
+        case "fontSize":
+            guard let textLayer = layer as? CATextLayer,
+                  let modelTextLayer = self as? CATextLayer,
+                  let resolved = resolveFromTo(animation, currentValue: additive ? 0 : modelTextLayer._fontSize) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            textLayer._fontSize = additive ? textLayer._fontSize + value : value
+
+        case "emitterZPosition", "emitterDepth":
+            guard let emitterLayer = layer as? CAEmitterLayer,
+                  let modelEmitterLayer = self as? CAEmitterLayer else { return }
+            let current = keyPath == "emitterZPosition" ? modelEmitterLayer._emitterZPosition : modelEmitterLayer._emitterDepth
+            guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : current) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            if keyPath == "emitterZPosition" {
+                emitterLayer._emitterZPosition = additive ? emitterLayer._emitterZPosition + value : value
+            } else {
+                emitterLayer._emitterDepth = additive ? emitterLayer._emitterDepth + value : value
+            }
+
+        case "birthRate", "lifetime", "velocity", "scale", "spin":
+            guard let emitterLayer = layer as? CAEmitterLayer,
+                  let modelEmitterLayer = self as? CAEmitterLayer else { return }
+            let current: Float
+            switch keyPath {
+            case "birthRate": current = modelEmitterLayer._birthRate
+            case "lifetime": current = modelEmitterLayer._lifetime
+            case "velocity": current = modelEmitterLayer._velocity
+            case "scale": current = modelEmitterLayer._scale
+            default: current = modelEmitterLayer._spin
+            }
+            guard let resolved = resolveFromToFloat(animation, currentValue: additive ? 0 : current) else { return }
+            let value = resolved.from + Float(progress) * (resolved.to - resolved.from)
+            switch keyPath {
+            case "birthRate": emitterLayer._birthRate = additive ? emitterLayer._birthRate + value : value
+            case "lifetime": emitterLayer._lifetime = additive ? emitterLayer._lifetime + value : value
+            case "velocity": emitterLayer._velocity = additive ? emitterLayer._velocity + value : value
+            case "scale": emitterLayer._scale = additive ? emitterLayer._scale + value : value
+            default: emitterLayer._spin = additive ? emitterLayer._spin + value : value
+            }
+
+        case "instanceDelay":
+            guard let replicatorLayer = layer as? CAReplicatorLayer,
+                  let modelReplicatorLayer = self as? CAReplicatorLayer,
+                  let resolved = resolveFromTo(animation, currentValue: additive ? 0 : CGFloat(modelReplicatorLayer._instanceDelay)) else { return }
+            let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+            replicatorLayer._instanceDelay = additive ? replicatorLayer._instanceDelay + CFTimeInterval(value) : CFTimeInterval(value)
+
+        case "instanceRedOffset", "instanceGreenOffset", "instanceBlueOffset", "instanceAlphaOffset":
+            guard let replicatorLayer = layer as? CAReplicatorLayer,
+                  let modelReplicatorLayer = self as? CAReplicatorLayer else { return }
+            let current: Float
+            switch keyPath {
+            case "instanceRedOffset": current = modelReplicatorLayer._instanceRedOffset
+            case "instanceGreenOffset": current = modelReplicatorLayer._instanceGreenOffset
+            case "instanceBlueOffset": current = modelReplicatorLayer._instanceBlueOffset
+            default: current = modelReplicatorLayer._instanceAlphaOffset
+            }
+            guard let resolved = resolveFromToFloat(animation, currentValue: additive ? 0 : current) else { return }
+            let value = resolved.from + Float(progress) * (resolved.to - resolved.from)
+            switch keyPath {
+            case "instanceRedOffset": replicatorLayer._instanceRedOffset = additive ? replicatorLayer._instanceRedOffset + value : value
+            case "instanceGreenOffset": replicatorLayer._instanceGreenOffset = additive ? replicatorLayer._instanceGreenOffset + value : value
+            case "instanceBlueOffset": replicatorLayer._instanceBlueOffset = additive ? replicatorLayer._instanceBlueOffset + value : value
+            default: replicatorLayer._instanceAlphaOffset = additive ? replicatorLayer._instanceAlphaOffset + value : value
+            }
 
         default:
             break
@@ -1053,6 +1446,30 @@ open class CALayer: CAMediaTiming, Hashable {
             } else {
                 gradientLayer._endPoint = value
             }
+
+        case "emitterPosition":
+            guard let emitterLayer = layer as? CAEmitterLayer,
+                  let modelEmitterLayer = self as? CAEmitterLayer,
+                  let resolved = resolveFromToPoint(animation, currentValue: additive ? .zero : modelEmitterLayer._emitterPosition) else { return }
+            let value = CGPoint(
+                x: resolved.from.x + CGFloat(progress) * (resolved.to.x - resolved.from.x),
+                y: resolved.from.y + CGFloat(progress) * (resolved.to.y - resolved.from.y)
+            )
+            emitterLayer._emitterPosition = additive
+                ? CGPoint(x: emitterLayer._emitterPosition.x + value.x, y: emitterLayer._emitterPosition.y + value.y)
+                : value
+
+        case "emitterSize":
+            guard let emitterLayer = layer as? CAEmitterLayer,
+                  let modelEmitterLayer = self as? CAEmitterLayer,
+                  let resolved = resolveFromToSize(animation, currentValue: additive ? .zero : modelEmitterLayer._emitterSize) else { return }
+            let value = CGSize(
+                width: resolved.from.width + CGFloat(progress) * (resolved.to.width - resolved.from.width),
+                height: resolved.from.height + CGFloat(progress) * (resolved.to.height - resolved.from.height)
+            )
+            emitterLayer._emitterSize = additive
+                ? CGSize(width: emitterLayer._emitterSize.width + value.width, height: emitterLayer._emitterSize.height + value.height)
+                : value
 
         default:
             break
@@ -1256,6 +1673,16 @@ open class CALayer: CAMediaTiming, Hashable {
                 layer._sublayerTransform = value
             }
 
+        case "instanceTransform":
+            guard let replicatorLayer = layer as? CAReplicatorLayer,
+                  let modelReplicatorLayer = self as? CAReplicatorLayer else { return }
+            let from = (animation.fromValue as? CATransform3D) ?? modelReplicatorLayer._instanceTransform
+            let to = (animation.toValue as? CATransform3D) ?? modelReplicatorLayer._instanceTransform
+            let value = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
+            replicatorLayer._instanceTransform = animation.isAdditive
+                ? CATransform3DConcat(value, replicatorLayer._instanceTransform)
+                : value
+
         default:
             break
         }
@@ -1307,6 +1734,22 @@ open class CALayer: CAMediaTiming, Hashable {
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             shapeLayer._strokeColor = additive ? addColor(value, to: shapeLayer._strokeColor) : value
 
+        case "foregroundColor":
+            guard let textLayer = layer as? CATextLayer,
+                  let modelTextLayer = self as? CATextLayer,
+                  let from = extractColor(animation.fromValue) ?? modelTextLayer._foregroundColor,
+                  let to = extractColor(animation.toValue) ?? modelTextLayer._foregroundColor else { return }
+            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            textLayer._foregroundColor = additive ? addColor(value, to: textLayer._foregroundColor) : value
+
+        case "instanceColor":
+            guard let replicatorLayer = layer as? CAReplicatorLayer,
+                  let modelReplicatorLayer = self as? CAReplicatorLayer,
+                  let from = extractColor(animation.fromValue) ?? modelReplicatorLayer._instanceColor,
+                  let to = extractColor(animation.toValue) ?? modelReplicatorLayer._instanceColor else { return }
+            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
+            replicatorLayer._instanceColor = additive ? addColor(value, to: replicatorLayer._instanceColor) : value
+
         default:
             break
         }
@@ -1323,6 +1766,97 @@ open class CALayer: CAMediaTiming, Hashable {
         let (vR, vG, vB, vA) = extractRGBA(from: value)
         let (bR, bG, bB, bA) = extractRGBA(from: base)
         return CGColor(red: bR + vR, green: bG + vG, blue: bB + vB, alpha: bA + vA)
+    }
+
+    private struct PathElementSample {
+        let type: CGPathElementType
+        let points: [CGPoint]
+    }
+
+    private func applyPathAnimation(
+        _ animation: CABasicAnimation,
+        to layer: CALayer,
+        keyPath: String,
+        progress: CFTimeInterval
+    ) {
+        let modelPath = keyPath == "path" ? (self as? CAShapeLayer)?._path : _shadowPath
+        guard let from = extractPath(animation.fromValue) ?? modelPath,
+              let to = extractPath(animation.toValue) ?? modelPath else { return }
+
+        let value = interpolatePath(from: from, to: to, progress: CGFloat(progress))
+        if keyPath == "path" {
+            (layer as? CAShapeLayer)?._path = value
+        } else {
+            layer._shadowPath = value
+        }
+    }
+
+    /// Interpolates paths with matching element topology. Incompatible paths
+    /// change discretely because their control points cannot be paired.
+    private func interpolatePath(from: CGPath, to: CGPath, progress: CGFloat) -> CGPath {
+        let fromElements = pathElements(from)
+        let toElements = pathElements(to)
+        guard fromElements.count == toElements.count else {
+            return progress < 1 ? from : to
+        }
+
+        let output = CGMutablePath()
+        for index in fromElements.indices {
+            let lhs = fromElements[index]
+            let rhs = toElements[index]
+            guard lhs.type == rhs.type, lhs.points.count == rhs.points.count else {
+                return progress < 1 ? from : to
+            }
+            let points = zip(lhs.points, rhs.points).map { start, end in
+                CGPoint(
+                    x: start.x + progress * (end.x - start.x),
+                    y: start.y + progress * (end.y - start.y)
+                )
+            }
+            switch lhs.type {
+            case .moveToPoint:
+                output.move(to: points[0])
+            case .addLineToPoint:
+                output.addLine(to: points[0])
+            case .addQuadCurveToPoint:
+                output.addQuadCurve(to: points[1], control: points[0])
+            case .addCurveToPoint:
+                output.addCurve(to: points[2], control1: points[0], control2: points[1])
+            case .closeSubpath:
+                output.closeSubpath()
+            @unknown default:
+                return progress < 1 ? from : to
+            }
+        }
+        return output
+    }
+
+    private func pathElements(_ path: CGPath) -> [PathElementSample] {
+        var result: [PathElementSample] = []
+        path.applyWithBlock { elementPointer in
+            let element = elementPointer.pointee
+            let pointCount: Int
+            switch element.type {
+            case .moveToPoint, .addLineToPoint:
+                pointCount = 1
+            case .addQuadCurveToPoint:
+                pointCount = 2
+            case .addCurveToPoint:
+                pointCount = 3
+            case .closeSubpath:
+                pointCount = 0
+            @unknown default:
+                pointCount = 0
+            }
+            let points: [CGPoint]
+            if pointCount > 0, let elementPoints = element.points {
+                points = (0..<pointCount).map { elementPoints[$0] }
+            } else {
+                points = []
+            }
+            result.append(PathElementSample(type: element.type, points: points))
+        }
+        return result
     }
 
     /// Safely extracts a CGPath from an Any value.
@@ -1897,6 +2431,48 @@ open class CALayer: CAMediaTiming, Hashable {
         case "locations":
             if let gradientLayer = layer as? CAGradientLayer, let v = value as? [CGFloat] { gradientLayer._locations = v }
 
+        // CATextLayer properties
+        case "fontSize":
+            if let textLayer = layer as? CATextLayer, let v = value as? CGFloat { textLayer._fontSize = v }
+        case "foregroundColor":
+            if let textLayer = layer as? CATextLayer, let v = extractColor(value) { textLayer._foregroundColor = v }
+
+        // CAEmitterLayer properties
+        case "emitterPosition":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? CGPoint { emitterLayer._emitterPosition = v }
+        case "emitterSize":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? CGSize { emitterLayer._emitterSize = v }
+        case "emitterZPosition":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? CGFloat { emitterLayer._emitterZPosition = v }
+        case "emitterDepth":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? CGFloat { emitterLayer._emitterDepth = v }
+        case "birthRate":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? Float { emitterLayer._birthRate = v }
+        case "lifetime":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? Float { emitterLayer._lifetime = v }
+        case "velocity":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? Float { emitterLayer._velocity = v }
+        case "scale":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? Float { emitterLayer._scale = v }
+        case "spin":
+            if let emitterLayer = layer as? CAEmitterLayer, let v = value as? Float { emitterLayer._spin = v }
+
+        // CAReplicatorLayer properties
+        case "instanceDelay":
+            if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? CFTimeInterval { replicatorLayer._instanceDelay = v }
+        case "instanceTransform":
+            if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? CATransform3D { replicatorLayer._instanceTransform = v }
+        case "instanceColor":
+            if let replicatorLayer = layer as? CAReplicatorLayer, let v = extractColor(value) { replicatorLayer._instanceColor = v }
+        case "instanceRedOffset":
+            if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? Float { replicatorLayer._instanceRedOffset = v }
+        case "instanceGreenOffset":
+            if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? Float { replicatorLayer._instanceGreenOffset = v }
+        case "instanceBlueOffset":
+            if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? Float { replicatorLayer._instanceBlueOffset = v }
+        case "instanceAlphaOffset":
+            if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? Float { replicatorLayer._instanceAlphaOffset = v }
+
         default:
             break
         }
@@ -2089,6 +2665,93 @@ open class CALayer: CAMediaTiming, Hashable {
                     interpolatedLocations.append(fromLocations[i] + CGFloat(progress) * (toLocations[i] - fromLocations[i]))
                 }
                 gradientLayer._locations = interpolatedLocations
+            }
+
+        // CATextLayer properties
+        case "fontSize":
+            if let textLayer = layer as? CATextLayer,
+               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                textLayer._fontSize = f + CGFloat(progress) * (t - f)
+            }
+        case "foregroundColor":
+            if let textLayer = layer as? CATextLayer,
+               let f = extractColor(fromValue), let t = extractColor(toValue) {
+                textLayer._foregroundColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
+            }
+
+        // CAEmitterLayer properties
+        case "emitterPosition":
+            if let emitterLayer = layer as? CAEmitterLayer,
+               let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
+                emitterLayer._emitterPosition = CGPoint(
+                    x: f.x + CGFloat(progress) * (t.x - f.x),
+                    y: f.y + CGFloat(progress) * (t.y - f.y)
+                )
+            }
+        case "emitterSize":
+            if let emitterLayer = layer as? CAEmitterLayer,
+               let f = fromValue as? CGSize, let t = toValue as? CGSize {
+                emitterLayer._emitterSize = CGSize(
+                    width: f.width + CGFloat(progress) * (t.width - f.width),
+                    height: f.height + CGFloat(progress) * (t.height - f.height)
+                )
+            }
+        case "emitterZPosition", "emitterDepth":
+            if let emitterLayer = layer as? CAEmitterLayer,
+               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                let value = f + CGFloat(progress) * (t - f)
+                if keyPath == "emitterZPosition" { emitterLayer._emitterZPosition = value }
+                else { emitterLayer._emitterDepth = value }
+            }
+        case "birthRate", "lifetime", "velocity", "scale", "spin":
+            if let emitterLayer = layer as? CAEmitterLayer,
+               let f = fromValue as? Float, let t = toValue as? Float {
+                let value = f + Float(progress) * (t - f)
+                switch keyPath {
+                case "birthRate": emitterLayer._birthRate = value
+                case "lifetime": emitterLayer._lifetime = value
+                case "velocity": emitterLayer._velocity = value
+                case "scale": emitterLayer._scale = value
+                default: emitterLayer._spin = value
+                }
+            }
+
+        // CAReplicatorLayer properties
+        case "instanceDelay":
+            if let replicatorLayer = layer as? CAReplicatorLayer,
+               let f = fromValue as? CFTimeInterval, let t = toValue as? CFTimeInterval {
+                replicatorLayer._instanceDelay = f + progress * (t - f)
+            }
+        case "instanceTransform":
+            if let replicatorLayer = layer as? CAReplicatorLayer,
+               let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
+                replicatorLayer._instanceTransform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
+            }
+        case "instanceColor":
+            if let replicatorLayer = layer as? CAReplicatorLayer,
+               let f = extractColor(fromValue), let t = extractColor(toValue) {
+                replicatorLayer._instanceColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
+            }
+        case "instanceRedOffset", "instanceGreenOffset", "instanceBlueOffset", "instanceAlphaOffset":
+            if let replicatorLayer = layer as? CAReplicatorLayer,
+               let f = fromValue as? Float, let t = toValue as? Float {
+                let value = f + Float(progress) * (t - f)
+                switch keyPath {
+                case "instanceRedOffset": replicatorLayer._instanceRedOffset = value
+                case "instanceGreenOffset": replicatorLayer._instanceGreenOffset = value
+                case "instanceBlueOffset": replicatorLayer._instanceBlueOffset = value
+                default: replicatorLayer._instanceAlphaOffset = value
+                }
+            }
+
+        case "path":
+            if let shapeLayer = layer as? CAShapeLayer,
+               let f = extractPath(fromValue), let t = extractPath(toValue) {
+                shapeLayer._path = interpolatePath(from: f, to: t, progress: CGFloat(progress))
+            }
+        case "shadowPath":
+            if let f = extractPath(fromValue), let t = extractPath(toValue) {
+                layer._shadowPath = interpolatePath(from: f, to: t, progress: CGFloat(progress))
             }
 
         default:
@@ -2312,7 +2975,12 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// An optional layer whose alpha channel is used to mask the layer's content.
-    open var mask: CALayer?
+    open var mask: CALayer? {
+        didSet {
+            guard oldValue !== mask else { return }
+            markDirty(.mask)
+        }
+    }
 
     private var _isDoubleSided: Bool = true
     /// A Boolean indicating whether the layer displays its content when facing away from the viewer. Animatable.
@@ -2320,7 +2988,9 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _isDoubleSided }
         set {
             let oldValue = _isDoubleSided
+            guard oldValue != newValue else { return }
             _isDoubleSided = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "isDoubleSided", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -2340,10 +3010,20 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// A bitmask defining which of the four corners receives the masking.
-    open var maskedCorners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+    open var maskedCorners: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner, .layerMinXMaxYCorner, .layerMaxXMaxYCorner] {
+        didSet {
+            guard oldValue != maskedCorners else { return }
+            markDirty(.appearance)
+        }
+    }
 
     /// The curve to use when drawing the rounded corners.
-    open var cornerCurve: CALayerCornerCurve = .circular
+    open var cornerCurve: CALayerCornerCurve = .circular {
+        didSet {
+            guard oldValue != cornerCurve else { return }
+            markDirty(.appearance)
+        }
+    }
 
     private var _borderWidth: CGFloat = 0
     /// The width of the layer's border. Animatable.
@@ -2455,10 +3135,20 @@ open class CALayer: CAMediaTiming, Hashable {
     open var style: [AnyHashable: Any]?
 
     /// A Boolean indicating whether the layer is allowed to perform edge antialiasing.
-    open var allowsEdgeAntialiasing: Bool = false
+    open var allowsEdgeAntialiasing: Bool = false {
+        didSet {
+            guard oldValue != allowsEdgeAntialiasing else { return }
+            markDirty(.rasterization)
+        }
+    }
 
     /// A Boolean indicating whether the layer is allowed to composite itself as a group separate from its parent.
-    open var allowsGroupOpacity: Bool = true
+    open var allowsGroupOpacity: Bool = true {
+        didSet {
+            guard oldValue != allowsGroupOpacity else { return }
+            markDirty(.appearance)
+        }
+    }
 
     // MARK: - Layer Filters
 
@@ -2470,23 +3160,43 @@ open class CALayer: CAMediaTiming, Hashable {
             let oldContribution = selfFilterContribution
             _filters = newValue
             CALayer.propagateFilterDelta(selfFilterContribution - oldContribution, startingAt: self)
+            markDirty(.filters)
         }
     }
 
     /// A CoreImage filter used to composite the layer and the content behind it. Animatable.
-    open var compositingFilter: Any?
+    open var compositingFilter: Any? {
+        didSet { markDirty(.filters) }
+    }
 
     /// An array of Core Image filters to apply to the content immediately behind the layer. Animatable.
-    open var backgroundFilters: [Any]?
+    open var backgroundFilters: [Any]? {
+        didSet { markDirty(.filters) }
+    }
 
     /// The filter used when reducing the size of the content.
-    open var minificationFilter: CALayerContentsFilter = .linear
+    open var minificationFilter: CALayerContentsFilter = .linear {
+        didSet {
+            guard oldValue != minificationFilter else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// The bias factor used by the minification filter to determine the levels of detail.
-    open var minificationFilterBias: Float = 0
+    open var minificationFilterBias: Float = 0 {
+        didSet {
+            guard oldValue != minificationFilterBias else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// The filter used when increasing the size of the content.
-    open var magnificationFilter: CALayerContentsFilter = .linear
+    open var magnificationFilter: CALayerContentsFilter = .linear {
+        didSet {
+            guard oldValue != magnificationFilter else { return }
+            markDirty(.contents)
+        }
+    }
 
     // MARK: - Configuring the Layer's Rendering Behavior
 
@@ -2503,7 +3213,12 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// A bitmask defining how the edges of the receiver are rasterized.
-    open var edgeAntialiasingMask: CAEdgeAntialiasingMask = [.layerLeftEdge, .layerRightEdge, .layerBottomEdge, .layerTopEdge]
+    open var edgeAntialiasingMask: CAEdgeAntialiasingMask = [.layerLeftEdge, .layerRightEdge, .layerBottomEdge, .layerTopEdge] {
+        didSet {
+            guard oldValue != edgeAntialiasingMask else { return }
+            markDirty(.rasterization)
+        }
+    }
 
     /// Returns a Boolean indicating whether the layer content is implicitly flipped when rendered.
     open func contentsAreFlipped() -> Bool {
@@ -2511,10 +3226,20 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// A Boolean that indicates whether the geometry of the layer and its sublayers is flipped vertically.
-    open var isGeometryFlipped: Bool = false
+    open var isGeometryFlipped: Bool = false {
+        didSet {
+            guard oldValue != isGeometryFlipped else { return }
+            markDirty(.geometry)
+        }
+    }
 
     /// A Boolean indicating whether drawing commands are deferred and processed asynchronously in a background thread.
-    open var drawsAsynchronously: Bool = false
+    open var drawsAsynchronously: Bool = false {
+        didSet {
+            guard oldValue != drawsAsynchronously else { return }
+            markDirty(.contentsRedraw)
+        }
+    }
 
     private var _shouldRasterize: Bool = false
     /// A Boolean that indicates whether the layer is rendered as a bitmap before compositing. Animatable.
@@ -2539,7 +3264,12 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// A hint for the desired storage format of the layer contents.
-    open var contentsFormat: CALayerContentsFormat = .RGBA8Uint
+    open var contentsFormat: CALayerContentsFormat = .RGBA8Uint {
+        didSet {
+            guard oldValue != contentsFormat else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// Renders the layer and its sublayers into the specified context.
     ///
@@ -3107,6 +3837,7 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _sublayerTransform
             _sublayerTransform = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "sublayerTransform", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -3118,7 +3849,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Sets the layer's transform to the specified affine transform.
     open func setAffineTransform(_ m: CGAffineTransform) {
-        _transform = CATransform3DMakeAffineTransform(m)
+        transform = CATransform3DMakeAffineTransform(m)
     }
 
     // MARK: - Managing the Layer Hierarchy
@@ -3132,27 +3863,39 @@ open class CALayer: CAMediaTiming, Hashable {
             if let old = _sublayers {
                 var shadowDelta = 0
                 var filterDelta = 0
+                var dirtyDelta = 0
                 for child in old {
                     shadowDelta += child._subtreeShadowCount
                     filterDelta += child._subtreeFilterCount
+                    dirtyDelta += child._subtreeDirtyCount
                     child._superlayer = nil
                 }
                 CALayer.propagateShadowDelta(-shadowDelta, startingAt: self)
                 CALayer.propagateFilterDelta(-filterDelta, startingAt: self)
+                CALayer.propagateDirtyDeltaPublic(-dirtyDelta, startingAt: self)
+            }
+            newValue?.forEach { child in
+                if child._superlayer !== self {
+                    child.removeFromSuperlayer()
+                }
             }
             // Set new sublayers (propagate +counts up from self after attaching)
             _sublayers = newValue
             if let new = newValue {
                 var shadowDelta = 0
                 var filterDelta = 0
+                var dirtyDelta = 0
                 for child in new {
                     child._superlayer = self
                     shadowDelta += child._subtreeShadowCount
                     filterDelta += child._subtreeFilterCount
+                    dirtyDelta += child._subtreeDirtyCount
                 }
                 CALayer.propagateShadowDelta(shadowDelta, startingAt: self)
                 CALayer.propagateFilterDelta(filterDelta, startingAt: self)
+                CALayer.propagateDirtyDeltaPublic(dirtyDelta, startingAt: self)
             }
+            markDirty(.sublayerHierarchy)
         }
     }
 
@@ -3192,6 +3935,7 @@ open class CALayer: CAMediaTiming, Hashable {
     internal var _dirtyMask: DirtyFlags = CALayer._initialDirtyMask
     internal var _subtreeDirtyCount: Int = 1
     internal var _presentationCacheToken: UInt64 = 0
+    internal var _presentationCacheIsValid: Bool = false
 
     // Phase 2 sublayer ordering cache (PERFORMANCE_DESIGN.md §4.3 / R2.3).
     // `_sortedSublayers` holds the painter's-algorithm sort of `_sublayers`
@@ -3410,17 +4154,42 @@ open class CALayer: CAMediaTiming, Hashable {
         // Copy per Apple's contract: "the animation is copied".
         let copied = anim.copy()
 
-        // Set up animation internal state on the copy
-        copied.addedTime = CACurrentMediaTime()
+        // Resolve defaults at insertion time. Core Animation stores a concrete
+        // begin time and duration on the animation copy returned by
+        // animation(forKey:), rather than consulting a later transaction.
+        let layerLocalTime = convertTime(CACurrentMediaTime(), from: nil)
+        if copied.beginTime == 0 {
+            copied.beginTime = layerLocalTime
+        }
+        let defaultDuration = CATransaction.animationDuration()
+        prepareAnimationForAddition(copied, inheritedDuration: defaultDuration)
+
+        // Set up animation internal state on the copy.
         copied.isFinished = false
+        copied.hasStarted = false
         copied.attachedLayer = self
         copied.animationKey = animKey
 
         _animations[animKey] = copied
+        CATransaction.registerAnimation(copied)
+        markDirty(.animations)
 
-        // Notify delegate that animation started (using the copy — its delegate
-        // was duplicated from the original during copy()).
-        copied.delegate?.animationDidStart(copied)
+    }
+
+    /// Resolves inherited durations throughout an animation group.
+    /// Group children whose duration is zero use their group's duration, and
+    /// nested groups repeat that rule recursively.
+    private func prepareAnimationForAddition(
+        _ animation: CAAnimation,
+        inheritedDuration: CFTimeInterval
+    ) {
+        if animation.duration == 0 {
+            animation.duration = inheritedDuration
+        }
+        guard let group = animation as? CAAnimationGroup else { return }
+        group.animations?.forEach {
+            prepareAnimationForAddition($0, inheritedDuration: group.duration)
+        }
     }
 
     /// Returns the animation object with the specified identifier.
@@ -3437,6 +4206,7 @@ open class CALayer: CAMediaTiming, Hashable {
             }
         }
         _animations.removeAll()
+        markDirty(.animations)
     }
 
     /// Remove the animation object with the specified key.
@@ -3448,6 +4218,7 @@ open class CALayer: CAMediaTiming, Hashable {
             }
         }
         _animations.removeValue(forKey: key)
+        markDirty(.animations)
     }
 
     /// Returns an array of strings that identify the animations currently attached to the layer.
@@ -3463,7 +4234,7 @@ open class CALayer: CAMediaTiming, Hashable {
     /// You typically don't need to call this method directly. Instead, use
     /// `CAAnimationEngine.shared` to manage the animation loop.
     public func processAnimationCompletions() {
-        let currentTime = CACurrentMediaTime()
+        let currentTime = convertTime(CACurrentMediaTime(), from: nil)
         var keysToRemove: [String] = []
 
         for (key, animation) in _animations {
@@ -3475,13 +4246,16 @@ open class CALayer: CAMediaTiming, Hashable {
                 continue
             }
 
-            // Use raw wall-clock elapsed time for completion check.
-            // totalDuration already accounts for speed.
-            let rawElapsed = currentTime - animation.addedTime - animation.beginTime
-            let totalDuration = animation.totalDuration
+            let duration = animation.duration > 0 ? animation.duration : animation.effectiveBaseDuration
+            let timing = CAMediaTimingEvaluator.evaluate(
+                animation,
+                parentTime: currentTime,
+                duration: duration
+            )
 
-            if rawElapsed >= totalDuration {
+            if timing.phase == .after {
                 // Animation has completed
+                animation.markStarted()
                 animation.markFinished(completed: true)
 
                 if animation.isRemovedOnCompletion {
@@ -3493,6 +4267,9 @@ open class CALayer: CAMediaTiming, Hashable {
         // Remove completed animations
         for key in keysToRemove {
             _animations.removeValue(forKey: key)
+        }
+        if !keysToRemove.isEmpty {
+            markDirty(.animations)
         }
     }
 

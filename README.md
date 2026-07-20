@@ -10,7 +10,7 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 
 | Evidence | Result |
 |---|---|
-| Native package | 307 tests passed |
+| Native package | 331 tests passed |
 | Browser | 3 checks passed, including CALayer colors read back from the WebGPU texture |
 | Remaining boundary | Complete QuartzCore semantic and rendering parity is not claimed |
 
@@ -34,7 +34,7 @@ layer.cornerRadius = 10
 
 | Layer Type | Description |
 |------------|-------------|
-| `CALayer` | Base layer with full property support (opacity, transform, shadow, border, mask, filters) |
+| `CALayer` | Base layer rendering for opacity, transform, shadow, border, mask, and filters |
 | `CAShapeLayer` | Vector shape rendering with paths, stroke, and fill |
 | `CAGradientLayer` | Linear and radial gradients |
 | `CATextLayer` | Text rendering with font and alignment |
@@ -82,7 +82,6 @@ layer.filters = [
     CAFilter.brightness(0.2),
     CAFilter.contrast(1.5),
     CAFilter.saturation(0.8)
-]
 ```
 
 Supported filter types:
@@ -107,7 +106,7 @@ Add OpenCoreAnimation to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/aspect-analytics/OpenCoreAnimation.git", branch: "main")
+    .package(url: "https://github.com/1amageek/OpenCoreAnimation.git", branch: "main")
 ]
 ```
 
@@ -122,8 +121,8 @@ Then add it to your target:
 
 ### Dependencies
 
-- [OpenCoreGraphics](https://github.com/aspect-analytics/OpenCoreGraphics) - CoreGraphics types for WASM
-- [swift-webgpu](https://github.com/aspect-analytics/swift-webgpu) - WebGPU bindings (WASM only)
+- [OpenCoreGraphics](https://github.com/1amageek/OpenCoreGraphics) - CoreGraphics types for WASM
+- [swift-webgpu](https://github.com/1amageek/swift-webgpu) - WebGPU bindings (WASM only)
 
 ## Usage
 

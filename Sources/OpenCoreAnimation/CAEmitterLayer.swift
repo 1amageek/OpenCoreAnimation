@@ -39,7 +39,9 @@ open class CAEmitterLayer: CALayer {
     // MARK: - Emitter Cells
 
     /// An array of CAEmitterCell objects that define the types of emitted objects.
-    open var emitterCells: [CAEmitterCell]?
+    open var emitterCells: [CAEmitterCell]? {
+        didSet { markDirty(.contents) }
+    }
 
     // MARK: - Emitter Geometry
 
@@ -50,6 +52,7 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _emitterPosition
             _emitterPosition = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "emitterPosition", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -61,6 +64,7 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _emitterZPosition
             _emitterZPosition = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "emitterZPosition", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -72,6 +76,7 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _emitterSize
             _emitterSize = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "emitterSize", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -83,23 +88,32 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _emitterDepth
             _emitterDepth = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "emitterDepth", oldValue: oldValue, newValue: newValue)
         }
     }
 
     /// The shape of the particle emitter.
-    open var emitterShape: CAEmitterLayerEmitterShape = .point
+    open var emitterShape: CAEmitterLayerEmitterShape = .point {
+        didSet { markDirty(.contents) }
+    }
 
     /// The emission mode of the particle emitter.
-    open var emitterMode: CAEmitterLayerEmitterMode = .volume
+    open var emitterMode: CAEmitterLayerEmitterMode = .volume {
+        didSet { markDirty(.contents) }
+    }
 
     // MARK: - Emitter Behavior
 
     /// The render mode of the particle emitter.
-    open var renderMode: CAEmitterLayerRenderMode = .unordered
+    open var renderMode: CAEmitterLayerRenderMode = .unordered {
+        didSet { markDirty(.contents) }
+    }
 
     /// Specifies whether this layer flattens its sublayers into its plane.
-    open var preservesDepth: Bool = false
+    open var preservesDepth: Bool = false {
+        didSet { markDirty(.geometry) }
+    }
 
     internal var _birthRate: Float = 1
     /// Defines a multiplier applied to the cell-defined birth rate. Animatable.
@@ -108,6 +122,7 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _birthRate
             _birthRate = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "birthRate", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -119,6 +134,7 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _lifetime
             _lifetime = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "lifetime", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -130,6 +146,7 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _velocity
             _velocity = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "velocity", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -141,6 +158,7 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _scale
             _scale = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "scale", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -152,11 +170,14 @@ open class CAEmitterLayer: CALayer {
         set {
             let oldValue = _spin
             _spin = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "spin", oldValue: oldValue, newValue: newValue)
         }
     }
 
     /// Specifies the seed used to initialize the random number generator.
-    open var seed: UInt32 = 0
+    open var seed: UInt32 = 0 {
+        didSet { markDirty(.contents) }
+    }
 
 }

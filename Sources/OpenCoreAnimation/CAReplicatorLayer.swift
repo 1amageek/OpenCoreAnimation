@@ -38,10 +38,14 @@ open class CAReplicatorLayer: CALayer {
     // MARK: - Instance Properties
 
     /// The number of copies to create, including the source layer.
-    open var instanceCount: Int = 1
+    open var instanceCount: Int = 1 {
+        didSet { markDirty(.sublayerHierarchy) }
+    }
 
     /// Specifies whether this layer flattens its sublayers into its plane.
-    open var preservesDepth: Bool = false
+    open var preservesDepth: Bool = false {
+        didSet { markDirty(.geometry) }
+    }
 
     internal var _instanceDelay: CFTimeInterval = 0
     /// The delay, in seconds, between replicated copies. Animatable.
@@ -50,6 +54,7 @@ open class CAReplicatorLayer: CALayer {
         set {
             let oldValue = _instanceDelay
             _instanceDelay = newValue
+            markDirty(.timing)
             CATransaction.registerChange(layer: self, keyPath: "instanceDelay", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -61,6 +66,7 @@ open class CAReplicatorLayer: CALayer {
         set {
             let oldValue = _instanceTransform
             _instanceTransform = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "instanceTransform", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -72,6 +78,7 @@ open class CAReplicatorLayer: CALayer {
         set {
             let oldValue = _instanceColor
             _instanceColor = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "instanceColor", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -83,6 +90,7 @@ open class CAReplicatorLayer: CALayer {
         set {
             let oldValue = _instanceRedOffset
             _instanceRedOffset = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "instanceRedOffset", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -94,6 +102,7 @@ open class CAReplicatorLayer: CALayer {
         set {
             let oldValue = _instanceGreenOffset
             _instanceGreenOffset = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "instanceGreenOffset", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -105,6 +114,7 @@ open class CAReplicatorLayer: CALayer {
         set {
             let oldValue = _instanceBlueOffset
             _instanceBlueOffset = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "instanceBlueOffset", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -116,6 +126,7 @@ open class CAReplicatorLayer: CALayer {
         set {
             let oldValue = _instanceAlphaOffset
             _instanceAlphaOffset = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "instanceAlphaOffset", oldValue: oldValue, newValue: newValue)
         }
     }

@@ -39,7 +39,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
 ///     }
 /// }
 /// ```
-open class CADisplayLink: @unchecked Sendable {
+@MainActor open class CADisplayLink {
 
     // MARK: - Properties
 
@@ -133,10 +133,6 @@ open class CADisplayLink: @unchecked Sendable {
         self.selector = sel
     }
 
-    deinit {
-        invalidate()
-    }
-
     // MARK: - Scheduling
 
     /// Registers the display link with a run loop.
@@ -182,46 +178,37 @@ open class CADisplayLink: @unchecked Sendable {
         stopAnimationLoop()
 
         animationFrameCallback = JSClosure { [weak self] arguments in
-            guard let self = self else { return .undefined }
-            guard self.isRunning && !self.isPaused else { return .undefined }
-
-            // Update timestamps (convert from milliseconds to seconds)
-            let timestampMs = arguments[0].number ?? 0
-            let currentTimestamp = timestampMs / 1000.0
-            self.timestamp = currentTimestamp
-            self.targetTimestamp = currentTimestamp + self.duration
-
-            // Check if we should dispatch this frame based on frame rate throttling
-            let minInterval = self.minimumFrameInterval
-            let shouldDispatch: Bool
-
-            if minInterval > 0 {
-                // Frame rate throttling is enabled
-                let timeSinceLastDispatch = currentTimestamp - self.lastDispatchedTimestamp
-                shouldDispatch = timeSinceLastDispatch >= minInterval
-            } else {
-                // No throttling, dispatch every frame
-                shouldDispatch = true
+            let timestampMilliseconds = arguments[0].number ?? 0
+            MainActor.assumeIsolated {
+                self?.handleAnimationFrame(timestampMilliseconds: timestampMilliseconds)
             }
-
-            if shouldDispatch {
-                self.lastDispatchedTimestamp = currentTimestamp
-
-                // Call the delegate method
-                if let delegate = self.target as? CADisplayLinkDelegate {
-                    delegate.displayLinkDidFire(self)
-                }
-            }
-
-            // Request next frame if still running (always request to maintain accurate timing)
-            if self.isRunning && !self.isPaused {
-                self.requestNextFrame()
-            }
-
             return .undefined
         }
 
         requestNextFrame()
+    }
+
+    private func handleAnimationFrame(timestampMilliseconds: Double) {
+        guard isRunning && !isPaused else { return }
+
+        let currentTimestamp = timestampMilliseconds / 1000.0
+        timestamp = currentTimestamp
+        targetTimestamp = currentTimestamp + duration
+
+        let minInterval = minimumFrameInterval
+        let shouldDispatch = minInterval == 0
+            || currentTimestamp - lastDispatchedTimestamp >= minInterval
+
+        if shouldDispatch {
+            lastDispatchedTimestamp = currentTimestamp
+            if let delegate = target as? CADisplayLinkDelegate {
+                delegate.displayLinkDidFire(self)
+            }
+        }
+
+        if isRunning && !isPaused {
+            requestNextFrame()
+        }
     }
 
     private func requestNextFrame() {

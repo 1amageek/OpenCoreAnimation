@@ -79,10 +79,14 @@ open class CATextLayer: CALayer {
     // MARK: - Text Properties
 
     /// The text to be rendered by the receiver.
-    open var string: Any?
+    open var string: Any? {
+        didSet { markDirty(.contents) }
+    }
 
     /// The font used to render the receiver's text.
-    open var font: Any?
+    open var font: Any? {
+        didSet { markDirty(.contents) }
+    }
 
     internal var _fontSize: CGFloat = 36
     /// The font size used to render the receiver's text. Animatable.
@@ -91,6 +95,7 @@ open class CATextLayer: CALayer {
         set {
             let oldValue = _fontSize
             _fontSize = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "fontSize", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -102,6 +107,7 @@ open class CATextLayer: CALayer {
         set {
             let oldValue = _foregroundColor
             _foregroundColor = newValue
+            markDirty(.appearance)
             CATransaction.registerChange(layer: self, keyPath: "foregroundColor", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -109,15 +115,35 @@ open class CATextLayer: CALayer {
     // MARK: - Layout Properties
 
     /// Determines whether the text is wrapped to fit within the receiver's bounds.
-    open var isWrapped: Bool = false
+    open var isWrapped: Bool = false {
+        didSet {
+            guard oldValue != isWrapped else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// The truncation mode to use when the text is too long.
-    open var truncationMode: CATextLayerTruncationMode = .none
+    open var truncationMode: CATextLayerTruncationMode = .none {
+        didSet {
+            guard oldValue != truncationMode else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// The text alignment mode.
-    open var alignmentMode: CATextLayerAlignmentMode = .natural
+    open var alignmentMode: CATextLayerAlignmentMode = .natural {
+        didSet {
+            guard oldValue != alignmentMode else { return }
+            markDirty(.contents)
+        }
+    }
 
     /// Determines whether font smoothing is allowed.
-    open var allowsFontSubpixelQuantization: Bool = false
+    open var allowsFontSubpixelQuantization: Bool = false {
+        didSet {
+            guard oldValue != allowsFontSubpixelQuantization else { return }
+            markDirty(.contents)
+        }
+    }
 
 }

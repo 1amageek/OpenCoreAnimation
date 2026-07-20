@@ -138,7 +138,10 @@ func installHarness() {
         h.expose("getCanvasHeight", returning: { .number(Double(canvasHeight)) })
         h.expose("getSublayerCount", returning: { .number(Double(sublayerCount)) })
         h.expose("isEngineRunning", returning: {
-            .boolean(CAAnimationEngine.shared.isRunning)
+            let isRunning = MainActor.assumeIsolated {
+                CAAnimationEngine.shared.isRunning
+            }
+            return .boolean(isRunning)
         })
         h.expose("getRasterizedGroupChildCount", returning: {
             .number(Double(rasterizedGroupRef?.sublayers?.count ?? 0))
@@ -150,16 +153,16 @@ func installHarness() {
             .string(pixelReadbackResult)
         })
         h.expose("beginPixelReadback", action: {
-            let engine = CAAnimationEngine.shared
-            engine.pause()
-            engine.renderFrame()
-
-            guard let renderer = engine.renderer as? CAWebGPURenderer else {
-                pixelReadbackResult = "error: renderer unavailable"
-                return
-            }
-
             Task { @MainActor in
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                engine.renderFrame()
+
+                guard let renderer = engine.renderer as? CAWebGPURenderer else {
+                    pixelReadbackResult = "error: renderer unavailable"
+                    return
+                }
+
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 80, y: 220),

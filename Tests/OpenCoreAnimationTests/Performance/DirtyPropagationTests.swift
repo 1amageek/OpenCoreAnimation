@@ -11,7 +11,8 @@ import CoreGraphics
 import OpenCoreGraphics
 #endif
 
-@Suite(.serialized)
+extension PerformanceTests {
+@Suite
 struct DirtyPropagationTests {
 
     init() { resetPerformanceTestState() }
@@ -270,4 +271,5 @@ struct DirtyPropagationTests {
         #expect(layer._dirtyMask.isEmpty)
         #expect(layer._needsDisplayForTest == true)   // independent axis
     }
+}
 }

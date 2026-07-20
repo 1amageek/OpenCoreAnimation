@@ -9,6 +9,7 @@
 // call into it.
 
 import Foundation
+import Synchronization
 
 #if canImport(CoreGraphics)
 import CoreGraphics
@@ -70,12 +71,22 @@ extension CALayer {
     // MARK: - Frame token
 
     /// Monotonic per-render-frame counter. Bumped by the renderer at the
-    /// top of each `render(layer:)`. Single-threaded by construction:
-    /// WASM is single-threaded by host; native test paths serialize
-    /// Performance/* suites via @Suite(.serialized).
-    /// `nonisolated(unsafe)` is the explicit acknowledgment of this
-    /// invariant under Swift 6 strict concurrency.
-    nonisolated(unsafe) internal static var _currentFrameToken: UInt64 = 0
+    /// top of each `render(layer:)`. Native renderers may be driven from
+    /// different executors, so the process-wide counter is synchronized.
+    private static let frameTokenStorage = Mutex<UInt64>(0)
+
+    internal static var _currentFrameToken: UInt64 {
+        get { frameTokenStorage.withLock { $0 } }
+        set { frameTokenStorage.withLock { $0 = newValue } }
+    }
+
+    @discardableResult
+    internal static func advanceFrameToken() -> UInt64 {
+        frameTokenStorage.withLock {
+            $0 &+= 1
+            return $0
+        }
+    }
 
     // MARK: - Mark dirty
 
@@ -92,7 +103,7 @@ extension CALayer {
         if wasClean && !_dirtyMask.isEmpty {
             CALayer.propagateDirtyDeltaPublic(+1, startingAt: self)
         }
-        _presentationCacheToken = 0
+        _presentationCacheIsValid = false
     }
 
     // MARK: - Subtree counter propagation

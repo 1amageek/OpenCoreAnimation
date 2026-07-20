@@ -30,7 +30,7 @@ public enum CARendererError: Error {
 /// Implementations of this protocol provide platform-specific rendering:
 /// - `CAMetalRenderer`: Uses Metal for Apple platforms (macOS/iOS)
 /// - `CAWebGPURenderer`: Uses WebGPU for WASM/Web platforms
-public protocol CARenderer: AnyObject {
+@MainActor public protocol CARenderer: AnyObject {
 
     /// The size of the render target in pixels.
     var size: CGSize { get }
@@ -41,7 +41,7 @@ public protocol CARenderer: AnyObject {
     /// and prepares all resources needed for rendering.
     ///
     /// - Throws: `CARendererError` if initialization fails.
-    @MainActor func initialize() async throws
+    func initialize() async throws
 
     /// Resizes the render target.
     ///

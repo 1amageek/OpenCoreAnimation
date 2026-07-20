@@ -38,6 +38,7 @@ open class CAGradientLayer: CALayer {
         set {
             let oldValue = _colors
             _colors = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "colors", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -50,6 +51,7 @@ open class CAGradientLayer: CALayer {
         set {
             let oldValue = _locations
             _locations = newValue
+            markDirty(.contents)
             CATransaction.registerChange(layer: self, keyPath: "locations", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -61,6 +63,7 @@ open class CAGradientLayer: CALayer {
         set {
             let oldValue = _startPoint
             _startPoint = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "startPoint", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -72,11 +75,17 @@ open class CAGradientLayer: CALayer {
         set {
             let oldValue = _endPoint
             _endPoint = newValue
+            markDirty(.geometry)
             CATransaction.registerChange(layer: self, keyPath: "endPoint", oldValue: oldValue, newValue: newValue)
         }
     }
 
     /// Style of gradient drawn by the layer.
-    open var type: CAGradientLayerType = .axial
+    open var type: CAGradientLayerType = .axial {
+        didSet {
+            guard oldValue != type else { return }
+            markDirty(.contents)
+        }
+    }
 
 }

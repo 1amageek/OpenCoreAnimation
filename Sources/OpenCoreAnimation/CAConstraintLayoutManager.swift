@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Synchronization
 
 
 /// An object that provides a constraint-based layout manager.
@@ -13,10 +14,10 @@ open class CAConstraintLayoutManager: CALayoutManager {
 
     /// Returns the shared constraint layout manager.
     public static func shared() -> CAConstraintLayoutManager {
-        return _shared
+        sharedStorage.withLock { $0 }
     }
 
-    nonisolated(unsafe) private static let _shared = CAConstraintLayoutManager()
+    private static let sharedStorage = Mutex(CAConstraintLayoutManager())
 
     public init() {}
 

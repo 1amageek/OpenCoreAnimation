@@ -59,19 +59,25 @@ open class CATiledLayer: CALayer {
     /// Each level of detail is rendered at half the resolution of the previous level.
     /// For example, if levelsOfDetail is 3, the layer maintains tiles at full resolution,
     /// half resolution, and quarter resolution.
-    open var levelsOfDetail: Int = 1
+    open var levelsOfDetail: Int = 1 {
+        didSet { markDirty(.contents) }
+    }
 
     /// The number of magnified levels of detail for this layer.
     ///
     /// Positive values add levels of detail for zooming in beyond the layer's normal size.
     /// A value of 2 means the layer can display tiles at 2x and 4x the normal resolution.
-    open var levelsOfDetailBias: Int = 0
+    open var levelsOfDetailBias: Int = 0 {
+        didSet { markDirty(.contents) }
+    }
 
     /// The maximum size of each tile.
     ///
     /// Tiles are the unit of asynchronous loading. Larger tiles require fewer draw calls
     /// but use more memory and take longer to render.
-    open var tileSize: CGSize = CGSize(width: 256, height: 256)
+    open var tileSize: CGSize = CGSize(width: 256, height: 256) {
+        didSet { markDirty(.contents) }
+    }
 
     /// Returns the fading duration for a given view.
     ///

@@ -21,7 +21,8 @@ private struct StubTexture: Equatable, Sendable {
     let id: Int
 }
 
-@Suite(.serialized)
+extension PerformanceTests {
+@Suite
 struct RasterizationCacheTests {
 
     init() { resetPerformanceTestState() }
@@ -172,4 +173,5 @@ struct RasterizationCacheTests {
         #expect(cache.bytes == 0)
         #expect(cache.entry(makeKey(1)) == nil)
     }
+}
 }

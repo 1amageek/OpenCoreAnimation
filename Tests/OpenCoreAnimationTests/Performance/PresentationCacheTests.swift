@@ -11,7 +11,8 @@ import CoreGraphics
 import OpenCoreGraphics
 #endif
 
-@Suite(.serialized)
+extension PerformanceTests {
+@Suite
 struct PresentationCacheTests {
 
     init() { resetPerformanceTestState() }
@@ -43,7 +44,7 @@ struct PresentationCacheTests {
         #expect(layer._dirtyMask.contains(.geometry))
 
         // Bump the frame token the way the renderer would.
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
 
         let p = layer._renderTimePresentation()
         #expect(p !== layer)
@@ -57,7 +58,7 @@ struct PresentationCacheTests {
         layer.bounds = CGRect(x: 0, y: 0, width: 10, height: 10)
 
         // Force a frame so the cache token can be set.
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
 
         let first  = layer.presentation()
         let second = layer.presentation()
@@ -73,7 +74,7 @@ struct PresentationCacheTests {
     @Test func nextFrameInvalidatesCache() {
         let layer = CALayer()
         layer.bounds = CGRect(x: 0, y: 0, width: 10, height: 10)
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
         guard let first = layer.presentation() else {
             Issue.record("presentation() returned nil on clean layer")
             return
@@ -83,7 +84,7 @@ struct PresentationCacheTests {
         #expect(firstWidth == expectedFirstWidth)
 
         // New frame + dirty mutation.
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
         layer.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
 
         guard let second = layer.presentation() else {
@@ -108,7 +109,7 @@ struct PresentationCacheTests {
         parent.addSublayer(c)
         parent._testClearDirty()
 
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
         let first = parent.sortedSublayers()
 
         // Same frame, no mutations: must hit the cache.
@@ -120,7 +121,7 @@ struct PresentationCacheTests {
 
         // Next frame, still clean: cache is invalidated by the token bump
         // but rebuilds the same ordering. Element identity must match.
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
         let nextFrame = parent.sortedSublayers()
         #expect(first.count == nextFrame.count)
         for (i, layer) in first.enumerated() {
@@ -136,7 +137,7 @@ struct PresentationCacheTests {
         parent.addSublayer(a)
         parent.addSublayer(b)
         parent._testClearDirty()
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
         let before = parent.sortedSublayers()
         #expect(before.count == 2)
 
@@ -157,7 +158,7 @@ struct PresentationCacheTests {
         parent.addSublayer(a)
         parent.addSublayer(b)
         parent._testClearDirty()
-        CALayer._currentFrameToken &+= 1
+        CALayer.advanceFrameToken()
         let before = parent.sortedSublayers()
         #expect(before.first === a)
         #expect(before.last  === b)
@@ -170,4 +171,5 @@ struct PresentationCacheTests {
         #expect(after.first === b)
         #expect(after.last  === a)
     }
+}
 }

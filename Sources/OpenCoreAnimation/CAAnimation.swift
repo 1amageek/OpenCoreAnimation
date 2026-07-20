@@ -28,7 +28,7 @@ open class CAAnimation: CAMediaTiming, CAAction {
         self.timingFunction = animation.timingFunction
         self.delegate = animation.delegate
         self.isRemovedOnCompletion = animation.isRemovedOnCompletion
-        // Runtime state (addedTime / isFinished / attachedLayer / animationKey)
+        // Runtime state (isFinished / attachedLayer / animationKey)
         // is intentionally NOT copied — a fresh copy represents a new, unstarted
         // animation that has not yet been attached to a layer.
     }
@@ -85,11 +85,11 @@ open class CAAnimation: CAMediaTiming, CAAction {
 
     // MARK: - Internal State
 
-    /// The time at which the animation was added to the layer.
-    internal var addedTime: CFTimeInterval = 0
-
     /// Whether the animation has completed.
     internal var isFinished: Bool = false
+
+    /// Whether the animation has entered its active interval.
+    internal var hasStarted: Bool = false
 
     /// The layer this animation is attached to (weak reference).
     internal weak var attachedLayer: CALayer?
@@ -97,28 +97,21 @@ open class CAAnimation: CAMediaTiming, CAAction {
     /// The key used when this animation was added to the layer.
     internal var animationKey: String?
 
+    /// Transaction completion blocks waiting for this animation.
+    private var completionCoordinators: [CATransactionCompletionCoordinator] = []
+
     /// Calculates the total wall-clock duration including repeats, autoreverses, and speed.
     ///
     /// The returned duration represents actual elapsed time (wall-clock),
     /// accounting for the `speed` multiplier. When `speed` is 0, the animation
     /// never completes, so `.infinity` is returned.
     internal var totalDuration: CFTimeInterval {
-        // Get base duration - subclasses may override effectiveBaseDuration
-        let baseDuration = effectiveBaseDuration
-        var total = baseDuration
-
-        // Note: If both repeatDuration and repeatCount are specified,
-        // the behavior is undefined according to Apple docs.
-        // We prioritize repeatDuration when set.
-        if repeatDuration > 0 {
-            total = repeatDuration
-        } else if repeatCount > 0 {
-            total *= CFTimeInterval(repeatCount)
-        }
-
-        if autoreverses {
-            total *= 2
-        }
+        let total = CAMediaTimingEvaluator.activeDuration(
+            duration: effectiveBaseDuration,
+            repeatCount: repeatCount,
+            repeatDuration: repeatDuration,
+            autoreverses: autoreverses
+        )
 
         // Convert from local time to wall-clock time by dividing by abs(speed).
         // speed=0 means the animation is paused and never completes.
@@ -140,6 +133,27 @@ open class CAAnimation: CAMediaTiming, CAAction {
         guard !isFinished else { return }
         isFinished = true
         delegate?.animationDidStop(self, finished: completed)
+        let coordinators = completionCoordinators
+        completionCoordinators.removeAll()
+        for coordinator in coordinators {
+            coordinator.animationCompleted()
+        }
+    }
+
+    /// Marks the animation as started and notifies its delegate once.
+    internal func markStarted() {
+        guard !hasStarted, !isFinished else { return }
+        hasStarted = true
+        delegate?.animationDidStart(self)
+    }
+
+    /// Registers this animation with a transaction completion coordinator.
+    internal func attachCompletionCoordinator(
+        _ coordinator: CATransactionCompletionCoordinator
+    ) {
+        guard !completionCoordinators.contains(where: { $0 === coordinator }) else { return }
+        completionCoordinators.append(coordinator)
+        coordinator.registerAnimation()
     }
 
     // MARK: - CAAction
@@ -199,8 +213,8 @@ open class CAAnimation: CAMediaTiming, CAAction {
             }
         }
 
-        // Add the animation to the layer
-        // Note: delegate?.animationDidStart is called inside layer.add()
+        // Add the animation to the layer. The start callback is delivered
+        // when the animation actually enters its active interval.
         layer.add(self, forKey: event)
     }
 

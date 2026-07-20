@@ -1,8 +1,8 @@
 import Testing
 @testable import OpenCoreAnimation
 
-func setStoredAnimationAddedTime(
-    _ addedTime: CFTimeInterval,
+func setStoredAnimationBeginTime(
+    _ beginTime: CFTimeInterval,
     on layer: CALayer,
     forKey key: String
 ) {
@@ -10,5 +10,5 @@ func setStoredAnimationAddedTime(
         Issue.record("Expected stored animation for key \(key).")
         return
     }
-    animation.addedTime = addedTime
+    animation.beginTime = beginTime
 }
