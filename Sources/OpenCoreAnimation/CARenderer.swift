@@ -41,7 +41,7 @@ public protocol CARenderer: AnyObject {
     /// and prepares all resources needed for rendering.
     ///
     /// - Throws: `CARendererError` if initialization fails.
-    func initialize() async throws
+    @MainActor func initialize() async throws
 
     /// Resizes the render target.
     ///

@@ -15,6 +15,7 @@ import OpenCoreGraphics
 #if canImport(Metal)
 
 @Suite(.serialized)
+@MainActor
 struct RendererDirtyClearTests {
 
     init() { resetPerformanceTestState() }

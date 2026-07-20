@@ -613,7 +613,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - CARenderer
 
-    public func initialize() async throws {
+    @MainActor public func initialize() async throws {
         // Get GPU
         guard let gpu = GPU.shared else {
             throw CARendererError.deviceNotAvailable

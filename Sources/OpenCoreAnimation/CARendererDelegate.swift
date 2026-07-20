@@ -68,7 +68,7 @@ internal protocol CARendererDelegate: AnyObject {
     /// and prepares all resources needed for rendering.
     ///
     /// - Throws: `CARendererError` if initialization fails.
-    func initialize() async throws
+    @MainActor func initialize() async throws
 
     /// Releases all GPU resources.
     ///
@@ -118,7 +118,7 @@ internal enum CARendererDelegateFactory {
     /// - Returns: A renderer delegate appropriate for the current platform.
     /// - Throws: `CARendererError` if renderer creation fails (WASM only).
     #if arch(wasm32)
-    static func createRenderer(canvas: JavaScriptKit.JSObject) async throws -> CARendererDelegate {
+    @MainActor static func createRenderer(canvas: JavaScriptKit.JSObject) async throws -> CARendererDelegate {
         let renderer = CAWebGPURenderer(canvas: canvas)
         try await renderer.initialize()
         return renderer
@@ -144,7 +144,7 @@ internal final class CAMetalRendererDelegate: CARendererDelegate, @unchecked Sen
 
     var size: CGSize = .zero
 
-    func initialize() async throws {
+    @MainActor func initialize() async throws {
         // No-op for testing
     }
 

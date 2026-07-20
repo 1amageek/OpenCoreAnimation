@@ -14,6 +14,7 @@ import Foundation
 #if canImport(Metal)
 
 @Suite(.serialized)
+@MainActor
 struct RasterizationTests {
 
     init() { resetPerformanceTestState() }

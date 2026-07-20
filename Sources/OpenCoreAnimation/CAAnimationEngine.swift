@@ -109,7 +109,7 @@ public final class CAAnimationEngine: CADisplayLinkDelegate {
     ///
     /// - Parameter canvas: The HTML canvas element to render to.
     /// - Throws: `CARendererError` if renderer initialization fails.
-    public func setCanvas(_ canvas: JavaScriptKit.JSObject) async throws {
+    @MainActor public func setCanvas(_ canvas: JavaScriptKit.JSObject) async throws {
         rendererDelegate = try await CARendererDelegateFactory.createRenderer(canvas: canvas)
     }
     #endif

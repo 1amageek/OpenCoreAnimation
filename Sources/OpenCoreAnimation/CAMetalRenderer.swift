@@ -46,7 +46,7 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate, @unchecked S
 
     // MARK: - CARenderer
 
-    public func initialize() async throws {
+    @MainActor public func initialize() async throws {
         // Get the default Metal device
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw CARendererError.deviceNotAvailable
