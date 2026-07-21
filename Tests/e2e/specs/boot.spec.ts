@@ -22,6 +22,7 @@ interface OCA extends Harness {
     getPixelReadback: () => string;
     getTransitionFilterProbeResult: () => string;
     getLayerFilterProbeResult: () => string;
+    getTextProbeResult: () => string;
     getShadowProbeResult: () => string;
     getDisplayLinkProbeResult: () => string;
     getEmitterProbeResult: () => string;
@@ -47,6 +48,7 @@ interface OCA extends Harness {
     exerciseUnsupportedTransitionSubtype: () => void;
     beginTransitionFilterProbes: () => void;
     beginLayerFilterProbe: () => void;
+    beginTextProbe: () => void;
     beginCompositionProbe: () => void;
     beginTransformDepthProbe: () => void;
     beginShadowProbe: () => void;
@@ -122,6 +124,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         );
         expect(await h.getActiveFilterResourceCount()).toBe(0);
         expect(await h.getLayerFilterFailureCount()).toBe(1);
+
+        await h.beginTextProbe();
+        await expect.poll(() => h.getTextProbeResult(), { timeout: 10_000 }).toBe(
+            "initial=0,0,0,255;255,255,255,255;255,255,255,255;0,0,0,255;255,255,255,255;255,255,255,255;0,0,0,255;0,0,0,255;255,255,255,255;0,0,0,255;255,255,255,255;0,0,0,255;255,255,255,255;255,255,255,255;0,0,0,255;0,0,0,255,mutated=0,0,0,255;255,255,255,255;255,255,255,255;0,0,0,255"
+        );
 
         await h.beginTransformDepthProbe();
         await expect.poll(() => h.getTransformDepthProbeResult(), { timeout: 10_000 }).toBe(

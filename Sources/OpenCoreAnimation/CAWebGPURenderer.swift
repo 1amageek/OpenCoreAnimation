@@ -6303,6 +6303,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard !text.isEmpty else {
             return
         }
+        guard textLayer.fontSize.isFinite, textLayer.fontSize > 0 else {
+            return
+        }
 
         // Determine text size: use bounds if set, otherwise measure with Canvas2D
         let width: Int
@@ -6412,14 +6415,28 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 x = 0
             }
 
-            // Draw text (simple single-line for now)
-            // For wrapped text, we would need to implement line breaking
+            // Draw measured single-line or wrapped text into the layer texture.
             if textLayer.isWrapped {
-                // Simple word wrapping
-                drawWrappedText(ctx: ctx, text: text, x: x, y: 0,
-                               maxWidth: Double(width), lineHeight: textLayer.fontSize * 1.2)
+                drawWrappedText(
+                    ctx: ctx,
+                    text: text,
+                    x: x,
+                    y: 0,
+                    maxWidth: Double(width),
+                    maxHeight: Double(height),
+                    lineHeight: textLayer.fontSize * 1.2,
+                    truncationMode: textLayer.truncationMode
+                )
             } else {
-                _ = ctx.fillText!(text, x, Double(textLayer.fontSize * 0.1))
+                let displayedText = CATextLayoutEngine.truncatedText(
+                    text,
+                    mode: textLayer.truncationMode,
+                    maximumWidth: CGFloat(width),
+                    measure: { candidate in
+                        CGFloat(self.measureWidth(ctx: ctx, candidate))
+                    }
+                )
+                _ = ctx.fillText!(displayedText, x, Double(textLayer.fontSize * 0.1))
             }
 
             // Get image data from canvas
@@ -6586,7 +6603,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             colorHex = "FFFFFFFF"
         }
 
-        return "\(text)_\(width)x\(height)_\(layer.fontSize)_\(layer.alignmentMode.rawValue)_\(fontFingerprint)_\(colorHex)_\(layer.isWrapped ? "w" : "n")"
+        return "\(text)_\(width)x\(height)_\(layer.fontSize)_\(layer.alignmentMode.rawValue)_\(layer.truncationMode.rawValue)_\(fontFingerprint)_\(colorHex)_\(layer.isWrapped ? "w" : "n")"
     }
 
     /// Returns `true` if the given Unicode scalar is in a CJK script range where
@@ -6687,49 +6704,77 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return out
     }
 
-    /// Draws wrapped text on a Canvas2D context using script-aware line breaks.
-    private func drawWrappedText(ctx: JSObject, text: String, x: Double, y: Double,
-                                 maxWidth: Double, lineHeight: CGFloat) {
-        let tokens = Self.lineBreakTokens(in: text)
+    /// Draws wrapped text and truncates the final visible line when requested.
+    private func drawWrappedText(
+        ctx: JSObject,
+        text: String,
+        x: Double,
+        y: Double,
+        maxWidth: Double,
+        maxHeight: Double,
+        lineHeight: CGFloat,
+        truncationMode: CATextLayerTruncationMode
+    ) {
+        guard lineHeight.isFinite, lineHeight > 0 else { return }
+        var lines: [String] = []
         var line = ""
-        var currentY = y
 
-        for token in tokens {
+        func appendLine() {
+            lines.append(line)
+            line = ""
+        }
+
+        for token in Self.lineBreakTokens(in: text) {
             let candidate = line.isEmpty ? token : line + " " + token
             let candidateWidth = measureWidth(ctx: ctx, candidate)
 
             if candidateWidth > maxWidth && !line.isEmpty {
-                // Commit the current line and try to place this token on a new one.
-                _ = ctx.fillText!(line, x, currentY)
-                currentY += Double(lineHeight)
-
-                // Does the token itself fit on an empty line?
+                appendLine()
                 if measureWidth(ctx: ctx, token) > maxWidth {
                     let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: maxWidth)
-                    // All but the last chunk each become their own line.
-                    for chunk in chunks.dropLast() {
-                        _ = ctx.fillText!(chunk, x, currentY)
-                        currentY += Double(lineHeight)
-                    }
+                    lines.append(contentsOf: chunks.dropLast())
                     line = chunks.last ?? ""
                 } else {
                     line = token
                 }
             } else if line.isEmpty && candidateWidth > maxWidth {
-                // First token on the line is already too wide — break per-character.
                 let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: maxWidth)
-                for chunk in chunks.dropLast() {
-                    _ = ctx.fillText!(chunk, x, currentY)
-                    currentY += Double(lineHeight)
-                }
+                lines.append(contentsOf: chunks.dropLast())
                 line = chunks.last ?? ""
             } else {
                 line = candidate
             }
         }
+        if !line.isEmpty || lines.isEmpty {
+            appendLine()
+        }
 
-        if !line.isEmpty {
-            _ = ctx.fillText!(line, x, currentY)
+        let visibleLineCount = max(1, Int(floor(maxHeight / Double(lineHeight))))
+        var displayedLines = lines
+        let shouldTruncate = truncationMode == .start
+            || truncationMode == .middle
+            || truncationMode == .end
+        if shouldTruncate, lines.count > visibleLineCount {
+            displayedLines = Array(lines.prefix(visibleLineCount))
+            let overflowText = lines
+                .dropFirst(visibleLineCount - 1)
+                .joined(separator: " ")
+            displayedLines[visibleLineCount - 1] = CATextLayoutEngine.truncatedText(
+                overflowText,
+                mode: truncationMode,
+                maximumWidth: CGFloat(maxWidth),
+                measure: { candidate in
+                    CGFloat(self.measureWidth(ctx: ctx, candidate))
+                }
+            )
+        }
+
+        for (index, displayedLine) in displayedLines.enumerated() {
+            _ = ctx.fillText!(
+                displayedLine,
+                x,
+                y + Double(index) * Double(lineHeight)
+            )
         }
     }
 

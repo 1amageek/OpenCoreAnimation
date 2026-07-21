@@ -37,6 +37,7 @@ nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
 nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
+nonisolated(unsafe) var textProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
@@ -86,6 +87,7 @@ public func setup() {
             pixelReadbackResult = "pending"
             transitionFilterProbeResult = "pending"
             layerFilterProbeResult = "pending"
+            textProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
             emitterProbeResult = "pending"
@@ -259,6 +261,9 @@ func installHarness() {
         })
         h.expose("getLayerFilterProbeResult", returning: {
             .string(layerFilterProbeResult)
+        })
+        h.expose("getTextProbeResult", returning: {
+            .string(textProbeResult)
         })
         h.expose("getShadowProbeResult", returning: {
             .string(shadowProbeResult)
@@ -697,6 +702,94 @@ func installHarness() {
                 rejected.removeFromSuperlayer()
                 alphaFiltered.removeFromSuperlayer()
                 engine.renderFrame()
+            }
+        })
+        h.expose("beginTextProbe", action: {
+            Task { @MainActor in
+                textProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    textProbeResult = "error: text dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func makeTextLayer(
+                    x: CGFloat,
+                    mode: CATextLayerTruncationMode,
+                    wrapped: Bool = false
+                ) -> CATextLayer {
+                    let layer = CATextLayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 48, height: 24)
+                    layer.position = CGPoint(x: x, y: 240)
+                    layer.zPosition = 100
+                    layer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+                    layer.foregroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                    layer.font = "monospace"
+                    layer.fontSize = 20
+                    layer.string = wrapped ? "██ ██ ██" : "████████"
+                    layer.isWrapped = wrapped
+                    layer.truncationMode = mode
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                let startLayer = makeTextLayer(x: 50, mode: .start)
+                let endLayer = makeTextLayer(x: 120, mode: .end)
+                let middleLayer = makeTextLayer(x: 190, mode: .middle)
+                let wrappedLayer = makeTextLayer(x: 260, mode: .end, wrapped: true)
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    startLayer.removeFromSuperlayer()
+                    endLayer.removeFromSuperlayer()
+                    middleLayer.removeFromSuperlayer()
+                    wrappedLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                let sampleOffsets: [CGFloat] = [-18, -6, 6, 18]
+                func samplePoints(for x: CGFloat) -> [CGPoint] {
+                    sampleOffsets.map { CGPoint(x: x + $0, y: 60) }
+                }
+
+                engine.renderFrame()
+                do {
+                    let initialPixels = try await renderer.readbackPixels(at:
+                        samplePoints(for: 50)
+                            + samplePoints(for: 120)
+                            + samplePoints(for: 190)
+                            + samplePoints(for: 260)
+                    )
+                    endLayer.truncationMode = .start
+                    engine.renderFrame()
+                    let mutatedPixels = try await renderer.readbackPixels(at: samplePoints(for: 120))
+
+                    restoreScene()
+
+                    textProbeResult = "initial="
+                        + initialPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",mutated="
+                        + mutatedPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                } catch {
+                    restoreScene()
+                    textProbeResult = "error: \(error)"
+                }
             }
         })
         h.expose("beginTransformDepthProbe", action: {
