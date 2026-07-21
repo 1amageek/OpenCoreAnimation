@@ -746,30 +746,53 @@ func installHarness() {
                     return
                 }
 
-                func makeEmitter(x: CGFloat, color: CGColor) -> CAEmitterLayer {
+                func makeEmitter(
+                    x: CGFloat,
+                    color: CGColor,
+                    shape: CAEmitterLayerEmitterShape,
+                    mode: CAEmitterLayerEmitterMode,
+                    size: CGSize,
+                    latitude: CGFloat,
+                    longitude: CGFloat
+                ) -> CAEmitterLayer {
                     let cell = CAEmitterCell()
                     cell.birthRate = 10
                     cell.lifetime = 5
-                    cell.velocity = 0
+                    cell.velocity = 10
                     cell.scale = 1
                     cell.color = color
+                    cell.emissionLatitude = latitude
+                    cell.emissionLongitude = longitude
 
                     let layer = CAEmitterLayer()
                     layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
                     layer.position = CGPoint(x: x, y: 140)
                     layer.zPosition = 100
                     layer.emitterPosition = CGPoint(x: 10, y: 10)
+                    layer.emitterShape = shape
+                    layer.emitterMode = mode
+                    layer.emitterSize = size
                     layer.emitterCells = [cell]
                     return layer
                 }
 
                 let first = makeEmitter(
                     x: 70,
-                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                    shape: .rectangle,
+                    mode: .outline,
+                    size: CGSize(width: 20, height: 12),
+                    latitude: .pi / 2,
+                    longitude: 0
                 )
                 let second = makeEmitter(
                     x: 170,
-                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+                    shape: .sphere,
+                    mode: .surface,
+                    size: CGSize(width: 10, height: 1),
+                    latitude: .pi / 2,
+                    longitude: .pi / 2
                 )
                 root.addSublayer(first)
                 root.addSublayer(second)
@@ -780,7 +803,32 @@ func installHarness() {
                     engine.renderFrame()
                     let firstCount = renderer.activeParticleCount(for: first)
                     let secondCount = renderer.activeParticleCount(for: second)
-                    var result = "before=\(firstCount),\(secondCount),states=\(renderer.activeEmitterStateCount)"
+                    guard let firstPosition = renderer.activeParticlePositions(for: first).first,
+                          let secondPosition = renderer.activeParticlePositions(for: second).first,
+                          let firstVelocity = renderer.activeParticleVelocities(for: first).first,
+                          let secondVelocity = renderer.activeParticleVelocities(for: second).first else {
+                        first.removeFromSuperlayer()
+                        second.removeFromSuperlayer()
+                        engine.renderFrame()
+                        emitterProbeResult = "error: particle diagnostics unavailable"
+                        return
+                    }
+                    let firstOnOutline = abs(abs(firstPosition.x - 10) - 10) < 0.001
+                        || abs(abs(firstPosition.y - 10) - 6) < 0.001
+                    let sphereOffset = secondPosition - SIMD3<Float>(10, 10, 0)
+                    let sphereRadius = sqrt(
+                        sphereOffset.x * sphereOffset.x
+                            + sphereOffset.y * sphereOffset.y
+                            + sphereOffset.z * sphereOffset.z
+                    )
+                    let geometryMatches = firstOnOutline && abs(sphereRadius - 10) < 0.001
+                    let directionsMatch = firstVelocity.x > 9.999
+                        && abs(firstVelocity.y) < 0.001
+                        && abs(firstVelocity.z) < 0.001
+                        && abs(secondVelocity.x) < 0.001
+                        && secondVelocity.y > 9.999
+                        && abs(secondVelocity.z) < 0.001
+                    var result = "before=\(firstCount),\(secondCount),states=\(renderer.activeEmitterStateCount),geometry=\(geometryMatches),directions=\(directionsMatch),failures=\(renderer.emitterSpawnFailureCount)"
 
                     first.removeFromSuperlayer()
                     engine.renderFrame()
