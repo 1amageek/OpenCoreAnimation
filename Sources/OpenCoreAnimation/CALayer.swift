@@ -3598,9 +3598,16 @@ open class CALayer: CAMediaTiming, Hashable {
     open var rasterizationScale: CGFloat {
         get { return _rasterizationScale }
         set {
-            guard _rasterizationScale != newValue else { return }
+            let oldValue = _rasterizationScale
+            guard oldValue != newValue else { return }
             _rasterizationScale = newValue
             markDirty(.rasterization)
+            CATransaction.registerChange(
+                layer: self,
+                keyPath: "rasterizationScale",
+                oldValue: oldValue,
+                newValue: newValue
+            )
         }
     }
 

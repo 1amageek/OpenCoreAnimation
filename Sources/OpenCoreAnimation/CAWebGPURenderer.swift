@@ -1416,6 +1416,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var explicitRasterizationCaptureCount: Int = 0
 
+    /// Pixel sizes of explicit `shouldRasterize` captures encoded in the latest frame.
+    @_spi(RendererDiagnostics)
+    public private(set) var explicitRasterizationCapturePixelSizes: [CGSize] = []
+
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCompositeCount: Int = 0
 
@@ -3468,6 +3472,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transformDepthNesting = 0
         transformFlatteningCaptureCount = 0
         explicitRasterizationCaptureCount = 0
+        explicitRasterizationCapturePixelSizes.removeAll(keepingCapacity: true)
         transformFlatteningCompositeCount = 0
         isRenderingMainPass = false
 
@@ -9880,6 +9885,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             transformFlatteningCaptureCount += 1
         } else if purpose == .explicit {
             explicitRasterizationCaptureCount += 1
+            explicitRasterizationCapturePixelSizes.append(
+                CGSize(width: pixelWidth, height: pixelHeight)
+            )
         }
     }
 

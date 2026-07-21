@@ -41,6 +41,7 @@ nonisolated(unsafe) var textProbeResult: String = "pending"
 nonisolated(unsafe) var edgeAntialiasingProbeResult: String = "pending"
 nonisolated(unsafe) var booleanAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var contentsAnimationProbeResult: String = "pending"
+nonisolated(unsafe) var rasterizationScaleProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -157,6 +158,7 @@ public func setup() {
             edgeAntialiasingProbeResult = "pending"
             booleanAnimationProbeResult = "pending"
             contentsAnimationProbeResult = "pending"
+            rasterizationScaleProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -343,6 +345,9 @@ func installHarness() {
         })
         h.expose("getContentsAnimationProbeResult", returning: {
             .string(contentsAnimationProbeResult)
+        })
+        h.expose("getRasterizationScaleProbeResult", returning: {
+            .string(rasterizationScaleProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1275,6 +1280,72 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     contentsAnimationProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginRasterizationScaleProbe", action: {
+            Task { @MainActor in
+                rasterizationScaleProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    rasterizationScaleProbeResult = "error: rasterization scale dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                let rasterizedLayer = CALayer()
+                rasterizedLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                rasterizedLayer.position = CGPoint(x: 200, y: 150)
+                rasterizedLayer.zPosition = 100
+                rasterizedLayer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                rasterizedLayer.shouldRasterize = true
+                let animation = CABasicAnimation(keyPath: "rasterizationScale")
+                animation.fromValue = CGFloat(1)
+                animation.toValue = CGFloat(2)
+                animation.duration = 1
+                animation.speed = 0
+                animation.timeOffset = 0.5
+                animation.fillMode = .both
+                animation.isRemovedOnCompletion = false
+                rasterizedLayer.add(animation, forKey: "browserRasterizationScale")
+                root.addSublayer(rasterizedLayer)
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    rasterizedLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                let presentationScale = rasterizedLayer.presentation()?.rasterizationScale ?? -1
+                let captureSize = renderer.explicitRasterizationCapturePixelSizes.first
+                let captureCount = renderer.explicitRasterizationCaptureCount
+                do {
+                    let pixel = try await renderer.readbackPixel(x: 200, y: 150)
+                    restoreScene()
+                    rasterizationScaleProbeResult = "pixel="
+                        + pixel.map(String.init).joined(separator: ",")
+                        + ",scale=\(presentationScale)"
+                        + ",size=\(Int(captureSize?.width ?? -1))x\(Int(captureSize?.height ?? -1))"
+                        + ",captures=\(captureCount)"
+                } catch {
+                    restoreScene()
+                    rasterizationScaleProbeResult = "error: \(error)"
                 }
             }
         })
