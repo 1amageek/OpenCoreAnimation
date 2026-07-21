@@ -843,6 +843,38 @@ func installHarness() {
                 narrowShadowPath.addRect(CGRect(x: 0, y: 0, width: 10, height: 20))
                 pathShadowGroup.shadowPath = narrowShadowPath
                 crossingGroup.addSublayer(pathShadowGroup)
+
+                let compositionBackdropPlane = CALayer()
+                compositionBackdropPlane.bounds = CGRect(x: 0, y: 0, width: 60, height: 40)
+                compositionBackdropPlane.position = CGPoint(x: 300, y: 40)
+                compositionBackdropPlane.zPosition = -100
+                compositionBackdropPlane.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                crossingGroup.addSublayer(compositionBackdropPlane)
+
+                let compositionPlane = CALayer()
+                compositionPlane.bounds = compositionBackdropPlane.bounds
+                compositionPlane.position = compositionBackdropPlane.position
+                compositionPlane.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                guard let compositionScreenFilter = CIFilter(name: "CIScreenCompositing") else {
+                    crossingGroup.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    transformDepthProbeResult = "error: composition depth filter unavailable"
+                    return
+                }
+                compositionPlane.compositingFilter = compositionScreenFilter
+                crossingGroup.addSublayer(compositionPlane)
+
+                let compositionCrossingPlane = CALayer()
+                compositionCrossingPlane.bounds = compositionBackdropPlane.bounds
+                compositionCrossingPlane.position = compositionBackdropPlane.position
+                compositionCrossingPlane.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                compositionCrossingPlane.transform = CATransform3DMakeRotation(.pi / 3, 0, 1, 0)
+                crossingGroup.addSublayer(compositionCrossingPlane)
                 root.addSublayer(crossingGroup)
 
                 let transparencyGroup = CATransformLayer()
@@ -939,6 +971,8 @@ func installHarness() {
                         CGPoint(x: 235, y: 160),
                         CGPoint(x: 245, y: 160),
                         CGPoint(x: 185, y: 160),
+                        CGPoint(x: 285, y: 260),
+                        CGPoint(x: 315, y: 260),
                     ])
                     let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
@@ -993,6 +1027,8 @@ func installHarness() {
                         && pixels[16][3] == 255
                     let customShadowPathIsRespected = pixels[14] == [255, 255, 255, 255]
                         && pixels[15] == [0, 0, 0, 255]
+                    let compositionPlaneWritesDepth = pixels[17] == [0, 0, 255, 255]
+                        && pixels[18] == [255, 255, 0, 255]
                     let changedSubtreeWasRecaptured = updatedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningRecaptureCount == 1
                         && flatteningUpdatedCompositeCount == 7
@@ -1012,6 +1048,7 @@ func installHarness() {
                         + ",nestedFilter=\(nestedFilterUsesLocalPixels)"
                         + ",shadow=\(expandedShadowIsVisible)"
                         + ",shadowPath=\(customShadowPathIsRespected)"
+                        + ",compositionDepth=\(compositionPlaneWritesDepth)"
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
                 } catch {

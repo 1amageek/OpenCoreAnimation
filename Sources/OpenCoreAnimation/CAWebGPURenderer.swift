@@ -307,6 +307,7 @@ private final class CompositionLayerResources {
     let backdropUniformBuffer: GPUBuffer
     let resultConversionUniformBuffer: GPUBuffer
     let displayUniformBuffer: GPUBuffer
+    let transformedDisplayUniformBuffer: GPUBuffer
     let backdropMaskUniformBuffer: GPUBuffer
     let backdropMaskVertexBuffer: GPUBuffer
     private(set) var clipUniformBuffers: [GPUBuffer] = []
@@ -362,6 +363,10 @@ private final class CompositionLayerResources {
         backdropUniformBuffer = makeUniformBuffer()
         resultConversionUniformBuffer = makeUniformBuffer()
         displayUniformBuffer = makeUniformBuffer()
+        transformedDisplayUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(MemoryLayout<TexturedUniforms>.stride),
+            usage: [.uniform, .copyDst]
+        ))
         backdropMaskUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
             size: caRendererAlignedUniformSize,
             usage: [.uniform, .copyDst]
@@ -419,6 +424,7 @@ private final class CompositionLayerResources {
         backdropUniformBuffer.destroy()
         resultConversionUniformBuffer.destroy()
         displayUniformBuffer.destroy()
+        transformedDisplayUniformBuffer.destroy()
         backdropMaskUniformBuffer.destroy()
         backdropMaskVertexBuffer.destroy()
         for buffer in clipUniformBuffers {
@@ -1236,6 +1242,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Replaces the current framebuffer with an already-composited backdrop snapshot.
     private var filterReplacementPipeline: GPURenderPipeline?
 
+    /// Replaces a true-3D layer plane while preserving its projected depth.
+    private var transformedCompositionPipeline: GPURenderPipeline?
+
+    /// Stencil-aware variant of the true-3D composition replacement pipeline.
+    private var transformedCompositionStencilPipeline: GPURenderPipeline?
+
     /// Restricts filtered backdrop pixels to the transformed layer shape.
     private var backdropFilterMixPipeline: GPURenderPipeline?
 
@@ -1334,6 +1346,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCompositeCount: Int = 0
+
+    /// Distinguishes the user-visible render pass from offscreen prefix captures.
+    private var isRenderingMainPass = false
 
 
     /// Persistent cache of `GPUTextureView`s keyed by `TexturedCacheKey`.
@@ -2846,6 +2861,64 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: .layout(shadowCompositePipelineLayout)
         ))
 
+        let transformedCompositionShaderModule = device.createShaderModule(
+            descriptor: GPUShaderModuleDescriptor(code: CAWebGPUShaders.transformedComposition)
+        )
+        let transformedCompositionVertexState = GPUVertexState(
+            module: transformedCompositionShaderModule,
+            entryPoint: "vertexMain",
+            buffers: [
+                GPUVertexBufferLayout(
+                    arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                    attributes: [
+                        GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                        GPUVertexAttribute(
+                            format: .float32x2,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride),
+                            shaderLocation: 1
+                        ),
+                        GPUVertexAttribute(
+                            format: .float32x4,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2),
+                            shaderLocation: 2
+                        ),
+                    ]
+                ),
+            ]
+        )
+        func makeTransformedCompositionPipeline(
+            stencilCompare: GPUCompareFunction
+        ) -> GPURenderPipeline {
+            device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+                vertex: transformedCompositionVertexState,
+                depthStencil: GPUDepthStencilState(
+                    format: .depth24plusStencil8,
+                    depthWriteEnabled: true,
+                    depthCompare: .greaterEqual,
+                    stencilFront: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    ),
+                    stencilBack: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    )
+                ),
+                fragment: GPUFragmentState(
+                    module: transformedCompositionShaderModule,
+                    entryPoint: "fragmentMain",
+                    targets: [GPUColorTargetState(format: preferredFormat)]
+                ),
+                layout: .auto
+            ))
+        }
+        transformedCompositionPipeline = makeTransformedCompositionPipeline(stencilCompare: .always)
+        transformedCompositionStencilPipeline = makeTransformedCompositionPipeline(stencilCompare: .equal)
+
         let backdropMixBindGroupLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
             entries: [
                 GPUBindGroupLayoutEntry(
@@ -3173,6 +3246,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transformDepthNesting = 0
         transformFlatteningCaptureCount = 0
         transformFlatteningCompositeCount = 0
+        isRenderingMainPass = false
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
@@ -3307,7 +3381,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         // Render layer tree (projectionMatrix already created above for shadow pre-rendering)
+        isRenderingMainPass = true
         renderLayer(rootLayer, renderPass: renderPass, parentMatrix: projectionMatrix)
+        isRenderingMainPass = false
 
         renderPass.end()
 
@@ -3581,6 +3657,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         maskedPipeline = nil
         maskBindGroupLayout = nil
         filterReplacementPipeline = nil
+        transformedCompositionPipeline = nil
+        transformedCompositionStencilPipeline = nil
         backdropFilterMixPipeline = nil
         compositionMaskIntersectPipeline = nil
         compositionMaskApplyPipeline = nil
@@ -3756,9 +3834,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
+        let hasBackdropComposition = presentationLayer.compositingFilter != nil
+            || presentationLayer.backgroundFilters?.isEmpty == false
         if rasterizePrerenderRootLayer !== layer,
+           !hasBackdropComposition,
            let flattenedTexture = prerasterizedTextures[currentRenderKey] {
-            if flattenedTexture.purpose == .transformFlattening {
+            if isRenderingMainPass,
+               flattenedTexture.purpose == .transformFlattening {
                 transformFlatteningCompositeCount += 1
             }
             renderRasterizedLayerComposite(
@@ -3796,6 +3878,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // Render mask to stencil buffer
             renderMaskToStencil(maskLayer, renderPass: renderPass, parentMatrix: modelMatrix)
         }
+        defer {
+            if hasMask {
+                clearStencilMask(renderPass: renderPass)
+            }
+        }
 
         // Render shadow before layer content. Filters apply to the layer subtree capture, but
         // the shadow itself is composited separately in the main pass.
@@ -3813,14 +3900,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Handle special layer types first
 
-        let hasBackdropComposition = presentationLayer.compositingFilter != nil
-            || presentationLayer.backgroundFilters?.isEmpty == false
         if filterPrerenderRootLayer !== layer, hasBackdropComposition {
             if let composition = prerenderedCompositions[currentRenderKey] {
                 renderPreparedComposition(
                     composition,
+                    presentationLayer: presentationLayer,
                     device: device,
-                    renderPass: renderPass
+                    renderPass: renderPass,
+                    modelMatrix: modelMatrix
                 )
             }
             // Requested backdrop effects never fall through to an unprocessed source-over draw.
@@ -3996,10 +4083,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         }
 
-        // Clear stencil mask if we used one
-        if hasMask {
-            clearStencilMask(renderPass: renderPass)
-        }
     }
 
     private func prerenderTransitions(
@@ -9863,9 +9946,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     private func renderPreparedComposition(
         _ composition: PrerenderedComposition,
+        presentationLayer: CALayer,
         device: GPUDevice,
-        renderPass: GPURenderPassEncoder
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
     ) {
+        if transformDepthNesting > 0 {
+            renderPreparedCompositionPlane(
+                composition,
+                presentationLayer: presentationLayer,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+            return
+        }
         guard let filterReplacementPipeline,
               let blurSampler else { return }
 
@@ -9891,6 +9986,72 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         renderPass.setPipeline(filterReplacementPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup)
+        renderPass.draw(vertexCount: 6)
+    }
+
+    private func renderPreparedCompositionPlane(
+        _ composition: PrerenderedComposition,
+        presentationLayer: CALayer,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) {
+        let selectedPipeline = maskNestingDepth > 0
+            ? transformedCompositionStencilPipeline
+            : transformedCompositionPipeline
+        guard let selectedPipeline,
+              let blurSampler,
+              let vertexBuffer else { return }
+        let bounds = presentationLayer.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return }
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(bounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(bounds.height), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        var uniforms = TexturedUniforms(
+            mvpMatrix: modelMatrix * scaleMatrix,
+            layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
+        )
+        device.queue.writeBuffer(
+            composition.resources.transformedDisplayUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &uniforms)
+        )
+
+        let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: selectedPipeline.getBindGroupLayout(index: 0),
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(
+                    composition.resources.transformedDisplayUniformBuffer,
+                    offset: 0,
+                    size: UInt64(MemoryLayout<TexturedUniforms>.stride)
+                )),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(composition.outputView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler)),
+            ]
+        ))
+        let white = SIMD4<Float>(repeating: 1)
+        var vertices = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: .zero, color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: .zero, color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: .zero, color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: .zero, color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: .zero, color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: .zero, color: white),
+        ]
+        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: allocation.vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup)
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: allocation.vertexOffset)
         renderPass.draw(vertexCount: 6)
     }
 
