@@ -606,6 +606,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// The WebGPU device.
     private var device: GPUDevice?
 
+    /// Retains the JavaScript callback used to surface uncaptured WebGPU failures.
+    private var uncapturedGPUErrorHandler: JSClosure?
+
+    /// First WebGPU failure that escaped an explicit error scope.
+    @_spi(RendererDiagnostics)
+    public private(set) var firstUncapturedGPUError: String?
+
     /// The canvas context.
     private var context: GPUCanvasContext?
 
@@ -1183,6 +1190,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Stencil-aware premultiplied textured pipeline with true-3D depth testing.
     private var premultipliedTexturedDepthStencilPipeline: GPURenderPipeline?
 
+    /// Interpolates two premultiplied transition captures in one fragment pass.
+    private var transitionFadePipeline: GPURenderPipeline?
+
+    /// True-3D variant of the premultiplied transition fade pipeline.
+    private var transitionFadeDepthPipeline: GPURenderPipeline?
+
+    /// Stencil-aware transition fade pipeline.
+    private var transitionFadeStencilPipeline: GPURenderPipeline?
+
+    /// Stencil-aware transition fade pipeline with true-3D depth testing.
+    private var transitionFadeDepthStencilPipeline: GPURenderPipeline?
+
+    /// Bindings for fade uniforms and the frozen source/target textures.
+    private var transitionFadeBindGroupLayout: GPUBindGroupLayout?
+
     /// The bind group layout for textured rendering.
     private var texturedBindGroupLayout: GPUBindGroupLayout?
 
@@ -1527,6 +1549,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Request device
         let device = try await adapter.requestDevice()
         self.device = device
+        uncapturedGPUErrorHandler = device.onUncapturedError { [weak self] event in
+            guard self?.firstUncapturedGPUError == nil else { return }
+            self?.firstUncapturedGPUError = event.error?.message
+        }
         transitionFilterProcessor = CIWebGPUTransitionProcessor(device: device)
         layerFilterProcessor = CIWebGPUFilterProcessor(device: device)
 
@@ -2341,6 +2367,116 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             device: device,
             bindGroupLayout: texturedBindGroupLayout
         )
+        createTransitionFadePipelines(device: device)
+    }
+
+    private func createTransitionFadePipelines(device: GPUDevice) {
+        let bindGroupLayout = device.createBindGroupLayout(
+            descriptor: GPUBindGroupLayoutDescriptor(entries: [
+                GPUBindGroupLayoutEntry(
+                    binding: 0,
+                    visibility: [.vertex, .fragment],
+                    buffer: GPUBufferBindingLayout(
+                        type: .uniform,
+                        hasDynamicOffset: true,
+                        minBindingSize: UInt64(MemoryLayout<TransitionFadeUniforms>.stride)
+                    )
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 1,
+                    visibility: .fragment,
+                    sampler: GPUSamplerBindingLayout(type: .filtering)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 2,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 3,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
+                ),
+            ])
+        )
+        transitionFadeBindGroupLayout = bindGroupLayout
+        let pipelineLayout = device.createPipelineLayout(
+            descriptor: GPUPipelineLayoutDescriptor(bindGroupLayouts: [bindGroupLayout])
+        )
+        let shaderModule = device.createShaderModule(
+            descriptor: GPUShaderModuleDescriptor(code: CAWebGPUShaders.transitionFade)
+        )
+        let vertexState = GPUVertexState(
+            module: shaderModule,
+            entryPoint: "vertexMain",
+            buffers: [
+                GPUVertexBufferLayout(
+                    arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                    attributes: [
+                        GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                        GPUVertexAttribute(
+                            format: .float32x2,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride),
+                            shaderLocation: 1
+                        ),
+                        GPUVertexAttribute(
+                            format: .float32x4,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2),
+                            shaderLocation: 2
+                        ),
+                    ]
+                )
+            ]
+        )
+        let blend = GPUBlendState(
+            color: GPUBlendComponent(
+                srcFactor: .one,
+                dstFactor: .oneMinusSrcAlpha,
+                operation: .add
+            ),
+            alpha: GPUBlendComponent(
+                srcFactor: .one,
+                dstFactor: .oneMinusSrcAlpha,
+                operation: .add
+            )
+        )
+
+        func makePipeline(
+            stencilCompare: GPUCompareFunction,
+            depthEnabled: Bool
+        ) -> GPURenderPipeline {
+            device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+                vertex: vertexState,
+                depthStencil: GPUDepthStencilState(
+                    format: .depth24plusStencil8,
+                    depthWriteEnabled: depthEnabled,
+                    depthCompare: depthEnabled ? .greaterEqual : .always,
+                    stencilFront: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    ),
+                    stencilBack: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    )
+                ),
+                fragment: GPUFragmentState(
+                    module: shaderModule,
+                    entryPoint: "fragmentMain",
+                    targets: [GPUColorTargetState(format: preferredFormat, blend: blend)]
+                ),
+                layout: .layout(pipelineLayout)
+            ))
+        }
+
+        transitionFadePipeline = makePipeline(stencilCompare: .always, depthEnabled: false)
+        transitionFadeStencilPipeline = makePipeline(stencilCompare: .equal, depthEnabled: false)
+        transitionFadeDepthPipeline = makePipeline(stencilCompare: .always, depthEnabled: true)
+        transitionFadeDepthStencilPipeline = makePipeline(stencilCompare: .equal, depthEnabled: true)
     }
 
     private func createEmitterTexturedAdditivePipelines(
@@ -3607,6 +3743,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     }
 
     public func invalidate() {
+        if let device, let uncapturedGPUErrorHandler {
+            device.removeUncapturedErrorHandler(uncapturedGPUErrorHandler)
+        }
+        uncapturedGPUErrorHandler = nil
+        firstUncapturedGPUError = nil
+
         // Invalidate buffer pools
         vertexBufferPool?.invalidate()
         vertexBufferPool = nil
@@ -3634,6 +3776,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         premultipliedTexturedStencilPipeline = nil
         premultipliedTexturedDepthPipeline = nil
         premultipliedTexturedDepthStencilPipeline = nil
+        transitionFadePipeline = nil
+        transitionFadeStencilPipeline = nil
+        transitionFadeDepthPipeline = nil
+        transitionFadeDepthStencilPipeline = nil
+        transitionFadeBindGroupLayout = nil
         texturedBindGroupLayout = nil
         textureSampler = nil
 
@@ -4585,8 +4732,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         switch state.type {
         case .fade:
-            renderParticipant(capture.source, cacheKey: .transitionSource(sourceID), offset: .zero, opacityMultiplier: 1)
-            renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: Float(progress))
+            renderFadeTransition(
+                capture,
+                sourceID: sourceID,
+                progress: Float(progress),
+                renderPass: renderPass,
+                parentMatrix: parentMatrix
+            )
 
         case .moveIn:
             guard let direction = transitionDirection(
@@ -4635,6 +4787,118 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         default:
             return
         }
+    }
+
+    private func renderFadeTransition(
+        _ capture: TransitionCapturePair,
+        sourceID: ObjectIdentifier,
+        progress: Float,
+        renderPass: GPURenderPassEncoder,
+        parentMatrix: Matrix4x4
+    ) {
+        guard let device,
+              let transitionFadeBindGroupLayout,
+              let textureSampler,
+              let vertexBuffer,
+              let uniformBuffer,
+              let selectedPipeline = selectedTransitionFadePipeline() else {
+            return
+        }
+
+        let presentation = capture.target.compositeLayer
+        let bounds = presentation.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return }
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(bounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(bounds.height), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: SIMD4(repeating: 1)),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: SIMD4(repeating: 1)),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: SIMD4(repeating: 1)),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: SIMD4(repeating: 1)),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: SIMD4(repeating: 1)),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: SIMD4(repeating: 1)),
+        ]
+        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+            return
+        }
+
+        var uniforms = TransitionFadeUniforms(
+            mvpMatrix: presentation.modelMatrix(parentMatrix: parentMatrix) * scaleMatrix,
+            colorMultiplier: currentReplicatorColor,
+            opacity: currentEffectiveOpacity * presentation.opacity,
+            progress: progress
+        )
+        let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+
+        let sourceView = cachedTransitionTextureView(
+            key: .transitionSource(sourceID),
+            texture: capture.source.texture
+        )
+        let targetView = cachedTransitionTextureView(
+            key: .transitionTarget(sourceID),
+            texture: capture.target.texture
+        )
+        let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: transitionFadeBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(
+                    binding: 0,
+                    resource: .bufferBinding(GPUBufferBinding(
+                        buffer: uniformBuffer,
+                        size: UInt64(MemoryLayout<TransitionFadeUniforms>.stride)
+                    ))
+                ),
+                GPUBindGroupEntry(binding: 1, resource: .sampler(textureSampler)),
+                GPUBindGroupEntry(binding: 2, resource: .textureView(sourceView)),
+                GPUBindGroupEntry(binding: 3, resource: .textureView(targetView)),
+            ]
+        ))
+
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.draw(vertexCount: 6)
+        if let pipeline {
+            renderPass.setPipeline(pipeline)
+        }
+    }
+
+    private func selectedTransitionFadePipeline() -> GPURenderPipeline? {
+        if transformDepthNesting > 0 {
+            return maskNestingDepth > 0
+                ? transitionFadeDepthStencilPipeline
+                : transitionFadeDepthPipeline
+        }
+        return maskNestingDepth > 0
+            ? transitionFadeStencilPipeline
+            : transitionFadePipeline
+    }
+
+    private func cachedTransitionTextureView(
+        key: TexturedCacheKey,
+        texture: GPUTexture
+    ) -> GPUTextureView {
+        if let cached = texturedTextureViewCache[key] {
+            return cached
+        }
+        let view = texture.createView()
+        texturedTextureViewCache[key] = view
+        return view
     }
 
     private func renderTransitionCapture(

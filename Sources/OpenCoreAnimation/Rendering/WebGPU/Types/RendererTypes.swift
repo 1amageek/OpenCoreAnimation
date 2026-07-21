@@ -100,6 +100,24 @@ public struct TexturedUniforms {
     }
 }
 
+/// Uniform data for premultiplied source/target transition interpolation.
+struct TransitionFadeUniforms {
+    var mvpMatrix: Matrix4x4
+    var colorMultiplier: SIMD4<Float>
+    var parameters: SIMD4<Float>
+
+    init(
+        mvpMatrix: Matrix4x4 = .identity,
+        colorMultiplier: SIMD4<Float> = SIMD4(repeating: 1),
+        opacity: Float = 1,
+        progress: Float = 0
+    ) {
+        self.mvpMatrix = mvpMatrix
+        self.colorMultiplier = colorMultiplier
+        self.parameters = SIMD4(opacity, progress, 0, 0)
+    }
+}
+
 /// Uniform data for single-pass filter compositing.
 public struct FilterCompositeUniforms {
     public var opacity: Float

@@ -510,6 +510,57 @@ public enum CAWebGPUShaders {
     }
     """
 
+    /// Interpolates two premultiplied layer captures without source-over feedback.
+    public static let transitionFade = """
+    struct Uniforms {
+        mvpMatrix: mat4x4<f32>,
+        colorMultiplier: vec4<f32>,
+        parameters: vec4<f32>,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+    @group(0) @binding(1) var textureSampler: sampler;
+    @group(0) @binding(2) var sourceTexture: texture_2d<f32>;
+    @group(0) @binding(3) var targetTexture: texture_2d<f32>;
+
+    struct VertexInput {
+        @location(0) position: vec2<f32>,
+        @location(1) texCoord: vec2<f32>,
+        @location(2) color: vec4<f32>,
+    }
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) texCoord: vec2<f32>,
+    }
+
+    @vertex
+    fn vertexMain(input: VertexInput) -> VertexOutput {
+        var output: VertexOutput;
+        output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
+        output.texCoord = input.texCoord;
+        return output;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        let progress = clamp(uniforms.parameters.y, 0.0, 1.0);
+        let opacity = clamp(uniforms.parameters.x, 0.0, 1.0);
+        let source = textureSample(sourceTexture, textureSampler, input.texCoord);
+        let targetColor = textureSample(targetTexture, textureSampler, input.texCoord);
+        let interpolated = mix(source, targetColor, progress);
+        let alphaScale = uniforms.colorMultiplier.a * opacity;
+        let result = vec4<f32>(
+            interpolated.rgb * uniforms.colorMultiplier.rgb * alphaScale,
+            interpolated.a * alphaScale
+        );
+        if (result.a <= 0.0) {
+            discard;
+        }
+        return result;
+    }
+    """
+
     // MARK: - Shadow Mask Shader
 
     /// Shader code for shadow mask generation.

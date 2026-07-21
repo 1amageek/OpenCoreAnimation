@@ -320,6 +320,13 @@ func installHarness() {
             }
             return .number(Double(count))
         })
+        h.expose("getFirstUncapturedGPUError", returning: {
+            let message = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .firstUncapturedGPUError ?? "none"
+            }
+            return .string(message)
+        })
         h.expose("getActiveFilterResourceCount", returning: {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
@@ -1786,7 +1793,7 @@ func installHarness() {
                 let shadowMaskHalf = CALayer()
                 shadowMaskHalf.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
                 shadowMaskHalf.position = CGPoint(x: 10, y: 10)
-                shadowMaskHalf.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0)
+                shadowMaskHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
                 shadowMaskHalf.filters = [CAFilter.brightness(0)]
                 let maskTransition = CATransition()
                 maskTransition.type = .fade
@@ -1796,7 +1803,7 @@ func installHarness() {
                 maskTransition.fillMode = .both
                 maskTransition.isRemovedOnCompletion = false
                 shadowMaskHalf.add(maskTransition, forKey: "maskFade")
-                shadowMaskHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                shadowMaskHalf.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0)
                 shadowMask.addSublayer(shadowMaskHalf)
                 maskedShadow.mask = shadowMask
                 root.addSublayer(silhouetteParent)
