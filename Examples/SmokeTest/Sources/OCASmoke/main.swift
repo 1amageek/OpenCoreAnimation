@@ -745,6 +745,32 @@ func installHarness() {
                     emitterProbeResult = "error: root layer or renderer unavailable"
                     return
                 }
+                func makeParticleImage(width: Int, height: Int, data: Data) -> CGImage? {
+                    CGImage(
+                        width: width,
+                        height: height,
+                        bitsPerComponent: 8,
+                        bitsPerPixel: 32,
+                        bytesPerRow: width * 4,
+                        space: .deviceRGB,
+                        bitmapInfo: CGBitmapInfo(
+                            rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                        ),
+                        provider: CGDataProvider(data: data),
+                        decode: nil,
+                        shouldInterpolate: false,
+                        intent: .defaultIntent
+                    )
+                }
+                let particleData = Data(repeating: 255, count: 8 * 8 * 4)
+                guard let particleImage = makeParticleImage(
+                    width: 8,
+                    height: 8,
+                    data: particleData
+                ) else {
+                    emitterProbeResult = "error: particle image unavailable"
+                    return
+                }
 
                 func makeEmitter(
                     x: CGFloat,
@@ -760,6 +786,7 @@ func installHarness() {
                     cell.lifetime = 5
                     cell.velocity = 10
                     cell.scale = 1
+                    cell.contents = particleImage
                     cell.color = color
                     cell.emissionLatitude = latitude
                     cell.emissionLongitude = longitude
@@ -796,7 +823,7 @@ func installHarness() {
                 )
                 let first = firstEmitter.layer
                 let second = secondEmitter.layer
-                var blendLayers: [CAEmitterLayer] = []
+                var transientEmitterLayers: [CAEmitterLayer] = []
                 root.addSublayer(first)
                 root.addSublayer(second)
 
@@ -888,29 +915,182 @@ func installHarness() {
                     additiveBlendEmitter.cell.birthRate = 20
                     additiveBlendEmitter.cell.velocity = 0
                     additiveBlendEmitter.layer.renderMode = .additive
-                    blendLayers = [sourceBlendEmitter.layer, additiveBlendEmitter.layer]
+                    transientEmitterLayers = [
+                        sourceBlendEmitter.layer,
+                        additiveBlendEmitter.layer,
+                    ]
                     root.addSublayer(sourceBlendEmitter.layer)
                     root.addSublayer(additiveBlendEmitter.layer)
                     engine.renderFrame()
                     try await Task.sleep(for: .milliseconds(100))
                     engine.renderFrame()
                     let blendPixels = try await renderer.readbackPixels(at: [
-                        CGPoint(x: 250, y: 160),
-                        CGPoint(x: 310, y: 160),
+                        CGPoint(x: 240, y: 170),
+                        CGPoint(x: 300, y: 170),
                     ])
                     let blendPixelsMatch = blendPixels.count == 2
                         && blendPixels.allSatisfy { $0.count >= 4 }
                         && blendPixels[1][0] > blendPixels[0][0] + 30
-                    for layer in blendLayers {
+                    for layer in transientEmitterLayers {
                         layer.removeFromSuperlayer()
                     }
                     engine.renderFrame()
-                    result += ";blend=\(blendPixelsMatch),final=\(renderer.activeEmitterStateCount)"
+                    transientEmitterLayers.removeAll(keepingCapacity: true)
+
+                    var croppedData = Data()
+                    croppedData.reserveCapacity(8 * 8 * 4)
+                    for _ in 0..<8 {
+                        for x in 0..<8 {
+                            croppedData.append(contentsOf: x < 4
+                                ? [255, 0, 0, 255]
+                                : [0, 255, 0, 255])
+                        }
+                    }
+                    guard let croppedImage = makeParticleImage(
+                        width: 8,
+                        height: 8,
+                        data: croppedData
+                    ) else {
+                        emitterProbeResult = "error: cropped particle image unavailable"
+                        return
+                    }
+                    let croppedEmitter = makeEmitter(
+                        x: 370,
+                        color: CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    croppedEmitter.cell.contents = croppedImage
+                    croppedEmitter.cell.contentsRect = CGRect(x: 0.5, y: 0, width: 0.5, height: 1)
+                    croppedEmitter.cell.contentsScale = 2
+                    croppedEmitter.cell.velocity = 0
+                    transientEmitterLayers.append(croppedEmitter.layer)
+                    root.addSublayer(croppedEmitter.layer)
+                    engine.renderFrame()
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let croppedPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 360, y: 170),
+                        CGPoint(x: 363, y: 170),
+                    ])
+                    let croppedImageMatches = croppedPixels.count == 2
+                        && croppedPixels.allSatisfy { $0.count >= 4 }
+                        && croppedPixels[0][1] > 200
+                        && croppedPixels[0][0] < 40
+                        && Int(croppedPixels[0][1]) > Int(croppedPixels[1][1]) + 100
+                    croppedEmitter.layer.removeFromSuperlayer()
+                    engine.renderFrame()
+                    transientEmitterLayers.removeAll(keepingCapacity: true)
+
+                    var minificationData = Data()
+                    minificationData.reserveCapacity(8 * 8 * 4)
+                    for _ in 0..<8 {
+                        for x in 0..<8 {
+                            minificationData.append(contentsOf: x < 7
+                                ? [255, 0, 0, 255]
+                                : [0, 0, 0, 255])
+                        }
+                    }
+                    guard let minificationImage = makeParticleImage(
+                        width: 8,
+                        height: 8,
+                        data: minificationData
+                    ) else {
+                        emitterProbeResult = "error: minification image unavailable"
+                        return
+                    }
+                    let linearEmitter = makeEmitter(
+                        x: 250,
+                        color: CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    let trilinearEmitter = makeEmitter(
+                        x: 310,
+                        color: CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    for emitter in [linearEmitter, trilinearEmitter] {
+                        emitter.cell.contents = minificationImage
+                        emitter.cell.birthRate = 20
+                        emitter.cell.velocity = 0
+                        emitter.cell.scale = 0.25
+                    }
+                    linearEmitter.cell.minificationFilter = CALayerContentsFilter.linear.rawValue
+                    trilinearEmitter.cell.minificationFilter = CALayerContentsFilter.trilinear.rawValue
+                    trilinearEmitter.cell.minificationFilterBias = 4
+                    transientEmitterLayers = [linearEmitter.layer, trilinearEmitter.layer]
+                    root.addSublayer(linearEmitter.layer)
+                    root.addSublayer(trilinearEmitter.layer)
+                    engine.renderFrame()
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let minificationPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 240, y: 170),
+                        CGPoint(x: 300, y: 170),
+                    ])
+                    let minificationMatches = minificationPixels.count == 2
+                        && minificationPixels.allSatisfy { $0.count >= 4 }
+                        && Int(minificationPixels[0][0]) > Int(minificationPixels[1][0]) + 10
+                        && minificationPixels[1][0] > 150
+                    for layer in transientEmitterLayers {
+                        layer.removeFromSuperlayer()
+                    }
+                    engine.renderFrame()
+                    transientEmitterLayers.removeAll(keepingCapacity: true)
+
+                    let invisibleEmitter = makeEmitter(
+                        x: 100,
+                        color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    invisibleEmitter.cell.contents = nil
+                    invisibleEmitter.cell.velocity = 0
+                    let unsupportedEmitter = makeEmitter(
+                        x: 160,
+                        color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    unsupportedEmitter.cell.contents = "unsupported"
+                    unsupportedEmitter.cell.velocity = 0
+                    transientEmitterLayers = [invisibleEmitter.layer, unsupportedEmitter.layer]
+                    root.addSublayer(invisibleEmitter.layer)
+                    root.addSublayer(unsupportedEmitter.layer)
+                    engine.renderFrame()
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let invisibleMatches = renderer.activeParticleCount(for: invisibleEmitter.layer) == 1
+                        && renderer.lastRenderedParticleSequences(for: invisibleEmitter.layer).isEmpty
+                    let unsupportedRejected = renderer.activeParticleCount(for: unsupportedEmitter.layer) == 0
+                        && renderer.emitterSpawnFailureCount == 1
+                    for layer in transientEmitterLayers {
+                        layer.removeFromSuperlayer()
+                    }
+                    engine.renderFrame()
+                    result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected);blend=\(blendPixelsMatch),final=\(renderer.activeEmitterStateCount)"
                     emitterProbeResult = result
                 } catch {
                     first.removeFromSuperlayer()
                     second.removeFromSuperlayer()
-                    for layer in blendLayers {
+                    for layer in transientEmitterLayers {
                         layer.removeFromSuperlayer()
                     }
                     engine.renderFrame()

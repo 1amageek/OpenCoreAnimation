@@ -329,6 +329,10 @@ public enum CAWebGPUShaders {
         layerSize: vec2<f32>,
         // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
         cornerRadii: vec4<f32>,
+        samplingBias: f32,
+        padding0: f32,
+        padding1: f32,
+        padding2: f32,
     }
 
     @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -352,7 +356,7 @@ public enum CAWebGPUShaders {
         var output: VertexOutput;
         output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
         output.texCoord = input.texCoord;
-        output.color = vec4<f32>(input.color.rgb, input.color.a * uniforms.opacity);
+        output.color = input.color;
         return output;
     }
 
@@ -390,7 +394,12 @@ public enum CAWebGPUShaders {
     @fragment
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
         // Sample texture
-        var texColor = textureSample(textureData, textureSampler, input.texCoord);
+        var texColor = textureSampleBias(
+            textureData,
+            textureSampler,
+            input.texCoord,
+            uniforms.samplingBias
+        ) * input.color;
 
         // Apply opacity
         texColor.a *= uniforms.opacity;
@@ -826,65 +835,6 @@ public enum CAWebGPUShaders {
     }
     """
 
-    // MARK: - Particle Shader
-
-    /// Shader code for particle rendering.
-    public static let particle = """
-    struct ParticleUniforms {
-        mvpMatrix: mat4x4<f32>,
-    }
-
-    @group(0) @binding(0) var<uniform> uniforms: ParticleUniforms;
-    @group(0) @binding(1) var particleTexture: texture_2d<f32>;
-    @group(0) @binding(2) var texSampler: sampler;
-
-    struct ParticleInstance {
-        @location(0) position: vec3<f32>,
-        @location(1) color: vec4<f32>,
-        @location(2) scaleRotation: vec2<f32>,
-    }
-
-    struct VertexOutput {
-        @builtin(position) position: vec4<f32>,
-        @location(0) texCoord: vec2<f32>,
-        @location(1) color: vec4<f32>,
-    }
-
-    @vertex
-    fn vertexMain(
-        @builtin(vertex_index) vertexIndex: u32,
-        instance: ParticleInstance
-    ) -> VertexOutput {
-        let corners = array<vec2<f32>, 6>(
-            vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5), vec2<f32>(-0.5, 0.5),
-            vec2<f32>(0.5, -0.5), vec2<f32>(0.5, 0.5), vec2<f32>(-0.5, 0.5)
-        );
-        var corner = corners[vertexIndex];
-
-        // Apply rotation
-        let cos_r = cos(instance.scaleRotation.y);
-        let sin_r = sin(instance.scaleRotation.y);
-        corner = vec2<f32>(
-            corner.x * cos_r - corner.y * sin_r,
-            corner.x * sin_r + corner.y * cos_r
-        );
-
-        // Apply scale
-        corner *= instance.scaleRotation.x;
-
-        var output: VertexOutput;
-        output.position = uniforms.mvpMatrix * vec4<f32>(instance.position + vec3<f32>(corner, 0.0), 1.0);
-        output.texCoord = corners[vertexIndex] + vec2<f32>(0.5);
-        output.color = instance.color;
-        return output;
-    }
-
-    @fragment
-    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
-        let texColor = textureSample(particleTexture, texSampler, input.texCoord);
-        return texColor * input.color;
-    }
-    """
 }
 
 #endif

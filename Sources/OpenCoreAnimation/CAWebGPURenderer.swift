@@ -75,8 +75,61 @@ private let caRendererAlignedUniformSize: UInt64 = {
 /// `ObjectIdentifier` would let those namespaces alias whenever an object
 /// address is reused, returning a stale `GPUTextureView`. Tagging the kind
 /// keeps the namespaces disjoint.
+fileprivate enum EmitterTextureSampling: CaseIterable, Hashable {
+    case nearestNearest
+    case nearestLinear
+    case nearestTrilinear
+    case linearNearest
+    case linearLinear
+    case linearTrilinear
+
+    init?(magnificationFilter: String, minificationFilter: String) {
+        let magnificationIsNearest: Bool
+        switch magnificationFilter {
+        case CALayerContentsFilter.nearest.rawValue:
+            magnificationIsNearest = true
+        case CALayerContentsFilter.linear.rawValue, CALayerContentsFilter.trilinear.rawValue:
+            magnificationIsNearest = false
+        default:
+            return nil
+        }
+
+        switch (magnificationIsNearest, minificationFilter) {
+        case (true, CALayerContentsFilter.nearest.rawValue): self = .nearestNearest
+        case (true, CALayerContentsFilter.linear.rawValue): self = .nearestLinear
+        case (true, CALayerContentsFilter.trilinear.rawValue): self = .nearestTrilinear
+        case (false, CALayerContentsFilter.nearest.rawValue): self = .linearNearest
+        case (false, CALayerContentsFilter.linear.rawValue): self = .linearLinear
+        case (false, CALayerContentsFilter.trilinear.rawValue): self = .linearTrilinear
+        default: return nil
+        }
+    }
+
+    var magnificationFilter: GPUFilterMode {
+        switch self {
+        case .nearestNearest, .nearestLinear, .nearestTrilinear: return .nearest
+        case .linearNearest, .linearLinear, .linearTrilinear: return .linear
+        }
+    }
+
+    var minificationFilter: GPUFilterMode {
+        switch self {
+        case .nearestNearest, .linearNearest: return .nearest
+        case .nearestLinear, .nearestTrilinear, .linearLinear, .linearTrilinear: return .linear
+        }
+    }
+
+    var usesMipmaps: Bool {
+        switch self {
+        case .nearestTrilinear, .linearTrilinear: return true
+        default: return false
+        }
+    }
+}
+
 fileprivate enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier)
+    case emitterImage(ObjectIdentifier, EmitterTextureSampling)
     case layer(ObjectIdentifier)
     case transitionSource(ObjectIdentifier)
     case transitionTarget(ObjectIdentifier)
@@ -679,6 +732,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// The texture sampler.
     private var textureSampler: GPUSampler?
 
+    /// Samplers covering every supported CAEmitterCell magnification/minification pair.
+    private var emitterTextureSamplers: [EmitterTextureSampling: GPUSampler] = [:]
+
+    /// Source-additive textured particle pipeline without stencil testing.
+    private var emitterTexturedAdditivePipeline: GPURenderPipeline?
+
+    /// Source-additive textured particle pipeline constrained by the active stencil mask.
+    private var emitterTexturedAdditiveStencilPipeline: GPURenderPipeline?
+
     /// Texture manager with LRU cache for efficient texture memory management.
     private var textureManager: GPUTextureManager?
 
@@ -871,12 +933,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Particle System (CAEmitterLayer)
 
-    /// Source-additive particle pipeline without stencil testing.
-    private var emitterAdditivePipeline: GPURenderPipeline?
-
-    /// Source-additive particle pipeline constrained by the active stencil mask.
-    private var emitterAdditiveStencilPipeline: GPURenderPipeline?
-
     /// Maximum number of particles.
     private static let maxParticles = 10000
 
@@ -1011,12 +1067,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(pipelineLayout)
         ))
-        createEmitterAdditivePipelines(
-            device: device,
-            shaderModule: shaderModule,
-            pipelineLayout: pipelineLayout
-        )
-
         // Create triple-buffered vertex buffer pool
         // Use maxVertexBufferSize (1MB) to accommodate complex shapes with many vertices
         let vertexBufferSize = Self.maxVertexBufferSize
@@ -1049,9 +1099,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // inherit the stale view/bind group.
         manager.onEvict = { [weak self] cgImage in
             guard let self = self else { return }
-            let key = TexturedCacheKey.image(ObjectIdentifier(cgImage))
-            self.texturedTextureViewCache.removeValue(forKey: key)
-            self.perFrameTexturedBindGroupCache.removeValue(forKey: key)
+            let imageID = ObjectIdentifier(cgImage)
+            let viewKeys = self.texturedTextureViewCache.keys.filter {
+                switch $0 {
+                case .image(let id), .emitterImage(let id, _): return id == imageID
+                default: return false
+                }
+            }
+            let bindGroupKeys = self.perFrameTexturedBindGroupCache.keys.filter {
+                switch $0 {
+                case .image(let id), .emitterImage(let id, _): return id == imageID
+                default: return false
+                }
+            }
+            for key in viewKeys {
+                self.texturedTextureViewCache.removeValue(forKey: key)
+            }
+            for key in bindGroupKeys {
+                self.perFrameTexturedBindGroupCache.removeValue(forKey: key)
+            }
         }
         textureManager = manager
 
@@ -1077,81 +1143,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create stencil pipelines for CALayer.mask
         try createStencilPipelines(device: device)
-    }
-
-    private func createEmitterAdditivePipelines(
-        device: GPUDevice,
-        shaderModule: GPUShaderModule,
-        pipelineLayout: GPUPipelineLayout
-    ) {
-        let vertexState = GPUVertexState(
-            module: shaderModule,
-            entryPoint: "vertexMain",
-            buffers: [
-                GPUVertexBufferLayout(
-                    arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
-                    attributes: [
-                        GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
-                        GPUVertexAttribute(
-                            format: .float32x2,
-                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride),
-                            shaderLocation: 1
-                        ),
-                        GPUVertexAttribute(
-                            format: .float32x4,
-                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2),
-                            shaderLocation: 2
-                        ),
-                    ]
-                )
-            ]
-        )
-        let additiveBlend = GPUBlendState(
-            color: GPUBlendComponent(
-                srcFactor: .srcAlpha,
-                dstFactor: .one,
-                operation: .add
-            ),
-            alpha: GPUBlendComponent(
-                srcFactor: .one,
-                dstFactor: .one,
-                operation: .add
-            )
-        )
-
-        func makePipeline(stencilCompare: GPUCompareFunction) -> GPURenderPipeline {
-            device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
-                vertex: vertexState,
-                depthStencil: GPUDepthStencilState(
-                    format: .depth24plusStencil8,
-                    depthWriteEnabled: false,
-                    depthCompare: .always,
-                    stencilFront: GPUStencilFaceState(
-                        compare: stencilCompare,
-                        failOp: .keep,
-                        depthFailOp: .keep,
-                        passOp: .keep
-                    ),
-                    stencilBack: GPUStencilFaceState(
-                        compare: stencilCompare,
-                        failOp: .keep,
-                        depthFailOp: .keep,
-                        passOp: .keep
-                    )
-                ),
-                fragment: GPUFragmentState(
-                    module: shaderModule,
-                    entryPoint: "fragmentMain",
-                    targets: [
-                        GPUColorTargetState(format: preferredFormat, blend: additiveBlend)
-                    ]
-                ),
-                layout: .layout(pipelineLayout)
-            ))
-        }
-
-        emitterAdditivePipeline = makePipeline(stencilCompare: .always)
-        emitterAdditiveStencilPipeline = makePipeline(stencilCompare: .equal)
     }
 
     /// Creates stencil pipelines for CALayer.mask functionality.
@@ -1338,8 +1329,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             addressModeW: .clampToEdge,
             magFilter: .linear,
             minFilter: .linear,
-            mipmapFilter: .linear
+            mipmapFilter: .nearest,
+            lodMinClamp: 0,
+            lodMaxClamp: 0
         ))
+        emitterTextureSamplers = Dictionary(uniqueKeysWithValues: EmitterTextureSampling.allCases.map {
+            sampling in
+            let sampler = device.createSampler(descriptor: GPUSamplerDescriptor(
+                addressModeU: .clampToEdge,
+                addressModeV: .clampToEdge,
+                addressModeW: .clampToEdge,
+                magFilter: sampling.magnificationFilter,
+                minFilter: sampling.minificationFilter,
+                mipmapFilter: sampling.usesMipmaps ? .linear : .nearest,
+                lodMinClamp: 0,
+                lodMaxClamp: sampling.usesMipmaps ? 32 : 0
+            ))
+            return (sampling, sampler)
+        })
 
         // Create bind group layout with uniform, sampler, and texture
         texturedBindGroupLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
@@ -1589,10 +1596,89 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: .layout(pipelineLayout)
         ))
 
+        createEmitterTexturedAdditivePipelines(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout
+        )
+
         createPremultipliedTexturedPipelines(
             device: device,
             bindGroupLayout: texturedBindGroupLayout
         )
+    }
+
+    private func createEmitterTexturedAdditivePipelines(
+        device: GPUDevice,
+        shaderModule: GPUShaderModule,
+        pipelineLayout: GPUPipelineLayout
+    ) {
+        let vertexState = GPUVertexState(
+            module: shaderModule,
+            entryPoint: "vertexMain",
+            buffers: [
+                GPUVertexBufferLayout(
+                    arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                    attributes: [
+                        GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                        GPUVertexAttribute(
+                            format: .float32x2,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride),
+                            shaderLocation: 1
+                        ),
+                        GPUVertexAttribute(
+                            format: .float32x4,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2),
+                            shaderLocation: 2
+                        ),
+                    ]
+                )
+            ]
+        )
+        let additiveBlend = GPUBlendState(
+            color: GPUBlendComponent(
+                srcFactor: .srcAlpha,
+                dstFactor: .one,
+                operation: .add
+            ),
+            alpha: GPUBlendComponent(
+                srcFactor: .one,
+                dstFactor: .one,
+                operation: .add
+            )
+        )
+
+        func makePipeline(stencilCompare: GPUCompareFunction) -> GPURenderPipeline {
+            device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+                vertex: vertexState,
+                depthStencil: GPUDepthStencilState(
+                    format: .depth24plusStencil8,
+                    depthWriteEnabled: false,
+                    depthCompare: .always,
+                    stencilFront: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    ),
+                    stencilBack: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    )
+                ),
+                fragment: GPUFragmentState(
+                    module: shaderModule,
+                    entryPoint: "fragmentMain",
+                    targets: [GPUColorTargetState(format: preferredFormat, blend: additiveBlend)]
+                ),
+                layout: .layout(pipelineLayout)
+            ))
+        }
+
+        emitterTexturedAdditivePipeline = makePipeline(stencilCompare: .always)
+        emitterTexturedAdditiveStencilPipeline = makePipeline(stencilCompare: .equal)
     }
 
     private func createPremultipliedTexturedPipelines(
@@ -2541,8 +2627,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentStencilValue = 0
 
         // Particle resources
-        emitterAdditivePipeline = nil
-        emitterAdditiveStencilPipeline = nil
+        emitterTextureSamplers.removeAll(keepingCapacity: false)
+        emitterTexturedAdditivePipeline = nil
+        emitterTexturedAdditiveStencilPipeline = nil
         emitterLayerStates.removeAll(keepingCapacity: false)
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
         emitterSpawnFailureCount = 0
@@ -2759,8 +2846,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 presentation: emitterPresentation,
                 device: device,
                 renderPass: renderPass,
-                modelMatrix: modelMatrix,
-                bindGroup: bindGroup
+                modelMatrix: modelMatrix
             )
             // Render sublayers after particles
             if let sublayers = layer.sublayers, !sublayers.isEmpty {
@@ -4363,6 +4449,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             for: contents,
             width: imageWidth,
             height: imageHeight,
+            memorySizeBytes: mipmappedRGBAByteCount(width: imageWidth, height: imageHeight),
             factory: { [weak self] in
                 self?.createGPUTexture(from: contents, device: device)
             }
@@ -4577,31 +4664,111 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Get RGBA data
         guard let rgbaData = getRGBAData(from: cgImage) else { return nil }
 
-        // Create texture
+        var mipLevelCount: UInt32 = 1
+        var mipWidth = width
+        var mipHeight = height
+        while mipWidth > 1 || mipHeight > 1 {
+            mipWidth = max(1, mipWidth / 2)
+            mipHeight = max(1, mipHeight / 2)
+            mipLevelCount += 1
+        }
+
+        // Every cached image receives a complete mip chain. Linear samplers clamp
+        // to level zero, while CAEmitterCell.trilinear selects between these levels.
         let textureDescriptor = GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            mipLevelCount: mipLevelCount,
             format: .rgba8unorm,
             usage: [.textureBinding, .copyDst, .renderAttachment]
         )
 
         let texture = device.createTexture(descriptor: textureDescriptor)
 
-        // Create JS Uint8Array from data
-        let jsArray = createUint8Array(from: rgbaData)
-
-        // Upload data
-        device.queue.writeTexture(
-            destination: GPUImageCopyTexture(texture: texture),
-            data: jsArray,
-            dataLayout: GPUImageDataLayout(
-                offset: 0,
-                bytesPerRow: UInt32(width * 4),
-                rowsPerImage: UInt32(height)
-            ),
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height))
-        )
+        var levelData = rgbaData
+        mipWidth = width
+        mipHeight = height
+        for level in 0..<mipLevelCount {
+            device.queue.writeTexture(
+                destination: GPUImageCopyTexture(texture: texture, mipLevel: level),
+                data: createUint8Array(from: levelData),
+                dataLayout: GPUImageDataLayout(
+                    offset: 0,
+                    bytesPerRow: UInt32(mipWidth * 4),
+                    rowsPerImage: UInt32(mipHeight)
+                ),
+                size: GPUExtent3D(width: UInt32(mipWidth), height: UInt32(mipHeight))
+            )
+            guard level + 1 < mipLevelCount else { continue }
+            levelData = downsampleRGBA8(
+                levelData,
+                width: mipWidth,
+                height: mipHeight
+            )
+            mipWidth = max(1, mipWidth / 2)
+            mipHeight = max(1, mipHeight / 2)
+        }
 
         return texture
+    }
+
+    private func mipmappedRGBAByteCount(width: Int, height: Int) -> UInt64 {
+        var levelWidth = max(1, width)
+        var levelHeight = max(1, height)
+        var byteCount: UInt64 = 0
+        while true {
+            byteCount += UInt64(levelWidth * levelHeight * 4)
+            guard levelWidth > 1 || levelHeight > 1 else { return byteCount }
+            levelWidth = max(1, levelWidth / 2)
+            levelHeight = max(1, levelHeight / 2)
+        }
+    }
+
+    /// Builds the next RGBA8 mip level with a box filter.
+    private func downsampleRGBA8(_ source: Data, width: Int, height: Int) -> Data {
+        let destinationWidth = max(1, width / 2)
+        let destinationHeight = max(1, height / 2)
+        var destination = Data(count: destinationWidth * destinationHeight * 4)
+        source.withUnsafeBytes { sourceBytes in
+            destination.withUnsafeMutableBytes { destinationBytes in
+                guard let sourceBase = sourceBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let destinationBase = destinationBytes.baseAddress?.assumingMemoryBound(
+                        to: UInt8.self
+                      ) else {
+                    return
+                }
+                for destinationY in 0..<destinationHeight {
+                    for destinationX in 0..<destinationWidth {
+                        let sourceMinX = destinationX * width / destinationWidth
+                        let sourceMinY = destinationY * height / destinationHeight
+                        let sourceMaxX = max(
+                            sourceMinX + 1,
+                            (destinationX + 1) * width / destinationWidth
+                        )
+                        let sourceMaxY = max(
+                            sourceMinY + 1,
+                            (destinationY + 1) * height / destinationHeight
+                        )
+                        let destinationOffset = (destinationY * destinationWidth + destinationX) * 4
+                        for component in 0..<4 {
+                            var sum: UInt32 = 0
+                            var sampleCount: UInt32 = 0
+                            for sourceY in sourceMinY..<sourceMaxY {
+                                for sourceX in sourceMinX..<sourceMaxX {
+                                    sum += UInt32(
+                                        sourceBase[(sourceY * width + sourceX) * 4 + component]
+                                    )
+                                    sampleCount += 1
+                                }
+                            }
+                            destinationBase[destinationOffset + component] = UInt8(
+                                (sum + sampleCount / 2) / sampleCount
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        return destination
     }
 
     /// Converts CGImage data to RGBA format.
@@ -7213,8 +7380,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         presentation emitterLayer: CAEmitterLayer,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
-        modelMatrix: Matrix4x4,
-        bindGroup: GPUBindGroup
+        modelMatrix: Matrix4x4
     ) {
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
@@ -7266,6 +7432,33 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 for _ in 0..<particlesToSpawn {
                     guard state.particles.count < Self.maxParticles else { break }
                     var particle = EmitterParticle()
+                    if let configuredContents = cell.contents {
+                        guard let image = configuredContents as? CGImage,
+                              image.width > 0,
+                              image.height > 0,
+                              cell.contentsScale.isFinite,
+                              cell.contentsScale > 0,
+                              cell.contentsRect.origin.x.isFinite,
+                              cell.contentsRect.origin.y.isFinite,
+                              cell.contentsRect.width.isFinite,
+                              cell.contentsRect.height.isFinite,
+                              cell.contentsRect.width > 0,
+                              cell.contentsRect.height > 0,
+                              cell.minificationFilterBias.isFinite,
+                              EmitterTextureSampling(
+                                magnificationFilter: cell.magnificationFilter,
+                                minificationFilter: cell.minificationFilter
+                              ) != nil else {
+                            emitterSpawnFailureCount += 1
+                            continue
+                        }
+                        particle.contents = image
+                        particle.contentsRect = cell.contentsRect
+                        particle.contentsScale = Float(cell.contentsScale)
+                        particle.magnificationFilter = cell.magnificationFilter
+                        particle.minificationFilter = cell.minificationFilter
+                        particle.minificationFilterBias = cell.minificationFilterBias
+                    }
                     guard let position = EmitterGeometry.position(
                         shape: emitterLayer.emitterShape,
                         mode: emitterLayer.emitterMode,
@@ -7343,22 +7536,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 }
             }
         }
-        let standardPipeline = maskNestingDepth > 0 ? stencilTestPipeline : pipeline
-        guard let standardPipeline else { return }
         state.lastRenderedBirthSequences.removeAll(keepingCapacity: true)
         state.lastRenderUsedAdditiveBlending = false
 
-        func draw(_ particle: EmitterParticle, using pipeline: GPURenderPipeline) {
+        func draw(_ particle: EmitterParticle, additive: Bool = false) {
             guard particle.isAlive else { return }
             if renderEmitterParticle(
                 particle,
                 device: device,
                 renderPass: renderPass,
                 modelMatrix: modelMatrix,
-                bindGroup: bindGroup,
-                pipeline: pipeline,
                 vertexBuffer: vertexBuffer,
-                uniformBuffer: uniformBuffer
+                uniformBuffer: uniformBuffer,
+                additive: additive
             ) {
                 state.lastRenderedBirthSequences.append(particle.birthSequence)
             }
@@ -7367,11 +7557,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         switch emitterLayer.renderMode {
         case .unordered, .oldestFirst:
             for particle in state.particles {
-                draw(particle, using: standardPipeline)
+                draw(particle)
             }
         case .oldestLast:
             for particle in state.particles.reversed() {
-                draw(particle, using: standardPipeline)
+                draw(particle)
             }
         case .backToFront:
             let indices = state.particles.indices.sorted { lhs, rhs in
@@ -7383,19 +7573,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 return lhsParticle.position.z < rhsParticle.position.z
             }
             for index in indices {
-                draw(state.particles[index], using: standardPipeline)
+                draw(state.particles[index])
             }
         case .additive:
             let additivePipeline = maskNestingDepth > 0
-                ? emitterAdditiveStencilPipeline
-                : emitterAdditivePipeline
-            guard let additivePipeline else {
+                ? emitterTexturedAdditiveStencilPipeline
+                : emitterTexturedAdditivePipeline
+            guard additivePipeline != nil else {
                 emitterRenderFailureCount += 1
                 return
             }
             state.lastRenderUsedAdditiveBlending = true
             for particle in state.particles {
-                draw(particle, using: additivePipeline)
+                draw(particle, additive: true)
             }
         default:
             emitterRenderFailureCount += 1
@@ -7407,33 +7597,66 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4,
-        bindGroup: GPUBindGroup,
-        pipeline: GPURenderPipeline,
         vertexBuffer: GPUBuffer,
-        uniformBuffer: GPUBuffer
+        uniformBuffer: GPUBuffer,
+        additive: Bool
     ) -> Bool {
-        let scale = particle.scale * 20
+        guard let image = particle.contents,
+              let sampling = EmitterTextureSampling(
+                magnificationFilter: particle.magnificationFilter,
+                minificationFilter: particle.minificationFilter
+              ),
+              let sampler = emitterTextureSamplers[sampling],
+              let texturedBindGroupLayout,
+              let selectedPipeline = additive
+                ? (maskNestingDepth > 0
+                    ? emitterTexturedAdditiveStencilPipeline
+                    : emitterTexturedAdditivePipeline)
+                : (maskNestingDepth > 0 ? texturedStencilPipeline : texturedPipeline),
+              let texture = textureManager?.getOrCreateTexture(
+                for: image,
+                width: image.width,
+                height: image.height,
+                memorySizeBytes: mipmappedRGBAByteCount(
+                    width: image.width,
+                    height: image.height
+                ),
+                factory: { [weak self] in
+                    self?.createGPUTexture(from: image, device: device)
+                }
+              ) else {
+            return false
+        }
+
+        let width = Float(image.width) / particle.contentsScale * particle.scale
+        let height = Float(image.height) / particle.contentsScale * particle.scale
         let rotation = particle.rotation
-        let p0 = rotatePoint(SIMD2(0, 0), angle: rotation)
-        let p1 = rotatePoint(SIMD2(1, 0), angle: rotation)
-        let p2 = rotatePoint(SIMD2(0, 1), angle: rotation)
-        let p3 = rotatePoint(SIMD2(1, 1), angle: rotation)
+        let center = SIMD2<Float>(0.5, 0.5)
+        let p0 = rotatePoint(SIMD2(0, 0), angle: rotation) - center
+        let p1 = rotatePoint(SIMD2(1, 0), angle: rotation) - center
+        let p2 = rotatePoint(SIMD2(0, 1), angle: rotation) - center
+        let p3 = rotatePoint(SIMD2(1, 1), angle: rotation) - center
+        let contentsRect = particle.contentsRect
+        let uvMinX = Float(contentsRect.minX)
+        let uvMinY = Float(contentsRect.minY)
+        let uvMaxX = Float(contentsRect.maxX)
+        let uvMaxY = Float(contentsRect.maxY)
 
         var vertices: [CARendererVertex] = [
-            CARendererVertex(position: p0, texCoord: SIMD2(0, 0), color: particle.color),
-            CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
-            CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
-            CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
-            CARendererVertex(position: p3, texCoord: SIMD2(1, 1), color: particle.color),
-            CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
+            CARendererVertex(position: p0, texCoord: SIMD2(uvMinX, uvMaxY), color: particle.color),
+            CARendererVertex(position: p1, texCoord: SIMD2(uvMaxX, uvMaxY), color: particle.color),
+            CARendererVertex(position: p2, texCoord: SIMD2(uvMinX, uvMinY), color: particle.color),
+            CARendererVertex(position: p1, texCoord: SIMD2(uvMaxX, uvMaxY), color: particle.color),
+            CARendererVertex(position: p3, texCoord: SIMD2(uvMaxX, uvMinY), color: particle.color),
+            CARendererVertex(position: p2, texCoord: SIMD2(uvMinX, uvMinY), color: particle.color),
         ]
         guard let (vertexOffset, layerIndex) = allocateVertices(count: vertices.count) else {
             return false
         }
 
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(scale, 0, 0, 0),
-            SIMD4<Float>(0, scale, 0, 0),
+            SIMD4<Float>(width, 0, 0, 0),
+            SIMD4<Float>(0, height, 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
@@ -7443,11 +7666,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(particle.position.x, particle.position.y, particle.position.z, 1)
         ))
-        var uniforms = CARendererUniforms(
+        var uniforms = TexturedUniforms(
             mvpMatrix: modelMatrix * translateMatrix * scaleMatrix,
-            opacity: 1,
-            cornerRadius: scale * 0.5,
-            layerSize: SIMD2<Float>(scale, scale)
+            opacity: currentEffectiveOpacity,
+            layerSize: SIMD2<Float>(width, height),
+            samplingBias: min(max(particle.minificationFilterBias, -16), 15.99)
         )
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
         device.queue.writeBuffer(
@@ -7460,8 +7683,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             bufferOffset: vertexOffset,
             data: createFloat32Array(from: &vertices)
         )
-        renderPass.setPipeline(pipeline)
-        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        let texturedBindGroup = cachedTexturedBindGroup(
+            cacheKey: .emitterImage(ObjectIdentifier(image), sampling),
+            gpuTexture: texture,
+            device: device,
+            layout: texturedBindGroupLayout,
+            sampler: sampler,
+            uniformBuffer: uniformBuffer,
+            uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
+        )
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: texturedBindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
         return true
@@ -7491,6 +7727,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             && particle.rotationSpeed.isFinite
             && particle.lifetime.isFinite
             && particle.maxLifetime.isFinite
+            && particle.contentsScale.isFinite
+            && particle.contentsScale > 0
+            && particle.contentsRect.origin.x.isFinite
+            && particle.contentsRect.origin.y.isFinite
+            && particle.contentsRect.width.isFinite
+            && particle.contentsRect.height.isFinite
+            && particle.minificationFilterBias.isFinite
     }
 
     // MARK: - CATiledLayer Rendering
@@ -7663,6 +7906,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             for: image,
             width: imageWidth,
             height: imageHeight,
+            memorySizeBytes: mipmappedRGBAByteCount(width: imageWidth, height: imageHeight),
             factory: { [weak self] in
                 self?.createGPUTexture(from: image, device: device)
             }

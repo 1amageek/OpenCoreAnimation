@@ -17,13 +17,9 @@ private struct TextureCacheEntry {
     let texture: GPUTexture
     let width: Int
     let height: Int
+    let memorySize: UInt64
     var lastAccessFrame: UInt64
     var accessCount: UInt64
-
-    /// Approximate memory usage in bytes (4 bytes per pixel for RGBA8).
-    var memorySize: UInt64 {
-        return UInt64(width * height * 4)
-    }
 }
 
 /// A texture manager with LRU (Least Recently Used) cache eviction.
@@ -142,6 +138,7 @@ public final class GPUTextureManager {
         for cgImage: CGImage,
         width: Int,
         height: Int,
+        memorySizeBytes: UInt64? = nil,
         factory: () -> GPUTexture?
     ) -> GPUTexture? {
         let key = ObjectIdentifier(cgImage)
@@ -163,7 +160,7 @@ public final class GPUTextureManager {
             return nil
         }
 
-        let memorySize = UInt64(width * height * 4)
+        let memorySize = memorySizeBytes ?? UInt64(width * height * 4)
 
         // Evict if necessary
         evictIfNeeded(forNewMemory: memorySize)
@@ -174,6 +171,7 @@ public final class GPUTextureManager {
             texture: texture,
             width: width,
             height: height,
+            memorySize: memorySize,
             lastAccessFrame: currentFrame,
             accessCount: 1
         )
@@ -227,6 +225,7 @@ public final class GPUTextureManager {
             texture: texture,
             width: width,
             height: height,
+            memorySize: memorySize,
             lastAccessFrame: currentFrame,
             accessCount: 1
         )

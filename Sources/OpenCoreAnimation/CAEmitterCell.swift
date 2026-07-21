@@ -21,6 +21,15 @@ open class CAEmitterCell: CAMediaTiming {
     /// The scale factor applied to the contents of the cell.
     open var contentsScale: CGFloat = 1.0
 
+    /// The filter used when the contents are enlarged.
+    open var magnificationFilter: String = CALayerContentsFilter.linear.rawValue
+
+    /// The filter used when the contents are reduced.
+    open var minificationFilter: String = CALayerContentsFilter.linear.rawValue
+
+    /// The bias applied when selecting a minification mip level.
+    open var minificationFilterBias: Float = 0
+
     // MARK: - Emitter Behavior
 
     /// The number of emitted objects created every second.
@@ -137,6 +146,10 @@ open class CAEmitterCell: CAMediaTiming {
             return CGRect(x: 0, y: 0, width: 1, height: 1)
         case "contentsScale":
             return CGFloat(1.0)
+        case "magnificationFilter", "minificationFilter":
+            return CALayerContentsFilter.linear.rawValue
+        case "minificationFilterBias":
+            return Float(0)
 
         // Emitter Behavior
         case "birthRate":

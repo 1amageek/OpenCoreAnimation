@@ -6,6 +6,12 @@ import Foundation
 /// Represents a single particle in the emitter system.
 public struct EmitterParticle {
     public var birthSequence: UInt64 = 0
+    public var contents: CGImage?
+    public var contentsRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    public var contentsScale: Float = 1
+    public var magnificationFilter: String = CALayerContentsFilter.linear.rawValue
+    public var minificationFilter: String = CALayerContentsFilter.linear.rawValue
+    public var minificationFilterBias: Float = 0
     public var position: SIMD3<Float> = .zero
     public var velocity: SIMD3<Float> = .zero
     public var acceleration: SIMD3<Float> = .zero
@@ -50,23 +56,6 @@ public struct EmitterParticle {
 
         // Update rotation
         rotation += rotationSpeed * deltaTime
-    }
-}
-
-/// GPU-compatible particle instance data.
-public struct ParticleInstanceData {
-    public var position: SIMD3<Float>
-    public var color: SIMD4<Float>
-    public var scaleRotation: SIMD2<Float>
-
-    public init(from particle: EmitterParticle) {
-        self.position = particle.position
-        self.color = particle.color
-        self.scaleRotation = SIMD2(particle.scale, particle.rotation)
-    }
-
-    public static var stride: UInt64 {
-        return UInt64(MemoryLayout<ParticleInstanceData>.stride)
     }
 }
 

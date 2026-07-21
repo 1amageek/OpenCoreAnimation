@@ -78,19 +78,25 @@ public struct TexturedUniforms {
     public var layerSize: SIMD2<Float>
     /// Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
     public var cornerRadii: SIMD4<Float>
+    public var samplingBias: Float
+    public var padding0: Float = 0
+    public var padding1: Float = 0
+    public var padding2: Float = 0
 
     public init(
         mvpMatrix: Matrix4x4 = .identity,
         opacity: Float = 1.0,
         cornerRadius: Float = 0.0,
         layerSize: SIMD2<Float> = .zero,
-        cornerRadii: SIMD4<Float> = .zero
+        cornerRadii: SIMD4<Float> = .zero,
+        samplingBias: Float = 0
     ) {
         self.mvpMatrix = mvpMatrix
         self.opacity = opacity
         self.cornerRadius = cornerRadius
         self.layerSize = layerSize
         self.cornerRadii = cornerRadii
+        self.samplingBias = samplingBias
     }
 }
 
