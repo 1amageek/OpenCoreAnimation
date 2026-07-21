@@ -243,6 +243,16 @@ private struct PrerenderedFilter {
     let outputView: GPUTextureView
 }
 
+private enum LayerFilterStage {
+    case renderer(CAFilterOperation)
+    case coreImage(CIFilter)
+}
+
+private enum FilterTextureAlphaMode: Equatable {
+    case premultiplied
+    case straight
+}
+
 private struct ShadowCaptureState: Equatable {
     let matrixColumns: [SIMD4<Float>]
     let layerSize: SIMD2<Float>
@@ -449,6 +459,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Number of filter transitions rejected before GPU dispatch.
     @_spi(RendererDiagnostics)
     public private(set) var transitionFilterFailureCount: Int = 0
+
+    /// Number of requested layer filters rejected before GPU dispatch.
+    @_spi(RendererDiagnostics)
+    public private(set) var layerFilterFailureCount: Int = 0
 
     /// Number of frozen source and target textures currently retained by the renderer.
     @_spi(RendererDiagnostics)
@@ -949,6 +963,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Filter outputs available to capture passes and the main pass this frame.
     private var prerenderedFilters: [LayerRenderKey: PrerenderedFilter] = [:]
 
+    /// Executes Core Image layer filters on this renderer's GPU device.
+    private var layerFilterProcessor: CIWebGPUFilterProcessor?
+
+    /// Executions encoded in the current frame and retained through the next submission.
+    private var activeLayerFilterExecutions: [CIWebGPUFilterExecution] = []
+
+    /// Executions from the preceding frame, released after one complete frame of GPU lifetime.
+    private var retiringLayerFilterExecutions: [CIWebGPUFilterExecution] = []
+
+    /// Requested layer-filter paths whose configuration is currently not executable.
+    private var failedLayerFilterKeys: Set<LayerRenderKey> = []
+
     /// The root layer currently being rendered into the offscreen filter source texture.
     /// While set, filter compositing is suppressed so the subtree can be captured raw.
     private weak var filterPrerenderRootLayer: CALayer?
@@ -1121,6 +1147,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let device = try await adapter.requestDevice()
         self.device = device
         transitionFilterProcessor = CIWebGPUTransitionProcessor(device: device)
+        layerFilterProcessor = CIWebGPUFilterProcessor(device: device)
 
         // Get preferred format
         preferredFormat = gpu.preferredCanvasFormat
@@ -2422,6 +2449,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Reset per-frame filter outputs; persistent resource ownership remains cached.
         prerenderedFilters.removeAll(keepingCapacity: true)
+        for execution in retiringLayerFilterExecutions {
+            execution.invalidate()
+        }
+        retiringLayerFilterExecutions = activeLayerFilterExecutions
+        activeLayerFilterExecutions.removeAll(keepingCapacity: true)
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
@@ -2493,7 +2525,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // When root layer has cornerRadius, use transparent clear color.
             // The background will be rendered as geometry with corner radius SDF.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
-        } else if prerenderedFilters[renderKey(for: rootLayer)] != nil {
+        } else if rootPresentation.filters?.isEmpty == false
+            || prerenderedFilters[renderKey(for: rootLayer)] != nil {
             // The filtered root layer is composited from the offscreen texture, so drawing
             // its background here would double-apply the root background color.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
@@ -2737,6 +2770,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
         filterLayerResources.removeAll(keepingCapacity: false)
         prerenderedFilters.removeAll(keepingCapacity: false)
+        for execution in activeLayerFilterExecutions {
+            execution.invalidate()
+        }
+        for execution in retiringLayerFilterExecutions {
+            execution.invalidate()
+        }
+        activeLayerFilterExecutions.removeAll(keepingCapacity: false)
+        retiringLayerFilterExecutions.removeAll(keepingCapacity: false)
+        failedLayerFilterKeys.removeAll(keepingCapacity: false)
+        layerFilterFailureCount = 0
+        layerFilterProcessor?.invalidate()
+        layerFilterProcessor = nil
 
         // Rasterization cache (R3.2 / R3.4)
         rasterizationCache?.removeAll()
@@ -2914,6 +2959,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         } else {
             modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
         }
+        if filterPrerenderRootLayer !== layer,
+           presentationLayer.filters?.isEmpty == false,
+           failedLayerFilterKeys.contains(renderKey(for: layer)) {
+            return
+        }
         // Backface culling: skip rendering when layer faces away from camera
         if !presentationLayer.isDoubleSided {
             // The 2x2 determinant of the upper-left submatrix indicates face direction.
@@ -2951,10 +3001,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Check for layer filters.
         // If this layer has supported filters and was pre-rendered, composite the filtered result.
-        let supportedFilterOperations = presentationLayer.supportedFilterOperations
+        let hasRequestedFilters = presentationLayer.filters?.isEmpty == false
         let shouldCompositeAsGroup = requiresGroupOpacity(presentationLayer)
         if filterPrerenderRootLayer !== layer,
-           (!supportedFilterOperations.isEmpty || shouldCompositeAsGroup) {
+           (hasRequestedFilters || shouldCompositeAsGroup) {
             if let prerendered = prerenderedFilters[renderKey(for: layer)] {
                 // Composite the pre-rendered filtered texture.
                 renderFilteredLayerComposite(
@@ -2964,6 +3014,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     renderPass: renderPass,
                     modelMatrix: modelMatrix
                 )
+                return
+            }
+            // A requested filter path must not silently fall back to unfiltered rendering.
+            if hasRequestedFilters {
                 return
             }
         }
@@ -6490,14 +6544,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         var targets: [LayerPrepassTarget] = []
         collectFilteredLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
         var activeRenderKeys: Set<LayerRenderKey> = []
+        var failedRenderKeys: Set<LayerRenderKey> = []
 
         for target in targets {
             let filteredLayer = target.layer
-            let operations = target.presentationLayer.supportedFilterOperations
+            let requestedFilters = target.presentationLayer.filters ?? []
             let requiresGroup = requiresGroupOpacity(target.presentationLayer)
-            guard !operations.isEmpty || requiresGroup else { continue }
+            guard !requestedFilters.isEmpty || requiresGroup else { continue }
 
             let filteredRenderKey = target.renderKey
+            guard let stages = layerFilterStages(from: requestedFilters) else {
+                failedRenderKeys.insert(filteredRenderKey)
+                if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
+                    layerFilterFailureCount += 1
+                }
+                continue
+            }
             activeRenderKeys.insert(filteredRenderKey)
             let resources: FilterLayerResources
             if let existing = filterLayerResources[filteredRenderKey] {
@@ -6554,53 +6616,171 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
             var currentTexture = resources.sourceTexture
             var currentView = resources.sourceView
-            for (operationIndex, operation) in operations.enumerated() {
-                let outputTexture = currentTexture === resources.sourceTexture
-                    ? resources.resultTexture
-                    : resources.sourceTexture
-                guard let outputView = resources.view(for: outputTexture) else { continue }
-                let operationUniformBuffer = resources.uniformBuffer(
-                    forOperationAt: operationIndex,
+            var currentAlphaMode = FilterTextureAlphaMode.premultiplied
+            var conversionIndex = 0
+            var didFail = false
+
+            func convert(to targetMode: FilterTextureAlphaMode) -> Bool {
+                guard currentAlphaMode != targetMode else { return true }
+                let outputTexture = currentTexture === resources.resultTexture
+                    ? resources.sourceTexture
+                    : resources.resultTexture
+                guard let outputView = resources.view(for: outputTexture) else { return false }
+                let uniformBuffer = resources.uniformBuffer(
+                    forOperationAt: stages.count + conversionIndex,
                     device: device
                 )
+                conversionIndex += 1
+                guard applyAlphaConversion(
+                    from: currentAlphaMode,
+                    inputTexture: currentTexture,
+                    outputTexture: outputTexture,
+                    uniformBuffer: uniformBuffer,
+                    resources: resources,
+                    encoder: encoder
+                ) else { return false }
+                currentTexture = outputTexture
+                currentView = outputView
+                currentAlphaMode = targetMode
+                return true
+            }
 
-                let applied: Bool
-                switch operation {
-                case let .gaussianBlur(radius):
-                    guard radius > 0 else { continue }
-                    applied = applyBlurFilter(
-                        inputTexture: currentTexture,
-                        intermediateTexture: resources.intermediateTexture,
-                        outputTexture: outputTexture,
-                        radius: radius,
-                        uniformBuffer: operationUniformBuffer,
-                        resources: resources,
-                        encoder: encoder
+            for (stageIndex, stage) in stages.enumerated() {
+                switch stage {
+                case let .renderer(operation):
+                    guard convert(to: .premultiplied) else {
+                        didFail = true
+                        break
+                    }
+                    let outputTexture = currentTexture === resources.resultTexture
+                        ? resources.sourceTexture
+                        : resources.resultTexture
+                    guard let outputView = resources.view(for: outputTexture) else {
+                        didFail = true
+                        break
+                    }
+                    let operationUniformBuffer = resources.uniformBuffer(
+                        forOperationAt: stageIndex,
+                        device: device
                     )
-                case .brightness, .contrast, .saturation, .colorInvert:
-                    applied = applyColorFilter(
-                        operation,
-                        inputTexture: currentTexture,
-                        outputTexture: outputTexture,
-                        uniformBuffer: operationUniformBuffer,
-                        resources: resources,
-                        encoder: encoder
-                    )
-                }
 
-                if applied {
+                    let applied: Bool
+                    switch operation {
+                    case let .gaussianBlur(radius):
+                        guard radius > 0 else { continue }
+                        applied = applyBlurFilter(
+                            inputTexture: currentTexture,
+                            intermediateTexture: resources.intermediateTexture,
+                            outputTexture: outputTexture,
+                            radius: radius,
+                            uniformBuffer: operationUniformBuffer,
+                            resources: resources,
+                            encoder: encoder
+                        )
+                    case .brightness, .contrast, .saturation, .colorInvert:
+                        applied = applyColorFilter(
+                            operation,
+                            inputTexture: currentTexture,
+                            outputTexture: outputTexture,
+                            uniformBuffer: operationUniformBuffer,
+                            resources: resources,
+                            encoder: encoder
+                        )
+                    }
+
+                    guard applied else {
+                        didFail = true
+                        break
+                    }
                     currentTexture = outputTexture
                     currentView = outputView
+
+                case let .coreImage(filter):
+                    guard convert(to: .straight) else {
+                        didFail = true
+                        break
+                    }
+                    guard let processor = layerFilterProcessor else {
+                        didFail = true
+                        break
+                    }
+                    do {
+                        let execution = try processor.makeExecution(
+                            filter: filter,
+                            inputMode: .singleInput,
+                            inputTexture: currentTexture,
+                            width: UInt32(size.width),
+                            height: UInt32(size.height)
+                        )
+                        try execution.encode(commandEncoder: encoder)
+                        activeLayerFilterExecutions.append(execution)
+                        currentTexture = execution.outputTexture
+                        currentView = execution.outputTexture.createView()
+                        currentAlphaMode = .straight
+                    } catch {
+                        didFail = true
+                    }
+                }
+
+                if didFail {
+                    break
                 }
             }
 
+            if didFail {
+                failedRenderKeys.insert(filteredRenderKey)
+                if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
+                    layerFilterFailureCount += 1
+                }
+                continue
+            }
+
+            guard convert(to: .premultiplied) else {
+                failedRenderKeys.insert(filteredRenderKey)
+                if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
+                    layerFilterFailureCount += 1
+                }
+                continue
+            }
+
+            failedLayerFilterKeys.remove(filteredRenderKey)
             prerenderedFilters[filteredRenderKey] = PrerenderedFilter(
                 resources: resources,
                 outputView: currentView
             )
         }
 
+        failedLayerFilterKeys.formIntersection(failedRenderKeys)
         evictFilterResources(except: activeRenderKeys)
+    }
+
+    private func layerFilterStages(from filters: [Any]) -> [LayerFilterStage]? {
+        var stages: [LayerFilterStage] = []
+        stages.reserveCapacity(filters.count)
+
+        for value in filters {
+            if let filter = value as? CAFilter {
+                if let operation = filter.operation {
+                    stages.append(.renderer(operation))
+                    continue
+                }
+                guard let coreImageFilter = CIFilter(name: filter.name) else {
+                    return nil
+                }
+                for (key, parameter) in filter.parameters {
+                    coreImageFilter.setValue(parameter, forKey: key)
+                }
+                stages.append(.coreImage(coreImageFilter))
+            } else if let filter = value as? CIFilter {
+                if filter.isEnabled {
+                    stages.append(.coreImage(filter))
+                }
+            } else {
+                return nil
+            }
+        }
+
+        return stages
     }
 
     private func evictFilterResources(except activeRenderKeys: Set<LayerRenderKey>) {
@@ -6980,9 +7160,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let filterBlurVerticalPipeline = filterBlurVerticalPipeline,
               let shadowBindGroupLayout = shadowBindGroupLayout,
               let blurSampler = blurSampler,
-              let inputView = resources.view(for: inputTexture),
               let intermediateView = resources.view(for: intermediateTexture),
               let outputView = resources.view(for: outputTexture) else { return false }
+        let inputView = inputTexture.createView()
 
         let inputBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
             layout: shadowBindGroupLayout,
@@ -7050,13 +7230,51 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         resources: FilterLayerResources,
         encoder: GPUCommandEncoder
     ) -> Bool {
+        guard let uniforms = filterCompositeUniforms(for: operation) else { return false }
+        return applyFilterOperation(
+            uniforms: uniforms,
+            inputTexture: inputTexture,
+            outputTexture: outputTexture,
+            uniformBuffer: uniformBuffer,
+            resources: resources,
+            encoder: encoder
+        )
+    }
+
+    private func applyAlphaConversion(
+        from sourceMode: FilterTextureAlphaMode,
+        inputTexture: GPUTexture,
+        outputTexture: GPUTexture,
+        uniformBuffer: GPUBuffer,
+        resources: FilterLayerResources,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
+        let filterType: Float = sourceMode == .premultiplied ? 5 : 6
+        return applyFilterOperation(
+            uniforms: FilterCompositeUniforms(filterType: filterType),
+            inputTexture: inputTexture,
+            outputTexture: outputTexture,
+            uniformBuffer: uniformBuffer,
+            resources: resources,
+            encoder: encoder
+        )
+    }
+
+    private func applyFilterOperation(
+        uniforms initialUniforms: FilterCompositeUniforms,
+        inputTexture: GPUTexture,
+        outputTexture: GPUTexture,
+        uniformBuffer: GPUBuffer,
+        resources: FilterLayerResources,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
         guard let device = device,
               let filterOperationPipeline = filterOperationPipeline,
               let blurSampler = blurSampler,
-              var uniforms = filterCompositeUniforms(for: operation),
-              let inputView = resources.view(for: inputTexture),
               let outputView = resources.view(for: outputTexture) else { return false }
+        let inputView = inputTexture.createView()
 
+        var uniforms = initialUniforms
         let filterUniformData = createFloat32Array(from: &uniforms)
         device.queue.writeBuffer(uniformBuffer, bufferOffset: 0, data: filterUniformData)
 
@@ -7127,7 +7345,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         }
 
-        if !presentationLayer.supportedFilterOperations.isEmpty
+        if presentationLayer.filters?.isEmpty == false
             || requiresGroupOpacity(presentationLayer) {
             result.append(LayerPrepassTarget(
                 layer: layer,

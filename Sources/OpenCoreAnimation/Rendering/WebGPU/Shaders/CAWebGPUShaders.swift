@@ -785,6 +785,12 @@ public enum CAWebGPUShaders {
             straightRGB = color.rgb / capturedAlpha;
         }
 
+        if (uniforms.filterType == 5.0) {
+            return vec4<f32>(straightRGB, capturedAlpha);
+        } else if (uniforms.filterType == 6.0) {
+            return vec4<f32>(color.rgb * capturedAlpha, capturedAlpha);
+        }
+
         if (uniforms.filterType == 1.0) {
             straightRGB = applyBrightness(straightRGB, uniforms.parameter0);
         } else if (uniforms.filterType == 2.0) {

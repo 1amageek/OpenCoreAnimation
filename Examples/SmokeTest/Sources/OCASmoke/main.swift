@@ -306,6 +306,13 @@ func installHarness() {
             }
             return .number(Double(count))
         })
+        h.expose("getLayerFilterFailureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .layerFilterFailureCount ?? -1
+            }
+            return .number(Double(count))
+        })
         h.expose("getActiveShadowResourceCount", returning: {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
@@ -457,7 +464,11 @@ func installHarness() {
                 chained.position = CGPoint(x: 40, y: 40)
                 chained.zPosition = 100
                 chained.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
-                chained.filters = [CAFilter.brightness(-0.5), CAFilter.colorInvert()]
+                guard let chainColorInvert = CIFilter(name: "CIColorInvert") else {
+                    layerFilterProbeResult = "error: chain CIColorInvert unavailable"
+                    return
+                }
+                chained.filters = [CAFilter.brightness(-0.5), chainColorInvert]
                 root.addSublayer(chained)
 
                 let sibling = CALayer()
@@ -465,7 +476,12 @@ func installHarness() {
                 sibling.position = CGPoint(x: 140, y: 40)
                 sibling.zPosition = 100
                 sibling.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
-                sibling.filters = [CAFilter.brightness(0.25)]
+                guard let coreImageBrightness = CIFilter(name: "CIColorControls") else {
+                    layerFilterProbeResult = "error: CIColorControls unavailable"
+                    return
+                }
+                coreImageBrightness.setValue(Float(0.25), forKey: kCIInputBrightnessKey)
+                sibling.filters = [coreImageBrightness, CAFilter.colorInvert()]
                 root.addSublayer(sibling)
 
                 let parent = CALayer()
@@ -482,6 +498,15 @@ func installHarness() {
                 child.filters = [CAFilter.colorInvert()]
                 parent.addSublayer(child)
                 root.addSublayer(parent)
+
+                guard let incompatibleFilter = CIFilter(name: "CISourceOverCompositing") else {
+                    layerFilterProbeResult = "error: CISourceOverCompositing unavailable"
+                    return
+                }
+                guard let alphaColorInvert = CIFilter(name: "CIColorInvert") else {
+                    layerFilterProbeResult = "error: CIColorInvert unavailable"
+                    return
+                }
 
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
@@ -512,6 +537,22 @@ func installHarness() {
                     translucentGroup.addSublayer(component)
                 }
                 root.addSublayer(translucentGroup)
+
+                let rejected = CALayer()
+                rejected.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                rejected.position = CGPoint(x: 140, y: 140)
+                rejected.zPosition = 100
+                rejected.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                rejected.filters = [incompatibleFilter]
+                root.addSublayer(rejected)
+
+                let alphaFiltered = CALayer()
+                alphaFiltered.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                alphaFiltered.position = CGPoint(x: 300, y: 140)
+                alphaFiltered.zPosition = 100
+                alphaFiltered.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 0.5)
+                alphaFiltered.filters = [alphaColorInvert]
+                root.addSublayer(alphaFiltered)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -523,9 +564,13 @@ func installHarness() {
                         CGPoint(x: 260, y: 260),
                         CGPoint(x: 360, y: 260),
                         CGPoint(x: 360, y: 200),
+                        CGPoint(x: 140, y: 160),
+                        CGPoint(x: 300, y: 160),
                     ])
                     let groupedPixel = pixels[4]
                     let translucentGroupedPixel = pixels[5]
+                    let rejectedPixel = pixels[6]
+                    let alphaFilteredPixel = pixels[7]
                     opacityGroup.allowsGroupOpacity = false
                     translucentGroup.allowsGroupOpacity = false
                     engine.renderFrame()
@@ -548,12 +593,17 @@ func installHarness() {
                         && (12...18).contains(translucentUngroupedPixel[1])
                         && (18...25).contains(translucentUngroupedPixel[2])
                         && translucentUngroupedPixel[3] == 255
+                    let rejectedExplicitly = rejectedPixel == [26, 26, 38, 255]
+                    let alphaFilteredCorrectly = alphaFilteredPixel == [13, 141, 147, 255]
                     layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
                         + ";group=\(grouped),ungrouped=\(ungrouped)"
                         + ",translucentGroup=\(translucentGrouped)"
                         + ",translucentUngrouped=\(translucentUngrouped)"
+                        + ",rejected=\(rejectedExplicitly)"
+                        + ",alphaFilter=\(alphaFilteredCorrectly)"
+                        + ",alphaPixel=\(alphaFilteredPixel.map(String.init).joined(separator: ","))"
                 } catch {
                     layerFilterProbeResult = "error: \(error)"
                 }
@@ -563,6 +613,8 @@ func installHarness() {
                 parent.removeFromSuperlayer()
                 opacityGroup.removeFromSuperlayer()
                 translucentGroup.removeFromSuperlayer()
+                rejected.removeFromSuperlayer()
+                alphaFiltered.removeFromSuperlayer()
                 engine.renderFrame()
             }
         })

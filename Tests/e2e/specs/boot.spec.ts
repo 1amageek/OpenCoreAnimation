@@ -32,6 +32,7 @@ interface OCA extends Harness {
     getTransitionFilterDispatchCount: () => number;
     getTransitionFilterFailureCount: () => number;
     getActiveFilterResourceCount: () => number;
+    getLayerFilterFailureCount: () => number;
     getActiveShadowResourceCount: () => number;
     getShadowRenderFailureCount: () => number;
     mutateTransitionTarget: () => void;
@@ -105,9 +106,10 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginLayerFilterProbe();
         await expect.poll(() => h.getLayerFilterProbeResult(), { timeout: 10_000 }).toBe(
-            "127,255,255,255;64,64,255,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true"
+            "127,255,255,255;191,191,0,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true,rejected=true,alphaFilter=true,alphaPixel=13,141,147,255"
         );
         expect(await h.getActiveFilterResourceCount()).toBe(0);
+        expect(await h.getLayerFilterFailureCount()).toBe(1);
 
         await h.beginShadowProbe();
         await expect.poll(() => h.getShadowProbeResult(), { timeout: 10_000 }).toBe(
