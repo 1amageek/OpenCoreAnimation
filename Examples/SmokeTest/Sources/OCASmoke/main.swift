@@ -771,6 +771,55 @@ func installHarness() {
                 nestedOccluder.zPosition = 50
                 nestedOccluder.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                 crossingGroup.addSublayer(nestedOccluder)
+
+                let opacityGroup = CALayer()
+                opacityGroup.bounds = flattenedContainer.bounds
+                opacityGroup.position = CGPoint(x: 30, y: 250)
+                opacityGroup.opacity = 0.5
+                opacityGroup.allowsGroupOpacity = true
+                let opacityRedChild = CALayer()
+                opacityRedChild.frame = opacityGroup.bounds
+                opacityRedChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                opacityGroup.addSublayer(opacityRedChild)
+                let opacityGreenChild = CALayer()
+                opacityGreenChild.frame = opacityGroup.bounds
+                opacityGreenChild.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                opacityGroup.addSublayer(opacityGreenChild)
+                crossingGroup.addSublayer(opacityGroup)
+
+                let filteredGroup = CALayer()
+                filteredGroup.bounds = flattenedContainer.bounds
+                filteredGroup.position = CGPoint(x: 30, y: 180)
+                filteredGroup.filters = [CAFilter.colorInvert()]
+                let filteredRedChild = CALayer()
+                filteredRedChild.frame = filteredGroup.bounds
+                filteredRedChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                filteredGroup.addSublayer(filteredRedChild)
+                crossingGroup.addSublayer(filteredGroup)
+
+                let nestedEffectGroup = CALayer()
+                nestedEffectGroup.bounds = flattenedContainer.bounds
+                nestedEffectGroup.position = CGPoint(x: 90, y: 180)
+                let nestedFilteredChild = CALayer()
+                nestedFilteredChild.frame = nestedEffectGroup.bounds
+                nestedFilteredChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                nestedFilteredChild.filters = [CAFilter.colorInvert()]
+                nestedEffectGroup.addSublayer(nestedFilteredChild)
+                crossingGroup.addSublayer(nestedEffectGroup)
+
+                let maskedGroup = CALayer()
+                maskedGroup.bounds = flattenedContainer.bounds
+                maskedGroup.position = CGPoint(x: 30, y: 110)
+                let maskedRedChild = CALayer()
+                maskedRedChild.frame = maskedGroup.bounds
+                maskedRedChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                maskedGroup.addSublayer(maskedRedChild)
+                let halfMask = CALayer()
+                halfMask.bounds = CGRect(x: 0, y: 0, width: 20, height: 40)
+                halfMask.position = CGPoint(x: 10, y: 20)
+                halfMask.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                maskedGroup.mask = halfMask
+                crossingGroup.addSublayer(maskedGroup)
                 root.addSublayer(crossingGroup)
 
                 let transparencyGroup = CATransformLayer()
@@ -858,6 +907,11 @@ func installHarness() {
                         CGPoint(x: 330, y: 200),
                         CGPoint(x: 280, y: 50),
                         CGPoint(x: 350, y: 50),
+                        CGPoint(x: 30, y: 50),
+                        CGPoint(x: 30, y: 120),
+                        CGPoint(x: 20, y: 190),
+                        CGPoint(x: 45, y: 190),
+                        CGPoint(x: 90, y: 120),
                     ])
                     let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
@@ -894,12 +948,20 @@ func installHarness() {
                     let independentGroupsAreIsolated = pixels[5] == [0, 255, 0, 255]
                     let normalSubtreeIsFlattened = pixels[6] == [0, 255, 0, 255]
                     let nestedTransformPreservesDepth = pixels[7] == [255, 0, 0, 255]
+                    let groupOpacityIsAppliedOnce = pixels[8][0] <= 1
+                        && (127...128).contains(pixels[8][1])
+                        && pixels[8][2] <= 1
+                        && pixels[8][3] == 255
+                    let filterUsesLocalPixels = pixels[9] == [0, 255, 255, 255]
+                    let contentMaskUsesLocalBounds = pixels[10] == [255, 0, 0, 255]
+                        && pixels[11] == [0, 0, 0, 255]
+                    let nestedFilterUsesLocalPixels = pixels[12] == [0, 255, 255, 255]
                     let changedSubtreeWasRecaptured = updatedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningRecaptureCount == 1
-                        && flatteningUpdatedCompositeCount == 1
+                        && flatteningUpdatedCompositeCount == 5
                     let unchangedSubtreeWasReused = reusedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningReuseCaptureCount == 0
-                        && flatteningReuseCompositeCount == 1
+                        && flatteningReuseCompositeCount == 5
                     transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
                         + ",transparent=\(transparentPixelsAreCorrect)"
                         + ",isolated=\(independentGroupsAreIsolated)"
@@ -907,6 +969,10 @@ func installHarness() {
                         + ",nested=\(nestedTransformPreservesDepth)"
                         + ",captures=\(flatteningCaptureCount)"
                         + ",composites=\(flatteningCompositeCount)"
+                        + ",groupOpacity=\(groupOpacityIsAppliedOnce)"
+                        + ",filter=\(filterUsesLocalPixels)"
+                        + ",mask=\(contentMaskUsesLocalBounds)"
+                        + ",nestedFilter=\(nestedFilterUsesLocalPixels)"
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
                 } catch {

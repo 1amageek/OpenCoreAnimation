@@ -38,6 +38,7 @@ internal struct LayerRenderKey: Hashable, Sendable {
 internal enum RasterizationCachePurpose: Hashable, Sendable {
     case explicit
     case transformFlattening
+    case effectFlattening
 }
 
 /// A stable identity for a cache entry. Production keys combine model-layer
@@ -102,9 +103,9 @@ internal struct RasterizedEntry<TextureRef> {
 
 // MARK: - Cache
 
-/// LRU + byte-budget cache for explicit rasterization and transform-flattening
-/// captures. Generic over the renderer's texture handle type — `GPUTexture`
-/// for the WebGPU renderer, a stub struct for unit tests.
+/// LRU + byte-budget cache for explicit rasterization, transform flattening,
+/// and nested effect flattening. Generic over the renderer's texture handle
+/// type — `GPUTexture` for the WebGPU renderer, a stub struct for unit tests.
 ///
 /// The cache is **not thread-safe by itself**. WASM is single-threaded
 /// and OpenCoreAnimation runs all rendering on the main actor in native

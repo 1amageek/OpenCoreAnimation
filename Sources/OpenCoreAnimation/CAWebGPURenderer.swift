@@ -200,6 +200,8 @@ private enum EmitterBirthRemainderKey: Hashable {
 /// and nested filters from overwriting a shared ping-pong chain before the command
 /// buffer is submitted.
 private final class FilterLayerResources {
+    let width: Int
+    let height: Int
     let sourceTexture: GPUTexture
     let sourceView: GPUTextureView
     let intermediateTexture: GPUTexture
@@ -210,6 +212,8 @@ private final class FilterLayerResources {
     private(set) var operationUniformBuffers: [GPUBuffer] = []
 
     init(device: GPUDevice, width: Int, height: Int, format: GPUTextureFormat) {
+        self.width = width
+        self.height = height
         let descriptor = GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
             format: format,
@@ -909,6 +913,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         presentationLayer.allowsGroupOpacity && presentationLayer.opacity < 1
     }
 
+    private func requiresTransformFlattening(
+        modelLayer: CALayer,
+        presentationLayer: CALayer
+    ) -> Bool {
+        modelLayer.sublayers?.isEmpty == false
+            || presentationLayer.filters?.isEmpty == false
+            || requiresGroupOpacity(presentationLayer)
+            || presentationLayer.mask != nil
+            || presentationLayer.masksToBounds
+    }
+
+    private func requiresEffectFlattening(_ presentationLayer: CALayer) -> Bool {
+        presentationLayer.filters?.isEmpty == false
+            || requiresGroupOpacity(presentationLayer)
+    }
+
     private func orderedSublayers(for layer: CALayer) -> [CALayer] {
         guard currentReplicatorTimeOffset != 0 else {
             return layer.sortedSublayers()
@@ -1281,14 +1301,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Capture-only depth textures retained until their command buffer has been submitted.
     private var transientCaptureDepthTextures: [GPUTexture] = []
 
+    /// Raw captures and filter ping-pong resources retained until their command buffer
+    /// has been submitted. The final filtered texture is owned by rasterizationCache.
+    private var transientRasterizationTextures: [GPUTexture] = []
+    private var transientRasterizationFilterResources: [FilterLayerResources] = []
+
     /// Per-frame scratch storage: layers whose subtree has been captured
     /// (or had a fresh cache hit) this frame, mapped to the texture used
     /// for compositing. Populated by `prerenderRasterizedLayers`,
     /// consumed by `renderLayer`, cleared after submit.
     private var prerasterizedTextures: [LayerRenderKey: PrerasterizedTexture] = [:]
-
-    /// Normal-layer subtrees captured as one plane for a CATransformLayer parent.
-    private var transformFlattenedLayerKeys: Set<LayerRenderKey> = []
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCaptureCount: Int = 0
@@ -3019,7 +3041,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // capture and its dependent texture view before replacement.
         configureRasterizationCache(width: width, height: height)
         prerasterizedTextures.removeAll(keepingCapacity: true)
-        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
     }
 
@@ -3070,6 +3091,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             texture.destroy()
         }
         transientCaptureDepthTextures.removeAll(keepingCapacity: true)
+        for texture in transientRasterizationTextures {
+            texture.destroy()
+        }
+        transientRasterizationTextures.removeAll(keepingCapacity: true)
+        for resources in transientRasterizationFilterResources {
+            resources.destroy()
+        }
+        transientRasterizationFilterResources.removeAll(keepingCapacity: true)
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
@@ -3103,7 +3132,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
-        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
 
         // Drop the previous frame's textured bind groups: the buffer pool has
@@ -3274,7 +3302,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cache.evictToBudget()
         }
         prerasterizedTextures.removeAll(keepingCapacity: true)
-        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         emitterLayerStates = emitterLayerStates.filter {
             activeEmitterLayerIDs.contains($0.key)
         }
@@ -3477,6 +3504,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             texture.destroy()
         }
         transientCaptureDepthTextures.removeAll(keepingCapacity: false)
+        for texture in transientRasterizationTextures {
+            texture.destroy()
+        }
+        transientRasterizationTextures.removeAll(keepingCapacity: false)
+        for resources in transientRasterizationFilterResources {
+            resources.destroy()
+        }
+        transientRasterizationFilterResources.removeAll(keepingCapacity: false)
         transitionSourceCaptureCount = 0
         transitionTargetCaptureCount = 0
         transitionFilterDispatchCount = 0
@@ -3485,7 +3520,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transitionFilterProcessor?.invalidate()
         transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
-        transformFlattenedLayerKeys.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
         for request in pendingTileDraws {
@@ -3673,9 +3707,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        if transformFlattenedLayerKeys.contains(currentRenderKey),
+        if rasterizePrerenderRootLayer !== layer,
            let flattenedTexture = prerasterizedTextures[currentRenderKey] {
-            transformFlatteningCompositeCount += 1
+            if flattenedTexture.purpose == .transformFlattening {
+                transformFlatteningCompositeCount += 1
+            }
             renderRasterizedLayerComposite(
                 layer,
                 presentationLayer: presentationLayer,
@@ -3688,6 +3724,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         if filterPrerenderRootLayer !== layer,
+           rasterizePrerenderRootLayer !== layer,
            presentationLayer.filters?.isEmpty == false,
            failedLayerFilterKeys.contains(renderKey(for: layer)) {
             return
@@ -3746,6 +3783,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let hasRequestedFilters = presentationLayer.filters?.isEmpty == false
         let shouldCompositeAsGroup = requiresGroupOpacity(presentationLayer)
         if filterPrerenderRootLayer !== layer,
+           rasterizePrerenderRootLayer !== layer,
            (hasRequestedFilters || shouldCompositeAsGroup) {
             if let prerendered = prerenderedFilters[currentRenderKey] {
                 // Composite the pre-rendered filtered texture.
@@ -3762,28 +3800,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             if hasRequestedFilters {
                 return
             }
-        }
-
-        // R3.2 cache-hit composite: when this layer was pre-rendered
-        // into a rasterization texture this frame and the renderer is
-        // now walking the tree for the main pass (i.e. we are NOT
-        // inside the capture pass for this same layer), draw the cached
-        // pixelSize texture as a quad placed at the layer's transform
-        // with the layer's current opacity. The capture pass itself
-        // reaches this layer with `rasterizePrerenderRootLayer === layer`,
-        // so we must let it through to render the actual content into
-        // the texture.
-        if rasterizePrerenderRootLayer !== layer,
-           let cachedTexture = prerasterizedTextures[currentRenderKey] {
-            renderRasterizedLayerComposite(
-                layer,
-                presentationLayer: presentationLayer,
-                prerasterized: cachedTexture,
-                device: device,
-                renderPass: renderPass,
-                modelMatrix: modelMatrix
-            )
-            return
         }
 
         // CAEmitterLayer: Render particle system
@@ -5716,7 +5732,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         textureManager?.clearAll()
         rasterizationCache?.removeAll()
         prerasterizedTextures.removeAll(keepingCapacity: true)
-        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         for resources in shadowLayerResources.values {
             resources.destroy()
         }
@@ -8567,6 +8582,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             rootLayer,
             parentMatrix: projectionMatrix,
             parentIsTransformLayer: false,
+            isInsideFlattenedSubtree: false,
             device: device,
             pipeline: pipeline,
             cache: cache,
@@ -8584,6 +8600,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
         parentIsTransformLayer: Bool,
+        isInsideFlattenedSubtree: Bool,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         cache: RasterizationCache<GPUTexture>,
@@ -8599,24 +8616,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let isTransformLayer = layer is CATransformLayer
         let requiresTransformFlattening = parentIsTransformLayer
             && !isTransformLayer
-            && layer.sublayers?.isEmpty == false
-
-        if !isTransformLayer,
-           presentationLayer.shouldRasterize || requiresTransformFlattening {
-            let purpose: RasterizationCachePurpose = requiresTransformFlattening
-                ? .transformFlattening
-                : .explicit
-            captureRasterizedLayer(
-                layer,
-                purpose: purpose,
-                device: device,
-                pipeline: pipeline,
-                cache: cache,
-                encoder: encoder,
-                frameToken: frameToken
+            && requiresTransformFlattening(
+                modelLayer: layer,
+                presentationLayer: presentationLayer
             )
-        }
+        let requiresEffectFlattening = isInsideFlattenedSubtree
+            && !isTransformLayer
+            && !presentationLayer.shouldRasterize
+            && !requiresTransformFlattening
+            && requiresEffectFlattening(presentationLayer)
+        let descendantsAreInsideFlattenedSubtree = isInsideFlattenedSubtree
+            || presentationLayer.shouldRasterize
+            || requiresTransformFlattening
 
+        // Capture descendants first so a parent capture composites already-finalized
+        // nested rasterization entries instead of baking their uncached live paths.
         forEachPrepassSublayer(
             of: layer,
             presentationLayer: presentationLayer,
@@ -8626,6 +8640,30 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
                 parentIsTransformLayer: isTransformLayer,
+                isInsideFlattenedSubtree: descendantsAreInsideFlattenedSubtree,
+                device: device,
+                pipeline: pipeline,
+                cache: cache,
+                encoder: encoder,
+                frameToken: frameToken
+            )
+        }
+
+        if !isTransformLayer,
+           presentationLayer.shouldRasterize
+            || requiresTransformFlattening
+            || requiresEffectFlattening {
+            let purpose: RasterizationCachePurpose
+            if requiresTransformFlattening {
+                purpose = .transformFlattening
+            } else if presentationLayer.shouldRasterize {
+                purpose = .explicit
+            } else {
+                purpose = .effectFlattening
+            }
+            captureRasterizedLayer(
+                layer,
+                purpose: purpose,
                 device: device,
                 pipeline: pipeline,
                 cache: cache,
@@ -8674,9 +8712,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 texture: entry.texture,
                 purpose: purpose
             )
-            if purpose == .transformFlattening {
-                transformFlattenedLayerKeys.insert(layerRenderKey)
-            }
             return
         }
 
@@ -8688,6 +8723,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let pixelWidth = max(1, Int((bounds.width * scale).rounded(.up)))
         let pixelHeight = max(1, Int((bounds.height * scale).rounded(.up)))
         guard bounds.width > 0, bounds.height > 0 else { return }
+
+        let requestedFilters = presentationLayer.filters ?? []
+        let filterStages: [LayerFilterStage]
+        if requestedFilters.isEmpty {
+            filterStages = []
+        } else {
+            guard let stages = layerFilterStages(from: requestedFilters) else {
+                return
+            }
+            filterStages = stages
+        }
 
         let captureTexture = device.createTexture(descriptor: GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(pixelWidth), height: UInt32(pixelHeight)),
@@ -8710,9 +8756,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // value only shows through where the layer doesn't draw at all
         // (a flat-rasterized `shouldRasterize` layer is treated as an
         // opaque image, mirroring CoreAnimation's WWDC 2014 #419 model).
-        let clearAlpha: Float = purpose == .transformFlattening
-            ? 0
-            : RasterizationDecisions.captureClearAlpha()
+        let clearAlpha: Float = purpose == .explicit
+            ? RasterizationDecisions.captureClearAlpha()
+            : 0
         let capturePass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
@@ -8757,30 +8803,72 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             far: 1000
         )
 
+        let captureSize = CGSize(width: CGFloat(pixelWidth), height: CGFloat(pixelHeight))
+        let previousCaptureRoot = rasterizePrerenderRootLayer
+        let previousRenderTargetSize = renderTargetSizeOverride
+        let previousClipStack = clipRectStack
+        let previousOpacityStack = opacityStack
+        let previousMaskNestingDepth = maskNestingDepth
+        let previousTransformDepthNesting = transformDepthNesting
+        let previousStencilValue = currentStencilValue
+
         rasterizePrerenderRootLayer = layer
+        renderTargetSizeOverride = captureSize
+        clipRectStack.removeAll(keepingCapacity: true)
+        opacityStack.removeAll(keepingCapacity: true)
+        maskNestingDepth = 0
+        transformDepthNesting = 0
+        currentStencilValue = 0
         renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
-        rasterizePrerenderRootLayer = nil
+
+        rasterizePrerenderRootLayer = previousCaptureRoot
+        renderTargetSizeOverride = previousRenderTargetSize
+        clipRectStack = previousClipStack
+        opacityStack = previousOpacityStack
+        maskNestingDepth = previousMaskNestingDepth
+        transformDepthNesting = previousTransformDepthNesting
+        currentStencilValue = previousStencilValue
 
         capturePass.end()
+
+        let cachedTexture: GPUTexture
+        if filterStages.isEmpty {
+            cachedTexture = captureTexture
+        } else {
+            transientRasterizationTextures.append(captureTexture)
+            guard let filteredTexture = executeRasterizedFilterStages(
+                filterStages,
+                inputTexture: captureTexture,
+                width: pixelWidth,
+                height: pixelHeight,
+                encoder: encoder
+            ) else {
+                if failedLayerFilterKeys.insert(layerRenderKey).inserted {
+                    layerFilterFailureCount += 1
+                }
+                return
+            }
+            failedLayerFilterKeys.remove(layerRenderKey)
+            cachedTexture = filteredTexture
+        }
 
         // Insert the entry. The cache enforces the byte budget only
         // when `evictToBudget` is called (post-submit), so an oversized
         // single insert is allowed to land here.
-        let pixelSize = CGSize(width: CGFloat(pixelWidth), height: CGFloat(pixelHeight))
+        let pixelSize = captureSize
         cache.insert(
             key,
-            texture: captureTexture,
+            texture: cachedTexture,
             pixelSize: pixelSize,
             contentBoundsHash: contentBoundsHash,
             atFrame: frameToken
         )
         prerasterizedTextures[layerRenderKey] = PrerasterizedTexture(
-            texture: captureTexture,
+            texture: cachedTexture,
             purpose: purpose
         )
         if purpose == .transformFlattening {
             transformFlatteningCaptureCount += 1
-            transformFlattenedLayerKeys.insert(layerRenderKey)
         }
     }
 
@@ -8802,6 +8890,130 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return false
         }
         return entry.contentBoundsHash == contentBoundsHash
+    }
+
+    private func executeRasterizedFilterStages(
+        _ stages: [LayerFilterStage],
+        inputTexture: GPUTexture,
+        width: Int,
+        height: Int,
+        encoder: GPUCommandEncoder
+    ) -> GPUTexture? {
+        guard let device else { return nil }
+
+        let resources = FilterLayerResources(
+            device: device,
+            width: width,
+            height: height,
+            format: preferredFormat
+        )
+        transientRasterizationFilterResources.append(resources)
+
+        var currentTexture = inputTexture
+        var currentAlphaMode = FilterTextureAlphaMode.premultiplied
+        var conversionIndex = 0
+
+        func convert(to targetMode: FilterTextureAlphaMode) -> Bool {
+            guard currentAlphaMode != targetMode else { return true }
+            let outputTexture = currentTexture === resources.resultTexture
+                ? resources.sourceTexture
+                : resources.resultTexture
+            let uniformBuffer = resources.uniformBuffer(
+                forOperationAt: stages.count + conversionIndex,
+                device: device
+            )
+            conversionIndex += 1
+            guard applyAlphaConversion(
+                from: currentAlphaMode,
+                inputTexture: currentTexture,
+                outputTexture: outputTexture,
+                uniformBuffer: uniformBuffer,
+                resources: resources,
+                encoder: encoder
+            ) else { return false }
+            currentTexture = outputTexture
+            currentAlphaMode = targetMode
+            return true
+        }
+
+        for (stageIndex, stage) in stages.enumerated() {
+            let uniformBuffer = resources.uniformBuffer(
+                forOperationAt: stageIndex,
+                device: device
+            )
+
+            switch stage {
+            case let .renderer(operation):
+                guard convert(to: .premultiplied) else { return nil }
+                let outputTexture = currentTexture === resources.resultTexture
+                    ? resources.sourceTexture
+                    : resources.resultTexture
+                let applied: Bool
+                switch operation {
+                case let .gaussianBlur(radius):
+                    if radius <= 0 { continue }
+                    applied = applyBlurFilter(
+                        inputTexture: currentTexture,
+                        intermediateTexture: resources.intermediateTexture,
+                        outputTexture: outputTexture,
+                        radius: radius,
+                        uniformBuffer: uniformBuffer,
+                        resources: resources,
+                        encoder: encoder
+                    )
+                case .brightness, .contrast, .saturation, .colorInvert:
+                    applied = applyColorFilter(
+                        operation,
+                        inputTexture: currentTexture,
+                        outputTexture: outputTexture,
+                        uniformBuffer: uniformBuffer,
+                        resources: resources,
+                        encoder: encoder
+                    )
+                }
+                guard applied else { return nil }
+                currentTexture = outputTexture
+
+            case let .coreImage(filter):
+                guard convert(to: .straight), let processor = layerFilterProcessor else {
+                    return nil
+                }
+                do {
+                    let execution = try processor.makeExecution(
+                        filter: filter,
+                        inputMode: .singleInput,
+                        inputTexture: currentTexture,
+                        width: UInt32(width),
+                        height: UInt32(height)
+                    )
+                    try execution.encode(commandEncoder: encoder)
+                    activeLayerFilterExecutions.append(execution)
+                    currentTexture = execution.outputTexture
+                    currentAlphaMode = .straight
+                } catch {
+                    return nil
+                }
+            }
+        }
+
+        guard convert(to: .premultiplied) else { return nil }
+
+        let finalTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: preferredFormat,
+            usage: [.renderAttachment, .textureBinding]
+        ))
+        guard applyFilterOperation(
+            uniforms: FilterCompositeUniforms(opacity: 1),
+            inputTexture: currentTexture,
+            outputView: finalTexture.createView(),
+            uniformBuffer: resources.compositeUniformBuffer,
+            encoder: encoder
+        ) else {
+            transientRasterizationTextures.append(finalTexture)
+            return nil
+        }
+        return finalTexture
     }
 
     /// Hash of the inputs that determine the captured pixels. Used by
@@ -8977,7 +9189,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         var blurUniforms = BlurUniforms(
-            texelSize: SIMD2<Float>(1.0 / Float(size.width), 1.0 / Float(size.height)),
+            texelSize: SIMD2<Float>(
+                1.0 / Float(resources.width),
+                1.0 / Float(resources.height)
+            ),
             blurRadius: Float(radius)
         )
         let blurUniformData = createFloat32Array(from: &blurUniforms)

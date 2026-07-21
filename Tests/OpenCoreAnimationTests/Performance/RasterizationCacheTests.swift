@@ -102,12 +102,13 @@ struct RasterizationCacheTests {
         #expect(cache.entry(secondKey)?.texture == StubTexture(id: 2))
     }
 
-    @Test func explicitAndTransformFlatteningUseDistinctCacheEntries() {
+    @Test func rasterizationPurposesUseDistinctCacheEntries() {
         let cache = RasterizationCache<StubTexture>(maxBytes: 1024)
         let layer = CALayer()
         let renderKey = LayerRenderKey(layer: ObjectIdentifier(layer))
         let explicitKey = RasterizationCacheKey(renderKey, purpose: .explicit)
         let flatteningKey = RasterizationCacheKey(renderKey, purpose: .transformFlattening)
+        let effectKey = RasterizationCacheKey(renderKey, purpose: .effectFlattening)
 
         cache.insert(
             explicitKey,
@@ -123,10 +124,18 @@ struct RasterizationCacheTests {
             contentBoundsHash: 0,
             atFrame: 0
         )
+        cache.insert(
+            effectKey,
+            texture: StubTexture(id: 3),
+            pixelSize: CGSize(width: 4, height: 4),
+            contentBoundsHash: 0,
+            atFrame: 0
+        )
 
-        #expect(cache.count == 2)
+        #expect(cache.count == 3)
         #expect(cache.entry(explicitKey)?.texture == StubTexture(id: 1))
         #expect(cache.entry(flatteningKey)?.texture == StubTexture(id: 2))
+        #expect(cache.entry(effectKey)?.texture == StubTexture(id: 3))
     }
 
     // C.3 — Inserting with a known per-pixel byte cost updates `bytes`.
