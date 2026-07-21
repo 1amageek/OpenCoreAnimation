@@ -22,16 +22,20 @@ interface OCA extends Harness {
     getPixelReadback: () => string;
     getTransitionFilterProbeResult: () => string;
     getLayerFilterProbeResult: () => string;
+    getShadowProbeResult: () => string;
     getTransitionSourceCaptureCount: () => number;
     getTransitionTargetCaptureCount: () => number;
     getActiveTransitionTextureCount: () => number;
     getTransitionFilterDispatchCount: () => number;
     getTransitionFilterFailureCount: () => number;
     getActiveFilterResourceCount: () => number;
+    getActiveShadowResourceCount: () => number;
+    getShadowRenderFailureCount: () => number;
     mutateTransitionTarget: () => void;
     exerciseUnsupportedTransitionFilter: () => void;
     beginTransitionFilterProbes: () => void;
     beginLayerFilterProbe: () => void;
+    beginShadowProbe: () => void;
     removeTransition: () => void;
     beginPixelReadback: () => void;
 }
@@ -98,6 +102,13 @@ test.describe("OpenCoreAnimation smoke", () => {
             "127,255,255,255;64,64,255,255;255,0,255,255;255,0,0,255"
         );
         expect(await h.getActiveFilterResourceCount()).toBe(0);
+
+        await h.beginShadowProbe();
+        await expect.poll(() => h.getShadowProbeResult(), { timeout: 10_000 }).toBe(
+            "255,0,0,255;13,140,19,255;13,13,146,255;26,26,38,255;255,0,0,255"
+        );
+        expect(await h.getActiveShadowResourceCount()).toBe(0);
+        expect(await h.getShadowRenderFailureCount()).toBe(0);
 
         await h.exerciseUnsupportedTransitionFilter();
         await expect.poll(() => h.getTransitionFilterFailureCount()).toBe(1);

@@ -5,6 +5,12 @@ import Foundation
 import JavaScriptKit
 import SwiftWebGPU
 
+private let caRendererAlignedUniformSize: UInt64 = {
+    let baseSize = UInt64(MemoryLayout<CARendererUniforms>.stride)
+    let alignment: UInt64 = 256
+    return ((baseSize + alignment - 1) / alignment) * alignment
+}()
+
 // MARK: - File Organization
 //
 // Types, helpers, and shaders are now organized in the Rendering/WebGPU directory:
@@ -171,6 +177,105 @@ private struct PrerenderedFilter {
     let outputView: GPUTextureView
 }
 
+private struct ShadowCaptureState: Equatable {
+    let matrixColumns: [SIMD4<Float>]
+    let layerSize: SIMD2<Float>
+    let cornerRadius: Float
+    let cornerRadii: SIMD4<Float>
+    let blurRadius: Float
+
+    init(
+        matrix: Matrix4x4,
+        layerSize: SIMD2<Float>,
+        cornerRadius: Float,
+        cornerRadii: SIMD4<Float>,
+        blurRadius: Float
+    ) {
+        matrixColumns = [
+            matrix.columns.0,
+            matrix.columns.1,
+            matrix.columns.2,
+            matrix.columns.3,
+        ]
+        self.layerSize = layerSize
+        self.cornerRadius = cornerRadius
+        self.cornerRadii = cornerRadii
+        self.blurRadius = blurRadius
+    }
+}
+
+/// GPU resources owned by one shadow-producing layer.
+private final class ShadowLayerResources {
+    let maskTexture: GPUTexture
+    let maskView: GPUTextureView
+    let intermediateTexture: GPUTexture
+    let intermediateView: GPUTextureView
+    let blurUniformBuffer: GPUBuffer
+    let maskUniformBuffer: GPUBuffer
+    let compositeUniformBuffer: GPUBuffer
+    private(set) var maskVertexBuffer: GPUBuffer
+    private(set) var maskVertexCapacity: Int
+    var hasRenderedContent = false
+    var captureState: ShadowCaptureState?
+
+    init(device: GPUDevice, width: Int, height: Int) {
+        let textureDescriptor = GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: .rgba8unorm,
+            usage: [.renderAttachment, .textureBinding]
+        )
+        maskTexture = device.createTexture(descriptor: textureDescriptor)
+        maskView = maskTexture.createView()
+        intermediateTexture = device.createTexture(descriptor: textureDescriptor)
+        intermediateView = intermediateTexture.createView()
+        blurUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(MemoryLayout<BlurUniforms>.stride),
+            usage: [.uniform, .copyDst]
+        ))
+        maskUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: caRendererAlignedUniformSize,
+            usage: [.uniform, .copyDst]
+        ))
+        compositeUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(MemoryLayout<ShadowUniforms>.stride),
+            usage: [.uniform, .copyDst]
+        ))
+        maskVertexCapacity = 6
+        maskVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(maskVertexCapacity * MemoryLayout<CARendererVertex>.stride),
+            usage: [.vertex, .copyDst]
+        ))
+    }
+
+    func ensureMaskVertexCapacity(_ count: Int, device: GPUDevice) -> GPUBuffer {
+        guard count > maskVertexCapacity else { return maskVertexBuffer }
+        var newCapacity = maskVertexCapacity
+        while newCapacity < count {
+            newCapacity *= 2
+        }
+        maskVertexBuffer.destroy()
+        maskVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(newCapacity * MemoryLayout<CARendererVertex>.stride),
+            usage: [.vertex, .copyDst]
+        ))
+        maskVertexCapacity = newCapacity
+        return maskVertexBuffer
+    }
+
+    func destroy() {
+        maskTexture.destroy()
+        intermediateTexture.destroy()
+        blurUniformBuffer.destroy()
+        maskUniformBuffer.destroy()
+        compositeUniformBuffer.destroy()
+        maskVertexBuffer.destroy()
+    }
+}
+
+private struct PrerenderedShadow {
+    let resources: ShadowLayerResources
+}
+
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
 ///
 /// This is the primary renderer for OpenCoreAnimation in production.
@@ -182,13 +287,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Maximum number of layers that can be rendered per frame.
     private static let maxLayers = 1024
 
-    /// Uniform buffer alignment requirement (WebGPU minimum is 256 bytes).
-    private static let uniformAlignment: UInt64 = 256
-
     /// Size of aligned uniform data per layer.
     private static var alignedUniformSize: UInt64 {
-        let baseSize = UInt64(MemoryLayout<CARendererUniforms>.stride)
-        return ((baseSize + uniformAlignment - 1) / uniformAlignment) * uniformAlignment
+        caRendererAlignedUniformSize
     }
 
     // MARK: - Properties
@@ -271,6 +372,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     public var activeFilterResourceCount: Int {
         filterLayerResources.count
     }
+
+    /// Number of shadow texture sets retained by the renderer.
+    @_spi(RendererDiagnostics)
+    public var activeShadowResourceCount: Int {
+        shadowLayerResources.count
+    }
+
+    /// Number of visible shadows that could not complete the GPU render path.
+    @_spi(RendererDiagnostics)
+    public private(set) var shadowRenderFailureCount: Int = 0
 
     /// The preferred texture format.
     private var preferredFormat: GPUTextureFormat = .bgra8unorm
@@ -493,18 +604,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Shadow Rendering
 
-    /// Shadow mask texture for blur operations.
-    private var shadowMaskTexture: GPUTexture?
-
-    /// Cached view for `shadowMaskTexture` (reset when the texture is recreated).
-    private var shadowMaskTextureView: GPUTextureView?
-
-    /// Intermediate texture for blur ping-pong.
-    private var shadowBlurTexture: GPUTexture?
-
-    /// Cached view for `shadowBlurTexture` (reset when the texture is recreated).
-    private var shadowBlurTextureView: GPUTextureView?
-
     /// Shadow blur pipeline (horizontal pass).
     private var shadowBlurHorizontalPipeline: GPURenderPipeline?
 
@@ -529,39 +628,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Full-screen quad sampler for blur.
     private var blurSampler: GPUSampler?
 
-    /// Blur uniform buffer.
-    private var blurUniformBuffer: GPUBuffer?
+    /// Persistent viewport-sized resources keyed by the shadow-producing layer identity.
+    private var shadowLayerResources: [ObjectIdentifier: ShadowLayerResources] = [:]
 
-    /// Bind group for horizontal blur pass (samples from shadowMaskTexture).
-    private var blurHorizontalBindGroup: GPUBindGroup?
-
-    /// Bind group for vertical blur pass (samples from shadowBlurTexture).
-    private var blurVerticalBindGroup: GPUBindGroup?
-
-    /// Cache of pre-blurred shadow textures keyed by layer identity.
-    private var blurredShadowCache: [ObjectIdentifier: GPUTexture] = [:]
+    /// Shadow outputs available to the main pass this frame.
+    private var prerenderedShadows: [ObjectIdentifier: PrerenderedShadow] = [:]
 
     // MARK: - Filter Rendering (CAFilter)
-
-    // MARK: - Pre-Render Dedicated Buffers
-
-    /// Dedicated vertex buffer for pre-render passes (shadow mask, filter source).
-    /// Prevents overwriting main render vertex data at offset 0.
-    private var preRenderVertexBuffer: GPUBuffer?
-
-    /// Dedicated uniform buffer for pre-render passes.
-    private var preRenderUniformBuffer: GPUBuffer?
-
-    /// Dedicated bind group for the pre-render uniform buffer.
-    private var preRenderBindGroup: GPUBindGroup?
-
-    // MARK: - Composite Buffers
-
-    /// Pre-allocated vertex buffer for shadow composite rendering.
-    private var shadowCompositeVertexBuffer: GPUBuffer?
-
-    /// Pre-allocated uniform buffer for shadow composite rendering.
-    private var shadowCompositeUniformBuffer: GPUBuffer?
 
     /// Filter composite pipeline for blending filtered result with optional tint.
     private var filterCompositePipeline: GPURenderPipeline?
@@ -908,50 +981,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Create shadow/blur pipelines
         try createShadowPipelines(device: device)
 
-        // Create shadow textures
-        createShadowTextures(width: Int(width), height: Int(height))
-
         // Create stencil pipelines for CALayer.mask
         try createStencilPipelines(device: device)
-
-        // Create dedicated pre-render buffers (6 vertices max for a quad)
-        let preRenderVertexSize = UInt64(6 * MemoryLayout<CARendererVertex>.stride)
-        preRenderVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: preRenderVertexSize,
-            usage: [.vertex, .copyDst]
-        ))
-
-        let preRenderUniformSize = Self.alignedUniformSize
-        preRenderUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: preRenderUniformSize,
-            usage: [.uniform, .copyDst]
-        ))
-
-        // Create bind group for pre-render uniform buffer
-        if let bindGroupLayout = bindGroupLayout, let preRenderUniformBuffer = preRenderUniformBuffer {
-            preRenderBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-                layout: bindGroupLayout,
-                entries: [
-                    GPUBindGroupEntry(
-                        binding: 0,
-                        resource: .bufferBinding(GPUBufferBinding(
-                            buffer: preRenderUniformBuffer,
-                            size: UInt64(MemoryLayout<CARendererUniforms>.stride)
-                        ))
-                    )
-                ]
-            ))
-        }
-
-        // Create composite buffers
-        shadowCompositeVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: preRenderVertexSize,
-            usage: [.vertex, .copyDst]
-        ))
-        shadowCompositeUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: preRenderUniformSize,
-            usage: [.uniform, .copyDst]
-        ))
     }
 
     /// Creates stencil pipelines for CALayer.mask functionality.
@@ -1880,65 +1911,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
     }
 
-    /// Creates or recreates shadow textures for the given size.
-    private func createShadowTextures(width: Int, height: Int) {
-        guard let device = device,
-              let shadowBindGroupLayout = shadowBindGroupLayout,
-              let blurSampler = blurSampler,
-              width > 0, height > 0 else { return }
-
-        // R3.7: the cache references the previous `shadowMaskTexture` handle;
-        // recreating it invalidates every entry.
-        blurredShadowCache.removeAll(keepingCapacity: true)
-
-        // Shadow mask texture (stores layer shape)
-        shadowMaskTexture = device.createTexture(descriptor: GPUTextureDescriptor(
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
-            format: .rgba8unorm,
-            usage: [.renderAttachment, .textureBinding]
-        ))
-        shadowMaskTextureView = shadowMaskTexture?.createView()
-
-        // Shadow blur texture (for ping-pong blur)
-        shadowBlurTexture = device.createTexture(descriptor: GPUTextureDescriptor(
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
-            format: .rgba8unorm,
-            usage: [.renderAttachment, .textureBinding]
-        ))
-        shadowBlurTextureView = shadowBlurTexture?.createView()
-
-        // Create blur uniform buffer
-        blurUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: UInt64(MemoryLayout<BlurUniforms>.stride),
-            usage: [.uniform, .copyDst]
-        ))
-
-        // Create bind groups for blur passes
-        guard let shadowMaskTexture = shadowMaskTexture,
-              let shadowBlurTexture = shadowBlurTexture,
-              let blurUniformBuffer = blurUniformBuffer else { return }
-
-        // Horizontal blur: samples from shadowMaskTexture, outputs to shadowBlurTexture
-        blurHorizontalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(shadowMaskTexture.createView())),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-
-        // Vertical blur: samples from shadowBlurTexture, outputs to shadowMaskTexture
-        blurVerticalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(shadowBlurTexture.createView())),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-    }
-
     /// Creates or recreates the depth texture for the given size.
     /// Uses depth24plus-stencil8 format to support both depth testing and stencil-based masking.
     private func createDepthTexture(width: Int, height: Int) {
@@ -1971,8 +1943,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Recreate depth texture
         createDepthTexture(width: width, height: height)
 
-        // Recreate shadow textures
-        createShadowTextures(width: width, height: height)
+        // Shadow captures are viewport-sized. A resize invalidates every per-layer set.
+        for resources in shadowLayerResources.values {
+            resources.destroy()
+        }
+        shadowLayerResources.removeAll(keepingCapacity: true)
+        prerenderedShadows.removeAll(keepingCapacity: true)
 
         // Filter captures are viewport-sized. A resize invalidates every per-layer set.
         for resources in filterLayerResources.values {
@@ -1991,13 +1967,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerasterizedTextures.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
     }
-
-    /// Tracks whether shadow pre-rendering has been done for this frame.
-    private var shadowsPrerendered: Bool = false
-
-    /// Stores the pre-blurred shadow alpha value for the current frame.
-    /// After blur, this is stored in shadowMaskTexture.
-    private var hasPrerenderredShadow: Bool = false
 
     public func render(layer rootLayer: CALayer) {
         guard let device = device,
@@ -2031,9 +2000,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
 
-        // Reset shadow pre-rendering state
-        shadowsPrerendered = false
-        hasPrerenderredShadow = false
+        // Reset per-frame shadow outputs; persistent resource ownership remains cached.
+        prerenderedShadows.removeAll(keepingCapacity: true)
 
         // Reset per-frame filter outputs; persistent resource ownership remains cached.
         prerenderedFilters.removeAll(keepingCapacity: true)
@@ -2309,10 +2277,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         textureSampler = nil
 
         // Shadow resources
-        shadowMaskTexture = nil
-        shadowMaskTextureView = nil
-        shadowBlurTexture = nil
-        shadowBlurTextureView = nil
+        for resources in shadowLayerResources.values {
+            resources.destroy()
+        }
+        shadowLayerResources.removeAll(keepingCapacity: false)
+        prerenderedShadows.removeAll(keepingCapacity: false)
+        shadowRenderFailureCount = 0
         depthTextureView = nil
         lastRenderedTexture = nil
         shadowBlurHorizontalPipeline = nil
@@ -2323,19 +2293,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         shadowMaskPipeline = nil
         shadowBindGroupLayout = nil
         blurSampler = nil
-        blurUniformBuffer = nil
-        blurHorizontalBindGroup = nil
-        blurVerticalBindGroup = nil
-        blurredShadowCache.removeAll()
         textTextureCache.removeAll()
         textTextureAccessOrder.removeAll()
 
-        // Pre-render buffers
-        preRenderVertexBuffer = nil
-        preRenderUniformBuffer = nil
-        preRenderBindGroup = nil
-        shadowCompositeVertexBuffer = nil
-        shadowCompositeUniformBuffer = nil
         // Filter resources
         filterCompositePipeline = nil
         filterCompositeStencilPipeline = nil
@@ -2468,8 +2428,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         parentMatrix: Matrix4x4
     ) {
         guard let device = device,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
               let bindGroup = bindGroup else { return }
 
         // Get the presentation layer for animated values, fall back to model layer
@@ -2542,8 +2500,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // the shadow itself is composited separately in the main pass.
         if filterPrerenderRootLayer == nil,
            presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil {
-            renderLayerShadow(presentationLayer, device: device, renderPass: renderPass,
-                            modelMatrix: modelMatrix, parentMatrix: parentMatrix)
+            renderLayerShadow(
+                layer,
+                presentationLayer: presentationLayer,
+                device: device,
+                renderPass: renderPass
+            )
         }
 
         // Handle special layer types first
@@ -4549,7 +4511,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// manager (e.g. layer-keyed rasterization composites).
     public func clearTextureCache() {
         textureManager?.clearAll()
-        blurredShadowCache.removeAll()
+        for resources in shadowLayerResources.values {
+            resources.destroy()
+        }
+        shadowLayerResources.removeAll(keepingCapacity: true)
+        prerenderedShadows.removeAll(keepingCapacity: true)
         for resources in filterLayerResources.values {
             resources.destroy()
         }
@@ -5823,192 +5789,255 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Shadow Rendering (2-Pass Gaussian Blur)
 
-    /// Pre-renders shadows with 2-pass Gaussian blur before the main render pass.
-    ///
-    /// This method finds the first layer needing a shadow and renders it with blur.
-    /// Currently supports one shadow per frame due to texture sharing constraints.
-    /// For multiple shadows, a texture pool would be needed.
+    /// Pre-renders every visible shadow with independently-owned GPU resources.
     private func prerenderShadows(
         _ rootLayer: CALayer,
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
-        // Fast-path: skip the recursive `findFirstShadowLayer` walk when no
-        // descendant carries a shadow contribution. The counter mirrors model
-        // state (see CALayer's subtree counters), so animations that animate
-        // shadowOpacity from a model value of 0 are not detected here.
-        guard rootLayer._subtreeShadowCount > 0 else { return }
+        var targets: [(layer: CALayer, parentMatrix: Matrix4x4)] = []
+        collectShadowLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
+
+        guard !targets.isEmpty else {
+            evictShadowResources(except: [])
+            return
+        }
 
         guard let device = device,
-              let pipeline = pipeline,
-              let preRenderVertexBuffer = preRenderVertexBuffer,
-              let preRenderUniformBuffer = preRenderUniformBuffer,
-              let preRenderBindGroup = preRenderBindGroup,
-              let shadowMaskTexture = shadowMaskTexture,
-              let shadowBlurTexture = shadowBlurTexture,
+              let bindGroupLayout = bindGroupLayout,
+              let shadowMaskPipeline = shadowMaskPipeline,
               let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
               let shadowBlurVerticalPipeline = shadowBlurVerticalPipeline,
-              let blurHorizontalBindGroup = blurHorizontalBindGroup,
-              let blurVerticalBindGroup = blurVerticalBindGroup,
-              let blurUniformBuffer = blurUniformBuffer else { return }
-
-        // Find first layer with shadow to pre-render
-        guard let (shadowLayer, _, shadowParentMatrix, shadowEffectiveOpacity) = findFirstShadowLayer(rootLayer, parentMatrix: projectionMatrix) else {
+              let shadowBindGroupLayout = shadowBindGroupLayout,
+              let blurSampler = blurSampler else {
+            shadowRenderFailureCount += targets.count
             return
         }
 
-        // R3.7 (PERFORMANCE_DESIGN.md §5.5): when the contributor's subtree
-        // is clean and we already have a blurred texture cached, skip the
-        // mask-extraction + 2-pass blur. `shadowMaskTexture` still holds
-        // last frame's blurred result because nothing else writes to it.
-        let shadowLayerID = ObjectIdentifier(shadowLayer)
-        if RasterizationDecisions.canReusePrerenderCache(
-            contributorLayer: shadowLayer,
-            hasCachedTexture: blurredShadowCache[shadowLayerID] != nil
-        ) {
-            hasPrerenderredShadow = true
-            shadowsPrerendered = true
-            return
-        }
+        var activeLayerIDs: Set<ObjectIdentifier> = []
+        activeLayerIDs.reserveCapacity(targets.count)
 
-        let presentationLayer = shadowLayer._renderTimePresentation()
-        let shadowRadius = presentationLayer.shadowRadius
-        let shadowOffset = presentationLayer.shadowOffset
+        for target in targets {
+            let shadowLayer = target.layer
+            let shadowLayerID = ObjectIdentifier(shadowLayer)
+            activeLayerIDs.insert(shadowLayerID)
 
-        // Calculate expanded bounds for shadow (includes blur radius)
-        let expandedWidth = presentationLayer.bounds.width + shadowRadius * 4
-        let expandedHeight = presentationLayer.bounds.height + shadowRadius * 4
-
-        // Step 1: Render layer shape to shadow mask texture
-        guard let shadowMaskTextureView = shadowMaskTextureView,
-              let shadowBlurTextureView = shadowBlurTextureView else { return }
-        let maskRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
-            colorAttachments: [
-                GPURenderPassColorAttachment(
-                    view: shadowMaskTextureView,
-                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
-                    loadOp: .clear,
-                    storeOp: .store
+            let resources: ShadowLayerResources
+            if let existing = shadowLayerResources[shadowLayerID] {
+                resources = existing
+            } else {
+                resources = ShadowLayerResources(
+                    device: device,
+                    width: Int(size.width),
+                    height: Int(size.height)
                 )
-            ]
-        ))
+                shadowLayerResources[shadowLayerID] = resources
+            }
 
-        // Apply shadow offset in parent coordinate space (not layer's local space).
-        // In CoreAnimation, shadow offset direction is constant regardless of layer rotation.
-        let shadowOffsetParentMatrix = shadowParentMatrix * Matrix4x4(translation: SIMD3<Float>(
-            Float(shadowOffset.width), Float(shadowOffset.height), 0
-        ))
-        let finalMatrix = presentationLayer.modelMatrix(parentMatrix: shadowOffsetParentMatrix)
+            let presentationLayer = shadowLayer._renderTimePresentation()
+            let shadowOffset = presentationLayer.shadowOffset
+            let shadowOffsetParentMatrix = target.parentMatrix * Matrix4x4(
+                translation: SIMD3<Float>(
+                    Float(shadowOffset.width),
+                    Float(shadowOffset.height),
+                    0
+                )
+            )
+            let finalMatrix = presentationLayer.modelMatrix(parentMatrix: shadowOffsetParentMatrix)
+            let layerSize = SIMD2<Float>(
+                Float(presentationLayer.bounds.width),
+                Float(presentationLayer.bounds.height)
+            )
+            let cornerRadius = Float(presentationLayer.cornerRadius)
+            let cornerRadii = presentationLayer.cornerRadiiComponents
+            let blurRadius = max(0, Float(presentationLayer.shadowRadius)) * 0.5
+            let captureState = ShadowCaptureState(
+                matrix: finalMatrix,
+                layerSize: layerSize,
+                cornerRadius: cornerRadius,
+                cornerRadii: cornerRadii,
+                blurRadius: blurRadius
+            )
 
-        var maskUniforms = CARendererUniforms(
-            mvpMatrix: finalMatrix,
-            opacity: shadowEffectiveOpacity,
-            cornerRadius: Float(presentationLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
-            cornerRadii: presentationLayer.cornerRadiiComponents
-        )
+            if presentationLayer.shadowPath == nil,
+               resources.captureState == captureState,
+               RasterizationDecisions.canReusePrerenderCache(
+                   contributorLayer: shadowLayer,
+                   hasCachedTexture: resources.hasRenderedContent
+               ) {
+                prerenderedShadows[shadowLayerID] = PrerenderedShadow(resources: resources)
+                continue
+            }
 
-        // Write mask uniforms to dedicated pre-render buffer
-        let maskUniformData = createFloat32Array(from: &maskUniforms)
-        device.queue.writeBuffer(preRenderUniformBuffer, bufferOffset: 0, data: maskUniformData)
+            // Opacity is applied once during composite. Baking it into the mask
+            // would square the effective opacity for every shadow.
+            var maskUniforms = CARendererUniforms(
+                mvpMatrix: finalMatrix,
+                opacity: 1,
+                cornerRadius: cornerRadius,
+                layerSize: layerSize,
+                cornerRadii: cornerRadii
+            )
+            let maskUniformData = createFloat32Array(from: &maskUniforms)
+            device.queue.writeBuffer(
+                resources.maskUniformBuffer,
+                bufferOffset: 0,
+                data: maskUniformData
+            )
 
-        // R3.6 (PERFORMANCE_DESIGN.md §5.4): when `shadowPath` is set, replace
-        // the bounds-rect silhouette with a tessellated path. The mvp matrix
-        // is unchanged because both rect and path coordinates live in
-        // layer-local space.
-        let whiteColor = SIMD4<Float>(1, 1, 1, 1)
-        var maskVertices: [CARendererVertex] = []
-        if RasterizationDecisions.useShadowPathFastPath(for: presentationLayer),
-           let shadowPath = presentationLayer.shadowPath {
-            let polylines = flattenPath(shadowPath)
-            for polyline in polylines {
-                guard polyline.count >= 3 else { continue }
-                let indices = triangulatePolygon(polyline)
-                for idx in indices {
-                    let point = polyline[idx]
-                    maskVertices.append(CARendererVertex(
-                        position: SIMD2(Float(point.x), Float(point.y)),
-                        texCoord: SIMD2(0, 0),
-                        color: whiteColor
-                    ))
+            let maskBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                layout: bindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .buffer(
+                            resources.maskUniformBuffer,
+                            offset: 0,
+                            size: Self.alignedUniformSize
+                        )
+                    )
+                ]
+            ))
+
+            let whiteColor = SIMD4<Float>(1, 1, 1, 1)
+            var maskVertices: [CARendererVertex] = []
+            let usesShadowPath = RasterizationDecisions.useShadowPathFastPath(
+                for: presentationLayer
+            )
+            if usesShadowPath,
+               let shadowPath = presentationLayer.shadowPath {
+                for polyline in flattenPath(shadowPath) where polyline.count >= 3 {
+                    for index in triangulatePolygon(polyline) {
+                        let point = polyline[index]
+                        maskVertices.append(CARendererVertex(
+                            position: SIMD2(Float(point.x), Float(point.y)),
+                            texCoord: .zero,
+                            color: whiteColor
+                        ))
+                    }
                 }
             }
+
+            if !usesShadowPath {
+                let width = Float(presentationLayer.bounds.width)
+                let height = Float(presentationLayer.bounds.height)
+                maskVertices = [
+                    CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: whiteColor),
+                    CARendererVertex(position: SIMD2(width, 0), texCoord: SIMD2(1, 0), color: whiteColor),
+                    CARendererVertex(position: SIMD2(0, height), texCoord: SIMD2(0, 1), color: whiteColor),
+                    CARendererVertex(position: SIMD2(width, 0), texCoord: SIMD2(1, 0), color: whiteColor),
+                    CARendererVertex(position: SIMD2(width, height), texCoord: SIMD2(1, 1), color: whiteColor),
+                    CARendererVertex(position: SIMD2(0, height), texCoord: SIMD2(0, 1), color: whiteColor),
+                ]
+            }
+
+            let maskVertexBuffer = resources.ensureMaskVertexCapacity(
+                maskVertices.count,
+                device: device
+            )
+            if !maskVertices.isEmpty {
+                let maskVertexData = createFloat32Array(from: &maskVertices)
+                device.queue.writeBuffer(maskVertexBuffer, bufferOffset: 0, data: maskVertexData)
+            }
+
+            let maskRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.maskView,
+                        clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ]
+            ))
+            maskRenderPass.setPipeline(shadowMaskPipeline)
+            maskRenderPass.setBindGroup(0, bindGroup: maskBindGroup, dynamicOffsets: [0])
+            if !maskVertices.isEmpty {
+                maskRenderPass.setVertexBuffer(0, buffer: maskVertexBuffer, offset: 0)
+                maskRenderPass.draw(vertexCount: UInt32(maskVertices.count))
+            }
+            maskRenderPass.end()
+
+            var blurUniforms = BlurUniforms(
+                texelSize: SIMD2<Float>(1 / Float(size.width), 1 / Float(size.height)),
+                blurRadius: blurRadius
+            )
+            let blurUniformData = createFloat32Array(from: &blurUniforms)
+            device.queue.writeBuffer(
+                resources.blurUniformBuffer,
+                bufferOffset: 0,
+                data: blurUniformData
+            )
+
+            let horizontalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                layout: shadowBindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(binding: 0, resource: .buffer(
+                        resources.blurUniformBuffer,
+                        offset: 0,
+                        size: UInt64(MemoryLayout<BlurUniforms>.stride)
+                    )),
+                    GPUBindGroupEntry(binding: 1, resource: .textureView(resources.maskView)),
+                    GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+                ]
+            ))
+            let verticalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                layout: shadowBindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(binding: 0, resource: .buffer(
+                        resources.blurUniformBuffer,
+                        offset: 0,
+                        size: UInt64(MemoryLayout<BlurUniforms>.stride)
+                    )),
+                    GPUBindGroupEntry(binding: 1, resource: .textureView(resources.intermediateView)),
+                    GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+                ]
+            ))
+
+            let horizontalPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.intermediateView,
+                        clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ]
+            ))
+            horizontalPass.setPipeline(shadowBlurHorizontalPipeline)
+            horizontalPass.setBindGroup(0, bindGroup: horizontalBindGroup)
+            horizontalPass.draw(vertexCount: 6)
+            horizontalPass.end()
+
+            let verticalPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.maskView,
+                        clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ]
+            ))
+            verticalPass.setPipeline(shadowBlurVerticalPipeline)
+            verticalPass.setBindGroup(0, bindGroup: verticalBindGroup)
+            verticalPass.draw(vertexCount: 6)
+            verticalPass.end()
+
+            resources.hasRenderedContent = true
+            resources.captureState = captureState
+            prerenderedShadows[shadowLayerID] = PrerenderedShadow(resources: resources)
         }
 
-        if maskVertices.isEmpty {
-            // Bounds-rect silhouette fallback (R3.6 disabled or empty path).
-            maskVertices = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: whiteColor),
-                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: whiteColor),
-                CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: whiteColor),
-                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), 0), texCoord: SIMD2(1, 0), color: whiteColor),
-                CARendererVertex(position: SIMD2(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)), texCoord: SIMD2(1, 1), color: whiteColor),
-                CARendererVertex(position: SIMD2(0, Float(presentationLayer.bounds.height)), texCoord: SIMD2(0, 1), color: whiteColor),
-            ]
+        evictShadowResources(except: activeLayerIDs)
+    }
+
+    private func evictShadowResources(except activeLayerIDs: Set<ObjectIdentifier>) {
+        let staleLayerIDs = shadowLayerResources.keys.filter { !activeLayerIDs.contains($0) }
+        for layerID in staleLayerIDs {
+            shadowLayerResources.removeValue(forKey: layerID)?.destroy()
+            prerenderedShadows.removeValue(forKey: layerID)
         }
-
-        let maskVertexCount = UInt32(maskVertices.count)
-        let maskVertexData = createFloat32Array(from: &maskVertices)
-        device.queue.writeBuffer(preRenderVertexBuffer, bufferOffset: 0, data: maskVertexData)
-
-        // Use shadowMaskPipeline (no depth/stencil) since the mask pass has no depth attachment
-        maskRenderPass.setPipeline(shadowMaskPipeline ?? pipeline)
-        maskRenderPass.setBindGroup(0, bindGroup: preRenderBindGroup, dynamicOffsets: [0])
-        maskRenderPass.setVertexBuffer(0, buffer: preRenderVertexBuffer, offset: 0)
-        maskRenderPass.draw(vertexCount: maskVertexCount)
-        maskRenderPass.end()
-
-        // Step 2: Horizontal blur (shadowMaskTexture → shadowBlurTexture)
-        var blurUniforms = BlurUniforms(
-            texelSize: SIMD2<Float>(1.0 / Float(size.width), 1.0 / Float(size.height)),
-            blurRadius: Float(shadowRadius) * 0.5
-        )
-        let blurUniformData = createFloat32Array(from: &blurUniforms)
-        device.queue.writeBuffer(blurUniformBuffer, bufferOffset: 0, data: blurUniformData)
-
-        let hBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
-            colorAttachments: [
-                GPURenderPassColorAttachment(
-                    view: shadowBlurTextureView,
-                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
-                    loadOp: .clear,
-                    storeOp: .store
-                )
-            ]
-        ))
-
-        hBlurPass.setPipeline(shadowBlurHorizontalPipeline)
-        hBlurPass.setBindGroup(0, bindGroup: blurHorizontalBindGroup)
-        hBlurPass.draw(vertexCount: 6)
-        hBlurPass.end()
-
-        // Step 3: Vertical blur (shadowBlurTexture → shadowMaskTexture)
-        let vBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
-            colorAttachments: [
-                GPURenderPassColorAttachment(
-                    view: shadowMaskTextureView,
-                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
-                    loadOp: .clear,
-                    storeOp: .store
-                )
-            ]
-        ))
-
-        vBlurPass.setPipeline(shadowBlurVerticalPipeline)
-        vBlurPass.setBindGroup(0, bindGroup: blurVerticalBindGroup)
-        vBlurPass.draw(vertexCount: 6)
-        vBlurPass.end()
-
-        // Mark that shadow was pre-rendered
-        hasPrerenderredShadow = true
-        shadowsPrerendered = true
-
-        // R3.7: remember which contributor produced the pixels currently
-        // sitting in `shadowMaskTexture`. Next frame's reuse check looks
-        // for this entry. The texture handle is shared/recreated on
-        // `createShadowTextures` (resize); cache is cleared there.
-        blurredShadowCache.removeAll(keepingCapacity: true)
-        blurredShadowCache[shadowLayerID] = shadowMaskTexture
     }
 
     /// Pre-renders every visible filtered layer into independently-owned textures.
@@ -6436,7 +6465,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            shadowRenderFailureCount += 1
+            return
+        }
         let (vertexOffset, layerIndex) = allocation
 
         // Scale the [0, 1] quad to bounds.size, then apply the layer's
@@ -6669,66 +6701,55 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
     }
 
-    /// Finds the first layer in the hierarchy that has a visible shadow.
-    /// Accumulates effective opacity through the hierarchy for correct shadow rendering.
-    private func findFirstShadowLayer(
+    /// Collects visible shadow-producing layers in main-pass render order.
+    private func collectShadowLayers(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
-        parentOpacity: Float = 1.0
-    ) -> (layer: CALayer, matrix: Matrix4x4, parentMatrix: Matrix4x4, effectiveOpacity: Float)? {
+        into result: inout [(layer: CALayer, parentMatrix: Matrix4x4)]
+    ) {
         let presentationLayer = layer._renderTimePresentation()
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else {
-            return nil
+            return
         }
 
-        let effectiveOpacity = parentOpacity * presentationLayer.opacity
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
-        // Check if this layer has a shadow
         if presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil {
-            return (layer, modelMatrix, parentMatrix, effectiveOpacity)
+            result.append((layer, parentMatrix))
         }
 
-        // Recursively check sublayers in render order (sorted by zPosition)
-        // to match the order in which shadows are actually drawn.
-        if let sublayers = layer.sublayers {
+        if let sublayers = layer.sublayers, !sublayers.isEmpty {
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-
             for sublayer in layer.sortedSublayers() {
-                if let result = findFirstShadowLayer(sublayer, parentMatrix: sublayerMatrix, parentOpacity: effectiveOpacity) {
-                    return result
-                }
+                collectShadowLayers(
+                    sublayer,
+                    parentMatrix: sublayerMatrix,
+                    into: &result
+                )
             }
         }
-
-        return nil
     }
 
     /// Renders the shadow for a layer using the pre-blurred shadow texture.
-    ///
-    /// If the shadow was pre-rendered with 2-pass Gaussian blur, this composites
-    /// the blurred texture. Otherwise, falls back to a simplified shadow approximation.
     private func renderLayerShadow(
-        _ layer: CALayer,
+        _ modelLayer: CALayer,
+        presentationLayer layer: CALayer,
         device: GPUDevice,
-        renderPass: GPURenderPassEncoder,
-        modelMatrix: Matrix4x4,
-        parentMatrix: Matrix4x4
+        renderPass: GPURenderPassEncoder
     ) {
         guard let shadowColor = layer.shadowColor,
-              let pipeline = pipeline,
               let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup else { return }
+              let prerendered = prerenderedShadows[ObjectIdentifier(modelLayer)],
+              let shadowCompositePipeline = shadowCompositePipeline,
+              let blurSampler = blurSampler else {
+            shadowRenderFailureCount += 1
+            return
+        }
 
-        // Get shadow properties
         let shadowOpacity = layer.shadowOpacity
         let shadowOffset = layer.shadowOffset
-        let shadowRadius = layer.shadowRadius
 
-        // Get shadow color components
-        // Multiply shadow alpha by effective opacity so shadows respect parent opacity
         let effectiveOpacity = currentEffectiveOpacity
         let colorComponents: SIMD4<Float>
         if let components = shadowColor.components, components.count >= 3 {
@@ -6742,130 +6763,60 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             colorComponents = SIMD4<Float>(0, 0, 0, shadowOpacity * effectiveOpacity)
         }
 
-        // If shadow was pre-rendered with blur, use the textured composite pipeline
-        if hasPrerenderredShadow,
-           let shadowMaskTextureView = shadowMaskTextureView,
-           let shadowCompositePipeline = shadowCompositePipeline,
-           let blurSampler = blurSampler {
+        var shadowUniforms = ShadowUniforms(
+            mvpMatrix: Matrix4x4.orthographic(
+                left: 0,
+                right: Float(size.width),
+                bottom: 0,
+                top: Float(size.height),
+                near: -1000,
+                far: 1000
+            ),
+            shadowColor: colorComponents,
+            shadowOffset: SIMD2<Float>(Float(shadowOffset.width), Float(shadowOffset.height)),
+            layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
+        )
+        let shadowUniformData = createFloat32Array(from: &shadowUniforms)
+        device.queue.writeBuffer(
+            prerendered.resources.compositeUniformBuffer,
+            bufferOffset: 0,
+            data: shadowUniformData
+        )
 
-            // Create shadow uniforms for the composite shader
-            // SpriteKit/CoreAnimation coordinate system (Y+ up)
-            var shadowUniforms = ShadowUniforms(
-                mvpMatrix: Matrix4x4.orthographic(
-                    left: 0, right: Float(size.width),
-                    bottom: 0, top: Float(size.height),
-                    near: -1000, far: 1000
-                ),
-                shadowColor: colorComponents,
-                shadowOffset: SIMD2<Float>(Float(shadowOffset.width), Float(shadowOffset.height)),
-                layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
-            )
-
-            // Use pre-allocated shadow composite uniform buffer
-            guard let shadowCompositeUniformBuffer = shadowCompositeUniformBuffer else { return }
-
-            let shadowUniformData = createFloat32Array(from: &shadowUniforms)
-            device.queue.writeBuffer(shadowCompositeUniformBuffer, bufferOffset: 0, data: shadowUniformData)
-
-            // Create shadow composite bind group with the blurred texture
-            let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-                layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
-                entries: [
-                    GPUBindGroupEntry(binding: 0, resource: .buffer(shadowCompositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<ShadowUniforms>.stride))),
-                    GPUBindGroupEntry(binding: 1, resource: .textureView(shadowMaskTextureView)),
-                    GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-                ]
-            ))
-
-            // Full-screen quad vertices for compositing the shadow texture
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
-                CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
-                CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
-                CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
-                CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 1), color: colorComponents),
-                CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+        let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(
+                    prerendered.resources.compositeUniformBuffer,
+                    offset: 0,
+                    size: UInt64(MemoryLayout<ShadowUniforms>.stride)
+                )),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(prerendered.resources.maskView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
-
-            guard let allocation = allocateVertices(count: vertices.count) else { return }
-            let (vertexOffset, _) = allocation
-
-            let vertexData = createFloat32Array(from: &vertices)
-            device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
-
-            renderPass.setPipeline(maskNestingDepth > 0 ? (shadowCompositeStencilPipeline ?? shadowCompositePipeline) : shadowCompositePipeline)
-            renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
-            renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-            renderPass.draw(vertexCount: 6)
-
-            // Mark that we've consumed the pre-rendered shadow
-            hasPrerenderredShadow = false
-            return
-        }
-
-        // Fallback: Simplified shadow without blur (for subsequent shadows or when blur is unavailable)
-        // Calculate shadow size (larger than layer for blur effect)
-        let expandedWidth = layer.bounds.width + shadowRadius * 2
-        let expandedHeight = layer.bounds.height + shadowRadius * 2
-
-        // Apply shadow offset in parent coordinate space (not layer's local space).
-        // In CoreAnimation, shadow offset direction is constant regardless of layer rotation.
-        let shadowOffsetParentMatrix = parentMatrix * Matrix4x4(translation: SIMD3<Float>(
-            Float(shadowOffset.width - shadowRadius),
-            Float(shadowOffset.height - shadowRadius),
-            0
-        ))
-        let shadowModelMatrix = layer.modelMatrix(parentMatrix: shadowOffsetParentMatrix)
-
-        let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(expandedWidth), 0, 0, 0),
-            SIMD4<Float>(0, Float(expandedHeight), 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
         ))
 
-        let finalMatrix = shadowModelMatrix * scaleMatrix
-
-        // Use larger corner radius to simulate blur
-        let effectiveCornerRadius = Float(layer.cornerRadius + shadowRadius * 0.5)
-
-        // Create shadow vertices
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else { return }
-        let (vertexOffset, layerIndex) = allocation
-
-        var uniforms = CARendererUniforms(
-            mvpMatrix: finalMatrix,
-            opacity: effectiveOpacity,
-            cornerRadius: effectiveCornerRadius,
-            layerSize: SIMD2<Float>(Float(expandedWidth), Float(expandedHeight))
-        )
-
-        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-        let uniformData = createFloat32Array(from: &uniforms)
-        device.queue.writeBuffer(
-            uniformBuffer,
-            bufferOffset: uniformOffset,
-            data: uniformData
-        )
+        let vertexOffset = allocation.vertexOffset
 
         let vertexData = createFloat32Array(from: &vertices)
-        device.queue.writeBuffer(
-            vertexBuffer,
-            bufferOffset: vertexOffset,
-            data: vertexData
-        )
+        device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
-        renderPass.setPipeline(pipeline)
-        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setPipeline(
+            maskNestingDepth > 0
+                ? (shadowCompositeStencilPipeline ?? shadowCompositePipeline)
+                : shadowCompositePipeline
+        )
+        renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
     }

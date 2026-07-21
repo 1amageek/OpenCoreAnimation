@@ -35,6 +35,7 @@ nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
 nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
+nonisolated(unsafe) var shadowProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -67,6 +68,7 @@ public func setup() {
             pixelReadbackResult = "pending"
             transitionFilterProbeResult = "pending"
             layerFilterProbeResult = "pending"
+            shadowProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -235,6 +237,9 @@ func installHarness() {
         h.expose("getLayerFilterProbeResult", returning: {
             .string(layerFilterProbeResult)
         })
+        h.expose("getShadowProbeResult", returning: {
+            .string(shadowProbeResult)
+        })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
@@ -274,6 +279,20 @@ func installHarness() {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
                     .activeFilterResourceCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getActiveShadowResourceCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .activeShadowResourceCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getShadowRenderFailureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .shadowRenderFailureCount ?? -1
             }
             return .number(Double(count))
         })
@@ -459,6 +478,110 @@ func installHarness() {
                 sibling.removeFromSuperlayer()
                 parent.removeFromSuperlayer()
                 engine.renderFrame()
+            }
+        })
+        h.expose("beginShadowProbe", action: {
+            Task { @MainActor in
+                shadowProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    shadowProbeResult = "error: root layer or renderer unavailable"
+                    return
+                }
+
+                func makeShadowLayer(
+                    x: CGFloat,
+                    color: CGColor,
+                    opacity: Float,
+                    parent: CALayer
+                ) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = CGPoint(x: x, y: 150)
+                    layer.zPosition = 100
+                    layer.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                    layer.opacity = opacity
+                    layer.shadowColor = color
+                    layer.shadowOpacity = 1
+                    layer.shadowOffset = CGSize(width: 40, height: 0)
+                    layer.shadowRadius = 4
+                    parent.addSublayer(layer)
+                    return layer
+                }
+
+                let movingContainer = CALayer()
+                movingContainer.bounds = root.bounds
+                movingContainer.position = root.position
+                movingContainer.zPosition = 100
+                root.addSublayer(movingContainer)
+
+                let red = makeShadowLayer(
+                    x: 40,
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                    opacity: 1,
+                    parent: movingContainer
+                )
+                let green = makeShadowLayer(
+                    x: 150,
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+                    opacity: 0.5,
+                    parent: root
+                )
+                let animated = makeShadowLayer(
+                    x: 260,
+                    color: CGColor(red: 0, green: 0, blue: 1, alpha: 1),
+                    opacity: 1,
+                    parent: root
+                )
+                animated.shadowOpacity = 0
+                let shadowAnimation = CABasicAnimation(keyPath: "shadowOpacity")
+                shadowAnimation.fromValue = Float(0)
+                shadowAnimation.toValue = Float(1)
+                shadowAnimation.duration = 1
+                shadowAnimation.speed = 0
+                shadowAnimation.timeOffset = 0.5
+                shadowAnimation.fillMode = .both
+                shadowAnimation.isRemovedOnCompletion = false
+                animated.add(shadowAnimation, forKey: "animatedShadowProbe")
+
+                let emptyPath = makeShadowLayer(
+                    x: 340,
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                    opacity: 1,
+                    parent: root
+                )
+                emptyPath.shadowPath = CGMutablePath()
+
+                engine.renderFrame()
+                var result: String
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 80, y: 150),
+                        CGPoint(x: 190, y: 150),
+                        CGPoint(x: 300, y: 150),
+                        CGPoint(x: 380, y: 150),
+                    ])
+                    result = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+
+                    movingContainer.position.x += 20
+                    engine.renderFrame()
+                    let movedPixel = try await renderer.readbackPixel(x: 100, y: 150)
+                    result += ";" + movedPixel.map(String.init).joined(separator: ",")
+                } catch {
+                    result = "error: \(error)"
+                }
+
+                red.removeFromSuperlayer()
+                green.removeFromSuperlayer()
+                animated.removeFromSuperlayer()
+                emptyPath.removeFromSuperlayer()
+                movingContainer.removeFromSuperlayer()
+                engine.renderFrame()
+                shadowProbeResult = result
             }
         })
         h.expose("removeTransition", action: {
