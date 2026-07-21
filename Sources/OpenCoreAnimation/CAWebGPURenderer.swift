@@ -179,6 +179,11 @@ private struct BackdropCompositionTarget {
     let sourceColor: SIMD4<Float>
 }
 
+private struct BackdropCompositionRoot {
+    let prepass: LayerPrepassTarget
+    let clearColor: GPUColor
+}
+
 private enum CompositionMaskTarget {
     case clipShape(LayerPrepassTarget)
     case layerContent(LayerPrepassTarget)
@@ -8483,7 +8488,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         isRoot: Bool = true
     ) -> Bool {
         let presentation = renderPresentation(for: layer)
-        let hasPreparedFilteredContent = prerenderedFilters[renderKey(for: layer)] != nil
+        let key = renderKey(for: layer)
+        let hasPreparedFilteredContent = prerenderedFilters[key] != nil
+        let hasRequestedBackdropComposition = presentation.compositingFilter != nil
+            || presentation.backgroundFilters?.isEmpty == false
+        let hasUnpreparedBackdropComposition = hasRequestedBackdropComposition
+            && prerenderedCompositions[key] == nil
         let hasUnpreparedTransition: Bool
         if let transitionState = presentation._transitionRenderState {
             hasUnpreparedTransition = transitionCaptures[
@@ -8495,8 +8505,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if (!isRoot
                 && presentation.filters?.isEmpty == false
                 && !hasPreparedFilteredContent)
-            || presentation.compositingFilter != nil
-            || presentation.backgroundFilters?.isEmpty == false
+            || hasUnpreparedBackdropComposition
             || hasUnpreparedTransition {
             return false
         }
@@ -8773,21 +8782,86 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // bakes the composition target into a flattened texture. Record those
         // ancestors so the first capture phase skips them and the second phase
         // runs after `prerenderBackdropCompositions` has produced their inputs.
-        var targets: [BackdropCompositionTarget] = []
-        collectBackdropCompositionTargets(
+        let roots = backdropCompositionRoots(
             rootLayer,
+            projectionMatrix: projectionMatrix,
+            mainClearColor: GPUColor(r: 0, g: 0, b: 0, a: 0)
+        )
+        var ancestorKeys: Set<LayerRenderKey> = []
+        for root in roots {
+            var targets: [BackdropCompositionTarget] = []
+            withPrepassContext(root.prepass) {
+                collectBackdropCompositionTargets(
+                    root.prepass.layer,
+                    parentMatrix: root.prepass.parentMatrix,
+                    parentBackdropTarget: nil,
+                    ancestorRenderKeys: [],
+                    ancestorBackdropScopes: [],
+                    ancestorClipTargets: [],
+                    ancestorContentMaskTargets: [],
+                    inheritedOpacity: 1,
+                    targets: &targets
+                )
+            }
+            ancestorKeys.formUnion(targets.flatMap(\.ancestorRenderKeys))
+        }
+        deferredCompositionRasterizationKeys = ancestorKeys
+    }
+
+    private func backdropCompositionRoots(
+        _ rootLayer: CALayer,
+        projectionMatrix: Matrix4x4,
+        mainClearColor: GPUColor
+    ) -> [BackdropCompositionRoot] {
+        var detachedRoots: [BackdropCompositionRoot] = []
+        var visitedRootKeys: Set<LayerRenderKey> = []
+
+        func visit(_ layer: CALayer, parentMatrix: Matrix4x4) {
+            let presentation = renderPresentation(for: layer)
+            guard !presentation.isHidden, presentation.opacity > 0 else { return }
+            let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
+
+            if let mask = presentation.mask {
+                let maskTarget = LayerPrepassTarget(
+                    layer: mask,
+                    presentationLayer: renderPresentation(for: mask),
+                    parentMatrix: modelMatrix,
+                    renderKey: renderKey(for: mask),
+                    timeOffset: currentReplicatorTimeOffset
+                )
+                if visitedRootKeys.insert(maskTarget.renderKey).inserted {
+                    withPrepassContext(maskTarget) {
+                        visit(mask, parentMatrix: modelMatrix)
+                    }
+                    detachedRoots.append(BackdropCompositionRoot(
+                        prepass: maskTarget,
+                        clearColor: GPUColor(r: 0, g: 0, b: 0, a: 0)
+                    ))
+                }
+            }
+
+            forEachPrepassSublayer(
+                of: layer,
+                presentationLayer: presentation,
+                modelMatrix: modelMatrix
+            ) { sublayer, sublayerParentMatrix in
+                visit(sublayer, parentMatrix: sublayerParentMatrix)
+            }
+        }
+
+        visit(rootLayer, parentMatrix: projectionMatrix)
+        let mainTarget = LayerPrepassTarget(
+            layer: rootLayer,
+            presentationLayer: renderPresentation(for: rootLayer),
             parentMatrix: projectionMatrix,
-            parentBackdropTarget: nil,
-            ancestorRenderKeys: [],
-            ancestorBackdropScopes: [],
-            ancestorClipTargets: [],
-            ancestorContentMaskTargets: [],
-            inheritedOpacity: 1,
-            targets: &targets
+            renderKey: renderKey(for: rootLayer),
+            timeOffset: currentReplicatorTimeOffset
         )
-        deferredCompositionRasterizationKeys = Set(
-            targets.flatMap(\.ancestorRenderKeys)
-        )
+        detachedRoots.append(BackdropCompositionRoot(
+            prepass: mainTarget,
+            clearColor: mainClearColor
+        ))
+        return detachedRoots
     }
 
     private func prerenderBackdropCompositions(
@@ -8801,333 +8875,347 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let depthTextureView,
               let processor = layerFilterProcessor else { return }
 
-        var targets: [BackdropCompositionTarget] = []
-        collectBackdropCompositionTargets(
+        let roots = backdropCompositionRoots(
             rootLayer,
-            parentMatrix: projectionMatrix,
-            parentBackdropTarget: nil,
-            ancestorRenderKeys: [],
-            ancestorBackdropScopes: [],
-            ancestorClipTargets: [],
-            ancestorContentMaskTargets: [],
-            inheritedOpacity: 1,
-            targets: &targets
+            projectionMatrix: projectionMatrix,
+            mainClearColor: clearColor
         )
-
         var activeKeys: Set<LayerRenderKey> = []
         var failedKeys: Set<LayerRenderKey> = []
-        var prefixIsValid = true
 
-        func recordFailure(_ key: LayerRenderKey) {
-            failedKeys.insert(key)
-            if failedCompositionKeys.insert(key).inserted {
-                compositionFilterFailureCount += 1
+        for root in roots {
+            var targets: [BackdropCompositionTarget] = []
+            withPrepassContext(root.prepass) {
+                collectBackdropCompositionTargets(
+                    root.prepass.layer,
+                    parentMatrix: root.prepass.parentMatrix,
+                    parentBackdropTarget: nil,
+                    ancestorRenderKeys: [],
+                    ancestorBackdropScopes: [],
+                    ancestorClipTargets: [],
+                    ancestorContentMaskTargets: [],
+                    inheritedOpacity: 1,
+                    targets: &targets
+                )
             }
-            prefixIsValid = false
-        }
-
-        let processingTargets = targets.enumerated().sorted { lhs, rhs in
-            if lhs.element.depth != rhs.element.depth {
-                return lhs.element.depth > rhs.element.depth
+            var prefixIsValid = true
+            let recordFailure: (LayerRenderKey) -> Void = { key in
+                failedKeys.insert(key)
+                if self.failedCompositionKeys.insert(key).inserted {
+                    self.compositionFilterFailureCount += 1
+                }
+                prefixIsValid = false
             }
-            return lhs.offset < rhs.offset
-        }.map(\.element)
-        var previousDepth = processingTargets.first?.depth
 
-        for compositionTarget in processingTargets {
-            if let previousDepth, compositionTarget.depth < previousDepth {
+            let processingTargets = targets.enumerated().sorted { lhs, rhs in
+                if lhs.element.depth != rhs.element.depth {
+                    return lhs.element.depth > rhs.element.depth
+                }
+                return lhs.offset < rhs.offset
+            }.map(\.element)
+            var previousDepth = processingTargets.first?.depth
+
+            for compositionTarget in processingTargets {
+                if let previousDepth, compositionTarget.depth < previousDepth {
+                    prerenderFilteredLayers(
+                        rootLayer,
+                        encoder: encoder,
+                        projectionMatrix: projectionMatrix
+                    )
+                }
+                previousDepth = compositionTarget.depth
+                let target = compositionTarget.prepass
+                let key = target.renderKey
+                let presentation = target.presentationLayer
+                let requestedBackgroundFilters = presentation.backgroundFilters ?? []
+                guard let backgroundStages = layerFilterStages(from: requestedBackgroundFilters) else {
+                    recordFailure(key)
+                    continue
+                }
+                let compositionFilter: CIFilter
+                if let requestedFilter = presentation.compositingFilter as? CIFilter {
+                    compositionFilter = requestedFilter
+                } else if presentation.compositingFilter != nil {
+                    recordFailure(key)
+                    continue
+                } else if let sourceOver = CIFilter(name: "CISourceOverCompositing") {
+                    compositionFilter = sourceOver
+                } else {
+                    recordFailure(key)
+                    continue
+                }
+                guard prefixIsValid,
+                      processor.supports(compositionFilter, inputMode: .foregroundAndBackground),
+                      let source = prerenderedFilters[key] else {
+                    recordFailure(key)
+                    continue
+                }
+
+                let resources: CompositionLayerResources
+                if let existing = compositionLayerResources[key] {
+                    resources = existing
+                } else {
+                    resources = CompositionLayerResources(
+                        device: device,
+                        width: Int(size.width),
+                        height: Int(size.height),
+                        format: preferredFormat
+                    )
+                    compositionLayerResources[key] = resources
+                }
+                activeKeys.insert(key)
+
+                let backdropClearColor = compositionTarget.scope == nil
+                    ? root.clearColor
+                    : GPUColor(r: 0, g: 0, b: 0, a: 0)
+                let backdropPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                    colorAttachments: [
+                        GPURenderPassColorAttachment(
+                            view: resources.backdropView,
+                            clearValue: backdropClearColor,
+                            loadOp: .clear,
+                            storeOp: .store
+                        )
+                    ],
+                    depthStencilAttachment: GPURenderPassDepthStencilAttachment(
+                        view: depthTextureView,
+                        depthClearValue: 1,
+                        depthLoadOp: .clear,
+                        depthStoreOp: .store,
+                        stencilClearValue: 0,
+                        stencilLoadOp: .clear,
+                        stencilStoreOp: .store
+                    )
+                ))
+                backdropPass.setPipeline(pipeline)
+                backdropPass.setViewport(
+                    x: 0,
+                    y: 0,
+                    width: Float(size.width),
+                    height: Float(size.height),
+                    minDepth: 0,
+                    maxDepth: 1
+                )
+
+                let savedOpacityStack = opacityStack
+                let savedColorStack = replicatorColorStack
+                let savedTimeStack = replicatorTimeOffsetStack
+                let savedInstancePath = replicatorInstancePath
+                let savedClipStack = clipRectStack
+                let savedMaskDepth = maskNestingDepth
+                let savedStencilValue = currentStencilValue
+                let savedStopKey = compositionCaptureStopKey
+                let savedDidReachStop = compositionCaptureDidReachStop
+                let savedPassThroughKeys = compositionCapturePassThroughKeys
+                let savedFilterPrerenderRoot = filterPrerenderRootLayer
+
+                opacityStack.removeAll(keepingCapacity: true)
+                replicatorColorStack.removeAll(keepingCapacity: true)
+                replicatorTimeOffsetStack.removeAll(keepingCapacity: true)
+                replicatorInstancePath.removeAll(keepingCapacity: true)
+                clipRectStack.removeAll(keepingCapacity: true)
+                maskNestingDepth = 0
+                currentStencilValue = 0
+                compositionCaptureStopKey = key
+                compositionCaptureDidReachStop = false
+                compositionCapturePassThroughKeys = Set(compositionTarget.ancestorRenderKeys)
+
+                if let scope = compositionTarget.scope {
+                    filterPrerenderRootLayer = scope.layer
+                    withPrepassContext(scope) {
+                        renderLayer(
+                            scope.layer,
+                            renderPass: backdropPass,
+                            parentMatrix: scope.parentMatrix
+                        )
+                    }
+                } else {
+                    withPrepassContext(root.prepass) {
+                        renderLayer(
+                            root.prepass.layer,
+                            renderPass: backdropPass,
+                            parentMatrix: root.prepass.parentMatrix
+                        )
+                    }
+                }
+                let didReachTarget = compositionCaptureDidReachStop
+
+                opacityStack = savedOpacityStack
+                replicatorColorStack = savedColorStack
+                replicatorTimeOffsetStack = savedTimeStack
+                replicatorInstancePath = savedInstancePath
+                clipRectStack = savedClipStack
+                maskNestingDepth = savedMaskDepth
+                currentStencilValue = savedStencilValue
+                compositionCaptureStopKey = savedStopKey
+                compositionCaptureDidReachStop = savedDidReachStop
+                compositionCapturePassThroughKeys = savedPassThroughKeys
+                filterPrerenderRootLayer = savedFilterPrerenderRoot
+                backdropPass.end()
+
+                let clipMaskView = buildCompositionClipMask(
+                    clipTargets: compositionTarget.clipAncestors,
+                    contentMaskTargets: compositionTarget.contentMaskAncestors,
+                    resources: resources,
+                    encoder: encoder
+                )
+                var premultipliedSourceTexture = source.outputTexture
+                if !compositionTarget.clipAncestors.isEmpty
+                    || !compositionTarget.contentMaskAncestors.isEmpty {
+                    guard let clipMaskView,
+                          let compositionMaskApplyPipeline,
+                          encodeCompositionMaskOperation(
+                            pipeline: compositionMaskApplyPipeline,
+                            firstView: source.outputView,
+                            secondView: clipMaskView,
+                            outputView: resources.clippedSourceView,
+                            encoder: encoder
+                          ) else {
+                        recordFailure(key)
+                        continue
+                    }
+                    premultipliedSourceTexture = resources.clippedSourceTexture
+                }
+                if compositionTarget.sourceOpacity < 1
+                    || compositionTarget.sourceColor != SIMD4<Float>(repeating: 1) {
+                    guard applyFilterOperation(
+                        uniforms: FilterCompositeUniforms(
+                            opacity: compositionTarget.sourceOpacity,
+                            colorMultiplier: compositionTarget.sourceColor
+                        ),
+                        inputTexture: premultipliedSourceTexture,
+                        outputView: resources.sourcePremultipliedView,
+                        uniformBuffer: resources.sourceOpacityUniformBuffer,
+                        encoder: encoder
+                    ) else {
+                        recordFailure(key)
+                        continue
+                    }
+                    premultipliedSourceTexture = resources.sourcePremultipliedTexture
+                }
+
+                guard didReachTarget,
+                      applyAlphaConversion(
+                        from: .premultiplied,
+                        inputTexture: premultipliedSourceTexture,
+                        outputView: resources.sourceStraightView,
+                        uniformBuffer: resources.sourceUniformBuffer,
+                        encoder: encoder
+                      ),
+                      applyAlphaConversion(
+                        from: .premultiplied,
+                        inputTexture: resources.backdropTexture,
+                        outputView: resources.backdropStraightView,
+                        uniformBuffer: resources.backdropUniformBuffer,
+                        encoder: encoder
+                      ) else {
+                    recordFailure(key)
+                    continue
+                }
+
+                var compositionBackdropTexture = resources.backdropStraightTexture
+                if !backgroundStages.isEmpty {
+                    guard let filteredBackdrop = executeBackdropFilterStages(
+                        backgroundStages,
+                        inputTexture: resources.backdropStraightTexture,
+                        inputView: resources.backdropStraightView,
+                        resources: resources.backgroundFilterResources,
+                        encoder: encoder
+                    ),
+                    renderBackdropFilterMask(
+                        for: compositionTarget,
+                        resources: resources,
+                        encoder: encoder
+                    ) else {
+                        recordFailure(key)
+                        continue
+                    }
+                    var backgroundMaskView = resources.backdropMaskView
+                    let backgroundClipMaskView: GPUTextureView?
+                    if let targetContentMask = compositionTarget.targetContentMask {
+                        backgroundClipMaskView = buildCompositionClipMask(
+                            clipTargets: compositionTarget.clipAncestors,
+                            contentMaskTargets: compositionTarget.contentMaskAncestors
+                                + [targetContentMask],
+                            resources: resources,
+                            encoder: encoder
+                        )
+                    } else {
+                        backgroundClipMaskView = clipMaskView
+                    }
+                    if let backgroundClipMaskView {
+                        guard let compositionMaskIntersectPipeline,
+                              encodeCompositionMaskOperation(
+                                pipeline: compositionMaskIntersectPipeline,
+                                firstView: resources.backdropMaskView,
+                                secondView: backgroundClipMaskView,
+                                outputView: resources.combinedBackdropMaskView,
+                                encoder: encoder
+                              ) else {
+                            recordFailure(key)
+                            continue
+                        }
+                        backgroundMaskView = resources.combinedBackdropMaskView
+                    }
+                    guard mixFilteredBackdrop(
+                        originalView: resources.backdropStraightView,
+                        filteredView: filteredBackdrop.view,
+                        maskView: backgroundMaskView,
+                        resources: resources,
+                        encoder: encoder
+                    ) else {
+                        recordFailure(key)
+                        continue
+                    }
+                    compositionBackdropTexture = resources.mixedBackdropStraightTexture
+                }
+
+                do {
+                    let execution = try processor.makeExecution(
+                        filter: compositionFilter,
+                        inputMode: .foregroundAndBackground,
+                        inputTexture: resources.sourceStraightTexture,
+                        backgroundTexture: compositionBackdropTexture,
+                        width: UInt32(size.width),
+                        height: UInt32(size.height)
+                    )
+                    try execution.encode(commandEncoder: encoder)
+                    activeCompositionExecutions.append(execution)
+                    guard applyAlphaConversion(
+                        from: .straight,
+                        inputTexture: execution.outputTexture,
+                        outputView: resources.resultPremultipliedView,
+                        uniformBuffer: resources.resultConversionUniformBuffer,
+                        encoder: encoder
+                    ) else {
+                        recordFailure(key)
+                        continue
+                    }
+                    failedCompositionKeys.remove(key)
+                    prerenderedCompositions[key] = PrerenderedComposition(
+                        resources: resources,
+                        outputTexture: resources.resultPremultipliedTexture,
+                        outputView: resources.resultPremultipliedView,
+                        samplingModelMatrix: presentation.modelMatrix(
+                            parentMatrix: target.parentMatrix
+                        )
+                    )
+                } catch {
+                    recordFailure(key)
+                }
+            }
+
+            if previousDepth != nil {
+                // Refresh every context so resources referenced by commands
+                // encoded for sibling mask roots remain alive until submission.
+                // The refreshed main tree also picks up depth-zero compositions
+                // that became available inside detached content masks.
                 prerenderFilteredLayers(
                     rootLayer,
                     encoder: encoder,
                     projectionMatrix: projectionMatrix
                 )
             }
-            previousDepth = compositionTarget.depth
-            let target = compositionTarget.prepass
-            let key = target.renderKey
-            let presentation = target.presentationLayer
-            let requestedBackgroundFilters = presentation.backgroundFilters ?? []
-            guard let backgroundStages = layerFilterStages(from: requestedBackgroundFilters) else {
-                recordFailure(key)
-                continue
-            }
-            let compositionFilter: CIFilter
-            if let requestedFilter = presentation.compositingFilter as? CIFilter {
-                compositionFilter = requestedFilter
-            } else if presentation.compositingFilter != nil {
-                recordFailure(key)
-                continue
-            } else if let sourceOver = CIFilter(name: "CISourceOverCompositing") {
-                compositionFilter = sourceOver
-            } else {
-                recordFailure(key)
-                continue
-            }
-            guard prefixIsValid,
-                  processor.supports(compositionFilter, inputMode: .foregroundAndBackground),
-                  let source = prerenderedFilters[key] else {
-                recordFailure(key)
-                continue
-            }
-
-            let resources: CompositionLayerResources
-            if let existing = compositionLayerResources[key] {
-                resources = existing
-            } else {
-                resources = CompositionLayerResources(
-                    device: device,
-                    width: Int(size.width),
-                    height: Int(size.height),
-                    format: preferredFormat
-                )
-                compositionLayerResources[key] = resources
-            }
-            activeKeys.insert(key)
-
-            let backdropClearColor = compositionTarget.scope == nil
-                ? clearColor
-                : GPUColor(r: 0, g: 0, b: 0, a: 0)
-            let backdropPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
-                colorAttachments: [
-                    GPURenderPassColorAttachment(
-                        view: resources.backdropView,
-                        clearValue: backdropClearColor,
-                        loadOp: .clear,
-                        storeOp: .store
-                    )
-                ],
-                depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                    view: depthTextureView,
-                    depthClearValue: 1,
-                    depthLoadOp: .clear,
-                    depthStoreOp: .store,
-                    stencilClearValue: 0,
-                    stencilLoadOp: .clear,
-                    stencilStoreOp: .store
-                )
-            ))
-            backdropPass.setPipeline(pipeline)
-            backdropPass.setViewport(
-                x: 0,
-                y: 0,
-                width: Float(size.width),
-                height: Float(size.height),
-                minDepth: 0,
-                maxDepth: 1
-            )
-
-            let savedOpacityStack = opacityStack
-            let savedColorStack = replicatorColorStack
-            let savedTimeStack = replicatorTimeOffsetStack
-            let savedInstancePath = replicatorInstancePath
-            let savedClipStack = clipRectStack
-            let savedMaskDepth = maskNestingDepth
-            let savedStencilValue = currentStencilValue
-            let savedStopKey = compositionCaptureStopKey
-            let savedDidReachStop = compositionCaptureDidReachStop
-            let savedPassThroughKeys = compositionCapturePassThroughKeys
-            let savedFilterPrerenderRoot = filterPrerenderRootLayer
-
-            opacityStack.removeAll(keepingCapacity: true)
-            replicatorColorStack.removeAll(keepingCapacity: true)
-            replicatorTimeOffsetStack.removeAll(keepingCapacity: true)
-            replicatorInstancePath.removeAll(keepingCapacity: true)
-            clipRectStack.removeAll(keepingCapacity: true)
-            maskNestingDepth = 0
-            currentStencilValue = 0
-            compositionCaptureStopKey = key
-            compositionCaptureDidReachStop = false
-            compositionCapturePassThroughKeys = Set(compositionTarget.ancestorRenderKeys)
-
-            if let scope = compositionTarget.scope {
-                filterPrerenderRootLayer = scope.layer
-                withPrepassContext(scope) {
-                    renderLayer(
-                        scope.layer,
-                        renderPass: backdropPass,
-                        parentMatrix: scope.parentMatrix
-                    )
-                }
-            } else {
-                renderLayer(rootLayer, renderPass: backdropPass, parentMatrix: projectionMatrix)
-            }
-            let didReachTarget = compositionCaptureDidReachStop
-
-            opacityStack = savedOpacityStack
-            replicatorColorStack = savedColorStack
-            replicatorTimeOffsetStack = savedTimeStack
-            replicatorInstancePath = savedInstancePath
-            clipRectStack = savedClipStack
-            maskNestingDepth = savedMaskDepth
-            currentStencilValue = savedStencilValue
-            compositionCaptureStopKey = savedStopKey
-            compositionCaptureDidReachStop = savedDidReachStop
-            compositionCapturePassThroughKeys = savedPassThroughKeys
-            filterPrerenderRootLayer = savedFilterPrerenderRoot
-            backdropPass.end()
-
-            let clipMaskView = buildCompositionClipMask(
-                clipTargets: compositionTarget.clipAncestors,
-                contentMaskTargets: compositionTarget.contentMaskAncestors,
-                resources: resources,
-                encoder: encoder
-            )
-            var premultipliedSourceTexture = source.outputTexture
-            if !compositionTarget.clipAncestors.isEmpty
-                || !compositionTarget.contentMaskAncestors.isEmpty {
-                guard let clipMaskView,
-                      let compositionMaskApplyPipeline,
-                      encodeCompositionMaskOperation(
-                        pipeline: compositionMaskApplyPipeline,
-                        firstView: source.outputView,
-                        secondView: clipMaskView,
-                        outputView: resources.clippedSourceView,
-                        encoder: encoder
-                      ) else {
-                    recordFailure(key)
-                    continue
-                }
-                premultipliedSourceTexture = resources.clippedSourceTexture
-            }
-            if compositionTarget.sourceOpacity < 1
-                || compositionTarget.sourceColor != SIMD4<Float>(repeating: 1) {
-                guard applyFilterOperation(
-                    uniforms: FilterCompositeUniforms(
-                        opacity: compositionTarget.sourceOpacity,
-                        colorMultiplier: compositionTarget.sourceColor
-                    ),
-                    inputTexture: premultipliedSourceTexture,
-                    outputView: resources.sourcePremultipliedView,
-                    uniformBuffer: resources.sourceOpacityUniformBuffer,
-                    encoder: encoder
-                ) else {
-                    recordFailure(key)
-                    continue
-                }
-                premultipliedSourceTexture = resources.sourcePremultipliedTexture
-            }
-
-            guard didReachTarget,
-                  applyAlphaConversion(
-                    from: .premultiplied,
-                    inputTexture: premultipliedSourceTexture,
-                    outputView: resources.sourceStraightView,
-                    uniformBuffer: resources.sourceUniformBuffer,
-                    encoder: encoder
-                  ),
-                  applyAlphaConversion(
-                    from: .premultiplied,
-                    inputTexture: resources.backdropTexture,
-                    outputView: resources.backdropStraightView,
-                    uniformBuffer: resources.backdropUniformBuffer,
-                    encoder: encoder
-                  ) else {
-                recordFailure(key)
-                continue
-            }
-
-            var compositionBackdropTexture = resources.backdropStraightTexture
-            if !backgroundStages.isEmpty {
-                guard let filteredBackdrop = executeBackdropFilterStages(
-                    backgroundStages,
-                    inputTexture: resources.backdropStraightTexture,
-                    inputView: resources.backdropStraightView,
-                    resources: resources.backgroundFilterResources,
-                    encoder: encoder
-                ),
-                renderBackdropFilterMask(
-                    for: compositionTarget,
-                    resources: resources,
-                    encoder: encoder
-                ) else {
-                    recordFailure(key)
-                    continue
-                }
-                var backgroundMaskView = resources.backdropMaskView
-                let backgroundClipMaskView: GPUTextureView?
-                if let targetContentMask = compositionTarget.targetContentMask {
-                    backgroundClipMaskView = buildCompositionClipMask(
-                        clipTargets: compositionTarget.clipAncestors,
-                        contentMaskTargets: compositionTarget.contentMaskAncestors
-                            + [targetContentMask],
-                        resources: resources,
-                        encoder: encoder
-                    )
-                } else {
-                    backgroundClipMaskView = clipMaskView
-                }
-                if let backgroundClipMaskView {
-                    guard let compositionMaskIntersectPipeline,
-                          encodeCompositionMaskOperation(
-                            pipeline: compositionMaskIntersectPipeline,
-                            firstView: resources.backdropMaskView,
-                            secondView: backgroundClipMaskView,
-                            outputView: resources.combinedBackdropMaskView,
-                            encoder: encoder
-                          ) else {
-                        recordFailure(key)
-                        continue
-                    }
-                    backgroundMaskView = resources.combinedBackdropMaskView
-                }
-                guard mixFilteredBackdrop(
-                    originalView: resources.backdropStraightView,
-                    filteredView: filteredBackdrop.view,
-                    maskView: backgroundMaskView,
-                    resources: resources,
-                    encoder: encoder
-                ) else {
-                    recordFailure(key)
-                    continue
-                }
-                compositionBackdropTexture = resources.mixedBackdropStraightTexture
-            }
-
-            do {
-                let execution = try processor.makeExecution(
-                    filter: compositionFilter,
-                    inputMode: .foregroundAndBackground,
-                    inputTexture: resources.sourceStraightTexture,
-                    backgroundTexture: compositionBackdropTexture,
-                    width: UInt32(size.width),
-                    height: UInt32(size.height)
-                )
-                try execution.encode(commandEncoder: encoder)
-                activeCompositionExecutions.append(execution)
-                guard applyAlphaConversion(
-                    from: .straight,
-                    inputTexture: execution.outputTexture,
-                    outputView: resources.resultPremultipliedView,
-                    uniformBuffer: resources.resultConversionUniformBuffer,
-                    encoder: encoder
-                ) else {
-                    recordFailure(key)
-                    continue
-                }
-                failedCompositionKeys.remove(key)
-                prerenderedCompositions[key] = PrerenderedComposition(
-                    resources: resources,
-                    outputTexture: resources.resultPremultipliedTexture,
-                    outputView: resources.resultPremultipliedView,
-                    samplingModelMatrix: presentation.modelMatrix(
-                        parentMatrix: target.parentMatrix
-                    )
-                )
-            } catch {
-                recordFailure(key)
-            }
-        }
-
-        if previousDepth != nil {
-            // Refresh isolated filter, group-opacity, and content-mask captures
-            // after the final depth-zero compositions become available. A
-            // mask-only ancestor is not itself a backdrop scope, but its
-            // captured subtree can still contain a depth-zero composition.
-            prerenderFilteredLayers(
-                rootLayer,
-                encoder: encoder,
-                projectionMatrix: projectionMatrix
-            )
         }
 
         failedCompositionKeys.formIntersection(failedKeys)

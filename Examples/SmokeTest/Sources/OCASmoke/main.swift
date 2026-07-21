@@ -1192,6 +1192,7 @@ func installHarness() {
                       let multiply = CIFilter(name: "CIMultiplyCompositing"),
                       let screen = CIFilter(name: "CIScreenCompositing"),
                       let sourceOver = CIFilter(name: "CISourceOverCompositing"),
+                      let sourceIn = CIFilter(name: "CISourceInCompositing"),
                       let invert = CIFilter(name: "CIColorInvert"),
                       let halfAlphaMask = CIFilter(name: "CIColorMatrix") else {
                     compositionProbeResult = "error: composition dependencies unavailable"
@@ -1491,6 +1492,49 @@ func installHarness() {
                 unboundedBackdropFilter.backgroundFilters = [CAFilter.colorInvert()]
                 unboundedFilterBackdrop.addSublayer(unboundedBackdropFilter)
                 root.addSublayer(unboundedFilterBackdrop)
+
+                let maskCompositedContent = CALayer()
+                maskCompositedContent.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                maskCompositedContent.position = CGPoint(x: 190, y: 200)
+                maskCompositedContent.zPosition = 218
+                maskCompositedContent.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                let compositionMask = CALayer()
+                compositionMask.bounds = maskCompositedContent.bounds
+                compositionMask.position = CGPoint(x: 20, y: 20)
+                let compositionMaskBackdrop = CALayer()
+                compositionMaskBackdrop.bounds = compositionMask.bounds
+                compositionMaskBackdrop.position = CGPoint(x: 20, y: 20)
+                compositionMaskBackdrop.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.5)
+                let compositionMaskSource = CALayer()
+                compositionMaskSource.bounds = compositionMask.bounds
+                compositionMaskSource.position = CGPoint(x: 20, y: 20)
+                compositionMaskSource.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 0.5)
+                compositionMaskSource.compositingFilter = sourceIn
+                compositionMask.addSublayer(compositionMaskBackdrop)
+                compositionMask.addSublayer(compositionMaskSource)
+                maskCompositedContent.mask = compositionMask
+                root.addSublayer(maskCompositedContent)
+
+                let maskBackdropFilteredContent = CALayer()
+                maskBackdropFilteredContent.bounds = maskCompositedContent.bounds
+                maskBackdropFilteredContent.position = CGPoint(x: 250, y: 200)
+                maskBackdropFilteredContent.zPosition = 219
+                maskBackdropFilteredContent.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                let backdropFilterMask = CALayer()
+                backdropFilterMask.bounds = maskBackdropFilteredContent.bounds
+                backdropFilterMask.position = CGPoint(x: 20, y: 20)
+                let narrowMaskBackdrop = CALayer()
+                narrowMaskBackdrop.bounds = CGRect(x: 0, y: 0, width: 4, height: 40)
+                narrowMaskBackdrop.position = CGPoint(x: 12, y: 20)
+                narrowMaskBackdrop.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                let maskBackdropFilter = CALayer()
+                maskBackdropFilter.bounds = backdropFilterMask.bounds
+                maskBackdropFilter.position = CGPoint(x: 20, y: 20)
+                maskBackdropFilter.backgroundFilters = [CAFilter.blur(radius: 8)]
+                backdropFilterMask.addSublayer(narrowMaskBackdrop)
+                backdropFilterMask.addSublayer(maskBackdropFilter)
+                maskBackdropFilteredContent.mask = backdropFilterMask
+                root.addSublayer(maskBackdropFilteredContent)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -1524,6 +1568,8 @@ func installHarness() {
                         CGPoint(x: 135, y: 100),
                         CGPoint(x: 300, y: 210),
                         CGPoint(x: 270, y: 210),
+                        CGPoint(x: 190, y: 100),
+                        CGPoint(x: 250, y: 100),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -1553,6 +1599,8 @@ func installHarness() {
                         && pixels[25] == [255, 0, 0, 255]
                     let unboundedBackgroundFilterUsesSuperlayerExtent = pixels[26] == [0, 255, 255, 255]
                         && pixels[27] == [0, 255, 255, 255]
+                    let maskBackdropEffectsAreRendered = pixels[28] == [10, 10, 78, 160]
+                        && pixels[29] == [54, 11, 16, 149]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -1581,12 +1629,14 @@ func installHarness() {
                     targetMaskBackdrop.removeFromSuperlayer()
                     targetMaskedFilter.removeFromSuperlayer()
                     unboundedFilterBackdrop.removeFromSuperlayer()
+                    maskCompositedContent.removeFromSuperlayer()
+                    maskBackdropFilteredContent.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
                     engine.renderFrame()
-                    compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
+                    compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),maskBackdrop=\(maskBackdropEffectsAreRendered),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
                 } catch {
                     compositionProbeResult = "error: \(error)"
                 }
