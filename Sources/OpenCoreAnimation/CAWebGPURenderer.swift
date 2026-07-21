@@ -240,6 +240,68 @@ private final class FilterLayerResources {
 
 private struct PrerenderedFilter {
     let resources: FilterLayerResources
+    let outputTexture: GPUTexture
+    let outputView: GPUTextureView
+}
+
+private final class CompositionLayerResources {
+    let backdropTexture: GPUTexture
+    let backdropView: GPUTextureView
+    let sourceStraightTexture: GPUTexture
+    let sourceStraightView: GPUTextureView
+    let backdropStraightTexture: GPUTexture
+    let backdropStraightView: GPUTextureView
+    let resultPremultipliedTexture: GPUTexture
+    let resultPremultipliedView: GPUTextureView
+    let sourceUniformBuffer: GPUBuffer
+    let backdropUniformBuffer: GPUBuffer
+    let resultConversionUniformBuffer: GPUBuffer
+    let displayUniformBuffer: GPUBuffer
+
+    init(device: GPUDevice, width: Int, height: Int, format: GPUTextureFormat) {
+        func makeTexture(_ format: GPUTextureFormat) -> GPUTexture {
+            device.createTexture(descriptor: GPUTextureDescriptor(
+                size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+                format: format,
+                usage: [.renderAttachment, .textureBinding]
+            ))
+        }
+        func makeUniformBuffer() -> GPUBuffer {
+            device.createBuffer(descriptor: GPUBufferDescriptor(
+                size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride),
+                usage: [.uniform, .copyDst]
+            ))
+        }
+
+        backdropTexture = makeTexture(format)
+        backdropView = backdropTexture.createView()
+        sourceStraightTexture = makeTexture(format)
+        sourceStraightView = sourceStraightTexture.createView()
+        backdropStraightTexture = makeTexture(format)
+        backdropStraightView = backdropStraightTexture.createView()
+        resultPremultipliedTexture = makeTexture(format)
+        resultPremultipliedView = resultPremultipliedTexture.createView()
+        sourceUniformBuffer = makeUniformBuffer()
+        backdropUniformBuffer = makeUniformBuffer()
+        resultConversionUniformBuffer = makeUniformBuffer()
+        displayUniformBuffer = makeUniformBuffer()
+    }
+
+    func destroy() {
+        backdropTexture.destroy()
+        sourceStraightTexture.destroy()
+        backdropStraightTexture.destroy()
+        resultPremultipliedTexture.destroy()
+        sourceUniformBuffer.destroy()
+        backdropUniformBuffer.destroy()
+        resultConversionUniformBuffer.destroy()
+        displayUniformBuffer.destroy()
+    }
+}
+
+private struct PrerenderedComposition {
+    let resources: CompositionLayerResources
+    let outputTexture: GPUTexture
     let outputView: GPUTextureView
 }
 
@@ -974,6 +1036,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Requested layer-filter paths whose configuration is currently not executable.
     private var failedLayerFilterKeys: Set<LayerRenderKey> = []
+
+    // MARK: - Backdrop Composition
+
+    private var compositionLayerResources: [LayerRenderKey: CompositionLayerResources] = [:]
+    private var prerenderedCompositions: [LayerRenderKey: PrerenderedComposition] = [:]
+    private var activeCompositionExecutions: [CIWebGPUFilterExecution] = []
+    private var retiringCompositionExecutions: [CIWebGPUFilterExecution] = []
+    private var compositionCaptureStopKey: LayerRenderKey?
+    private var compositionCaptureDidReachStop = false
+    private var failedCompositionKeys: Set<LayerRenderKey> = []
+
+    /// Number of requested backdrop compositions rejected before GPU dispatch.
+    @_spi(RendererDiagnostics)
+    public private(set) var compositionFilterFailureCount: Int = 0
+
+    @_spi(RendererDiagnostics)
+    public var activeCompositionResourceCount: Int {
+        compositionLayerResources.count
+    }
 
     /// The root layer currently being rendered into the offscreen filter source texture.
     /// While set, filter compositing is suppressed so the subtree can be captured raw.
@@ -2454,6 +2535,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
         retiringLayerFilterExecutions = activeLayerFilterExecutions
         activeLayerFilterExecutions.removeAll(keepingCapacity: true)
+        prerenderedCompositions.removeAll(keepingCapacity: true)
+        for execution in retiringCompositionExecutions {
+            execution.invalidate()
+        }
+        retiringCompositionExecutions = activeCompositionExecutions
+        activeCompositionExecutions.removeAll(keepingCapacity: true)
+        compositionCaptureStopKey = nil
+        compositionCaptureDidReachStop = false
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
@@ -2545,6 +2634,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Store root layer to skip its backgroundColor rendering in renderLayer()
         currentRootLayer = rootLayer
+
+        prerenderBackdropCompositions(
+            rootLayer,
+            clearColor: clearColor,
+            encoder: encoder,
+            projectionMatrix: projectionMatrix
+        )
 
         // Begin render pass with depth attachment
         let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
@@ -2782,6 +2878,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         layerFilterFailureCount = 0
         layerFilterProcessor?.invalidate()
         layerFilterProcessor = nil
+        for resources in compositionLayerResources.values {
+            resources.destroy()
+        }
+        compositionLayerResources.removeAll(keepingCapacity: false)
+        prerenderedCompositions.removeAll(keepingCapacity: false)
+        for execution in activeCompositionExecutions {
+            execution.invalidate()
+        }
+        for execution in retiringCompositionExecutions {
+            execution.invalidate()
+        }
+        activeCompositionExecutions.removeAll(keepingCapacity: false)
+        retiringCompositionExecutions.removeAll(keepingCapacity: false)
+        compositionCaptureStopKey = nil
+        compositionCaptureDidReachStop = false
+        failedCompositionKeys.removeAll(keepingCapacity: false)
+        compositionFilterFailureCount = 0
 
         // Rasterization cache (R3.2 / R3.4)
         rasterizationCache?.removeAll()
@@ -2920,6 +3033,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Skip hidden layers (using presentation layer values)
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
 
+        let currentRenderKey = renderKey(for: layer)
+        if compositionCaptureDidReachStop {
+            return
+        }
+        if compositionCaptureStopKey == currentRenderKey {
+            compositionCaptureDidReachStop = true
+            return
+        }
+
         if transitionSuppressedLayer !== layer,
            let transitionState = presentationLayer._transitionRenderState {
             renderTransition(
@@ -2999,13 +3121,27 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Handle special layer types first
 
+        let hasBackdropComposition = presentationLayer.compositingFilter != nil
+            || presentationLayer.backgroundFilters?.isEmpty == false
+        if filterPrerenderRootLayer !== layer, hasBackdropComposition {
+            if let composition = prerenderedCompositions[currentRenderKey] {
+                renderPreparedComposition(
+                    composition,
+                    device: device,
+                    renderPass: renderPass
+                )
+            }
+            // Requested backdrop effects never fall through to an unprocessed source-over draw.
+            return
+        }
+
         // Check for layer filters.
         // If this layer has supported filters and was pre-rendered, composite the filtered result.
         let hasRequestedFilters = presentationLayer.filters?.isEmpty == false
         let shouldCompositeAsGroup = requiresGroupOpacity(presentationLayer)
         if filterPrerenderRootLayer !== layer,
            (hasRequestedFilters || shouldCompositeAsGroup) {
-            if let prerendered = prerenderedFilters[renderKey(for: layer)] {
+            if let prerendered = prerenderedFilters[currentRenderKey] {
                 // Composite the pre-rendered filtered texture.
                 renderFilteredLayerComposite(
                     layer,
@@ -3032,7 +3168,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // so we must let it through to render the actual content into
         // the texture.
         if rasterizePrerenderRootLayer !== layer,
-           let cachedTexture = prerasterizedTextures[renderKey(for: layer)] {
+           let cachedTexture = prerasterizedTextures[currentRenderKey] {
             renderRasterizedLayerComposite(
                 layer,
                 presentationLayer: presentationLayer,
@@ -3189,7 +3325,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Render border AFTER sublayers so it sits on top (Apple spec).
         // Border is part of the layer itself, so it draws in the parent's scissor rect
         // (masksToBounds clipping for sublayers has already been restored above).
-        if presentationLayer.borderWidth > 0 && presentationLayer.borderColor != nil {
+        if !compositionCaptureDidReachStop,
+           presentationLayer.borderWidth > 0 && presentationLayer.borderColor != nil {
             renderLayerBorder(
                 presentationLayer,
                 device: device,
@@ -6550,7 +6687,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let filteredLayer = target.layer
             let requestedFilters = target.presentationLayer.filters ?? []
             let requiresGroup = requiresGroupOpacity(target.presentationLayer)
-            guard !requestedFilters.isEmpty || requiresGroup else { continue }
+            let requiresCompositionSource = target.presentationLayer.compositingFilter != nil
+                || target.presentationLayer.backgroundFilters?.isEmpty == false
+            guard !requestedFilters.isEmpty || requiresGroup || requiresCompositionSource else { continue }
 
             let filteredRenderKey = target.renderKey
             guard let stages = layerFilterStages(from: requestedFilters) else {
@@ -6746,6 +6885,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             failedLayerFilterKeys.remove(filteredRenderKey)
             prerenderedFilters[filteredRenderKey] = PrerenderedFilter(
                 resources: resources,
+                outputTexture: currentTexture,
                 outputView: currentView
             )
         }
@@ -6790,6 +6930,235 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         for renderKey in staleRenderKeys {
             filterLayerResources.removeValue(forKey: renderKey)?.destroy()
             prerenderedFilters.removeValue(forKey: renderKey)
+        }
+    }
+
+    private func prerenderBackdropCompositions(
+        _ rootLayer: CALayer,
+        clearColor: GPUColor,
+        encoder: GPUCommandEncoder,
+        projectionMatrix: Matrix4x4
+    ) {
+        guard let device,
+              let pipeline,
+              let depthTextureView,
+              let processor = layerFilterProcessor else { return }
+
+        var targets: [LayerPrepassTarget] = []
+        var structurallyInvalidKeys: Set<LayerRenderKey> = []
+        collectBackdropCompositionTargets(
+            rootLayer,
+            parentMatrix: projectionMatrix,
+            ancestorCompositionKeys: [],
+            targets: &targets,
+            structurallyInvalidKeys: &structurallyInvalidKeys
+        )
+
+        var activeKeys: Set<LayerRenderKey> = []
+        var failedKeys: Set<LayerRenderKey> = []
+        var prefixIsValid = true
+
+        func recordFailure(_ key: LayerRenderKey) {
+            failedKeys.insert(key)
+            if failedCompositionKeys.insert(key).inserted {
+                compositionFilterFailureCount += 1
+            }
+            prefixIsValid = false
+        }
+
+        for target in targets {
+            let key = target.renderKey
+            let presentation = target.presentationLayer
+            guard prefixIsValid,
+                  !structurallyInvalidKeys.contains(key),
+                  key.replicatorPath.isEmpty,
+                  presentation.opacity == 1,
+                  presentation.backgroundFilters?.isEmpty != false,
+                  let filter = presentation.compositingFilter as? CIFilter,
+                  processor.supports(filter, inputMode: .foregroundAndBackground),
+                  let source = prerenderedFilters[key] else {
+                recordFailure(key)
+                continue
+            }
+
+            let resources: CompositionLayerResources
+            if let existing = compositionLayerResources[key] {
+                resources = existing
+            } else {
+                resources = CompositionLayerResources(
+                    device: device,
+                    width: Int(size.width),
+                    height: Int(size.height),
+                    format: preferredFormat
+                )
+                compositionLayerResources[key] = resources
+            }
+            activeKeys.insert(key)
+
+            let backdropPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.backdropView,
+                        clearValue: clearColor,
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ],
+                depthStencilAttachment: GPURenderPassDepthStencilAttachment(
+                    view: depthTextureView,
+                    depthClearValue: 1,
+                    depthLoadOp: .clear,
+                    depthStoreOp: .store,
+                    stencilClearValue: 0,
+                    stencilLoadOp: .clear,
+                    stencilStoreOp: .store
+                )
+            ))
+            backdropPass.setPipeline(pipeline)
+            backdropPass.setViewport(
+                x: 0,
+                y: 0,
+                width: Float(size.width),
+                height: Float(size.height),
+                minDepth: 0,
+                maxDepth: 1
+            )
+
+            let savedOpacityStack = opacityStack
+            let savedColorStack = replicatorColorStack
+            let savedTimeStack = replicatorTimeOffsetStack
+            let savedInstancePath = replicatorInstancePath
+            let savedClipStack = clipRectStack
+            let savedMaskDepth = maskNestingDepth
+            let savedStencilValue = currentStencilValue
+            let savedStopKey = compositionCaptureStopKey
+            let savedDidReachStop = compositionCaptureDidReachStop
+
+            opacityStack.removeAll(keepingCapacity: true)
+            replicatorColorStack.removeAll(keepingCapacity: true)
+            replicatorTimeOffsetStack.removeAll(keepingCapacity: true)
+            replicatorInstancePath.removeAll(keepingCapacity: true)
+            clipRectStack.removeAll(keepingCapacity: true)
+            maskNestingDepth = 0
+            currentStencilValue = 0
+            compositionCaptureStopKey = key
+            compositionCaptureDidReachStop = false
+
+            renderLayer(rootLayer, renderPass: backdropPass, parentMatrix: projectionMatrix)
+            let didReachTarget = compositionCaptureDidReachStop
+
+            opacityStack = savedOpacityStack
+            replicatorColorStack = savedColorStack
+            replicatorTimeOffsetStack = savedTimeStack
+            replicatorInstancePath = savedInstancePath
+            clipRectStack = savedClipStack
+            maskNestingDepth = savedMaskDepth
+            currentStencilValue = savedStencilValue
+            compositionCaptureStopKey = savedStopKey
+            compositionCaptureDidReachStop = savedDidReachStop
+            backdropPass.end()
+
+            guard didReachTarget,
+                  applyAlphaConversion(
+                    from: .premultiplied,
+                    inputTexture: source.outputTexture,
+                    outputView: resources.sourceStraightView,
+                    uniformBuffer: resources.sourceUniformBuffer,
+                    encoder: encoder
+                  ),
+                  applyAlphaConversion(
+                    from: .premultiplied,
+                    inputTexture: resources.backdropTexture,
+                    outputView: resources.backdropStraightView,
+                    uniformBuffer: resources.backdropUniformBuffer,
+                    encoder: encoder
+                  ) else {
+                recordFailure(key)
+                continue
+            }
+
+            do {
+                let execution = try processor.makeExecution(
+                    filter: filter,
+                    inputMode: .foregroundAndBackground,
+                    inputTexture: resources.sourceStraightTexture,
+                    backgroundTexture: resources.backdropStraightTexture,
+                    width: UInt32(size.width),
+                    height: UInt32(size.height)
+                )
+                try execution.encode(commandEncoder: encoder)
+                activeCompositionExecutions.append(execution)
+                guard applyAlphaConversion(
+                    from: .straight,
+                    inputTexture: execution.outputTexture,
+                    outputView: resources.resultPremultipliedView,
+                    uniformBuffer: resources.resultConversionUniformBuffer,
+                    encoder: encoder
+                ) else {
+                    recordFailure(key)
+                    continue
+                }
+                failedCompositionKeys.remove(key)
+                prerenderedCompositions[key] = PrerenderedComposition(
+                    resources: resources,
+                    outputTexture: resources.resultPremultipliedTexture,
+                    outputView: resources.resultPremultipliedView
+                )
+            } catch {
+                recordFailure(key)
+            }
+        }
+
+        failedCompositionKeys.formIntersection(failedKeys)
+        let staleKeys = compositionLayerResources.keys.filter { !activeKeys.contains($0) }
+        for key in staleKeys {
+            compositionLayerResources.removeValue(forKey: key)?.destroy()
+            prerenderedCompositions.removeValue(forKey: key)
+        }
+    }
+
+    private func collectBackdropCompositionTargets(
+        _ layer: CALayer,
+        parentMatrix: Matrix4x4,
+        ancestorCompositionKeys: [LayerRenderKey],
+        targets: inout [LayerPrepassTarget],
+        structurallyInvalidKeys: inout Set<LayerRenderKey>
+    ) {
+        let presentation = renderPresentation(for: layer)
+        guard !presentation.isHidden && presentation.opacity > 0 else { return }
+
+        let key = renderKey(for: layer)
+        let hasComposition = presentation.compositingFilter != nil
+            || presentation.backgroundFilters?.isEmpty == false
+        var descendantAncestors = ancestorCompositionKeys
+        if hasComposition {
+            targets.append(LayerPrepassTarget(
+                layer: layer,
+                presentationLayer: presentation,
+                parentMatrix: parentMatrix,
+                renderKey: key,
+                timeOffset: currentReplicatorTimeOffset
+            ))
+            if !ancestorCompositionKeys.isEmpty {
+                structurallyInvalidKeys.insert(key)
+                structurallyInvalidKeys.formUnion(ancestorCompositionKeys)
+            }
+            descendantAncestors.append(key)
+        }
+
+        let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
+        forEachPrepassSublayer(
+            of: layer,
+            presentationLayer: presentation,
+            modelMatrix: modelMatrix
+        ) { sublayer, sublayerParentMatrix in
+            collectBackdropCompositionTargets(
+                sublayer,
+                parentMatrix: sublayerParentMatrix,
+                ancestorCompositionKeys: descendantAncestors,
+                targets: &targets,
+                structurallyInvalidKeys: &structurallyInvalidKeys
+            )
         }
     }
 
@@ -7230,13 +7599,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         resources: FilterLayerResources,
         encoder: GPUCommandEncoder
     ) -> Bool {
-        guard let uniforms = filterCompositeUniforms(for: operation) else { return false }
+        guard let uniforms = filterCompositeUniforms(for: operation),
+              let outputView = resources.view(for: outputTexture) else { return false }
         return applyFilterOperation(
             uniforms: uniforms,
             inputTexture: inputTexture,
-            outputTexture: outputTexture,
+            outputView: outputView,
             uniformBuffer: uniformBuffer,
-            resources: resources,
             encoder: encoder
         )
     }
@@ -7250,12 +7619,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder
     ) -> Bool {
         let filterType: Float = sourceMode == .premultiplied ? 5 : 6
+        guard let outputView = resources.view(for: outputTexture) else { return false }
         return applyFilterOperation(
             uniforms: FilterCompositeUniforms(filterType: filterType),
             inputTexture: inputTexture,
-            outputTexture: outputTexture,
+            outputView: outputView,
             uniformBuffer: uniformBuffer,
-            resources: resources,
+            encoder: encoder
+        )
+    }
+
+    private func applyAlphaConversion(
+        from sourceMode: FilterTextureAlphaMode,
+        inputTexture: GPUTexture,
+        outputView: GPUTextureView,
+        uniformBuffer: GPUBuffer,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
+        let filterType: Float = sourceMode == .premultiplied ? 5 : 6
+        return applyFilterOperation(
+            uniforms: FilterCompositeUniforms(filterType: filterType),
+            inputTexture: inputTexture,
+            outputView: outputView,
+            uniformBuffer: uniformBuffer,
             encoder: encoder
         )
     }
@@ -7263,15 +7649,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func applyFilterOperation(
         uniforms initialUniforms: FilterCompositeUniforms,
         inputTexture: GPUTexture,
-        outputTexture: GPUTexture,
+        outputView: GPUTextureView,
         uniformBuffer: GPUBuffer,
-        resources: FilterLayerResources,
         encoder: GPUCommandEncoder
     ) -> Bool {
         guard let device = device,
               let filterOperationPipeline = filterOperationPipeline,
-              let blurSampler = blurSampler,
-              let outputView = resources.view(for: outputTexture) else { return false }
+              let blurSampler = blurSampler else { return false }
         let inputView = inputTexture.createView()
 
         var uniforms = initialUniforms
@@ -7346,7 +7730,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         if presentationLayer.filters?.isEmpty == false
-            || requiresGroupOpacity(presentationLayer) {
+            || requiresGroupOpacity(presentationLayer)
+            || presentationLayer.compositingFilter != nil
+            || presentationLayer.backgroundFilters?.isEmpty == false {
             result.append(LayerPrepassTarget(
                 layer: layer,
                 presentationLayer: presentationLayer,
@@ -7497,19 +7883,46 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
+        renderPremultipliedFullScreenTexture(
+            prerendered.outputView,
+            uniformBuffer: prerendered.resources.compositeUniformBuffer,
+            uniforms: FilterCompositeUniforms(
+                opacity: currentEffectiveOpacity,
+                colorMultiplier: currentReplicatorColor
+            ),
+            device: device,
+            renderPass: renderPass
+        )
+    }
+
+    private func renderPreparedComposition(
+        _ composition: PrerenderedComposition,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder
+    ) {
+        renderPremultipliedFullScreenTexture(
+            composition.outputView,
+            uniformBuffer: composition.resources.displayUniformBuffer,
+            uniforms: FilterCompositeUniforms(),
+            device: device,
+            renderPass: renderPass
+        )
+    }
+
+    private func renderPremultipliedFullScreenTexture(
+        _ textureView: GPUTextureView,
+        uniformBuffer: GPUBuffer,
+        uniforms initialUniforms: FilterCompositeUniforms,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder
+    ) {
         guard let filterCompositePipeline = filterCompositePipeline,
               let blurSampler = blurSampler else { return }
 
-        var filterUniforms = FilterCompositeUniforms(
-            opacity: currentEffectiveOpacity,
-            filterType: 0,
-            parameter0: 0,
-            parameter1: 0,
-            colorMultiplier: currentReplicatorColor
-        )
+        var filterUniforms = initialUniforms
         let filterUniformData = createFloat32Array(from: &filterUniforms)
         device.queue.writeBuffer(
-            prerendered.resources.compositeUniformBuffer,
+            uniformBuffer,
             bufferOffset: 0,
             data: filterUniformData
         )
@@ -7518,8 +7931,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
             layout: filterCompositePipeline.getBindGroupLayout(index: 0),
             entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(prerendered.resources.compositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(prerendered.outputView)),
+                GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(textureView)),
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
         ))

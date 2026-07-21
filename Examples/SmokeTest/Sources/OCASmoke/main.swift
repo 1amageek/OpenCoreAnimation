@@ -39,6 +39,7 @@ nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
 nonisolated(unsafe) var replicatorProbeResult: String = "pending"
+nonisolated(unsafe) var compositionProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -84,6 +85,7 @@ public func setup() {
             displayLinkProbeResult = "pending"
             emitterProbeResult = "pending"
             replicatorProbeResult = "pending"
+            compositionProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -264,6 +266,9 @@ func installHarness() {
         h.expose("getReplicatorProbeResult", returning: {
             .string(replicatorProbeResult)
         })
+        h.expose("getCompositionProbeResult", returning: {
+            .string(compositionProbeResult)
+        })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
@@ -310,6 +315,20 @@ func installHarness() {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
                     .layerFilterFailureCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getCompositionFilterFailureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .compositionFilterFailureCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getActiveCompositionResourceCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .activeCompositionResourceCount ?? -1
             }
             return .number(Double(count))
         })
@@ -616,6 +635,84 @@ func installHarness() {
                 rejected.removeFromSuperlayer()
                 alphaFiltered.removeFromSuperlayer()
                 engine.renderFrame()
+            }
+        })
+        h.expose("beginCompositionProbe", action: {
+            Task { @MainActor in
+                compositionProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer,
+                      let multiply = CIFilter(name: "CIMultiplyCompositing"),
+                      let screen = CIFilter(name: "CIScreenCompositing") else {
+                    compositionProbeResult = "error: composition dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let backdrop = CALayer()
+                backdrop.bounds = CGRect(x: 0, y: 0, width: 360, height: 60)
+                backdrop.position = CGPoint(x: 200, y: 140)
+                backdrop.zPosition = 200
+                backdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(backdrop)
+
+                let source = CALayer()
+                source.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                source.position = CGPoint(x: 160, y: 140)
+                source.zPosition = 201
+                source.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                source.compositingFilter = multiply
+                root.addSublayer(source)
+
+                let screenedSource = CALayer()
+                screenedSource.bounds = source.bounds
+                screenedSource.position = CGPoint(x: 240, y: 140)
+                screenedSource.zPosition = 202
+                screenedSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                screenedSource.compositingFilter = screen
+                root.addSublayer(screenedSource)
+
+                let translucentSource = CALayer()
+                translucentSource.bounds = source.bounds
+                translucentSource.position = CGPoint(x: 320, y: 140)
+                translucentSource.zPosition = 203
+                translucentSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 0.5)
+                translucentSource.compositingFilter = multiply
+                root.addSublayer(translucentSource)
+
+                let laterSource = CALayer()
+                laterSource.bounds = source.bounds
+                laterSource.position = CGPoint(x: 370, y: 140)
+                laterSource.zPosition = 204
+                laterSource.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                root.addSublayer(laterSource)
+                CATransaction.commit()
+
+                engine.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 160, y: 160),
+                        CGPoint(x: 240, y: 160),
+                        CGPoint(x: 320, y: 160),
+                        CGPoint(x: 370, y: 160),
+                    ])
+                    let composited = pixels[0] == [0, 0, 0, 255]
+                        && pixels[1] == [255, 255, 0, 255]
+                        && pixels[2] == [127, 0, 0, 255]
+                        && pixels[3] == [0, 0, 255, 255]
+                    backdrop.removeFromSuperlayer()
+                    source.removeFromSuperlayer()
+                    screenedSource.removeFromSuperlayer()
+                    translucentSource.removeFromSuperlayer()
+                    laterSource.removeFromSuperlayer()
+                    engine.renderFrame()
+                    compositionProbeResult = "ordered=\(composited),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),after=\(renderer.activeCompositionResourceCount)"
+                } catch {
+                    compositionProbeResult = "error: \(error)"
+                }
             }
         })
         h.expose("beginShadowProbe", action: {
