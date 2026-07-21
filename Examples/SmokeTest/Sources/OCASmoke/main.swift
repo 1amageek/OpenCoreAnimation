@@ -883,6 +883,49 @@ func installHarness() {
                 clippedBackdropFilter.backgroundFilters = [CAFilter.colorInvert()]
                 filterClippingParent.addSublayer(clippedBackdropFilter)
                 root.addSublayer(filterClippingParent)
+
+                func makeHalfMask() -> CALayer {
+                    let mask = CALayer()
+                    mask.bounds = CGRect(x: 0, y: 0, width: 30, height: 60)
+                    mask.position = CGPoint(x: 15, y: 30)
+                    mask.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                    return mask
+                }
+
+                let contentMaskBackdrop = CALayer()
+                contentMaskBackdrop.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                contentMaskBackdrop.position = CGPoint(x: 50, y: 200)
+                contentMaskBackdrop.zPosition = 191
+                contentMaskBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(contentMaskBackdrop)
+
+                let contentMaskParent = CALayer()
+                contentMaskParent.bounds = contentMaskBackdrop.bounds
+                contentMaskParent.position = contentMaskBackdrop.position
+                contentMaskParent.zPosition = 215
+                contentMaskParent.mask = makeHalfMask()
+                let contentMaskedSource = CALayer()
+                contentMaskedSource.bounds = contentMaskBackdrop.bounds
+                contentMaskedSource.position = CGPoint(x: 30, y: 30)
+                contentMaskedSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                contentMaskedSource.compositingFilter = screen
+                contentMaskParent.addSublayer(contentMaskedSource)
+                root.addSublayer(contentMaskParent)
+
+                let targetMaskBackdrop = CALayer()
+                targetMaskBackdrop.bounds = contentMaskBackdrop.bounds
+                targetMaskBackdrop.position = CGPoint(x: 120, y: 200)
+                targetMaskBackdrop.zPosition = 190
+                targetMaskBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(targetMaskBackdrop)
+
+                let targetMaskedFilter = CALayer()
+                targetMaskedFilter.bounds = targetMaskBackdrop.bounds
+                targetMaskedFilter.position = targetMaskBackdrop.position
+                targetMaskedFilter.zPosition = 216
+                targetMaskedFilter.mask = makeHalfMask()
+                targetMaskedFilter.backgroundFilters = [CAFilter.colorInvert()]
+                root.addSublayer(targetMaskedFilter)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -910,6 +953,10 @@ func installHarness() {
                         CGPoint(x: 350, y: 50),
                         CGPoint(x: 315, y: 50),
                         CGPoint(x: 332, y: 68),
+                        CGPoint(x: 35, y: 100),
+                        CGPoint(x: 65, y: 100),
+                        CGPoint(x: 105, y: 100),
+                        CGPoint(x: 135, y: 100),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -933,6 +980,10 @@ func installHarness() {
                         && pixels[19] == [0, 255, 255, 255]
                         && pixels[20] == [255, 0, 0, 255]
                         && pixels[21] == [255, 0, 0, 255]
+                        && pixels[22] == [255, 255, 0, 255]
+                        && pixels[23] == [255, 0, 0, 255]
+                        && pixels[24] == [0, 255, 255, 255]
+                        && pixels[25] == [255, 0, 0, 255]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -956,6 +1007,10 @@ func installHarness() {
                     clippingParent.removeFromSuperlayer()
                     clippedFilterBackdrop.removeFromSuperlayer()
                     filterClippingParent.removeFromSuperlayer()
+                    contentMaskBackdrop.removeFromSuperlayer()
+                    contentMaskParent.removeFromSuperlayer()
+                    targetMaskBackdrop.removeFromSuperlayer()
+                    targetMaskedFilter.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
