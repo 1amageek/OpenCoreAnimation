@@ -3411,7 +3411,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Returns a Boolean indicating whether the layer content is implicitly flipped when rendered.
     open func contentsAreFlipped() -> Bool {
-        return false
+        isGeometryFlipped
     }
 
     /// A Boolean that indicates whether the geometry of the layer and its sublayers is flipped vertically.

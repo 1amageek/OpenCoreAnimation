@@ -38,6 +38,7 @@ nonisolated(unsafe) var pixelReadbackResult: String = "pending"
 nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var textProbeResult: String = "pending"
+nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
@@ -50,6 +51,68 @@ final class SmokeTileDelegate: CALayerDelegate {
         tileDrawCount += 1
         context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
         context.fill(layer.bounds)
+    }
+}
+
+final class DelegateDrawProbeDelegate: CALayerDelegate {
+    var usesSwappedColors = false
+    private(set) var willDrawCount = 0
+    private(set) var drawCount = 0
+
+    func layerWillDraw(_ layer: CALayer) {
+        willDrawCount += 1
+    }
+
+    func draw(_ layer: CALayer, in context: CGContext) {
+        drawCount += 1
+        let leftColor = usesSwappedColors
+            ? CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+            : CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        let rightColor = usesSwappedColors
+            ? CGColor(red: 1, green: 1, blue: 0, alpha: 1)
+            : CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+        let leftRect = CGRect(
+            x: layer.bounds.minX,
+            y: layer.bounds.minY,
+            width: layer.bounds.width / 2,
+            height: layer.bounds.height
+        )
+        let rightRect = CGRect(
+            x: leftRect.maxX,
+            y: layer.bounds.minY,
+            width: layer.bounds.width / 2,
+            height: layer.bounds.height
+        )
+        context.setFillColor(leftColor)
+        context.fill(leftRect)
+        context.setFillColor(rightColor)
+        context.fill(rightRect)
+        context.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(
+            x: layer.bounds.minX,
+            y: layer.bounds.minY,
+            width: layer.bounds.width,
+            height: layer.bounds.height / 4
+        ))
+    }
+}
+
+final class DelegateDisplayProbeDelegate: CALayerDelegate {
+    let image: CGImage
+    private(set) var displayCount = 0
+    private(set) var drawCount = 0
+
+    init(image: CGImage) {
+        self.image = image
+    }
+
+    func display(_ layer: CALayer) {
+        displayCount += 1
+        layer.contents = image
+    }
+
+    func draw(_ layer: CALayer, in context: CGContext) {
+        drawCount += 1
     }
 }
 
@@ -88,6 +151,7 @@ public func setup() {
             transitionFilterProbeResult = "pending"
             layerFilterProbeResult = "pending"
             textProbeResult = "pending"
+            delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
             emitterProbeResult = "pending"
@@ -264,6 +328,9 @@ func installHarness() {
         })
         h.expose("getTextProbeResult", returning: {
             .string(textProbeResult)
+        })
+        h.expose("getDelegateDrawProbeResult", returning: {
+            .string(delegateDrawProbeResult)
         })
         h.expose("getShadowProbeResult", returning: {
             .string(shadowProbeResult)
@@ -835,6 +902,153 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     textProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginDelegateDrawProbe", action: {
+            Task { @MainActor in
+                delegateDrawProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    delegateDrawProbeResult = "error: delegate draw dependencies unavailable"
+                    return
+                }
+
+                let displayImageData = Data([0, 0, 255, 255])
+                guard let displayImage = CGImage(
+                    width: 1,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 4,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                    provider: CGDataProvider(data: displayImageData),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    delegateDrawProbeResult = "error: display delegate image unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                let delegate = DelegateDrawProbeDelegate()
+                let displayDelegate = DelegateDisplayProbeDelegate(image: displayImage)
+                let layer = CALayer()
+                layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                layer.position = CGPoint(x: 340, y: 140)
+                layer.zPosition = 100
+                layer.delegate = delegate
+                layer.setNeedsDisplay()
+                root.addSublayer(layer)
+
+                let invalidLayer = CALayer()
+                invalidLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                invalidLayer.position = CGPoint(x: 280, y: 140)
+                invalidLayer.zPosition = 100
+                invalidLayer.contentsScale = .infinity
+                invalidLayer.delegate = delegate
+                invalidLayer.setNeedsDisplay()
+                root.addSublayer(invalidLayer)
+
+                let displayLayer = CALayer()
+                displayLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                displayLayer.position = CGPoint(x: 220, y: 140)
+                displayLayer.zPosition = 100
+                displayLayer.delegate = displayDelegate
+                displayLayer.setNeedsDisplay()
+                root.addSublayer(displayLayer)
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    layer.removeFromSuperlayer()
+                    invalidLayer.removeFromSuperlayer()
+                    displayLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (existingLayer, wasHidden) in existingLayerStates {
+                        existingLayer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                let samplePoints = [
+                    CGPoint(x: 330, y: 160),
+                    CGPoint(x: 350, y: 160),
+                ]
+                let verticalSamplePoints = [
+                    CGPoint(x: 330, y: 145),
+                    CGPoint(x: 330, y: 175),
+                ]
+                engine.renderFrame()
+                do {
+                    let initialReadback = try await renderer.readbackPixels(
+                        at: samplePoints + verticalSamplePoints + [
+                            CGPoint(x: 220, y: 160),
+                            CGPoint(x: 280, y: 160),
+                        ]
+                    )
+                    let initialPixels = Array(initialReadback.prefix(samplePoints.count))
+                    let normalVerticalPixels = Array(
+                        initialReadback.dropFirst(samplePoints.count).prefix(verticalSamplePoints.count)
+                    )
+                    let displayPixel = initialReadback[4]
+                    let invalidPixel = initialReadback[5]
+                    delegate.usesSwappedColors = true
+                    layer.setNeedsDisplay()
+                    displayLayer.setNeedsDisplay()
+                    engine.renderFrame()
+                    let updatedPixels = try await renderer.readbackPixels(at: samplePoints)
+                    layer.isGeometryFlipped = true
+                    layer.setNeedsDisplay()
+                    engine.renderFrame()
+                    let flippedVerticalPixels = try await renderer.readbackPixels(at: verticalSamplePoints)
+                    let drewExactlyThreeTimes = delegate.willDrawCount == 3 && delegate.drawCount == 3
+                    let displayedWithoutDrawing = displayDelegate.displayCount == 2
+                        && displayDelegate.drawCount == 0
+                        && displayPixel == [0, 0, 255, 255]
+                    let retainedOneBackingStore = renderer.activeDelegateBackingStoreCount == 1
+                    let failed = renderer.delegateDrawFailureCount
+
+                    layer.contents = displayImage
+                    engine.renderFrame()
+                    let replacementPixel = try await renderer.readbackPixels(
+                        at: [CGPoint(x: 340, y: 160)]
+                    )[0]
+                    let explicitContentsReplacedBackingStore = replacementPixel == [0, 0, 255, 255]
+                        && renderer.activeDelegateBackingStoreCount == 0
+
+                    restoreScene()
+                    let releasedBackingStore = renderer.activeDelegateBackingStoreCount == 0
+                    delegateDrawProbeResult = "initial="
+                        + initialPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",updated="
+                        + updatedPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",normalVertical="
+                        + normalVerticalPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",flippedVertical="
+                        + flippedVerticalPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",callbacks=\(drewExactlyThreeTimes)"
+                        + ",display=\(displayedWithoutDrawing)"
+                        + ",retained=\(retainedOneBackingStore)"
+                        + ",replaced=\(explicitContentsReplacedBackingStore)"
+                        + ",released=\(releasedBackingStore)"
+                        + ",rejected=\(invalidPixel == [0, 0, 0, 255])"
+                        + ",failures=\(failed)"
+                } catch {
+                    restoreScene()
+                    delegateDrawProbeResult = "error: \(error)"
                 }
             }
         })

@@ -26,6 +26,15 @@ struct CALayerBoundsBehaviorTests {
         layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
         #expect(layer.needsDisplay() == false)
     }
+
+    @Test("Geometry flipping reports an implicitly flipped content context")
+    func geometryFlippingControlsContentContext() {
+        let layer = CALayer()
+
+        #expect(layer.contentsAreFlipped() == false)
+        layer.isGeometryFlipped = true
+        #expect(layer.contentsAreFlipped() == true)
+    }
 }
 
 @Suite("CALayer Time Conversion Tests")

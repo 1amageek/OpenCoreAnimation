@@ -802,11 +802,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var rasterizationFailureCount: Int = 0
 
+    /// Number of requested delegate backing-store draws that could not produce an image.
+    @_spi(RendererDiagnostics)
+    public private(set) var delegateDrawFailureCount: Int = 0
+
+    /// Number of live delegate-generated backing stores retained by the renderer.
+    @_spi(RendererDiagnostics)
+    public var activeDelegateBackingStoreCount: Int {
+        delegateBackingStores.count
+    }
+
     /// The preferred texture format.
     private var preferredFormat: GPUTextureFormat = .bgra8unorm
 
     /// The swap-chain texture most recently submitted for presentation.
     private var lastRenderedTexture: GPUTexture?
+
+    /// Software-rasterized backing stores for ordinary CALayer delegates.
+    private var delegateBackingStores: [ObjectIdentifier: CGImage] = [:]
 
     /// The canvas element (JavaScript object).
     private let canvas: JSObject
@@ -3419,6 +3432,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         suppressShadowRendering = false
         activeEmitterLayerIDs.removeAll(keepingCapacity: true)
         collectEmitterLayerIDs(rootLayer, into: &activeEmitterLayerIDs)
+        updateDelegateBackingStores(
+            in: rootLayer,
+            maximumTextureDimension: max(1, Int(device.limits.maxTextureDimension2D))
+        )
 
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
@@ -3655,6 +3672,130 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
     }
 
+    /// Resolves ordinary CALayer delegate drawing before any shadow, filter,
+    /// rasterization, or composition prepass consumes the layer subtree.
+    private func updateDelegateBackingStores(
+        in rootLayer: CALayer,
+        maximumTextureDimension: Int
+    ) {
+        var visited: Set<ObjectIdentifier> = []
+        var activeLayerIDs: Set<ObjectIdentifier> = []
+
+        func visit(_ layer: CALayer) {
+            let identifier = ObjectIdentifier(layer)
+            guard visited.insert(identifier).inserted else { return }
+            activeLayerIDs.insert(identifier)
+
+            if layer.needsDisplay(), supportsDelegateBackingStore(for: layer) {
+                updateDelegateBackingStore(
+                    for: layer,
+                    identifier: identifier,
+                    maximumTextureDimension: maximumTextureDimension
+                )
+            } else if layer._dirtyMask.contains(.contents) {
+                // An explicit contents assignment supersedes the previously
+                // rasterized delegate backing store.
+                delegateBackingStores.removeValue(forKey: identifier)
+            }
+            if let mask = layer.mask {
+                visit(mask)
+            }
+            for sublayer in layer.sublayers ?? [] {
+                visit(sublayer)
+            }
+        }
+
+        visit(rootLayer)
+        delegateBackingStores = delegateBackingStores.filter {
+            activeLayerIDs.contains($0.key)
+        }
+    }
+
+    private func supportsDelegateBackingStore(for layer: CALayer) -> Bool {
+        !(layer is CATiledLayer)
+            && !(layer is CATransformLayer)
+            && !(layer is CAEmitterLayer)
+            && !(layer is CATextLayer)
+            && !(layer is CAShapeLayer)
+            && !(layer is CAGradientLayer)
+    }
+
+    private func updateDelegateBackingStore(
+        for layer: CALayer,
+        identifier: ObjectIdentifier,
+        maximumTextureDimension: Int
+    ) {
+        let revisionBeforeDisplay = layer._contentRevision
+        layer.displayIfNeeded()
+        if layer._contentRevision != revisionBeforeDisplay {
+            delegateBackingStores.removeValue(forKey: identifier)
+            return
+        }
+
+        guard let delegate = layer.delegate else {
+            delegateBackingStores.removeValue(forKey: identifier)
+            return
+        }
+        let bounds = layer.bounds
+        let scale = layer.contentsScale
+        guard bounds.width.isFinite,
+              bounds.height.isFinite,
+              bounds.width > 0,
+              bounds.height > 0,
+              scale.isFinite,
+              scale > 0 else {
+            delegateBackingStores.removeValue(forKey: identifier)
+            delegateDrawFailureCount += 1
+            return
+        }
+
+        let pixelWidthValue = ceil(bounds.width * scale)
+        let pixelHeightValue = ceil(bounds.height * scale)
+        let maximumDimension = CGFloat(maximumTextureDimension)
+        guard pixelWidthValue.isFinite,
+              pixelHeightValue.isFinite,
+              pixelWidthValue <= maximumDimension,
+              pixelHeightValue <= maximumDimension else {
+            delegateBackingStores.removeValue(forKey: identifier)
+            delegateDrawFailureCount += 1
+            return
+        }
+        let pixelWidth = Int(pixelWidthValue)
+        let pixelHeight = Int(pixelHeightValue)
+        guard let context = CGContext(
+            softwareData: nil,
+            width: pixelWidth,
+            height: pixelHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: .deviceRGB,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        ) else {
+            delegateBackingStores.removeValue(forKey: identifier)
+            delegateDrawFailureCount += 1
+            return
+        }
+
+        context.scaleBy(x: scale, y: scale)
+        if layer.contentsAreFlipped() {
+            context.translateBy(x: -bounds.minX, y: -bounds.minY)
+        } else {
+            // CGImage row zero is the top row, while OpenCoreAnimation's
+            // default layer geometry is Y-up. Write logical Y=0 into the
+            // final bitmap row so textured display preserves that contract.
+            context.translateBy(x: -bounds.minX, y: bounds.maxY)
+            context.scaleBy(x: 1, y: -1)
+        }
+        delegate.layerWillDraw(layer)
+        layer.draw(in: context)
+        guard let image = context.makeImage() else {
+            delegateBackingStores.removeValue(forKey: identifier)
+            delegateDrawFailureCount += 1
+            return
+        }
+        delegateBackingStores[identifier] = image
+    }
+
     private func collectEmitterLayerIDs(
         _ layer: CALayer,
         into result: inout Set<ObjectIdentifier>
@@ -3797,6 +3938,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerenderedShadows.removeAll(keepingCapacity: false)
         shadowRenderFailureCount = 0
         rasterizationFailureCount = 0
+        delegateBackingStores.removeAll(keepingCapacity: false)
+        delegateDrawFailureCount = 0
         depthTextureView = nil
         lastRenderedTexture = nil
         shadowBlurHorizontalPipeline = nil
@@ -4263,6 +4406,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                   let colors = gradientLayer.colors, !colors.isEmpty {
             renderGradientLayer(gradientLayer, device: device, renderPass: renderPass,
                               modelMatrix: modelMatrix, bindGroup: bindGroup)
+        } else if let contents = delegateBackingStores[ObjectIdentifier(layer)] {
+            renderContentsLayer(presentationLayer, contents: contents, device: device,
+                               renderPass: renderPass, modelMatrix: modelMatrix)
         } else if let contents = presentationLayer.contents as? CGImage {
             renderContentsLayer(presentationLayer, contents: contents, device: device,
                                renderPass: renderPass, modelMatrix: modelMatrix)
