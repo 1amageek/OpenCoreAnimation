@@ -12,7 +12,7 @@
 
 import Foundation
 import WasmTesting
-import OpenCoreAnimation
+@_spi(RendererDiagnostics) import OpenCoreAnimation
 #if canImport(Testing)
 import Testing
 #endif
@@ -26,6 +26,7 @@ nonisolated(unsafe) var sublayerCount: Int = 0
 nonisolated(unsafe) var rootLayerRef: CALayer?
 nonisolated(unsafe) var rasterizedGroupRef: CALayer?
 nonisolated(unsafe) var tiledLayerRef: CATiledLayer?
+nonisolated(unsafe) var transitioningLayerRef: CALayer?
 nonisolated(unsafe) var tileDelegateRef: SmokeTileDelegate?
 nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
@@ -53,6 +54,7 @@ public func setup() {
             sublayerCount = 0
             rootLayerRef = nil
             tiledLayerRef = nil
+            transitioningLayerRef = nil
             tileDelegateRef = nil
             tileDrawCount = 0
             pixelReadbackResult = "pending"
@@ -144,8 +146,9 @@ func performSetup() async {
     let transitioning = CALayer()
     transitioning.bounds = CGRect(x: 0, y: 0, width: 80, height: 80)
     transitioning.position = CGPoint(x: 320, y: 220)
-    transitioning.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+    transitioning.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 0.5)
     root.addSublayer(transitioning)
+    transitioningLayerRef = transitioning
 
     let transition = CATransition()
     transition.type = .fade
@@ -153,7 +156,7 @@ func performSetup() async {
     transition.speed = 0
     transition.timeOffset = 0.5
     transitioning.add(transition, forKey: "browserCrossfade")
-    transitioning.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+    transitioning.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 0.5)
 
     rootLayerRef = root
     sublayerCount = root.sublayers?.count ?? 0
@@ -198,6 +201,26 @@ func installHarness() {
         h.expose("getPixelReadback", returning: {
             .string(pixelReadbackResult)
         })
+        h.expose("getTransitionSourceCaptureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .transitionSourceCaptureCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getActiveTransitionSourceTextureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .activeTransitionSourceTextureCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("removeTransition", action: {
+            MainActor.assumeIsolated {
+                transitioningLayerRef?.removeAnimation(forKey: "browserCrossfade")
+                CAAnimationEngine.shared.renderFrame()
+            }
+        })
         h.expose("beginPixelReadback", action: {
             Task { @MainActor in
                 do {
@@ -220,6 +243,7 @@ func installHarness() {
                     let pixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 80, y: 220),
                         CGPoint(x: 200, y: 220),
+                        CGPoint(x: 340, y: 240),
                         CGPoint(x: 10, y: 10),
                         CGPoint(x: 200, y: 80),
                         CGPoint(x: 320, y: 80),

@@ -20,6 +20,9 @@ interface OCA extends Harness {
     getTileState: () => string;
     isEngineRunning: () => boolean;
     getPixelReadback: () => string;
+    getTransitionSourceCaptureCount: () => number;
+    getActiveTransitionSourceTextureCount: () => number;
+    removeTransition: () => void;
     beginPixelReadback: () => void;
 }
 
@@ -55,11 +58,16 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getStatus()).toBe("ready");
         expect(await h.getTileState()).toBe("delegate=true,bounds=80.0x80.0");
         await expect.poll(() => h.getTileDrawCount(), { timeout: 2_000 }).toBeGreaterThan(0);
+        await expect.poll(() => h.getTransitionSourceCaptureCount()).toBe(1);
+        expect(await h.getActiveTransitionSourceTextureCount()).toBe(1);
         await h.beginPixelReadback();
 
         await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
         expect(await h.getPixelReadback()).toBe(
-            "255,0,0,255;0,255,0,255;26,26,38,255;255,0,255,255;128,0,128,255"
+            "255,0,0,255;0,255,0,255;0,0,255,255;26,26,38,255;255,0,255,255;106,10,78,255"
         );
+
+        await h.removeTransition();
+        await expect.poll(() => h.getActiveTransitionSourceTextureCount()).toBe(0);
     });
 });
