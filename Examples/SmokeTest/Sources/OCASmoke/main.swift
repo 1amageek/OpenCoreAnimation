@@ -645,13 +645,21 @@ func installHarness() {
                 guard let root = rootLayerRef,
                       let renderer = engine.renderer as? CAWebGPURenderer,
                       let multiply = CIFilter(name: "CIMultiplyCompositing"),
-                      let screen = CIFilter(name: "CIScreenCompositing") else {
+                      let screen = CIFilter(name: "CIScreenCompositing"),
+                      let sourceOver = CIFilter(name: "CISourceOverCompositing"),
+                      let invert = CIFilter(name: "CIColorInvert") else {
                     compositionProbeResult = "error: composition dependencies unavailable"
                     return
                 }
 
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0.1, green: 0.1, blue: 0.15, alpha: 0.5)
                 let backdrop = CALayer()
                 backdrop.bounds = CGRect(x: 0, y: 0, width: 360, height: 60)
                 backdrop.position = CGPoint(x: 200, y: 140)
@@ -689,6 +697,22 @@ func installHarness() {
                 laterSource.zPosition = 204
                 laterSource.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                 root.addSublayer(laterSource)
+
+                let backdropFiltered = CALayer()
+                backdropFiltered.bounds = source.bounds
+                backdropFiltered.position = CGPoint(x: 80, y: 140)
+                backdropFiltered.zPosition = 205
+                backdropFiltered.cornerRadius = 20
+                backdropFiltered.backgroundFilters = [CAFilter.brightness(0), invert]
+                root.addSublayer(backdropFiltered)
+
+                let transparentSource = CALayer()
+                transparentSource.bounds = source.bounds
+                transparentSource.position = CGPoint(x: 50, y: 240)
+                transparentSource.zPosition = 206
+                transparentSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 0.5)
+                transparentSource.compositingFilter = sourceOver
+                root.addSublayer(transparentSource)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -698,16 +722,28 @@ func installHarness() {
                         CGPoint(x: 240, y: 160),
                         CGPoint(x: 320, y: 160),
                         CGPoint(x: 370, y: 160),
+                        CGPoint(x: 80, y: 140),
+                        CGPoint(x: 52, y: 188),
+                        CGPoint(x: 50, y: 60),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
                         && pixels[2] == [127, 0, 0, 255]
                         && pixels[3] == [0, 0, 255, 255]
+                        && pixels[4] == [0, 255, 255, 255]
+                        && pixels[5] == [255, 0, 0, 255]
+                        && pixels[6] == [7, 135, 10, 192]
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
                     screenedSource.removeFromSuperlayer()
                     translucentSource.removeFromSuperlayer()
                     laterSource.removeFromSuperlayer()
+                    backdropFiltered.removeFromSuperlayer()
+                    transparentSource.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
                     engine.renderFrame()
                     compositionProbeResult = "ordered=\(composited),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),after=\(renderer.activeCompositionResourceCount)"
                 } catch {

@@ -811,6 +811,43 @@ public enum CAWebGPUShaders {
     }
     """
 
+    /// Combines a filtered backdrop with its unmodified source through a layer-shape mask.
+    public static let backdropFilterMix = """
+    @group(0) @binding(0) var originalBackdrop: texture_2d<f32>;
+    @group(0) @binding(1) var filteredBackdrop: texture_2d<f32>;
+    @group(0) @binding(2) var layerMask: texture_2d<f32>;
+    @group(0) @binding(3) var texSampler: sampler;
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) texCoord: vec2<f32>,
+    }
+
+    @vertex
+    fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+        let positions = array<vec2<f32>, 6>(
+            vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+            vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+        );
+        let texCoords = array<vec2<f32>, 6>(
+            vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+            vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
+        );
+        var output: VertexOutput;
+        output.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+        output.texCoord = texCoords[vertexIndex];
+        return output;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        let original = textureSample(originalBackdrop, texSampler, input.texCoord);
+        let filtered = textureSample(filteredBackdrop, texSampler, input.texCoord);
+        let coverage = clamp(textureSample(layerMask, texSampler, input.texCoord).a, 0.0, 1.0);
+        return mix(original, filtered, coverage);
+    }
+    """
+
     // MARK: - Masked Rendering Shader
 
     /// Shader code for masked rendering.

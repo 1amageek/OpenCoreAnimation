@@ -253,10 +253,17 @@ private final class CompositionLayerResources {
     let backdropStraightView: GPUTextureView
     let resultPremultipliedTexture: GPUTexture
     let resultPremultipliedView: GPUTextureView
+    let backdropMaskTexture: GPUTexture
+    let backdropMaskView: GPUTextureView
+    let mixedBackdropStraightTexture: GPUTexture
+    let mixedBackdropStraightView: GPUTextureView
+    let backgroundFilterResources: FilterLayerResources
     let sourceUniformBuffer: GPUBuffer
     let backdropUniformBuffer: GPUBuffer
     let resultConversionUniformBuffer: GPUBuffer
     let displayUniformBuffer: GPUBuffer
+    let backdropMaskUniformBuffer: GPUBuffer
+    let backdropMaskVertexBuffer: GPUBuffer
 
     init(device: GPUDevice, width: Int, height: Int, format: GPUTextureFormat) {
         func makeTexture(_ format: GPUTextureFormat) -> GPUTexture {
@@ -281,10 +288,28 @@ private final class CompositionLayerResources {
         backdropStraightView = backdropStraightTexture.createView()
         resultPremultipliedTexture = makeTexture(format)
         resultPremultipliedView = resultPremultipliedTexture.createView()
+        backdropMaskTexture = makeTexture(format)
+        backdropMaskView = backdropMaskTexture.createView()
+        mixedBackdropStraightTexture = makeTexture(format)
+        mixedBackdropStraightView = mixedBackdropStraightTexture.createView()
+        backgroundFilterResources = FilterLayerResources(
+            device: device,
+            width: width,
+            height: height,
+            format: format
+        )
         sourceUniformBuffer = makeUniformBuffer()
         backdropUniformBuffer = makeUniformBuffer()
         resultConversionUniformBuffer = makeUniformBuffer()
         displayUniformBuffer = makeUniformBuffer()
+        backdropMaskUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: caRendererAlignedUniformSize,
+            usage: [.uniform, .copyDst]
+        ))
+        backdropMaskVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(6 * MemoryLayout<CARendererVertex>.stride),
+            usage: [.vertex, .copyDst]
+        ))
     }
 
     func destroy() {
@@ -292,10 +317,15 @@ private final class CompositionLayerResources {
         sourceStraightTexture.destroy()
         backdropStraightTexture.destroy()
         resultPremultipliedTexture.destroy()
+        backdropMaskTexture.destroy()
+        mixedBackdropStraightTexture.destroy()
+        backgroundFilterResources.destroy()
         sourceUniformBuffer.destroy()
         backdropUniformBuffer.destroy()
         resultConversionUniformBuffer.destroy()
         displayUniformBuffer.destroy()
+        backdropMaskUniformBuffer.destroy()
+        backdropMaskVertexBuffer.destroy()
     }
 }
 
@@ -1012,6 +1042,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Filter composite pipeline for blending filtered result with optional tint.
     private var filterCompositePipeline: GPURenderPipeline?
+
+    /// Replaces the current framebuffer with an already-composited backdrop snapshot.
+    private var filterReplacementPipeline: GPURenderPipeline?
+
+    /// Restricts filtered backdrop pixels to the transformed layer shape.
+    private var backdropFilterMixPipeline: GPURenderPipeline?
 
     /// Stencil-aware filter composite pipeline.
     private var filterCompositeStencilPipeline: GPURenderPipeline?
@@ -2335,6 +2371,79 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: .layout(shadowCompositePipelineLayout)
         ))
 
+        filterReplacementPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: filterCompositeShaderModule,
+                entryPoint: "vertexMain"
+            ),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plusStencil8,
+                depthWriteEnabled: false,
+                depthCompare: .always,
+                stencilFront: GPUStencilFaceState(
+                    compare: .always,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                ),
+                stencilBack: GPUStencilFaceState(
+                    compare: .always,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                )
+            ),
+            fragment: GPUFragmentState(
+                module: filterCompositeShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [GPUColorTargetState(format: preferredFormat)]
+            ),
+            layout: .layout(shadowCompositePipelineLayout)
+        ))
+
+        let backdropMixBindGroupLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
+            entries: [
+                GPUBindGroupLayoutEntry(
+                    binding: 0,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 1,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 2,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 3,
+                    visibility: .fragment,
+                    sampler: GPUSamplerBindingLayout(type: .filtering)
+                ),
+            ]
+        ))
+        let backdropMixPipelineLayout = device.createPipelineLayout(descriptor: GPUPipelineLayoutDescriptor(
+            bindGroupLayouts: [backdropMixBindGroupLayout]
+        ))
+        let backdropMixShaderModule = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
+            code: CAWebGPUShaders.backdropFilterMix
+        ))
+        backdropFilterMixPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: backdropMixShaderModule,
+                entryPoint: "vertexMain"
+            ),
+            fragment: GPUFragmentState(
+                module: backdropMixShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [GPUColorTargetState(format: preferredFormat)]
+            ),
+            layout: .layout(backdropMixPipelineLayout)
+        ))
+
         filterOperationPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
             vertex: GPUVertexState(
                 module: filterCompositeShaderModule,
@@ -2622,11 +2731,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         } else if let bgColor = rootLayer.backgroundColor,
            let components = bgColor.components,
            components.count >= 4 {
+            let alpha = components[3]
             clearColor = GPUColor(
-                r: components[0],
-                g: components[1],
-                b: components[2],
-                a: components[3]
+                r: components[0] * alpha,
+                g: components[1] * alpha,
+                b: components[2] * alpha,
+                a: alpha
             )
         } else {
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 1)
@@ -2929,6 +3039,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         maskTexture = nil
         maskedPipeline = nil
         maskBindGroupLayout = nil
+        filterReplacementPipeline = nil
+        backdropFilterMixPipeline = nil
 
         // Stencil resources
         stencilWritePipeline = nil
@@ -6933,6 +7045,222 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
     }
 
+    private func executeBackdropFilterStages(
+        _ stages: [LayerFilterStage],
+        inputTexture: GPUTexture,
+        inputView: GPUTextureView,
+        resources: FilterLayerResources,
+        encoder: GPUCommandEncoder
+    ) -> (texture: GPUTexture, view: GPUTextureView)? {
+        guard let device else { return nil }
+
+        var currentTexture = inputTexture
+        var currentView = inputView
+        var currentAlphaMode = FilterTextureAlphaMode.straight
+        var conversionIndex = 0
+
+        func convert(to targetMode: FilterTextureAlphaMode) -> Bool {
+            guard currentAlphaMode != targetMode else { return true }
+            let outputTexture = currentTexture === resources.resultTexture
+                ? resources.sourceTexture
+                : resources.resultTexture
+            guard let outputView = resources.view(for: outputTexture) else { return false }
+            let uniformBuffer = resources.uniformBuffer(
+                forOperationAt: stages.count + conversionIndex,
+                device: device
+            )
+            conversionIndex += 1
+            guard applyAlphaConversion(
+                from: currentAlphaMode,
+                inputTexture: currentTexture,
+                outputTexture: outputTexture,
+                uniformBuffer: uniformBuffer,
+                resources: resources,
+                encoder: encoder
+            ) else { return false }
+            currentTexture = outputTexture
+            currentView = outputView
+            currentAlphaMode = targetMode
+            return true
+        }
+
+        for (stageIndex, stage) in stages.enumerated() {
+            switch stage {
+            case let .renderer(operation):
+                guard convert(to: .premultiplied) else { return nil }
+                let outputTexture = currentTexture === resources.resultTexture
+                    ? resources.sourceTexture
+                    : resources.resultTexture
+                guard let outputView = resources.view(for: outputTexture) else { return nil }
+                let operationUniformBuffer = resources.uniformBuffer(
+                    forOperationAt: stageIndex,
+                    device: device
+                )
+
+                let applied: Bool
+                switch operation {
+                case let .gaussianBlur(radius):
+                    if radius <= 0 { continue }
+                    applied = applyBlurFilter(
+                        inputTexture: currentTexture,
+                        intermediateTexture: resources.intermediateTexture,
+                        outputTexture: outputTexture,
+                        radius: radius,
+                        uniformBuffer: operationUniformBuffer,
+                        resources: resources,
+                        encoder: encoder
+                    )
+                case .brightness, .contrast, .saturation, .colorInvert:
+                    applied = applyColorFilter(
+                        operation,
+                        inputTexture: currentTexture,
+                        outputTexture: outputTexture,
+                        uniformBuffer: operationUniformBuffer,
+                        resources: resources,
+                        encoder: encoder
+                    )
+                }
+                guard applied else { return nil }
+                currentTexture = outputTexture
+                currentView = outputView
+
+            case let .coreImage(filter):
+                guard convert(to: .straight),
+                      let processor = layerFilterProcessor else { return nil }
+                do {
+                    let execution = try processor.makeExecution(
+                        filter: filter,
+                        inputMode: .singleInput,
+                        inputTexture: currentTexture,
+                        width: UInt32(size.width),
+                        height: UInt32(size.height)
+                    )
+                    try execution.encode(commandEncoder: encoder)
+                    activeCompositionExecutions.append(execution)
+                    currentTexture = execution.outputTexture
+                    currentView = execution.outputTexture.createView()
+                    currentAlphaMode = .straight
+                } catch {
+                    return nil
+                }
+            }
+        }
+
+        guard convert(to: .straight) else { return nil }
+        return (currentTexture, currentView)
+    }
+
+    private func renderBackdropFilterMask(
+        for target: LayerPrepassTarget,
+        resources: CompositionLayerResources,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
+        guard let device,
+              let bindGroupLayout,
+              let shadowMaskPipeline else { return false }
+
+        let presentation = target.presentationLayer
+        let bounds = presentation.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return false }
+
+        let modelMatrix = presentation.modelMatrix(parentMatrix: target.parentMatrix)
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(Float(bounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(bounds.height), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        var uniforms = CARendererUniforms(
+            mvpMatrix: modelMatrix * scaleMatrix,
+            opacity: 1,
+            cornerRadius: Float(presentation.cornerRadius),
+            layerSize: SIMD2<Float>(Float(bounds.width), Float(bounds.height)),
+            cornerRadii: presentation.cornerRadiiComponents
+        )
+        device.queue.writeBuffer(
+            resources.backdropMaskUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &uniforms)
+        )
+
+        let white = SIMD4<Float>(repeating: 1)
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: white),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: white),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
+        ]
+        device.queue.writeBuffer(
+            resources.backdropMaskVertexBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &vertices)
+        )
+        let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: bindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(
+                    resources.backdropMaskUniformBuffer,
+                    offset: 0,
+                    size: Self.alignedUniformSize
+                )),
+            ]
+        ))
+        let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: resources.backdropMaskView,
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                ),
+            ]
+        ))
+        renderPass.setPipeline(shadowMaskPipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [0])
+        renderPass.setVertexBuffer(0, buffer: resources.backdropMaskVertexBuffer, offset: 0)
+        renderPass.draw(vertexCount: 6)
+        renderPass.end()
+        return true
+    }
+
+    private func mixFilteredBackdrop(
+        originalView: GPUTextureView,
+        filteredView: GPUTextureView,
+        resources: CompositionLayerResources,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
+        guard let device,
+              let backdropFilterMixPipeline,
+              let blurSampler else { return false }
+
+        let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: backdropFilterMixPipeline.getBindGroupLayout(index: 0),
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .textureView(originalView)),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(filteredView)),
+                GPUBindGroupEntry(binding: 2, resource: .textureView(resources.backdropMaskView)),
+                GPUBindGroupEntry(binding: 3, resource: .sampler(blurSampler)),
+            ]
+        ))
+        let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: resources.mixedBackdropStraightView,
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                ),
+            ]
+        ))
+        renderPass.setPipeline(backdropFilterMixPipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup)
+        renderPass.draw(vertexCount: 6)
+        renderPass.end()
+        return true
+    }
+
     private func prerenderBackdropCompositions(
         _ rootLayer: CALayer,
         clearColor: GPUColor,
@@ -6950,6 +7278,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             rootLayer,
             parentMatrix: projectionMatrix,
             ancestorCompositionKeys: [],
+            hasUnsupportedAncestorClip: false,
             targets: &targets,
             structurallyInvalidKeys: &structurallyInvalidKeys
         )
@@ -6969,13 +7298,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         for target in targets {
             let key = target.renderKey
             let presentation = target.presentationLayer
+            let requestedBackgroundFilters = presentation.backgroundFilters ?? []
+            guard let backgroundStages = layerFilterStages(from: requestedBackgroundFilters) else {
+                recordFailure(key)
+                continue
+            }
+            let compositionFilter: CIFilter
+            if let requestedFilter = presentation.compositingFilter as? CIFilter {
+                compositionFilter = requestedFilter
+            } else if presentation.compositingFilter != nil {
+                recordFailure(key)
+                continue
+            } else if let sourceOver = CIFilter(name: "CISourceOverCompositing") {
+                compositionFilter = sourceOver
+            } else {
+                recordFailure(key)
+                continue
+            }
             guard prefixIsValid,
                   !structurallyInvalidKeys.contains(key),
                   key.replicatorPath.isEmpty,
                   presentation.opacity == 1,
-                  presentation.backgroundFilters?.isEmpty != false,
-                  let filter = presentation.compositingFilter as? CIFilter,
-                  processor.supports(filter, inputMode: .foregroundAndBackground),
+                  presentation.mask == nil,
+                  processor.supports(compositionFilter, inputMode: .foregroundAndBackground),
                   let source = prerenderedFilters[key] else {
                 recordFailure(key)
                 continue
@@ -7077,12 +7422,38 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 continue
             }
 
+            var compositionBackdropTexture = resources.backdropStraightTexture
+            if !backgroundStages.isEmpty {
+                guard let filteredBackdrop = executeBackdropFilterStages(
+                    backgroundStages,
+                    inputTexture: resources.backdropStraightTexture,
+                    inputView: resources.backdropStraightView,
+                    resources: resources.backgroundFilterResources,
+                    encoder: encoder
+                ),
+                renderBackdropFilterMask(
+                    for: target,
+                    resources: resources,
+                    encoder: encoder
+                ),
+                mixFilteredBackdrop(
+                    originalView: resources.backdropStraightView,
+                    filteredView: filteredBackdrop.view,
+                    resources: resources,
+                    encoder: encoder
+                ) else {
+                    recordFailure(key)
+                    continue
+                }
+                compositionBackdropTexture = resources.mixedBackdropStraightTexture
+            }
+
             do {
                 let execution = try processor.makeExecution(
-                    filter: filter,
+                    filter: compositionFilter,
                     inputMode: .foregroundAndBackground,
                     inputTexture: resources.sourceStraightTexture,
-                    backgroundTexture: resources.backdropStraightTexture,
+                    backgroundTexture: compositionBackdropTexture,
                     width: UInt32(size.width),
                     height: UInt32(size.height)
                 )
@@ -7121,6 +7492,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
         ancestorCompositionKeys: [LayerRenderKey],
+        hasUnsupportedAncestorClip: Bool,
         targets: inout [LayerPrepassTarget],
         structurallyInvalidKeys: inout Set<LayerRenderKey>
     ) {
@@ -7143,6 +7515,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 structurallyInvalidKeys.insert(key)
                 structurallyInvalidKeys.formUnion(ancestorCompositionKeys)
             }
+            if hasUnsupportedAncestorClip {
+                structurallyInvalidKeys.insert(key)
+            }
             descendantAncestors.append(key)
         }
 
@@ -7156,6 +7531,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
                 ancestorCompositionKeys: descendantAncestors,
+                hasUnsupportedAncestorClip: hasUnsupportedAncestorClip
+                    || presentation.mask != nil
+                    || presentation.masksToBounds,
                 targets: &targets,
                 structurallyInvalidKeys: &structurallyInvalidKeys
             )
@@ -7900,13 +8278,32 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         device: GPUDevice,
         renderPass: GPURenderPassEncoder
     ) {
-        renderPremultipliedFullScreenTexture(
-            composition.outputView,
-            uniformBuffer: composition.resources.displayUniformBuffer,
-            uniforms: FilterCompositeUniforms(),
-            device: device,
-            renderPass: renderPass
+        guard let filterReplacementPipeline,
+              let blurSampler else { return }
+
+        var uniforms = FilterCompositeUniforms()
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(
+            composition.resources.displayUniformBuffer,
+            bufferOffset: 0,
+            data: uniformData
         )
+        let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: filterReplacementPipeline.getBindGroupLayout(index: 0),
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(
+                    composition.resources.displayUniformBuffer,
+                    offset: 0,
+                    size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride)
+                )),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(composition.outputView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler)),
+            ]
+        ))
+
+        renderPass.setPipeline(filterReplacementPipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup)
+        renderPass.draw(vertexCount: 6)
     }
 
     private func renderPremultipliedFullScreenTexture(
