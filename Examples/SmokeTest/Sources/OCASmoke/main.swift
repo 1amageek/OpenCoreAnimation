@@ -1139,6 +1139,7 @@ func installHarness() {
                 backdropFiltered.position = CGPoint(x: 80, y: 140)
                 backdropFiltered.zPosition = 205
                 backdropFiltered.cornerRadius = 20
+                backdropFiltered.masksToBounds = true
                 backdropFiltered.backgroundFilters = [CAFilter.brightness(0), invert]
                 root.addSublayer(backdropFiltered)
 
@@ -1361,6 +1362,18 @@ func installHarness() {
                 targetMaskedFilter.mask = makeHalfMask()
                 targetMaskedFilter.backgroundFilters = [CAFilter.colorInvert()]
                 root.addSublayer(targetMaskedFilter)
+
+                let unboundedFilterBackdrop = CALayer()
+                unboundedFilterBackdrop.bounds = CGRect(x: 0, y: 0, width: 80, height: 40)
+                unboundedFilterBackdrop.position = CGPoint(x: 300, y: 90)
+                unboundedFilterBackdrop.zPosition = 217
+                unboundedFilterBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                let unboundedBackdropFilter = CALayer()
+                unboundedBackdropFilter.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                unboundedBackdropFilter.position = CGPoint(x: 40, y: 20)
+                unboundedBackdropFilter.backgroundFilters = [CAFilter.colorInvert()]
+                unboundedFilterBackdrop.addSublayer(unboundedBackdropFilter)
+                root.addSublayer(unboundedFilterBackdrop)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -1392,6 +1405,8 @@ func installHarness() {
                         CGPoint(x: 65, y: 100),
                         CGPoint(x: 105, y: 100),
                         CGPoint(x: 135, y: 100),
+                        CGPoint(x: 300, y: 210),
+                        CGPoint(x: 270, y: 210),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -1419,6 +1434,8 @@ func installHarness() {
                         && pixels[23] == [255, 0, 0, 255]
                         && pixels[24] == [0, 255, 255, 255]
                         && pixels[25] == [255, 0, 0, 255]
+                    let unboundedBackgroundFilterUsesSuperlayerExtent = pixels[26] == [0, 255, 255, 255]
+                        && pixels[27] == [0, 255, 255, 255]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -1446,12 +1463,13 @@ func installHarness() {
                     contentMaskParent.removeFromSuperlayer()
                     targetMaskBackdrop.removeFromSuperlayer()
                     targetMaskedFilter.removeFromSuperlayer()
+                    unboundedFilterBackdrop.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
                     engine.renderFrame()
-                    compositionProbeResult = "ordered=\(composited),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
+                    compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
                 } catch {
                     compositionProbeResult = "error: \(error)"
                 }

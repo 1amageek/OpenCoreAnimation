@@ -169,6 +169,7 @@ private struct LayerPrepassTarget {
 private struct BackdropCompositionTarget {
     let prepass: LayerPrepassTarget
     let scope: LayerPrepassTarget?
+    let backgroundFilterExtent: LayerPrepassTarget?
     let depth: Int
     let clipAncestors: [LayerPrepassTarget]
     let contentMaskAncestors: [LayerPrepassTarget]
@@ -7838,12 +7839,26 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     }
 
     private func renderBackdropFilterMask(
-        for target: LayerPrepassTarget,
+        for target: BackdropCompositionTarget,
         resources: CompositionLayerResources,
         encoder: GPUCommandEncoder
     ) -> Bool {
-        renderCompositionClipShape(
-            target,
+        guard let extent = target.backgroundFilterExtent else {
+            let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.backdropMaskView,
+                        clearValue: GPUColor(r: 1, g: 1, b: 1, a: 1),
+                        loadOp: .clear,
+                        storeOp: .store
+                    ),
+                ]
+            ))
+            renderPass.end()
+            return true
+        }
+        return renderCompositionClipShape(
+            extent,
             outputView: resources.backdropMaskView,
             uniformBuffer: resources.backdropMaskUniformBuffer,
             vertexBuffer: resources.backdropMaskVertexBuffer,
@@ -8247,6 +8262,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         collectBackdropCompositionTargets(
             rootLayer,
             parentMatrix: projectionMatrix,
+            parentBackdropTarget: nil,
             ancestorBackdropScopes: [],
             ancestorClipTargets: [],
             ancestorContentMaskTargets: [],
@@ -8476,7 +8492,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     encoder: encoder
                 ),
                 renderBackdropFilterMask(
-                    for: target,
+                    for: compositionTarget,
                     resources: resources,
                     encoder: encoder
                 ) else {
@@ -8574,6 +8590,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func collectBackdropCompositionTargets(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
+        parentBackdropTarget: LayerPrepassTarget?,
         ancestorBackdropScopes: [LayerPrepassTarget],
         ancestorClipTargets: [LayerPrepassTarget],
         ancestorContentMaskTargets: [LayerPrepassTarget],
@@ -8596,6 +8613,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 collectBackdropCompositionTargets(
                     sublayer,
                     parentMatrix: sublayerParentMatrix,
+                    parentBackdropTarget: parentBackdropTarget,
                     ancestorBackdropScopes: ancestorBackdropScopes,
                     ancestorClipTargets: ancestorClipTargets,
                     ancestorContentMaskTargets: ancestorContentMaskTargets,
@@ -8638,6 +8656,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             targets.append(BackdropCompositionTarget(
                 prepass: prepass,
                 scope: ancestorBackdropScopes.last,
+                backgroundFilterExtent: presentation.masksToBounds
+                    ? prepass
+                    : parentBackdropTarget,
                 depth: ancestorBackdropScopes.count,
                 clipAncestors: ancestorClipTargets,
                 contentMaskAncestors: ancestorContentMaskTargets,
@@ -8669,6 +8690,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             collectBackdropCompositionTargets(
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
+                parentBackdropTarget: prepass,
                 ancestorBackdropScopes: descendantScopes,
                 ancestorClipTargets: descendantClipTargets,
                 ancestorContentMaskTargets: descendantContentMaskTargets,
