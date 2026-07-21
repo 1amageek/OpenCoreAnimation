@@ -6,6 +6,8 @@ import Foundation
 /// Represents a single particle in the emitter system.
 public struct EmitterParticle {
     public var birthSequence: UInt64 = 0
+    public var generation: Int = 0
+    public var emitterCells: [CAEmitterCell] = []
     public var contents: CGImage?
     public var contentsRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     public var contentsScale: Float = 1
@@ -13,15 +15,20 @@ public struct EmitterParticle {
     public var minificationFilter: String = CALayerContentsFilter.linear.rawValue
     public var minificationFilterBias: Float = 0
     public var position: SIMD3<Float> = .zero
+    public var previousPosition: SIMD3<Float> = .zero
     public var velocity: SIMD3<Float> = .zero
+    public var emissionDirection: SIMD3<Float> = SIMD3(0, 0, 1)
     public var acceleration: SIMD3<Float> = .zero
     public var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
+    public var previousColor: SIMD4<Float> = SIMD4(1, 1, 1, 1)
     public var colorSpeed: SIMD4<Float> = .zero
     public var scale: Float = 1.0
+    public var previousScale: Float = 1.0
     public var scaleSpeed: Float = 0.0
     public var rotation: Float = 0.0
     public var rotationSpeed: Float = 0.0
     public var lifetime: Float = 0.0
+    public var previousLifetime: Float = 0.0
     public var maxLifetime: Float = 1.0
     public var isAlive: Bool = false
 
@@ -31,18 +38,25 @@ public struct EmitterParticle {
     public mutating func update(deltaTime: Float) {
         guard isAlive else { return }
 
-        lifetime -= deltaTime
-        if lifetime <= 0 {
-            isAlive = false
-            return
-        }
+        previousPosition = position
+        previousColor = color
+        previousScale = scale
+        previousLifetime = lifetime
+
+        let step = max(0, min(deltaTime, lifetime))
 
         // Update position
-        velocity += acceleration * deltaTime
-        position += velocity * deltaTime
+        velocity += acceleration * step
+        position += velocity * step
+        let velocityLength = sqrt(
+            velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z
+        )
+        if velocityLength > 0 {
+            emissionDirection = velocity / velocityLength
+        }
 
         // Update color
-        color += colorSpeed * deltaTime
+        color += colorSpeed * step
         color = SIMD4(
             max(0, min(1, color.x)),
             max(0, min(1, color.y)),
@@ -51,11 +65,17 @@ public struct EmitterParticle {
         )
 
         // Update scale
-        scale += scaleSpeed * deltaTime
+        scale += scaleSpeed * step
         scale = max(0, scale)
 
         // Update rotation
-        rotation += rotationSpeed * deltaTime
+        rotation += rotationSpeed * step
+
+        lifetime -= step
+        if lifetime <= 0 {
+            lifetime = 0
+            isAlive = false
+        }
     }
 }
 

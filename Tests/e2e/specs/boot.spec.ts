@@ -116,7 +116,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginEmitterProbe();
         await expect.poll(() => h.getEmitterProbeResult(), { timeout: 10_000 }).toBe(
-            "before=1,1,states=2,geometry=true,directions=true,failures=0;orders=true,additive=true,unknown=true;after=0,2,states=1;image=true,sampling=true,nil=true,rejected=true;blend=true,final=0"
+            "before=1,1,states=2,geometry=true,directions=true,failures=0;orders=true,additive=true,unknown=true;after=0,2,states=1;image=true,sampling=true,nil=true,rejected=true,child=true;blend=true,final=0"
         );
 
         await h.beginDisplayLinkProbe();

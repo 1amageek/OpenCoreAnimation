@@ -1085,7 +1085,69 @@ func installHarness() {
                         layer.removeFromSuperlayer()
                     }
                     engine.renderFrame()
-                    result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected);blend=\(blendPixelsMatch),final=\(renderer.activeEmitterStateCount)"
+
+                    let childCell = CAEmitterCell()
+                    childCell.birthRate = 20
+                    childCell.beginTime = 0.025
+                    childCell.lifetime = 1
+                    childCell.velocity = 5
+                    childCell.scale = 2
+                    childCell.color = CGColor(red: 0.5, green: 1, blue: 1, alpha: 0.5)
+                    childCell.contents = particleImage
+                    let parentEmitter = makeEmitter(
+                        x: 220,
+                        color: CGColor(red: 1, green: 0.5, blue: 0.25, alpha: 1),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: .pi / 2,
+                        longitude: 0
+                    )
+                    parentEmitter.cell.lifetime = 2
+                    parentEmitter.cell.scale = 0.5
+                    parentEmitter.cell.emitterCells = [childCell]
+                    transientEmitterLayers = [parentEmitter.layer]
+                    root.addSublayer(parentEmitter.layer)
+                    engine.renderFrame()
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let childWasDelayed = !renderer.activeParticleGenerations(
+                        for: parentEmitter.layer
+                    ).contains(1)
+                    parentEmitter.cell.birthRate = 0
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let generations = renderer.activeParticleGenerations(for: parentEmitter.layer)
+                    let positions = renderer.activeParticlePositions(for: parentEmitter.layer)
+                    let velocities = renderer.activeParticleVelocities(for: parentEmitter.layer)
+                    let colors = renderer.activeParticleColors(for: parentEmitter.layer)
+                    let scales = renderer.activeParticleScales(for: parentEmitter.layer)
+                    let childMatches: Bool
+                    if let childIndex = generations.firstIndex(of: 1),
+                       positions.indices.contains(childIndex),
+                       velocities.indices.contains(childIndex),
+                       colors.indices.contains(childIndex),
+                       scales.indices.contains(childIndex) {
+                        let childPosition = positions[childIndex]
+                        let childVelocity = velocities[childIndex]
+                        let childColor = colors[childIndex]
+                        childMatches = childWasDelayed
+                            && abs(childPosition.x - 10.5) < 0.15
+                            && abs(childPosition.y - 10) < 0.01
+                            && childVelocity.x > 4.99
+                            && abs(childVelocity.y) < 0.01
+                            && abs(childVelocity.z) < 0.01
+                            && abs(childColor.x - 0.5) < 0.01
+                            && abs(childColor.y - 0.5) < 0.01
+                            && abs(childColor.z - 0.25) < 0.01
+                            && abs(childColor.w - 0.5) < 0.01
+                            && abs(scales[childIndex] - 1) < 0.01
+                    } else {
+                        childMatches = false
+                    }
+                    parentEmitter.layer.removeFromSuperlayer()
+                    engine.renderFrame()
+                    result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected),child=\(childMatches);blend=\(blendPixelsMatch),final=\(renderer.activeEmitterStateCount)"
                     emitterProbeResult = result
                 } catch {
                     first.removeFromSuperlayer()
