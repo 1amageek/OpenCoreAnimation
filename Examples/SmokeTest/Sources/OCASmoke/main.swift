@@ -31,6 +31,7 @@ nonisolated(unsafe) var transitioningLayerRef: CALayer?
 nonisolated(unsafe) var filteredTransitioningLayerRef: CALayer?
 nonisolated(unsafe) var unsupportedTransitioningLayerRef: CALayer?
 nonisolated(unsafe) var unsupportedBuiltInTransitioningLayerRef: CALayer?
+nonisolated(unsafe) var unsupportedTransitionSubtypeLayerRef: CALayer?
 nonisolated(unsafe) var tileDelegateRef: SmokeTileDelegate?
 nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
@@ -78,6 +79,7 @@ public func setup() {
             filteredTransitioningLayerRef = nil
             unsupportedTransitioningLayerRef = nil
             unsupportedBuiltInTransitioningLayerRef = nil
+            unsupportedTransitionSubtypeLayerRef = nil
             tileDelegateRef = nil
             tileDrawCount = 0
             pixelReadbackResult = "pending"
@@ -399,6 +401,26 @@ func installHarness() {
                 layer.add(transition, forKey: "unsupportedBuiltInTransition")
                 layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                 unsupportedBuiltInTransitioningLayerRef = layer
+                CAAnimationEngine.shared.renderFrame()
+            }
+        })
+        h.expose("exerciseUnsupportedTransitionSubtype", action: {
+            MainActor.assumeIsolated {
+                let layer = CALayer()
+                layer.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+                layer.position = CGPoint(x: 20, y: 4)
+                layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                rootLayerRef?.addSublayer(layer)
+
+                let transition = CATransition()
+                transition.type = .push
+                transition.subtype = CATransitionSubtype(rawValue: "unsupported")
+                transition.duration = 1
+                transition.speed = 0
+                transition.timeOffset = 0.5
+                layer.add(transition, forKey: "unsupportedTransitionSubtype")
+                layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                unsupportedTransitionSubtypeLayerRef = layer
                 CAAnimationEngine.shared.renderFrame()
             }
         })
@@ -2028,6 +2050,7 @@ func installHarness() {
                 filteredTransitioningLayerRef?.removeAnimation(forKey: "browserFilteredTransition")
                 unsupportedTransitioningLayerRef?.removeFromSuperlayer()
                 unsupportedBuiltInTransitioningLayerRef?.removeFromSuperlayer()
+                unsupportedTransitionSubtypeLayerRef?.removeFromSuperlayer()
                 CAAnimationEngine.shared.renderFrame()
             }
         })

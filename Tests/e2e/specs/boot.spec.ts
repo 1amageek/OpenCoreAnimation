@@ -42,6 +42,7 @@ interface OCA extends Harness {
     mutateTransitionTarget: () => void;
     exerciseUnsupportedTransitionFilter: () => void;
     exerciseUnsupportedBuiltInTransition: () => void;
+    exerciseUnsupportedTransitionSubtype: () => void;
     beginTransitionFilterProbes: () => void;
     beginLayerFilterProbe: () => void;
     beginCompositionProbe: () => void;
@@ -153,6 +154,10 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.exerciseUnsupportedBuiltInTransition();
         await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(1);
+        expect(await h.getActiveTransitionTextureCount()).toBe(2);
+
+        await h.exerciseUnsupportedTransitionSubtype();
+        await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(2);
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.removeTransition();

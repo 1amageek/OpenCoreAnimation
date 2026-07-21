@@ -3646,7 +3646,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                             pipeline: pipeline,
                             encoder: encoder
                         )
-                    } else if supportsBuiltInTransition(state.type) {
+                    } else if supportsBuiltInTransition(
+                        type: state.type,
+                        subtype: state.subtype
+                    ) {
                         capture = createBuiltInTransitionCapture(
                             sourceLayer: state.sourceLayer,
                             targetLayer: layer,
@@ -3698,10 +3701,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         failedTransitionSourceIDs = failedTransitionSourceIDs.intersection(activeTransitionSourceIDs)
     }
 
-    private func supportsBuiltInTransition(_ type: CATransitionType) -> Bool {
+    private func supportsBuiltInTransition(
+        type: CATransitionType,
+        subtype: CATransitionSubtype?
+    ) -> Bool {
         switch type {
-        case .fade, .moveIn, .push, .reveal:
+        case .fade:
             return true
+        case .moveIn, .push, .reveal:
+            switch subtype {
+            case .fromRight, .fromLeft, .fromTop, .fromBottom, nil:
+                return true
+            default:
+                return false
+            }
         default:
             return false
         }
@@ -3949,10 +3962,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard let capture = transitionCaptures[sourceID] else { return }
         let targetLayer = capture.target.compositeLayer
         let progress = CGFloat(max(0, min(1, state.progress)))
-        let direction = transitionDirection(
-            subtype: state.subtype,
-            bounds: targetLayer.bounds
-        )
         let baseModelMatrix = targetLayer.modelMatrix(parentMatrix: parentMatrix)
         let transitionClip = calculateClipRect(layer: targetLayer, modelMatrix: baseModelMatrix)
         clipRectStack.append(currentClipRect.intersection(with: transitionClip))
@@ -3999,6 +4008,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: Float(progress))
 
         case .moveIn:
+            guard let direction = transitionDirection(
+                subtype: state.subtype,
+                bounds: targetLayer.bounds
+            ) else { return }
             renderParticipant(capture.source, cacheKey: .transitionSource(sourceID), offset: .zero, opacityMultiplier: 1)
             renderParticipant(
                 capture.target,
@@ -4008,6 +4021,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
 
         case .push:
+            guard let direction = transitionDirection(
+                subtype: state.subtype,
+                bounds: targetLayer.bounds
+            ) else { return }
             renderParticipant(
                 capture.source,
                 cacheKey: .transitionSource(sourceID),
@@ -4022,6 +4039,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
 
         case .reveal:
+            guard let direction = transitionDirection(
+                subtype: state.subtype,
+                bounds: targetLayer.bounds
+            ) else { return }
             renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: 1)
             renderParticipant(
                 capture.source,
@@ -4125,7 +4146,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
     }
 
-    private func transitionDirection(subtype: CATransitionSubtype?, bounds: CGRect) -> CGPoint {
+    private func transitionDirection(
+        subtype: CATransitionSubtype?,
+        bounds: CGRect
+    ) -> CGPoint? {
         switch subtype {
         case .fromRight:
             return CGPoint(x: bounds.width, y: 0)
@@ -4136,7 +4160,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         case .fromLeft, nil:
             return CGPoint(x: -bounds.width, y: 0)
         default:
-            return CGPoint(x: -bounds.width, y: 0)
+            return nil
         }
     }
 
