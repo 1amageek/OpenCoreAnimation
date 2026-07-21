@@ -703,6 +703,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         color * currentReplicatorColor
     }
 
+    private func requiresGroupOpacity(_ presentationLayer: CALayer) -> Bool {
+        presentationLayer.allowsGroupOpacity && presentationLayer.opacity < 1
+    }
+
     private func orderedSublayers(for layer: CALayer) -> [CALayer] {
         guard currentReplicatorTimeOffset != 0 else {
             return layer.sortedSublayers()
@@ -2207,7 +2211,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         format: preferredFormat,
                         blend: GPUBlendState(
                             color: GPUBlendComponent(
-                                srcFactor: .srcAlpha,
+                                srcFactor: .one,
                                 dstFactor: .oneMinusSrcAlpha,
                                 operation: .add
                             ),
@@ -2266,7 +2270,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         format: preferredFormat,
                         blend: GPUBlendState(
                             color: GPUBlendComponent(
-                                srcFactor: .srcAlpha,
+                                srcFactor: .one,
                                 dstFactor: .oneMinusSrcAlpha,
                                 operation: .add
                             ),
@@ -2931,7 +2935,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Render shadow before layer content. Filters apply to the layer subtree capture, but
         // the shadow itself is composited separately in the main pass.
-        if filterPrerenderRootLayer == nil,
+        if filterPrerenderRootLayer !== layer,
+           rasterizePrerenderRootLayer !== layer,
            shadowCaptureRootLayer == nil,
            presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil {
             renderLayerShadow(
@@ -2947,7 +2952,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Check for layer filters.
         // If this layer has supported filters and was pre-rendered, composite the filtered result.
         let supportedFilterOperations = presentationLayer.supportedFilterOperations
-        if filterPrerenderRootLayer !== layer, !supportedFilterOperations.isEmpty {
+        let shouldCompositeAsGroup = requiresGroupOpacity(presentationLayer)
+        if filterPrerenderRootLayer !== layer,
+           (!supportedFilterOperations.isEmpty || shouldCompositeAsGroup) {
             if let prerendered = prerenderedFilters[renderKey(for: layer)] {
                 // Composite the pre-rendered filtered texture.
                 renderFilteredLayerComposite(
@@ -6476,15 +6483,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
-        // Fast-path: skip the recursive collection walk when no
-        // descendant has a non-empty `filters` array. The counter checks for
-        // non-empty content; unsupported filter types are still filtered later
-        // by `supportedFilterOperations`.
-        guard rootLayer._subtreeFilterCount > 0 else {
-            evictFilterResources(except: [])
-            return
-        }
-
         guard let device = device,
               let pipeline = pipeline,
               let depthTextureView = depthTextureView else { return }
@@ -6496,7 +6494,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         for target in targets {
             let filteredLayer = target.layer
             let operations = target.presentationLayer.supportedFilterOperations
-            guard !operations.isEmpty else { continue }
+            let requiresGroup = requiresGroupOpacity(target.presentationLayer)
+            guard !operations.isEmpty || requiresGroup else { continue }
 
             let filteredRenderKey = target.renderKey
             activeRenderKeys.insert(filteredRenderKey)
@@ -7128,7 +7127,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         }
 
-        if !presentationLayer.supportedFilterOperations.isEmpty {
+        if !presentationLayer.supportedFilterOperations.isEmpty
+            || requiresGroupOpacity(presentationLayer) {
             result.append(LayerPrepassTarget(
                 layer: layer,
                 presentationLayer: presentationLayer,

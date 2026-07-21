@@ -105,7 +105,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginLayerFilterProbe();
         await expect.poll(() => h.getLayerFilterProbeResult(), { timeout: 10_000 }).toBe(
-            "127,255,255,255;64,64,255,255;255,0,255,255;255,0,0,255"
+            "127,255,255,255;64,64,255,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true"
         );
         expect(await h.getActiveFilterResourceCount()).toBe(0);
 

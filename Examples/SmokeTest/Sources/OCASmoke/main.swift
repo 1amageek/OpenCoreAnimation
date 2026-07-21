@@ -483,6 +483,37 @@ func installHarness() {
                 parent.addSublayer(child)
                 root.addSublayer(parent)
 
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let opacityGroup = CALayer()
+                opacityGroup.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                opacityGroup.position = CGPoint(x: 360, y: 40)
+                opacityGroup.zPosition = 100
+                opacityGroup.opacity = 0.5
+                opacityGroup.allowsGroupOpacity = true
+                for _ in 0..<2 {
+                    let component = CALayer()
+                    component.frame = opacityGroup.bounds
+                    component.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                    opacityGroup.addSublayer(component)
+                }
+                root.addSublayer(opacityGroup)
+
+                let translucentGroup = CALayer()
+                translucentGroup.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                translucentGroup.position = CGPoint(x: 360, y: 100)
+                translucentGroup.zPosition = 100
+                translucentGroup.opacity = 0.5
+                translucentGroup.allowsGroupOpacity = true
+                for _ in 0..<2 {
+                    let component = CALayer()
+                    component.frame = translucentGroup.bounds
+                    component.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 0.5)
+                    translucentGroup.addSublayer(component)
+                }
+                root.addSublayer(translucentGroup)
+                CATransaction.commit()
+
                 engine.renderFrame()
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
@@ -490,10 +521,39 @@ func installHarness() {
                         CGPoint(x: 140, y: 260),
                         CGPoint(x: 225, y: 260),
                         CGPoint(x: 260, y: 260),
+                        CGPoint(x: 360, y: 260),
+                        CGPoint(x: 360, y: 200),
                     ])
-                    layerFilterProbeResult = pixels
+                    let groupedPixel = pixels[4]
+                    let translucentGroupedPixel = pixels[5]
+                    opacityGroup.allowsGroupOpacity = false
+                    translucentGroup.allowsGroupOpacity = false
+                    engine.renderFrame()
+                    let ungroupedPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 360, y: 260),
+                        CGPoint(x: 360, y: 200),
+                    ])
+                    let ungroupedPixel = ungroupedPixels[0]
+                    let translucentUngroupedPixel = ungroupedPixels[1]
+                    let grouped = groupedPixel == [140, 13, 19, 255]
+                    let ungrouped = ungroupedPixel[0] >= 195
+                        && ungroupedPixel[1] <= 7
+                        && ungroupedPixel[2] <= 11
+                        && ungroupedPixel[3] == 255
+                    let translucentGrouped = (108...115).contains(translucentGroupedPixel[0])
+                        && (13...19).contains(translucentGroupedPixel[1])
+                        && (20...27).contains(translucentGroupedPixel[2])
+                        && translucentGroupedPixel[3] == 255
+                    let translucentUngrouped = (122...130).contains(translucentUngroupedPixel[0])
+                        && (12...18).contains(translucentUngroupedPixel[1])
+                        && (18...25).contains(translucentUngroupedPixel[2])
+                        && translucentUngroupedPixel[3] == 255
+                    layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
+                        + ";group=\(grouped),ungrouped=\(ungrouped)"
+                        + ",translucentGroup=\(translucentGrouped)"
+                        + ",translucentUngrouped=\(translucentUngrouped)"
                 } catch {
                     layerFilterProbeResult = "error: \(error)"
                 }
@@ -501,6 +561,8 @@ func installHarness() {
                 chained.removeFromSuperlayer()
                 sibling.removeFromSuperlayer()
                 parent.removeFromSuperlayer()
+                opacityGroup.removeFromSuperlayer()
+                translucentGroup.removeFromSuperlayer()
                 engine.renderFrame()
             }
         })

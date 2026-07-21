@@ -779,19 +779,28 @@ public enum CAWebGPUShaders {
     @fragment
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
         var color = textureSample(inputTexture, texSampler, input.texCoord);
-
-        if (uniforms.filterType == 1.0) {
-            color.rgb = applyBrightness(color.rgb, uniforms.parameter0);
-        } else if (uniforms.filterType == 2.0) {
-            color.rgb = applyContrast(color.rgb, uniforms.parameter0);
-        } else if (uniforms.filterType == 3.0) {
-            color.rgb = applySaturation(color.rgb, uniforms.parameter0);
-        } else if (uniforms.filterType == 4.0) {
-            color.rgb = applyColorInvert(color.rgb);
+        let capturedAlpha = color.a;
+        var straightRGB = vec3<f32>(0.0);
+        if (capturedAlpha > 0.00001) {
+            straightRGB = color.rgb / capturedAlpha;
         }
 
-        color *= uniforms.colorMultiplier;
-        color.a *= uniforms.opacity;
+        if (uniforms.filterType == 1.0) {
+            straightRGB = applyBrightness(straightRGB, uniforms.parameter0);
+        } else if (uniforms.filterType == 2.0) {
+            straightRGB = applyContrast(straightRGB, uniforms.parameter0);
+        } else if (uniforms.filterType == 3.0) {
+            straightRGB = applySaturation(straightRGB, uniforms.parameter0);
+        } else if (uniforms.filterType == 4.0) {
+            straightRGB = applyColorInvert(straightRGB);
+        }
+
+        color.rgb = straightRGB * capturedAlpha;
+        color *= vec4<f32>(
+            uniforms.colorMultiplier.rgb * uniforms.colorMultiplier.a,
+            uniforms.colorMultiplier.a
+        );
+        color *= uniforms.opacity;
         return color;
     }
     """
