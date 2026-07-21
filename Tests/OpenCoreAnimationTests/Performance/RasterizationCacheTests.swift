@@ -61,6 +61,47 @@ struct RasterizationCacheTests {
         #expect(cache.misses == 0)
     }
 
+    @Test func replicatedInstancesUseDistinctCacheEntries() {
+        let cache = RasterizationCache<StubTexture>(maxBytes: 1024)
+        let layer = CALayer()
+        let replicator = CAReplicatorLayer()
+        let layerID = ObjectIdentifier(layer)
+        let replicatorID = ObjectIdentifier(replicator)
+        let firstKey = RasterizationCacheKey(LayerRenderKey(
+            layer: layerID,
+            replicatorPath: [ReplicatorInstancePathComponent(
+                replicator: replicatorID,
+                instanceIndex: 0
+            )]
+        ))
+        let secondKey = RasterizationCacheKey(LayerRenderKey(
+            layer: layerID,
+            replicatorPath: [ReplicatorInstancePathComponent(
+                replicator: replicatorID,
+                instanceIndex: 1
+            )]
+        ))
+
+        cache.insert(
+            firstKey,
+            texture: StubTexture(id: 1),
+            pixelSize: CGSize(width: 4, height: 4),
+            contentBoundsHash: 0,
+            atFrame: 0
+        )
+        cache.insert(
+            secondKey,
+            texture: StubTexture(id: 2),
+            pixelSize: CGSize(width: 4, height: 4),
+            contentBoundsHash: 0,
+            atFrame: 0
+        )
+
+        #expect(cache.count == 2)
+        #expect(cache.entry(firstKey)?.texture == StubTexture(id: 1))
+        #expect(cache.entry(secondKey)?.texture == StubTexture(id: 2))
+    }
+
     // C.3 — Inserting with a known per-pixel byte cost updates `bytes`.
     @Test func bytesAccountedOnInsert() {
         let cache = RasterizationCache<StubTexture>(maxBytes: 1_000_000)

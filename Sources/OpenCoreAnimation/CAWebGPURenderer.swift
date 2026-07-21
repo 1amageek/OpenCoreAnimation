@@ -130,7 +130,7 @@ fileprivate enum EmitterTextureSampling: CaseIterable, Hashable {
 fileprivate enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier)
     case emitterImage(ObjectIdentifier, EmitterTextureSampling)
-    case layer(ObjectIdentifier)
+    case layer(LayerRenderKey)
     case transitionSource(ObjectIdentifier)
     case transitionTarget(ObjectIdentifier)
     case transitionFilter(ObjectIdentifier)
@@ -144,6 +144,14 @@ private struct PendingTileDraw {
     let scale: CGFloat
     let pixelWidth: Int
     let pixelHeight: Int
+}
+
+private struct LayerPrepassTarget {
+    let layer: CALayer
+    let presentationLayer: CALayer
+    let parentMatrix: Matrix4x4
+    let renderKey: LayerRenderKey
+    let timeOffset: CFTimeInterval
 }
 
 private struct TransitionParticipantCapture {
@@ -646,6 +654,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Animation-time offset inherited from enclosing replicator instances.
     private var replicatorTimeOffsetStack: [CFTimeInterval] = []
 
+    /// Stable instance path used to separate per-instance offscreen resources.
+    private var replicatorInstancePath: [ReplicatorInstancePathComponent] = []
+
     /// Tile delegate calls are deferred until the next frame boundary so layer-tree
     /// rendering never re-enters CGContext setup from inside an active render pass.
     private var pendingTileDraws: [PendingTileDraw] = []
@@ -674,6 +685,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         replicatorTimeOffsetStack.last ?? 0
     }
 
+    private func renderKey(for layer: CALayer) -> LayerRenderKey {
+        LayerRenderKey(
+            layer: ObjectIdentifier(layer),
+            replicatorPath: replicatorInstancePath
+        )
+    }
+
     private func renderPresentation(for layer: CALayer) -> CALayer {
         let timeOffset = currentReplicatorTimeOffset
         return timeOffset == 0
@@ -694,6 +712,68 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let rhsZ = renderPresentation(for: rhs.element).zPosition
             return lhsZ == rhsZ ? lhs.offset < rhs.offset : lhsZ < rhsZ
         }.map(\.element)
+    }
+
+    private func forEachPrepassSublayer(
+        of layer: CALayer,
+        presentationLayer: CALayer,
+        modelMatrix: Matrix4x4,
+        _ body: (CALayer, Matrix4x4) -> Void
+    ) {
+        guard layer.sublayers?.isEmpty == false else { return }
+        let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
+        guard let replicatorPresentation = presentationLayer as? CAReplicatorLayer,
+              let replicatorModel = layer as? CAReplicatorLayer else {
+            for sublayer in orderedSublayers(for: layer) {
+                body(sublayer, sublayerMatrix)
+            }
+            return
+        }
+
+        let instanceCount = max(0, replicatorPresentation.instanceCount)
+        var cumulativeTransform = CATransform3DIdentity
+        for instanceIndex in 0..<instanceCount {
+            let inheritedTimeOffset = currentReplicatorTimeOffset
+            replicatorTimeOffsetStack.append(
+                inheritedTimeOffset
+                    + CFTimeInterval(instanceIndex) * replicatorPresentation.instanceDelay
+            )
+            replicatorInstancePath.append(ReplicatorInstancePathComponent(
+                replicator: ObjectIdentifier(replicatorModel),
+                instanceIndex: instanceIndex
+            ))
+
+            let instanceMatrix = sublayerMatrix * cumulativeTransform.matrix4x4
+            for sublayer in orderedSublayers(for: layer) {
+                body(sublayer, instanceMatrix)
+            }
+
+            _ = replicatorInstancePath.popLast()
+            _ = replicatorTimeOffsetStack.popLast()
+            cumulativeTransform = CATransform3DConcat(
+                cumulativeTransform,
+                replicatorPresentation.instanceTransform
+            )
+        }
+    }
+
+    private func withPrepassContext<T>(
+        _ target: LayerPrepassTarget,
+        _ body: () -> T
+    ) -> T {
+        let savedColorStack = replicatorColorStack
+        let savedTimeOffsetStack = replicatorTimeOffsetStack
+        let savedInstancePath = replicatorInstancePath
+
+        replicatorColorStack.removeAll(keepingCapacity: true)
+        replicatorTimeOffsetStack = target.timeOffset == 0 ? [] : [target.timeOffset]
+        replicatorInstancePath = target.renderKey.replicatorPath
+        defer {
+            replicatorColorStack = savedColorStack
+            replicatorTimeOffsetStack = savedTimeOffsetStack
+            replicatorInstancePath = savedInstancePath
+        }
+        return body()
     }
 
     /// The full viewport clip rect.
@@ -842,11 +922,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Full-screen quad sampler for blur.
     private var blurSampler: GPUSampler?
 
-    /// Persistent viewport-sized resources keyed by the shadow-producing layer identity.
-    private var shadowLayerResources: [ObjectIdentifier: ShadowLayerResources] = [:]
+    /// Persistent viewport-sized resources keyed by layer identity and replicator path.
+    private var shadowLayerResources: [LayerRenderKey: ShadowLayerResources] = [:]
 
     /// Shadow outputs available to the main pass this frame.
-    private var prerenderedShadows: [ObjectIdentifier: PrerenderedShadow] = [:]
+    private var prerenderedShadows: [LayerRenderKey: PrerenderedShadow] = [:]
 
     // MARK: - Filter Rendering (CAFilter)
 
@@ -859,11 +939,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Executes color-adjustment operations into preferred-format offscreen textures.
     private var filterOperationPipeline: GPURenderPipeline?
 
-    /// Persistent viewport-sized resources keyed by the filtered layer identity.
-    private var filterLayerResources: [ObjectIdentifier: FilterLayerResources] = [:]
+    /// Persistent viewport-sized resources keyed by layer identity and replicator path.
+    private var filterLayerResources: [LayerRenderKey: FilterLayerResources] = [:]
 
     /// Filter outputs available to capture passes and the main pass this frame.
-    private var prerenderedFilters: [ObjectIdentifier: PrerenderedFilter] = [:]
+    private var prerenderedFilters: [LayerRenderKey: PrerenderedFilter] = [:]
 
     /// The root layer currently being rendered into the offscreen filter source texture.
     /// While set, filter compositing is suppressed so the subtree can be captured raw.
@@ -898,7 +978,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// (or had a fresh cache hit) this frame, mapped to the texture used
     /// for compositing. Populated by `prerenderRasterizedLayers`,
     /// consumed by `renderLayer`, cleared after submit.
-    private var prerasterizedTextures: [ObjectIdentifier: GPUTexture] = [:]
+    private var prerasterizedTextures: [LayerRenderKey: GPUTexture] = [:]
 
     /// Persistent cache of `GPUTextureView`s keyed by `TexturedCacheKey`.
     ///
@@ -908,8 +988,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ///
     /// **Identity contract**: keyed by either `.image(OID(cgImage))` for
     /// regular content layers (eviction wired to `GPUTextureManager.onEvict`)
-    /// or `.layer(OID(layer))` for rasterized composites of
-    /// `shouldRasterize` subtrees. Tagging the kind keeps the two
+    /// or `.layer(renderKey)` for rasterized composites of `shouldRasterize`
+    /// subtrees. Tagging the kind keeps the two
     /// namespaces disjoint — a raw `ObjectIdentifier` would let a freed
     /// layer's address be reused by a fresh `CGImage` (or vice versa) and
     /// return a stale view. See `TextureManager.swift` for the broader
@@ -2316,6 +2396,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         opacityStack.removeAll()
         replicatorColorStack.removeAll()
         replicatorTimeOffsetStack.removeAll()
+        replicatorInstancePath.removeAll()
         transitionSuppressedLayer = nil
         renderTargetSizeOverride = nil
         activeTransitionSourceIDs.removeAll(keepingCapacity: true)
@@ -2408,7 +2489,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // When root layer has cornerRadius, use transparent clear color.
             // The background will be rendered as geometry with corner radius SDF.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
-        } else if prerenderedFilters[ObjectIdentifier(rootLayer)] != nil {
+        } else if prerenderedFilters[renderKey(for: rootLayer)] != nil {
             // The filtered root layer is composited from the offscreen texture, so drawing
             // its background here would double-apply the root background color.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
@@ -2867,7 +2948,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // If this layer has supported filters and was pre-rendered, composite the filtered result.
         let supportedFilterOperations = presentationLayer.supportedFilterOperations
         if filterPrerenderRootLayer !== layer, !supportedFilterOperations.isEmpty {
-            if let prerendered = prerenderedFilters[ObjectIdentifier(layer)] {
+            if let prerendered = prerenderedFilters[renderKey(for: layer)] {
                 // Composite the pre-rendered filtered texture.
                 renderFilteredLayerComposite(
                     layer,
@@ -2890,7 +2971,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // so we must let it through to render the actual content into
         // the texture.
         if rasterizePrerenderRootLayer !== layer,
-           let cachedTexture = prerasterizedTextures[ObjectIdentifier(layer)] {
+           let cachedTexture = prerasterizedTextures[renderKey(for: layer)] {
             renderRasterizedLayerComposite(
                 layer,
                 presentationLayer: presentationLayer,
@@ -3019,8 +3100,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // `sortedSublayers()` is cached on the model parent (`layer`); a
             // CAReplicatorLayer's presentation copy has no sublayers of its
             // own, so the cache must be read off the model side.
-            if let replicatorLayer = presentationLayer as? CAReplicatorLayer {
+            if let replicatorLayer = presentationLayer as? CAReplicatorLayer,
+               let replicatorModelLayer = layer as? CAReplicatorLayer {
                 renderReplicatorSublayers(
+                    replicatorModelLayer: replicatorModelLayer,
                     replicatorLayer: replicatorLayer,
                     sublayers: layer.sublayers ?? [],
                     renderPass: renderPass,
@@ -3907,6 +3990,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// - instanceDelay: Animation time offset between instances (staggered animations)
     /// - instanceColor/instanceRedOffset/etc.: Color variations per instance
     private func renderReplicatorSublayers(
+        replicatorModelLayer: CAReplicatorLayer,
         replicatorLayer: CAReplicatorLayer,
         sublayers: [CALayer],
         renderPass: GPURenderPassEncoder,
@@ -3948,6 +4032,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let inheritedTimeOffset = currentReplicatorTimeOffset
             replicatorColorStack.append(inheritedColor * instanceColor)
             replicatorTimeOffsetStack.append(inheritedTimeOffset + timeOffset)
+            replicatorInstancePath.append(ReplicatorInstancePathComponent(
+                replicator: ObjectIdentifier(replicatorModelLayer),
+                instanceIndex: instanceIndex
+            ))
 
             let orderedSublayers = sublayers.enumerated().sorted { lhs, rhs in
                 let lhsZ = renderPresentation(for: lhs.element).zPosition
@@ -3962,6 +4050,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 )
             }
 
+            _ = replicatorInstancePath.popLast()
             _ = replicatorTimeOffsetStack.popLast()
             _ = replicatorColorStack.popLast()
 
@@ -4504,7 +4593,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ///   persistent `GPUTextureView` cache and the per-frame
     ///   `GPUBindGroup` cache. Use `.image(OID(cgImage))` for content
     ///   textures (the `GPUTextureManager` retains the CGImage and
-    ///   notifies eviction via `onEvict`), or `.layer(OID(layer))` for
+    ///   notifies eviction via `onEvict`), or `.layer(renderKey)` for
     ///   layer-owned rasterization composites. The case discriminator
     ///   keeps the two identity namespaces disjoint so a freed layer's
     ///   reused address cannot alias a fresh CGImage.
@@ -6048,7 +6137,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
-        var targets: [(layer: CALayer, parentMatrix: Matrix4x4)] = []
+        var targets: [LayerPrepassTarget] = []
         collectShadowLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
 
         guard !targets.isEmpty else {
@@ -6069,16 +6158,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        var activeLayerIDs: Set<ObjectIdentifier> = []
-        activeLayerIDs.reserveCapacity(targets.count)
+        var activeRenderKeys: Set<LayerRenderKey> = []
+        activeRenderKeys.reserveCapacity(targets.count)
 
         for target in targets {
             let shadowLayer = target.layer
-            let shadowLayerID = ObjectIdentifier(shadowLayer)
-            activeLayerIDs.insert(shadowLayerID)
+            let shadowRenderKey = target.renderKey
+            activeRenderKeys.insert(shadowRenderKey)
 
             let resources: ShadowLayerResources
-            if let existing = shadowLayerResources[shadowLayerID] {
+            if let existing = shadowLayerResources[shadowRenderKey] {
                 resources = existing
             } else {
                 resources = ShadowLayerResources(
@@ -6087,10 +6176,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     height: Int(size.height),
                     format: preferredFormat
                 )
-                shadowLayerResources[shadowLayerID] = resources
+                shadowLayerResources[shadowRenderKey] = resources
             }
 
-            let presentationLayer = shadowLayer._renderTimePresentation()
+            let presentationLayer = target.presentationLayer
             let shadowOffset = presentationLayer.shadowOffset
             let shadowOffsetParentMatrix = target.parentMatrix * Matrix4x4(
                 translation: SIMD3<Float>(
@@ -6128,7 +6217,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                    contributorLayer: shadowLayer,
                    hasCachedTexture: resources.hasRenderedContent
                ) {
-                prerenderedShadows[shadowLayerID] = PrerenderedShadow(resources: resources)
+                prerenderedShadows[shadowRenderKey] = PrerenderedShadow(resources: resources)
                 continue
             }
 
@@ -6207,14 +6296,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 }
                 maskRenderPass.end()
             } else {
-                captureShadowContent(
-                    shadowLayer,
-                    parentMatrix: shadowOffsetParentMatrix,
-                    resources: resources,
-                    pipeline: pipeline,
-                    depthTextureView: depthTextureView,
-                    encoder: encoder
-                )
+                withPrepassContext(target) {
+                    captureShadowContent(
+                        shadowLayer,
+                        parentMatrix: shadowOffsetParentMatrix,
+                        resources: resources,
+                        pipeline: pipeline,
+                        depthTextureView: depthTextureView,
+                        encoder: encoder
+                    )
+                }
             }
 
             var blurUniforms = BlurUniforms(
@@ -6285,10 +6376,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
             resources.hasRenderedContent = true
             resources.captureState = captureState
-            prerenderedShadows[shadowLayerID] = PrerenderedShadow(resources: resources)
+            prerenderedShadows[shadowRenderKey] = PrerenderedShadow(resources: resources)
         }
 
-        evictShadowResources(except: activeLayerIDs)
+        evictShadowResources(except: activeRenderKeys)
     }
 
     /// Captures the actual rendered alpha of a layer subtree for the default shadow shape.
@@ -6368,11 +6459,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return visit(rootLayer)
     }
 
-    private func evictShadowResources(except activeLayerIDs: Set<ObjectIdentifier>) {
-        let staleLayerIDs = shadowLayerResources.keys.filter { !activeLayerIDs.contains($0) }
-        for layerID in staleLayerIDs {
-            shadowLayerResources.removeValue(forKey: layerID)?.destroy()
-            prerenderedShadows.removeValue(forKey: layerID)
+    private func evictShadowResources(except activeRenderKeys: Set<LayerRenderKey>) {
+        let staleRenderKeys = shadowLayerResources.keys.filter { !activeRenderKeys.contains($0) }
+        for renderKey in staleRenderKeys {
+            shadowLayerResources.removeValue(forKey: renderKey)?.destroy()
+            prerenderedShadows.removeValue(forKey: renderKey)
         }
     }
 
@@ -6398,19 +6489,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let pipeline = pipeline,
               let depthTextureView = depthTextureView else { return }
 
-        var targets: [(layer: CALayer, parentMatrix: Matrix4x4)] = []
+        var targets: [LayerPrepassTarget] = []
         collectFilteredLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
-        var activeLayerIDs: Set<ObjectIdentifier> = []
+        var activeRenderKeys: Set<LayerRenderKey> = []
 
         for target in targets {
             let filteredLayer = target.layer
-            let operations = filteredLayer._renderTimePresentation().supportedFilterOperations
+            let operations = target.presentationLayer.supportedFilterOperations
             guard !operations.isEmpty else { continue }
 
-            let layerID = ObjectIdentifier(filteredLayer)
-            activeLayerIDs.insert(layerID)
+            let filteredRenderKey = target.renderKey
+            activeRenderKeys.insert(filteredRenderKey)
             let resources: FilterLayerResources
-            if let existing = filterLayerResources[layerID] {
+            if let existing = filterLayerResources[filteredRenderKey] {
                 resources = existing
             } else {
                 resources = FilterLayerResources(
@@ -6419,7 +6510,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     height: Int(size.height),
                     format: preferredFormat
                 )
-                filterLayerResources[layerID] = resources
+                filterLayerResources[filteredRenderKey] = resources
             }
 
             let contentRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
@@ -6451,13 +6542,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 maxDepth: 1
             )
 
-            filterPrerenderRootLayer = filteredLayer
-            renderLayer(
-                filteredLayer,
-                renderPass: contentRenderPass,
-                parentMatrix: target.parentMatrix
-            )
-            filterPrerenderRootLayer = nil
+            withPrepassContext(target) {
+                filterPrerenderRootLayer = filteredLayer
+                renderLayer(
+                    filteredLayer,
+                    renderPass: contentRenderPass,
+                    parentMatrix: target.parentMatrix
+                )
+                filterPrerenderRootLayer = nil
+            }
             contentRenderPass.end()
 
             var currentTexture = resources.sourceTexture
@@ -6502,22 +6595,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 }
             }
 
-            prerenderedFilters[layerID] = PrerenderedFilter(
+            prerenderedFilters[filteredRenderKey] = PrerenderedFilter(
                 resources: resources,
                 outputView: currentView
             )
         }
 
-        evictFilterResources(except: activeLayerIDs)
+        evictFilterResources(except: activeRenderKeys)
     }
 
-    private func evictFilterResources(except activeLayerIDs: Set<ObjectIdentifier>) {
-        let staleLayerIDs = filterLayerResources.keys.filter {
-            !activeLayerIDs.contains($0)
+    private func evictFilterResources(except activeRenderKeys: Set<LayerRenderKey>) {
+        let staleRenderKeys = filterLayerResources.keys.filter {
+            !activeRenderKeys.contains($0)
         }
-        for layerID in staleLayerIDs {
-            filterLayerResources.removeValue(forKey: layerID)?.destroy()
-            prerenderedFilters.removeValue(forKey: layerID)
+        for renderKey in staleRenderKeys {
+            filterLayerResources.removeValue(forKey: renderKey)?.destroy()
+            prerenderedFilters.removeValue(forKey: renderKey)
         }
     }
 
@@ -6575,7 +6668,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder,
         frameToken: UInt64
     ) {
-        let presentationLayer = layer._renderTimePresentation()
+        let presentationLayer = renderPresentation(for: layer)
         guard !presentationLayer.isHidden, presentationLayer.opacity > 0 else {
             return
         }
@@ -6594,20 +6687,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         }
 
-        if let sublayers = layer.sublayers, !sublayers.isEmpty {
-            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-            for sublayer in sublayers {
-                collectAndCaptureRasterizedLayers(
-                    sublayer,
-                    parentMatrix: sublayerMatrix,
-                    device: device,
-                    pipeline: pipeline,
-                    depthTextureView: depthTextureView,
-                    cache: cache,
-                    encoder: encoder,
-                    frameToken: frameToken
-                )
-            }
+        forEachPrepassSublayer(
+            of: layer,
+            presentationLayer: presentationLayer,
+            modelMatrix: modelMatrix
+        ) { sublayer, sublayerParentMatrix in
+            collectAndCaptureRasterizedLayers(
+                sublayer,
+                parentMatrix: sublayerParentMatrix,
+                device: device,
+                pipeline: pipeline,
+                depthTextureView: depthTextureView,
+                cache: cache,
+                encoder: encoder,
+                frameToken: frameToken
+            )
         }
     }
 
@@ -6633,7 +6727,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder,
         frameToken: UInt64
     ) {
-        let key = RasterizationCacheKey(ObjectIdentifier(layer))
+        let layerRenderKey = renderKey(for: layer)
+        let key = RasterizationCacheKey(layerRenderKey)
         let contentBoundsHash = rasterizationContentBoundsHash(for: layer)
 
         // Cache lookup updates `lastUsedFrame` on a hit so the idle
@@ -6643,13 +6738,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                layer: layer,
                cached: entry,
                currentContentBoundsHash: contentBoundsHash) {
-            prerasterizedTextures[ObjectIdentifier(layer)] = entry.texture
+            prerasterizedTextures[layerRenderKey] = entry.texture
             return
         }
 
         // Miss — allocate a layer-sized texture (`bounds × scale`) and
         // render the subtree into it under a bounds-local projection.
-        let presentationLayer = layer._renderTimePresentation()
+        let presentationLayer = renderPresentation(for: layer)
         let bounds = presentationLayer.bounds
         let scale = max(1.0, CGFloat(presentationLayer.rasterizationScale))
         let pixelWidth = max(1, Int((bounds.width * scale).rounded(.up)))
@@ -6732,7 +6827,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             contentBoundsHash: contentBoundsHash,
             atFrame: frameToken
         )
-        prerasterizedTextures[ObjectIdentifier(layer)] = captureTexture
+        prerasterizedTextures[layerRenderKey] = captureTexture
     }
 
     /// Hash of the inputs that determine the captured pixels. Used by
@@ -6848,7 +6943,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // entry whose `ObjectIdentifier` happens to match this layer's
         // (post-dealloc) heap address.
         let texturedBindGroup = cachedTexturedBindGroup(
-            cacheKey: .layer(ObjectIdentifier(layer)),
+            cacheKey: .layer(renderKey(for: layer)),
             gpuTexture: texture,
             device: device,
             layout: texturedBindGroupLayout,
@@ -7012,28 +7107,35 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func collectFilteredLayers(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
-        into result: inout [(layer: CALayer, parentMatrix: Matrix4x4)]
+        into result: inout [LayerPrepassTarget]
     ) {
-        let presentationLayer = layer._renderTimePresentation()
+        let presentationLayer = renderPresentation(for: layer)
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else {
             return
         }
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
-        if let sublayers = layer.sublayers, !sublayers.isEmpty {
-            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-            for sublayer in orderedSublayers(for: layer) {
-                collectFilteredLayers(
-                    sublayer,
-                    parentMatrix: sublayerMatrix,
-                    into: &result
-                )
-            }
+        forEachPrepassSublayer(
+            of: layer,
+            presentationLayer: presentationLayer,
+            modelMatrix: modelMatrix
+        ) { sublayer, sublayerParentMatrix in
+            collectFilteredLayers(
+                sublayer,
+                parentMatrix: sublayerParentMatrix,
+                into: &result
+            )
         }
 
         if !presentationLayer.supportedFilterOperations.isEmpty {
-            result.append((layer, parentMatrix))
+            result.append(LayerPrepassTarget(
+                layer: layer,
+                presentationLayer: presentationLayer,
+                parentMatrix: parentMatrix,
+                renderKey: renderKey(for: layer),
+                timeOffset: currentReplicatorTimeOffset
+            ))
         }
     }
 
@@ -7041,9 +7143,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func collectShadowLayers(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
-        into result: inout [(layer: CALayer, parentMatrix: Matrix4x4)]
+        into result: inout [LayerPrepassTarget]
     ) {
-        let presentationLayer = layer._renderTimePresentation()
+        let presentationLayer = renderPresentation(for: layer)
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else {
             return
@@ -7052,18 +7154,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
         if presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil {
-            result.append((layer, parentMatrix))
+            result.append(LayerPrepassTarget(
+                layer: layer,
+                presentationLayer: presentationLayer,
+                parentMatrix: parentMatrix,
+                renderKey: renderKey(for: layer),
+                timeOffset: currentReplicatorTimeOffset
+            ))
         }
 
-        if let sublayers = layer.sublayers, !sublayers.isEmpty {
-            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-            for sublayer in orderedSublayers(for: layer) {
-                collectShadowLayers(
-                    sublayer,
-                    parentMatrix: sublayerMatrix,
-                    into: &result
-                )
-            }
+        forEachPrepassSublayer(
+            of: layer,
+            presentationLayer: presentationLayer,
+            modelMatrix: modelMatrix
+        ) { sublayer, sublayerParentMatrix in
+            collectShadowLayers(
+                sublayer,
+                parentMatrix: sublayerParentMatrix,
+                into: &result
+            )
         }
     }
 
@@ -7076,7 +7185,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) {
         guard let shadowColor = layer.shadowColor,
               let vertexBuffer = vertexBuffer,
-              let prerendered = prerenderedShadows[ObjectIdentifier(modelLayer)],
+              let prerendered = prerenderedShadows[renderKey(for: modelLayer)],
               let shadowCompositePipeline = shadowCompositePipeline,
               let blurSampler = blurSampler else {
             shadowRenderFailureCount += 1
@@ -7135,12 +7244,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 1), color: colorComponents),
+            CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 0), color: colorComponents),
+            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 0), color: colorComponents),
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else { return }

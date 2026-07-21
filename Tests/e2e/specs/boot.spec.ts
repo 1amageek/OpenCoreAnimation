@@ -123,7 +123,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginReplicatorProbe();
         await expect.poll(() => h.getReplicatorProbeResult(), { timeout: 10_000 }).toBe(
-            "content=true,zero=true,delay=true"
+            "content=true,zero=true,delay=true,filter=true,shadow=true,raster=true"
         );
 
         await h.beginDisplayLinkProbe();

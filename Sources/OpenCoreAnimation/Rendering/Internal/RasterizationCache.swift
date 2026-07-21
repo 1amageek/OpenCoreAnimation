@@ -17,18 +17,39 @@ import OpenCoreGraphics
 
 // MARK: - Key
 
-/// A stable identity for a cache entry. Keyed by the layer's
-/// `ObjectIdentifier` in production; tests can construct keys from raw
-/// integers without manufacturing CALayers.
+internal struct ReplicatorInstancePathComponent: Hashable, Sendable {
+    internal let replicator: ObjectIdentifier
+    internal let instanceIndex: Int
+}
+
+internal struct LayerRenderKey: Hashable, Sendable {
+    internal let layer: ObjectIdentifier
+    internal let replicatorPath: [ReplicatorInstancePathComponent]
+
+    internal init(
+        layer: ObjectIdentifier,
+        replicatorPath: [ReplicatorInstancePathComponent] = []
+    ) {
+        self.layer = layer
+        self.replicatorPath = replicatorPath
+    }
+}
+
+/// A stable identity for a cache entry. Production keys combine model-layer
+/// identity with the enclosing replicator instance path; tests can construct
+/// keys from raw integers without manufacturing CALayers.
 internal struct RasterizationCacheKey: Hashable, Sendable {
     private enum Storage: Hashable {
-        case object(ObjectIdentifier)
+        case layer(LayerRenderKey)
         case raw(Int)
     }
     private let storage: Storage
 
     internal init(_ identifier: ObjectIdentifier) {
-        self.storage = .object(identifier)
+        self.storage = .layer(LayerRenderKey(layer: identifier))
+    }
+    internal init(_ renderKey: LayerRenderKey) {
+        self.storage = .layer(renderKey)
     }
     internal init(raw: Int) {
         self.storage = .raw(raw)

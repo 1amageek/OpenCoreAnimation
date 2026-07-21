@@ -609,12 +609,12 @@ func installHarness() {
                 let emptyBaselines: [[UInt8]]
                 do {
                     emptyBaselines = try await renderer.readbackPixels(at: [
-                        CGPoint(x: 165, y: 140),
-                        CGPoint(x: 300, y: 80),
-                        CGPoint(x: 115, y: 25),
-                        CGPoint(x: 165, y: 25),
-                        CGPoint(x: 120, y: 140),
-                        CGPoint(x: 160, y: 140),
+                        CGPoint(x: 205, y: 160),
+                        CGPoint(x: 300, y: 220),
+                        CGPoint(x: 75, y: 275),
+                        CGPoint(x: 165, y: 275),
+                        CGPoint(x: 160, y: 160),
+                        CGPoint(x: 200, y: 160),
                     ])
                 } catch {
                     shadowProbeResult = "error: \(error)"
@@ -627,7 +627,7 @@ func installHarness() {
                 silhouetteParent.zPosition = 100
                 silhouetteParent.shadowColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
                 silhouetteParent.shadowOpacity = 1
-                silhouetteParent.shadowOffset = CGSize(width: 40, height: 0)
+                silhouetteParent.shadowOffset = CGSize(width: 80, height: 0)
                 silhouetteParent.shadowRadius = 0
 
                 let silhouetteChild = CALayer()
@@ -694,12 +694,12 @@ func installHarness() {
                 engine.renderFrame()
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
-                        CGPoint(x: 120, y: 140),
-                        CGPoint(x: 165, y: 140),
-                        CGPoint(x: 300, y: 80),
-                        CGPoint(x: 115, y: 25),
-                        CGPoint(x: 140, y: 25),
-                        CGPoint(x: 165, y: 25),
+                        CGPoint(x: 160, y: 160),
+                        CGPoint(x: 205, y: 160),
+                        CGPoint(x: 300, y: 220),
+                        CGPoint(x: 75, y: 275),
+                        CGPoint(x: 140, y: 275),
+                        CGPoint(x: 165, y: 275),
                     ])
                     result += ";" + pixels[0].map(String.init).joined(separator: ",")
                     result += ";emptyRegion=\(pixels[1] == emptyBaselines[0])"
@@ -717,8 +717,8 @@ func installHarness() {
                         storedAnimation.timeOffset = 1
                         engine.renderFrame()
                         let animatedPixels = try await renderer.readbackPixels(at: [
-                            CGPoint(x: 120, y: 140),
-                            CGPoint(x: 160, y: 140),
+                            CGPoint(x: 160, y: 160),
+                            CGPoint(x: 200, y: 160),
                         ])
                         let newPositionIsShadow = animatedPixels[1][0] >= 240
                             && animatedPixels[1][1] <= 5
@@ -906,7 +906,101 @@ func installHarness() {
                     let delayMatches = Int(delayedPixels[0][0]) > Int(delayedPixels[1][0]) + 40
                         && delayedPixels.allSatisfy { $0[3] == 255 }
                     delayedReplicator.removeFromSuperlayer()
-                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches)"
+
+                    func makeDelayedColorReplicator(
+                        x: CGFloat,
+                        configure: (CALayer) -> Void
+                    ) -> CAReplicatorLayer {
+                        let result = CAReplicatorLayer()
+                        result.bounds = root.bounds
+                        result.position = root.position
+                        result.zPosition = 100
+                        result.instanceCount = 2
+                        result.instanceDelay = 0.5
+                        result.instanceTransform = CATransform3DMakeTranslation(40, 0, 0)
+
+                        let source = CALayer()
+                        source.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                        source.position = CGPoint(x: x, y: 250)
+                        source.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                        configure(source)
+                        result.addSublayer(source)
+
+                        let color = CABasicAnimation(keyPath: "backgroundColor")
+                        color.fromValue = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                        color.toValue = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                        color.duration = 2
+                        color.beginTime = source.convertTime(CACurrentMediaTime(), from: nil) - 1
+                        color.fillMode = .both
+                        color.isRemovedOnCompletion = false
+                        source.add(color, forKey: "replicatorDelayedColor")
+                        return result
+                    }
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    let filteredReplicator = makeDelayedColorReplicator(x: 40) { source in
+                        source.filters = [CAFilter.brightness(0)]
+                    }
+                    root.addSublayer(filteredReplicator)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let filteredPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 40, y: 50),
+                        CGPoint(x: 80, y: 50),
+                    ])
+                    let filterMatches = Int(filteredPixels[0][2]) > Int(filteredPixels[1][2]) + 40
+                        && Int(filteredPixels[0][0]) + 40 < Int(filteredPixels[1][0])
+                    filteredReplicator.removeFromSuperlayer()
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    let shadowReplicator = CAReplicatorLayer()
+                    shadowReplicator.bounds = root.bounds
+                    shadowReplicator.position = root.position
+                    shadowReplicator.zPosition = 100
+                    shadowReplicator.instanceCount = 2
+                    shadowReplicator.instanceTransform = CATransform3DMakeTranslation(40, 0, 0)
+                    let shadowSource = CALayer()
+                    shadowSource.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                    shadowSource.position = CGPoint(x: 160, y: 250)
+                    let shadowPath = CGMutablePath()
+                    shadowPath.addRect(shadowSource.bounds)
+                    shadowSource.shadowPath = shadowPath
+                    shadowSource.shadowColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                    shadowSource.shadowOpacity = 1
+                    shadowSource.shadowRadius = 0
+                    shadowSource.shadowOffset = .zero
+                    shadowReplicator.addSublayer(shadowSource)
+                    root.addSublayer(shadowReplicator)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let shadowPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 160, y: 50),
+                        CGPoint(x: 200, y: 50),
+                    ])
+                    let shadowMatches = shadowPixels.allSatisfy { pixel in
+                        pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240 && pixel[3] == 255
+                    }
+                    shadowReplicator.removeFromSuperlayer()
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    let rasterizedReplicator = makeDelayedColorReplicator(x: 280) { source in
+                        source.shouldRasterize = true
+                    }
+                    root.addSublayer(rasterizedReplicator)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let rasterizedPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 280, y: 50),
+                        CGPoint(x: 320, y: 50),
+                    ])
+                    let rasterMatches = Int(rasterizedPixels[0][2]) > Int(rasterizedPixels[1][2]) + 40
+                        && Int(rasterizedPixels[0][0]) + 40 < Int(rasterizedPixels[1][0])
+                    rasterizedReplicator.removeFromSuperlayer()
+
+                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches),filter=\(filterMatches),shadow=\(shadowMatches),raster=\(rasterMatches)"
                 } catch {
                     replicatorProbeResult = "error: \(error)"
                 }
