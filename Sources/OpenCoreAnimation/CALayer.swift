@@ -4614,51 +4614,137 @@ open class CALayer: CAMediaTiming, Hashable {
 
     // MARK: - Mapping Between Coordinate and Time Spaces
 
-    /// Converts a point from this layer's local coordinates to its superlayer's coordinates.
-    private func convertPointToSuperlayer(_ p: CGPoint) -> CGPoint {
-        // First, offset by bounds origin (scroll offset)
-        var point = CGPoint(x: p.x - _bounds.origin.x, y: p.y - _bounds.origin.y)
+    private func localToSuperlayerTransform() -> CATransform3D {
+        var result = CATransform3DMakeTranslation(
+            -_bounds.origin.x - _bounds.size.width * _anchorPoint.x,
+            -_bounds.origin.y - _bounds.size.height * _anchorPoint.y,
+            -_anchorPointZ
+        )
+        result = CATransform3DConcat(result, _transform)
+        result = CATransform3DConcat(
+            result,
+            CATransform3DMakeTranslation(_position.x, _position.y, _zPosition)
+        )
 
-        // Then offset by anchor point (convert to anchor-relative coordinates)
-        point.x -= _bounds.size.width * _anchorPoint.x
-        point.y -= _bounds.size.height * _anchorPoint.y
+        if let superlayer = _superlayer {
+            result = CATransform3DConcat(
+                result,
+                CATransform3DMakeTranslation(
+                    -superlayer._bounds.origin.x,
+                    -superlayer._bounds.origin.y,
+                    0
+                )
+            )
+            result = CATransform3DConcat(result, superlayer._sublayerTransform)
+            result = CATransform3DConcat(
+                result,
+                CATransform3DMakeTranslation(
+                    superlayer._bounds.origin.x,
+                    superlayer._bounds.origin.y,
+                    0
+                )
+            )
+        }
+        return result
+    }
 
-        // Apply transform
-        if !CATransform3DIsIdentity(_transform) {
-            let tx = point.x * _transform.m11 + point.y * _transform.m21 + _transform.m41
-            let ty = point.x * _transform.m12 + point.y * _transform.m22 + _transform.m42
-            point = CGPoint(x: tx, y: ty)
+    private struct PlaneProjectiveTransform {
+        let m11: CGFloat
+        let m12: CGFloat
+        let m13: CGFloat
+        let m21: CGFloat
+        let m22: CGFloat
+        let m23: CGFloat
+        let m31: CGFloat
+        let m32: CGFloat
+        let m33: CGFloat
+
+        init(_ transform: CATransform3D) {
+            m11 = transform.m11
+            m12 = transform.m12
+            m13 = transform.m14
+            m21 = transform.m21
+            m22 = transform.m22
+            m23 = transform.m24
+            m31 = transform.m41
+            m32 = transform.m42
+            m33 = transform.m44
         }
 
-        // Translate to superlayer coordinates using position
-        point.x += _position.x
-        point.y += _position.y
+        init(
+            m11: CGFloat, m12: CGFloat, m13: CGFloat,
+            m21: CGFloat, m22: CGFloat, m23: CGFloat,
+            m31: CGFloat, m32: CGFloat, m33: CGFloat
+        ) {
+            self.m11 = m11
+            self.m12 = m12
+            self.m13 = m13
+            self.m21 = m21
+            self.m22 = m22
+            self.m23 = m23
+            self.m31 = m31
+            self.m32 = m32
+            self.m33 = m33
+        }
 
-        return point
+        func concatenating(_ other: Self) -> Self {
+            Self(
+                m11: m11 * other.m11 + m12 * other.m21 + m13 * other.m31,
+                m12: m11 * other.m12 + m12 * other.m22 + m13 * other.m32,
+                m13: m11 * other.m13 + m12 * other.m23 + m13 * other.m33,
+                m21: m21 * other.m11 + m22 * other.m21 + m23 * other.m31,
+                m22: m21 * other.m12 + m22 * other.m22 + m23 * other.m32,
+                m23: m21 * other.m13 + m22 * other.m23 + m23 * other.m33,
+                m31: m31 * other.m11 + m32 * other.m21 + m33 * other.m31,
+                m32: m31 * other.m12 + m32 * other.m22 + m33 * other.m32,
+                m33: m31 * other.m13 + m32 * other.m23 + m33 * other.m33
+            )
+        }
+
+        func inverted() -> Self? {
+            let determinant = m11 * (m22 * m33 - m23 * m32)
+                - m12 * (m21 * m33 - m23 * m31)
+                + m13 * (m21 * m32 - m22 * m31)
+            guard determinant.isFinite,
+                  abs(determinant) > 0.000001 else {
+                return nil
+            }
+            let reciprocal = 1 / determinant
+            return Self(
+                m11: reciprocal * (m22 * m33 - m23 * m32),
+                m12: reciprocal * (m13 * m32 - m12 * m33),
+                m13: reciprocal * (m12 * m23 - m13 * m22),
+                m21: reciprocal * (m23 * m31 - m21 * m33),
+                m22: reciprocal * (m11 * m33 - m13 * m31),
+                m23: reciprocal * (m13 * m21 - m11 * m23),
+                m31: reciprocal * (m21 * m32 - m22 * m31),
+                m32: reciprocal * (m12 * m31 - m11 * m32),
+                m33: reciprocal * (m11 * m22 - m12 * m21)
+            )
+        }
+
+        func project(_ point: CGPoint) -> CGPoint {
+            let x = point.x * m11 + point.y * m21 + m31
+            let y = point.x * m12 + point.y * m22 + m32
+            let w = point.x * m13 + point.y * m23 + m33
+            guard x.isFinite,
+                  y.isFinite,
+                  w.isFinite,
+                  abs(w) > 0.000001 else {
+                return CGPoint(x: CGFloat.nan, y: CGFloat.nan)
+            }
+            return CGPoint(x: x / w, y: y / w)
+        }
     }
 
     /// Converts a point from this layer's superlayer's coordinates to local coordinates.
     private func convertPointFromSuperlayer(_ p: CGPoint) -> CGPoint {
-        // Translate from superlayer coordinates using position
-        var point = CGPoint(x: p.x - _position.x, y: p.y - _position.y)
-
-        // Apply inverse transform
-        if !CATransform3DIsIdentity(_transform) {
-            let inverted = CATransform3DInvert(_transform)
-            let tx = point.x * inverted.m11 + point.y * inverted.m21 + inverted.m41
-            let ty = point.x * inverted.m12 + point.y * inverted.m22 + inverted.m42
-            point = CGPoint(x: tx, y: ty)
+        guard let inverse = PlaneProjectiveTransform(
+            localToSuperlayerTransform()
+        ).inverted() else {
+            return CGPoint(x: CGFloat.nan, y: CGFloat.nan)
         }
-
-        // Offset by anchor point (convert from anchor-relative to bounds-relative)
-        point.x += _bounds.size.width * _anchorPoint.x
-        point.y += _bounds.size.height * _anchorPoint.y
-
-        // Add bounds origin (scroll offset)
-        point.x += _bounds.origin.x
-        point.y += _bounds.origin.y
-
-        return point
+        return inverse.project(p)
     }
 
     /// Returns the chain of layers from this layer up to the root (or until reaching the specified ancestor).
@@ -4678,58 +4764,40 @@ open class CALayer: CAMediaTiming, Hashable {
         guard let sourceLayer = l else { return p }
         if sourceLayer === self { return p }
 
-        // Convert from source layer up to common ancestor (or root)
-        var point = p
-        var current: CALayer? = sourceLayer
-        while let layer = current, layer !== self {
-            point = layer.convertPointToSuperlayer(point)
-            current = layer._superlayer
-        }
-
-        // If we found self in the chain, we're done
-        if current === self {
-            return point
-        }
-
-        // Otherwise, we need to convert down from root to self
-        // First, get the chain from self to root
-        let selfChain = ancestorChain()
-
-        // Find common ancestor
         var sourceAncestors = Set<ObjectIdentifier>()
-        current = sourceLayer
+        var current: CALayer? = sourceLayer
         while let layer = current {
             sourceAncestors.insert(ObjectIdentifier(layer))
             current = layer._superlayer
         }
-
-        var commonAncestorIndex = selfChain.count - 1
-        for (index, layer) in selfChain.enumerated() {
-            if sourceAncestors.contains(ObjectIdentifier(layer)) {
-                commonAncestorIndex = index
-                break
-            }
+        let commonAncestor = ancestorChain().first {
+            sourceAncestors.contains(ObjectIdentifier($0))
         }
 
-        // Convert from source to common ancestor
-        point = p
-        current = sourceLayer
-        while let layer = current {
-            if selfChain.indices.contains(commonAncestorIndex) && layer === selfChain[commonAncestorIndex] {
-                break
+        func transform(
+            from layer: CALayer,
+            to ancestor: CALayer?
+        ) -> CATransform3D {
+            var result = CATransform3DIdentity
+            var current: CALayer? = layer
+            while let node = current, node !== ancestor {
+                result = CATransform3DConcat(result, node.localToSuperlayerTransform())
+                current = node._superlayer
             }
-            point = layer.convertPointToSuperlayer(point)
-            current = layer._superlayer
+            return result
         }
 
-        // Convert from common ancestor down to self
-        if commonAncestorIndex > 0 {
-            for i in stride(from: commonAncestorIndex - 1, through: 0, by: -1) {
-                point = selfChain[i].convertPointFromSuperlayer(point)
-            }
+        let sourceToCommon = transform(from: sourceLayer, to: commonAncestor)
+        let receiverToCommon = transform(from: self, to: commonAncestor)
+        let sourceProjection = PlaneProjectiveTransform(sourceToCommon)
+        guard let receiverProjectionInverse = PlaneProjectiveTransform(
+            receiverToCommon
+        ).inverted() else {
+            return CGPoint(x: CGFloat.nan, y: CGFloat.nan)
         }
-
-        return point
+        return sourceProjection
+            .concatenating(receiverProjectionInverse)
+            .project(p)
     }
 
     /// Converts the point from the receiver's coordinate system to the specified layer's coordinate system.
