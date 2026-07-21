@@ -119,6 +119,23 @@ struct CAMediaTimingEvaluatorTests {
         #expect(completed.progress == 0)
     }
 
+    @Test("paused animation at its active-duration offset samples the endpoint")
+    func pausedAnimationAtTerminalOffsetSamplesEndpoint() {
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 1
+
+        let result = CAMediaTimingEvaluator.evaluate(
+            animation,
+            parentTime: 10,
+            duration: animation.duration
+        )
+
+        #expect(result.phase == .active)
+        #expect(result.progress == 1)
+    }
+
     @Test("zero begin time and duration resolve when added")
     func addResolvesTransactionDefaults() {
         let layer = CALayer()

@@ -595,6 +595,138 @@ func installHarness() {
                 emptyPath.removeFromSuperlayer()
                 movingContainer.removeFromSuperlayer()
                 engine.renderFrame()
+
+                let emptyBaselines: [[UInt8]]
+                do {
+                    emptyBaselines = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 165, y: 140),
+                        CGPoint(x: 300, y: 80),
+                        CGPoint(x: 115, y: 25),
+                        CGPoint(x: 165, y: 25),
+                        CGPoint(x: 120, y: 140),
+                        CGPoint(x: 160, y: 140),
+                    ])
+                } catch {
+                    shadowProbeResult = "error: \(error)"
+                    return
+                }
+
+                let silhouetteParent = CALayer()
+                silhouetteParent.bounds = CGRect(x: 0, y: 0, width: 80, height: 50)
+                silhouetteParent.position = CGPoint(x: 100, y: 140)
+                silhouetteParent.zPosition = 100
+                silhouetteParent.shadowColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                silhouetteParent.shadowOpacity = 1
+                silhouetteParent.shadowOffset = CGSize(width: 40, height: 0)
+                silhouetteParent.shadowRadius = 0
+
+                let silhouetteChild = CALayer()
+                silhouetteChild.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                silhouetteChild.position = CGPoint(x: 20, y: 25)
+                silhouetteChild.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                let silhouetteAnimation = CABasicAnimation(keyPath: "position")
+                silhouetteAnimation.fromValue = CGPoint(x: 20, y: 25)
+                silhouetteAnimation.toValue = CGPoint(x: 60, y: 25)
+                silhouetteAnimation.duration = 1
+                silhouetteAnimation.speed = 0
+                silhouetteAnimation.timeOffset = 0
+                silhouetteAnimation.fillMode = .both
+                silhouetteAnimation.isRemovedOnCompletion = false
+                silhouetteChild.add(silhouetteAnimation, forKey: "shadowSilhouettePosition")
+                silhouetteParent.addSublayer(silhouetteChild)
+
+                let emptyContent = CALayer()
+                emptyContent.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                emptyContent.position = CGPoint(x: 260, y: 80)
+                emptyContent.zPosition = 100
+                emptyContent.shadowColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                emptyContent.shadowOpacity = 1
+                emptyContent.shadowOffset = CGSize(width: 40, height: 0)
+                emptyContent.shadowRadius = 0
+
+                let imageData = Data([
+                    0, 0, 0, 0,
+                    255, 255, 255, 255,
+                    0, 0, 0, 0,
+                ])
+                let imageProvider = CGDataProvider(data: imageData)
+                guard let transparentImage = CGImage(
+                    width: 3,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 12,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(
+                        rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                    ),
+                    provider: imageProvider,
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    shadowProbeResult = "error: transparent image unavailable"
+                    return
+                }
+                let imageContent = CALayer()
+                imageContent.bounds = CGRect(x: 0, y: 0, width: 60, height: 20)
+                imageContent.position = CGPoint(x: 100, y: 25)
+                imageContent.zPosition = 100
+                imageContent.contents = transparentImage
+                imageContent.shadowColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                imageContent.shadowOpacity = 1
+                imageContent.shadowOffset = CGSize(width: 40, height: 0)
+                imageContent.shadowRadius = 0
+                root.addSublayer(silhouetteParent)
+                root.addSublayer(emptyContent)
+                root.addSublayer(imageContent)
+
+                engine.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 120, y: 140),
+                        CGPoint(x: 165, y: 140),
+                        CGPoint(x: 300, y: 80),
+                        CGPoint(x: 115, y: 25),
+                        CGPoint(x: 140, y: 25),
+                        CGPoint(x: 165, y: 25),
+                    ])
+                    result += ";" + pixels[0].map(String.init).joined(separator: ",")
+                    result += ";emptyRegion=\(pixels[1] == emptyBaselines[0])"
+                    result += ";emptyLayer=\(pixels[2] == emptyBaselines[1])"
+                    result += ";imageEdges=\(pixels[3] == emptyBaselines[2] && pixels[5] == emptyBaselines[3])"
+                    let imageCenterIsShadow = pixels[4][0] >= 240
+                        && pixels[4][1] <= 5
+                        && pixels[4][2] <= 5
+                        && pixels[4][3] == 255
+                    result += ";imageCenter=\(imageCenterIsShadow)"
+
+                    if let storedAnimation = silhouetteChild.animation(
+                        forKey: "shadowSilhouettePosition"
+                    ) {
+                        storedAnimation.timeOffset = 1
+                        engine.renderFrame()
+                        let animatedPixels = try await renderer.readbackPixels(at: [
+                            CGPoint(x: 120, y: 140),
+                            CGPoint(x: 160, y: 140),
+                        ])
+                        let newPositionIsShadow = animatedPixels[1][0] >= 240
+                            && animatedPixels[1][1] <= 5
+                            && animatedPixels[1][2] <= 5
+                            && animatedPixels[1][3] == 255
+                        let oldPositionCleared = animatedPixels[0] == emptyBaselines[4]
+                        result += ";animatedSilhouette=\(oldPositionCleared && newPositionIsShadow)"
+                    } else {
+                        result = "error: silhouette animation unavailable"
+                    }
+                } catch {
+                    result = "error: \(error)"
+                }
+
+                silhouetteParent.removeFromSuperlayer()
+                emptyContent.removeFromSuperlayer()
+                imageContent.removeFromSuperlayer()
+                engine.renderFrame()
                 shadowProbeResult = result
             }
         })

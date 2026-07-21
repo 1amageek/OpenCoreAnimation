@@ -105,7 +105,9 @@ internal enum CAMediaTimingEvaluator {
             }
         }
 
-        let isTerminalSample = phase != .active
+        let isPausedAtTerminalOffset = speed == 0
+            && abs(sampledActiveTime - activeDuration) < 0.000_000_001
+        let isTerminalSample = (phase != .active || isPausedAtTerminalOffset)
             && abs(sampledActiveTime - activeDuration) < 0.000_000_001
         let basicTime = mapActiveTimeToBasicTime(
             sampledActiveTime,

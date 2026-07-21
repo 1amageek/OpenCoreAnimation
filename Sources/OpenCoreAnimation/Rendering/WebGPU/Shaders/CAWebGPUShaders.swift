@@ -525,6 +525,53 @@ public enum CAWebGPUShaders {
 
     // MARK: - Blur Shaders
 
+    /// Horizontal shadow blur that derives the silhouette from captured alpha.
+    public static let shadowAlphaBlurHorizontal = """
+    struct BlurUniforms {
+        texelSize: vec2<f32>,
+        blurRadius: f32,
+        padding: f32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: BlurUniforms;
+    @group(0) @binding(1) var inputTexture: texture_2d<f32>;
+    @group(0) @binding(2) var texSampler: sampler;
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) texCoord: vec2<f32>,
+    }
+
+    @vertex
+    fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+        let positions = array<vec2<f32>, 6>(
+            vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+            vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+        );
+        let texCoords = array<vec2<f32>, 6>(
+            vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+            vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
+        );
+        var output: VertexOutput;
+        output.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+        output.texCoord = texCoords[vertexIndex];
+        return output;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        let weights = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+        var alpha = textureSample(inputTexture, texSampler, input.texCoord).a * weights[0];
+
+        for (var i = 1; i < 5; i++) {
+            let offset = vec2<f32>(f32(i) * uniforms.blurRadius * uniforms.texelSize.x, 0.0);
+            alpha += textureSample(inputTexture, texSampler, input.texCoord + offset).a * weights[i];
+            alpha += textureSample(inputTexture, texSampler, input.texCoord - offset).a * weights[i];
+        }
+        return vec4<f32>(alpha);
+    }
+    """
+
     /// Shader code for Gaussian blur (horizontal pass).
     public static let blurHorizontal = """
     struct BlurUniforms {

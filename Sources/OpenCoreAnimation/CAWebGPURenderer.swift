@@ -218,10 +218,15 @@ private final class ShadowLayerResources {
     var hasRenderedContent = false
     var captureState: ShadowCaptureState?
 
-    init(device: GPUDevice, width: Int, height: Int) {
+    init(
+        device: GPUDevice,
+        width: Int,
+        height: Int,
+        format: GPUTextureFormat
+    ) {
         let textureDescriptor = GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
-            format: .rgba8unorm,
+            format: format,
             usage: [.renderAttachment, .textureBinding]
         )
         maskTexture = device.createTexture(descriptor: textureDescriptor)
@@ -654,6 +659,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// The root layer currently being rendered into the offscreen filter source texture.
     /// While set, filter compositing is suppressed so the subtree can be captured raw.
     private weak var filterPrerenderRootLayer: CALayer?
+
+    /// The root layer whose rendered alpha is being captured as a shadow silhouette.
+    private weak var shadowCaptureRootLayer: CALayer?
 
     // MARK: - Rasterization Cache (R3.2 / R3.4)
 
@@ -1558,20 +1566,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
 
         // Create horizontal blur pipeline
+        let shadowBlurHShaderModule = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
+            code: CAWebGPUShaders.shadowAlphaBlurHorizontal
+        ))
         let blurHShaderModule = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
             code: CAWebGPUShaders.blurHorizontal
         ))
 
         shadowBlurHorizontalPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
             vertex: GPUVertexState(
-                module: blurHShaderModule,
+                module: shadowBlurHShaderModule,
                 entryPoint: "vertexMain"
             ),
             fragment: GPUFragmentState(
-                module: blurHShaderModule,
+                module: shadowBlurHShaderModule,
                 entryPoint: "fragmentMain",
                 targets: [
-                    GPUColorTargetState(format: .rgba8unorm)
+                    GPUColorTargetState(format: preferredFormat)
                 ]
             ),
             layout: .layout(blurPipelineLayout)
@@ -1591,7 +1602,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 module: blurVShaderModule,
                 entryPoint: "fragmentMain",
                 targets: [
-                    GPUColorTargetState(format: .rgba8unorm)
+                    GPUColorTargetState(format: preferredFormat)
                 ]
             ),
             layout: .layout(blurPipelineLayout)
@@ -1904,7 +1915,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 module: maskShaderModule,
                 entryPoint: "fragmentMain",
                 targets: [
-                    GPUColorTargetState(format: .rgba8unorm)
+                    GPUColorTargetState(format: preferredFormat)
                 ]
             ),
             layout: .layout(maskPipelineLayout)
@@ -1996,6 +2007,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transientCaptureDepthTextures.removeAll(keepingCapacity: true)
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
+        shadowCaptureRootLayer = nil
 
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
@@ -2329,6 +2341,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
+        shadowCaptureRootLayer = nil
         for request in pendingTileDraws {
             request.tiledLayer.loadingTiles.remove(request.tileKey)
         }
@@ -2455,6 +2468,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // at composite time.
         let isCaptureRoot =
             filterPrerenderRootLayer === layer
+            || shadowCaptureRootLayer === layer
             || rasterizePrerenderRootLayer === layer
         let opacityMultiplier: Float = isCaptureRoot ? 1 : presentationLayer.opacity
         let effectiveOpacity = currentEffectiveOpacity * opacityMultiplier
@@ -2499,6 +2513,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Render shadow before layer content. Filters apply to the layer subtree capture, but
         // the shadow itself is composited separately in the main pass.
         if filterPrerenderRootLayer == nil,
+           shadowCaptureRootLayer == nil,
            presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil {
             renderLayerShadow(
                 layer,
@@ -2596,7 +2611,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if presentationLayer.backgroundColor != nil
             && presentationLayer.bounds.width > 0
             && presentationLayer.bounds.height > 0
-            && (layer !== currentRootLayer || presentationLayer.cornerRadius > 0) {
+            && (layer !== currentRootLayer
+                || presentationLayer.cornerRadius > 0
+                || shadowCaptureRootLayer === layer) {
             renderLayerBackgroundColor(
                 presentationLayer,
                 device: device,
@@ -5804,6 +5821,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         guard let device = device,
+              let pipeline = pipeline,
+              let depthTextureView = depthTextureView,
               let bindGroupLayout = bindGroupLayout,
               let shadowMaskPipeline = shadowMaskPipeline,
               let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
@@ -5829,7 +5848,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 resources = ShadowLayerResources(
                     device: device,
                     width: Int(size.width),
-                    height: Int(size.height)
+                    height: Int(size.height),
+                    format: preferredFormat
                 )
                 shadowLayerResources[shadowLayerID] = resources
             }
@@ -5859,7 +5879,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 blurRadius: blurRadius
             )
 
-            if presentationLayer.shadowPath == nil,
+            let usesShadowPath = RasterizationDecisions.useShadowPathFastPath(
+                for: presentationLayer
+            )
+            let contentHasActiveAnimations = !usesShadowPath
+                && subtreeHasAnimations(shadowLayer)
+
+            if !usesShadowPath,
+               !contentHasActiveAnimations,
                resources.captureState == captureState,
                RasterizationDecisions.canReusePrerenderCache(
                    contributorLayer: shadowLayer,
@@ -5869,43 +5896,39 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 continue
             }
 
-            // Opacity is applied once during composite. Baking it into the mask
-            // would square the effective opacity for every shadow.
-            var maskUniforms = CARendererUniforms(
-                mvpMatrix: finalMatrix,
-                opacity: 1,
-                cornerRadius: cornerRadius,
-                layerSize: layerSize,
-                cornerRadii: cornerRadii
-            )
-            let maskUniformData = createFloat32Array(from: &maskUniforms)
-            device.queue.writeBuffer(
-                resources.maskUniformBuffer,
-                bufferOffset: 0,
-                data: maskUniformData
-            )
+            if usesShadowPath, let shadowPath = presentationLayer.shadowPath {
+                // Opacity is applied once during composite. Baking it into the mask
+                // would square the effective opacity for every shadow.
+                var maskUniforms = CARendererUniforms(
+                    mvpMatrix: finalMatrix,
+                    opacity: 1,
+                    cornerRadius: cornerRadius,
+                    layerSize: layerSize,
+                    cornerRadii: cornerRadii
+                )
+                let maskUniformData = createFloat32Array(from: &maskUniforms)
+                device.queue.writeBuffer(
+                    resources.maskUniformBuffer,
+                    bufferOffset: 0,
+                    data: maskUniformData
+                )
 
-            let maskBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-                layout: bindGroupLayout,
-                entries: [
-                    GPUBindGroupEntry(
-                        binding: 0,
-                        resource: .buffer(
-                            resources.maskUniformBuffer,
-                            offset: 0,
-                            size: Self.alignedUniformSize
+                let maskBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                    layout: bindGroupLayout,
+                    entries: [
+                        GPUBindGroupEntry(
+                            binding: 0,
+                            resource: .buffer(
+                                resources.maskUniformBuffer,
+                                offset: 0,
+                                size: Self.alignedUniformSize
+                            )
                         )
-                    )
-                ]
-            ))
+                    ]
+                ))
 
-            let whiteColor = SIMD4<Float>(1, 1, 1, 1)
-            var maskVertices: [CARendererVertex] = []
-            let usesShadowPath = RasterizationDecisions.useShadowPathFastPath(
-                for: presentationLayer
-            )
-            if usesShadowPath,
-               let shadowPath = presentationLayer.shadowPath {
+                let whiteColor = SIMD4<Float>(1, 1, 1, 1)
+                var maskVertices: [CARendererVertex] = []
                 for polyline in flattenPath(shadowPath) where polyline.count >= 3 {
                     for index in triangulatePolygon(polyline) {
                         let point = polyline[index]
@@ -5916,47 +5939,47 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         ))
                     }
                 }
-            }
 
-            if !usesShadowPath {
-                let width = Float(presentationLayer.bounds.width)
-                let height = Float(presentationLayer.bounds.height)
-                maskVertices = [
-                    CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: whiteColor),
-                    CARendererVertex(position: SIMD2(width, 0), texCoord: SIMD2(1, 0), color: whiteColor),
-                    CARendererVertex(position: SIMD2(0, height), texCoord: SIMD2(0, 1), color: whiteColor),
-                    CARendererVertex(position: SIMD2(width, 0), texCoord: SIMD2(1, 0), color: whiteColor),
-                    CARendererVertex(position: SIMD2(width, height), texCoord: SIMD2(1, 1), color: whiteColor),
-                    CARendererVertex(position: SIMD2(0, height), texCoord: SIMD2(0, 1), color: whiteColor),
-                ]
-            }
-
-            let maskVertexBuffer = resources.ensureMaskVertexCapacity(
-                maskVertices.count,
-                device: device
-            )
-            if !maskVertices.isEmpty {
-                let maskVertexData = createFloat32Array(from: &maskVertices)
-                device.queue.writeBuffer(maskVertexBuffer, bufferOffset: 0, data: maskVertexData)
-            }
-
-            let maskRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
-                colorAttachments: [
-                    GPURenderPassColorAttachment(
-                        view: resources.maskView,
-                        clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
-                        loadOp: .clear,
-                        storeOp: .store
+                let maskVertexBuffer = resources.ensureMaskVertexCapacity(
+                    maskVertices.count,
+                    device: device
+                )
+                if !maskVertices.isEmpty {
+                    let maskVertexData = createFloat32Array(from: &maskVertices)
+                    device.queue.writeBuffer(
+                        maskVertexBuffer,
+                        bufferOffset: 0,
+                        data: maskVertexData
                     )
-                ]
-            ))
-            maskRenderPass.setPipeline(shadowMaskPipeline)
-            maskRenderPass.setBindGroup(0, bindGroup: maskBindGroup, dynamicOffsets: [0])
-            if !maskVertices.isEmpty {
-                maskRenderPass.setVertexBuffer(0, buffer: maskVertexBuffer, offset: 0)
-                maskRenderPass.draw(vertexCount: UInt32(maskVertices.count))
+                }
+
+                let maskRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                    colorAttachments: [
+                        GPURenderPassColorAttachment(
+                            view: resources.maskView,
+                            clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                            loadOp: .clear,
+                            storeOp: .store
+                        )
+                    ]
+                ))
+                maskRenderPass.setPipeline(shadowMaskPipeline)
+                maskRenderPass.setBindGroup(0, bindGroup: maskBindGroup, dynamicOffsets: [0])
+                if !maskVertices.isEmpty {
+                    maskRenderPass.setVertexBuffer(0, buffer: maskVertexBuffer, offset: 0)
+                    maskRenderPass.draw(vertexCount: UInt32(maskVertices.count))
+                }
+                maskRenderPass.end()
+            } else {
+                captureShadowContent(
+                    shadowLayer,
+                    parentMatrix: shadowOffsetParentMatrix,
+                    resources: resources,
+                    pipeline: pipeline,
+                    depthTextureView: depthTextureView,
+                    encoder: encoder
+                )
             }
-            maskRenderPass.end()
 
             var blurUniforms = BlurUniforms(
                 texelSize: SIMD2<Float>(1 / Float(size.width), 1 / Float(size.height)),
@@ -6030,6 +6053,83 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         evictShadowResources(except: activeLayerIDs)
+    }
+
+    /// Captures the actual rendered alpha of a layer subtree for the default shadow shape.
+    private func captureShadowContent(
+        _ layer: CALayer,
+        parentMatrix: Matrix4x4,
+        resources: ShadowLayerResources,
+        pipeline: GPURenderPipeline,
+        depthTextureView: GPUTextureView,
+        encoder: GPUCommandEncoder
+    ) {
+        let contentRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: resources.maskView,
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ],
+            depthStencilAttachment: GPURenderPassDepthStencilAttachment(
+                view: depthTextureView,
+                depthClearValue: 1,
+                depthLoadOp: .clear,
+                depthStoreOp: .store,
+                stencilClearValue: 0,
+                stencilLoadOp: .clear,
+                stencilStoreOp: .store
+            )
+        ))
+        contentRenderPass.setPipeline(pipeline)
+        contentRenderPass.setViewport(
+            x: 0,
+            y: 0,
+            width: Float(size.width),
+            height: Float(size.height),
+            minDepth: 0,
+            maxDepth: 1
+        )
+
+        let previousCaptureRoot = shadowCaptureRootLayer
+        let previousRenderTargetSize = renderTargetSizeOverride
+        let previousClipStack = clipRectStack
+        let previousOpacityStack = opacityStack
+        let previousMaskNestingDepth = maskNestingDepth
+        let previousStencilValue = currentStencilValue
+
+        shadowCaptureRootLayer = layer
+        renderTargetSizeOverride = size
+        clipRectStack.removeAll(keepingCapacity: true)
+        opacityStack.removeAll(keepingCapacity: true)
+        maskNestingDepth = 0
+        currentStencilValue = 0
+
+        renderLayer(layer, renderPass: contentRenderPass, parentMatrix: parentMatrix)
+
+        shadowCaptureRootLayer = previousCaptureRoot
+        renderTargetSizeOverride = previousRenderTargetSize
+        clipRectStack = previousClipStack
+        opacityStack = previousOpacityStack
+        maskNestingDepth = previousMaskNestingDepth
+        currentStencilValue = previousStencilValue
+        contentRenderPass.end()
+    }
+
+    private func subtreeHasAnimations(_ rootLayer: CALayer) -> Bool {
+        var visited: Set<ObjectIdentifier> = []
+
+        func visit(_ layer: CALayer) -> Bool {
+            let identifier = ObjectIdentifier(layer)
+            guard visited.insert(identifier).inserted else { return false }
+            if layer.animationKeys()?.isEmpty == false { return true }
+            if let mask = layer.mask, visit(mask) { return true }
+            return layer.sublayers?.contains(where: visit) == true
+        }
+
+        return visit(rootLayer)
     }
 
     private func evictShadowResources(except activeLayerIDs: Set<ObjectIdentifier>) {
