@@ -915,6 +915,38 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }.map(\.element)
     }
 
+    /// Orders transform-layer children by their projected center depth so blended
+    /// pixels see the already-rendered farther surface before depth-tested nearer ones.
+    private func depthOrderedSublayers(
+        for layer: CALayer,
+        parentMatrix: Matrix4x4
+    ) -> [CALayer] {
+        (layer.sublayers ?? []).enumerated().sorted { lhs, rhs in
+            let lhsDepth = projectedCenterDepth(of: lhs.element, parentMatrix: parentMatrix)
+            let rhsDepth = projectedCenterDepth(of: rhs.element, parentMatrix: parentMatrix)
+            return lhsDepth == rhsDepth ? lhs.offset < rhs.offset : lhsDepth < rhsDepth
+        }.map(\.element)
+    }
+
+    private func projectedCenterDepth(
+        of layer: CALayer,
+        parentMatrix: Matrix4x4
+    ) -> Float {
+        let presentation = renderPresentation(for: layer)
+        let matrix = presentation.modelMatrix(parentMatrix: parentMatrix)
+        let center = SIMD4<Float>(
+            Float(presentation.bounds.width * 0.5),
+            Float(presentation.bounds.height * 0.5),
+            0,
+            1
+        )
+        let projected = matrix * center
+        guard projected.z.isFinite, projected.w.isFinite, projected.w != 0 else {
+            return 0
+        }
+        return projected.z / projected.w
+    }
+
     private func forEachPrepassSublayer(
         of layer: CALayer,
         presentationLayer: CALayer,
@@ -1081,11 +1113,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// The textured render pipeline.
     private var texturedPipeline: GPURenderPipeline?
 
+    /// Textured pipeline used while traversing a true-3D transform hierarchy.
+    private var texturedDepthPipeline: GPURenderPipeline?
+
     /// Composites premultiplied-alpha offscreen captures.
     private var premultipliedTexturedPipeline: GPURenderPipeline?
 
+    /// Premultiplied textured pipeline with true-3D depth testing.
+    private var premultipliedTexturedDepthPipeline: GPURenderPipeline?
+
     /// Stencil-aware variant for premultiplied-alpha captures.
     private var premultipliedTexturedStencilPipeline: GPURenderPipeline?
+
+    /// Stencil-aware premultiplied textured pipeline with true-3D depth testing.
+    private var premultipliedTexturedDepthStencilPipeline: GPURenderPipeline?
 
     /// The bind group layout for textured rendering.
     private var texturedBindGroupLayout: GPUBindGroupLayout?
@@ -1099,8 +1140,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Source-additive textured particle pipeline without stencil testing.
     private var emitterTexturedAdditivePipeline: GPURenderPipeline?
 
+    /// Additive particle pipeline with true-3D depth testing.
+    private var emitterTexturedAdditiveDepthPipeline: GPURenderPipeline?
+
     /// Source-additive textured particle pipeline constrained by the active stencil mask.
     private var emitterTexturedAdditiveStencilPipeline: GPURenderPipeline?
+
+    /// Stencil-aware additive particle pipeline with true-3D depth testing.
+    private var emitterTexturedAdditiveDepthStencilPipeline: GPURenderPipeline?
 
     /// Texture manager with LRU cache for efficient texture memory management.
     private var textureManager: GPUTextureManager?
@@ -1314,6 +1361,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Only renders where stencil value matches.
     private var stencilTestPipeline: GPURenderPipeline?
 
+    /// Solid-color stencil pipeline with true-3D depth testing.
+    private var depthStencilTestPipeline: GPURenderPipeline?
+
+    /// Solid-color pipeline with true-3D depth testing.
+    private var depthPipeline: GPURenderPipeline?
+
+    /// Writes the farthest depth without changing color or stencil.
+    private var depthClearPipeline: GPURenderPipeline?
+
     /// Current stencil reference value for nested masks.
     private var currentStencilValue: UInt32 = 0
 
@@ -1322,15 +1378,27 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Supports nested masks (e.g., child B with mask inside parent A with mask).
     private var maskNestingDepth: Int = 0
 
+    /// Number of active CATransformLayer ancestors in the current traversal.
+    private var transformDepthNesting: Int = 0
+
     /// Stencil-aware textured pipeline (tests stencil buffer for mask).
     private var texturedStencilPipeline: GPURenderPipeline?
+
+    /// Stencil-aware textured pipeline with true-3D depth testing.
+    private var texturedDepthStencilPipeline: GPURenderPipeline?
 
     /// Opaque textured pipeline (no alpha blend). R3.5 — selected when
     /// `RasterizationDecisions.blendEnabled(for:)` returns false.
     private var texturedOpaquePipeline: GPURenderPipeline?
 
+    /// Opaque textured pipeline with true-3D depth testing.
+    private var texturedDepthOpaquePipeline: GPURenderPipeline?
+
     /// Opaque stencil-aware textured pipeline (R3.5 + mask).
     private var texturedStencilOpaquePipeline: GPURenderPipeline?
+
+    /// Opaque stencil-aware textured pipeline with true-3D depth testing.
+    private var texturedDepthStencilOpaquePipeline: GPURenderPipeline?
 
     /// Stencil-aware shadow composite pipeline (tests stencil buffer for mask).
     private var shadowCompositeStencilPipeline: GPURenderPipeline?
@@ -1472,6 +1540,57 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(pipelineLayout)
         ))
+        depthPipeline = createLayerPipeline(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout,
+            blend: GPUBlendState(
+                color: GPUBlendComponent(
+                    srcFactor: .srcAlpha,
+                    dstFactor: .oneMinusSrcAlpha,
+                    operation: .add
+                ),
+                alpha: GPUBlendComponent(
+                    srcFactor: .one,
+                    dstFactor: .oneMinusSrcAlpha,
+                    operation: .add
+                )
+            ),
+            stencilCompare: .always,
+            depthEnabled: true
+        )
+
+        let depthClearShader = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
+            code: CAWebGPUShaders.depthClear
+        ))
+        depthClearPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(module: depthClearShader, entryPoint: "vertexMain"),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plusStencil8,
+                depthWriteEnabled: true,
+                depthCompare: .always,
+                stencilFront: GPUStencilFaceState(
+                    compare: .always,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                ),
+                stencilBack: GPUStencilFaceState(
+                    compare: .always,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                )
+            ),
+            fragment: GPUFragmentState(
+                module: depthClearShader,
+                entryPoint: "fragmentMain",
+                targets: [
+                    GPUColorTargetState(format: preferredFormat, writeMask: [])
+                ]
+            ),
+            layout: .auto
+        ))
         // Create triple-buffered vertex buffer pool
         // Use maxVertexBufferSize (1MB) to accommodate complex shapes with many vertices
         let vertexBufferSize = Self.maxVertexBufferSize
@@ -1548,6 +1667,64 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create stencil pipelines for CALayer.mask
         try createStencilPipelines(device: device)
+    }
+
+    /// Creates the standard vertex/color pipeline with optional transform-layer depth testing.
+    private func createLayerPipeline(
+        device: GPUDevice,
+        shaderModule: GPUShaderModule,
+        pipelineLayout: GPUPipelineLayout,
+        blend: GPUBlendState?,
+        stencilCompare: GPUCompareFunction,
+        depthEnabled: Bool
+    ) -> GPURenderPipeline {
+        device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: shaderModule,
+                entryPoint: "vertexMain",
+                buffers: [
+                    GPUVertexBufferLayout(
+                        arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                        attributes: [
+                            GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                            GPUVertexAttribute(
+                                format: .float32x2,
+                                offset: UInt64(MemoryLayout<SIMD2<Float>>.stride),
+                                shaderLocation: 1
+                            ),
+                            GPUVertexAttribute(
+                                format: .float32x4,
+                                offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2),
+                                shaderLocation: 2
+                            )
+                        ]
+                    )
+                ]
+            ),
+            depthStencil: GPUDepthStencilState(
+                format: .depth24plusStencil8,
+                depthWriteEnabled: depthEnabled,
+                depthCompare: depthEnabled ? .greaterEqual : .always,
+                stencilFront: GPUStencilFaceState(
+                    compare: stencilCompare,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                ),
+                stencilBack: GPUStencilFaceState(
+                    compare: stencilCompare,
+                    failOp: .keep,
+                    depthFailOp: .keep,
+                    passOp: .keep
+                )
+            ),
+            fragment: GPUFragmentState(
+                module: shaderModule,
+                entryPoint: "fragmentMain",
+                targets: [GPUColorTargetState(format: preferredFormat, blend: blend)]
+            ),
+            layout: .layout(pipelineLayout)
+        ))
     }
 
     /// Creates stencil pipelines for CALayer.mask functionality.
@@ -1718,6 +1895,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(pipelineLayout)
         ))
+        depthStencilTestPipeline = createLayerPipeline(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout,
+            blend: GPUBlendState(
+                color: GPUBlendComponent(
+                    srcFactor: .srcAlpha,
+                    dstFactor: .oneMinusSrcAlpha,
+                    operation: .add
+                ),
+                alpha: GPUBlendComponent(
+                    srcFactor: .one,
+                    dstFactor: .oneMinusSrcAlpha,
+                    operation: .add
+                )
+            ),
+            stencilCompare: .equal,
+            depthEnabled: true
+        )
     }
 
     /// Creates the textured render pipeline for layer.contents rendering.
@@ -2001,6 +2197,51 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: .layout(pipelineLayout)
         ))
 
+        let alphaBlend = GPUBlendState(
+            color: GPUBlendComponent(
+                srcFactor: .srcAlpha,
+                dstFactor: .oneMinusSrcAlpha,
+                operation: .add
+            ),
+            alpha: GPUBlendComponent(
+                srcFactor: .one,
+                dstFactor: .oneMinusSrcAlpha,
+                operation: .add
+            )
+        )
+        texturedDepthPipeline = createLayerPipeline(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout,
+            blend: alphaBlend,
+            stencilCompare: .always,
+            depthEnabled: true
+        )
+        texturedDepthStencilPipeline = createLayerPipeline(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout,
+            blend: alphaBlend,
+            stencilCompare: .equal,
+            depthEnabled: true
+        )
+        texturedDepthOpaquePipeline = createLayerPipeline(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout,
+            blend: nil,
+            stencilCompare: .always,
+            depthEnabled: true
+        )
+        texturedDepthStencilOpaquePipeline = createLayerPipeline(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout,
+            blend: nil,
+            stencilCompare: .equal,
+            depthEnabled: true
+        )
+
         createEmitterTexturedAdditivePipelines(
             device: device,
             shaderModule: shaderModule,
@@ -2053,13 +2294,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         )
 
-        func makePipeline(stencilCompare: GPUCompareFunction) -> GPURenderPipeline {
+        func makePipeline(
+            stencilCompare: GPUCompareFunction,
+            depthEnabled: Bool
+        ) -> GPURenderPipeline {
             device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
                 vertex: vertexState,
                 depthStencil: GPUDepthStencilState(
                     format: .depth24plusStencil8,
-                    depthWriteEnabled: false,
-                    depthCompare: .always,
+                    depthWriteEnabled: depthEnabled,
+                    depthCompare: depthEnabled ? .greaterEqual : .always,
                     stencilFront: GPUStencilFaceState(
                         compare: stencilCompare,
                         failOp: .keep,
@@ -2082,8 +2326,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ))
         }
 
-        emitterTexturedAdditivePipeline = makePipeline(stencilCompare: .always)
-        emitterTexturedAdditiveStencilPipeline = makePipeline(stencilCompare: .equal)
+        emitterTexturedAdditivePipeline = makePipeline(stencilCompare: .always, depthEnabled: false)
+        emitterTexturedAdditiveStencilPipeline = makePipeline(stencilCompare: .equal, depthEnabled: false)
+        emitterTexturedAdditiveDepthPipeline = makePipeline(stencilCompare: .always, depthEnabled: true)
+        emitterTexturedAdditiveDepthStencilPipeline = makePipeline(stencilCompare: .equal, depthEnabled: true)
     }
 
     private func createPremultipliedTexturedPipelines(
@@ -2131,13 +2377,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         )
 
-        func makePipeline(stencilCompare: GPUCompareFunction) -> GPURenderPipeline {
+        func makePipeline(
+            stencilCompare: GPUCompareFunction,
+            depthEnabled: Bool
+        ) -> GPURenderPipeline {
             device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
                 vertex: vertexState,
                 depthStencil: GPUDepthStencilState(
                     format: .depth24plusStencil8,
-                    depthWriteEnabled: false,
-                    depthCompare: .always,
+                    depthWriteEnabled: depthEnabled,
+                    depthCompare: depthEnabled ? .greaterEqual : .always,
                     stencilFront: GPUStencilFaceState(
                         compare: stencilCompare,
                         failOp: .keep,
@@ -2162,8 +2411,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ))
         }
 
-        premultipliedTexturedPipeline = makePipeline(stencilCompare: .always)
-        premultipliedTexturedStencilPipeline = makePipeline(stencilCompare: .equal)
+        premultipliedTexturedPipeline = makePipeline(stencilCompare: .always, depthEnabled: false)
+        premultipliedTexturedStencilPipeline = makePipeline(stencilCompare: .equal, depthEnabled: false)
+        premultipliedTexturedDepthPipeline = makePipeline(stencilCompare: .always, depthEnabled: true)
+        premultipliedTexturedDepthStencilPipeline = makePipeline(stencilCompare: .equal, depthEnabled: true)
     }
 
     /// R3.5: pick the textured pipeline based on stencil state and the
@@ -2171,6 +2422,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// variant when an opaque pipeline isn't created (test fallback).
     private func selectTexturedPipeline(for layer: CALayer) -> GPURenderPipeline? {
         let blendOff = !RasterizationDecisions.blendEnabled(for: layer)
+        if transformDepthNesting > 0 {
+            if maskNestingDepth > 0 {
+                if blendOff, let opaque = texturedDepthStencilOpaquePipeline { return opaque }
+                return texturedDepthStencilPipeline ?? texturedDepthPipeline
+            }
+            if blendOff, let opaque = texturedDepthOpaquePipeline { return opaque }
+            return texturedDepthPipeline
+        }
         if maskNestingDepth > 0 {
             if blendOff, let opaque = texturedStencilOpaquePipeline { return opaque }
             return texturedStencilPipeline ?? texturedPipeline
@@ -2804,6 +3063,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         activeCompositionExecutions.removeAll(keepingCapacity: true)
         compositionCaptureStopKey = nil
         compositionCaptureDidReachStop = false
+        transformDepthNesting = 0
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
@@ -2916,7 +3176,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ],
             depthStencilAttachment: GPURenderPassDepthStencilAttachment(
                 view: depthTextureView,
-                depthClearValue: 1.0,
+                depthClearValue: 0.0,
                 depthLoadOp: .clear,
                 depthStoreOp: .store,
                 stencilClearValue: 0,
@@ -3092,10 +3352,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         bindGroupLayout = nil
         depthTexture = nil
         pipeline = nil
+        depthPipeline = nil
+        depthClearPipeline = nil
         texturedPipeline = nil
+        texturedDepthPipeline = nil
         texturedOpaquePipeline = nil
+        texturedDepthOpaquePipeline = nil
         premultipliedTexturedPipeline = nil
         premultipliedTexturedStencilPipeline = nil
+        premultipliedTexturedDepthPipeline = nil
+        premultipliedTexturedDepthStencilPipeline = nil
         texturedBindGroupLayout = nil
         textureSampler = nil
 
@@ -3201,16 +3467,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         stencilWritePipeline = nil
         stencilWriteRoundedPipeline = nil
         stencilTestPipeline = nil
+        depthStencilTestPipeline = nil
         texturedStencilPipeline = nil
+        texturedDepthStencilPipeline = nil
         texturedStencilOpaquePipeline = nil
+        texturedDepthStencilOpaquePipeline = nil
         shadowCompositeStencilPipeline = nil
         maskNestingDepth = 0
+        transformDepthNesting = 0
         currentStencilValue = 0
 
         // Particle resources
         emitterTextureSamplers.removeAll(keepingCapacity: false)
         emitterTexturedAdditivePipeline = nil
         emitterTexturedAdditiveStencilPipeline = nil
+        emitterTexturedAdditiveDepthPipeline = nil
+        emitterTexturedAdditiveDepthStencilPipeline = nil
         emitterLayerStates.removeAll(keepingCapacity: false)
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
         emitterSpawnFailureCount = 0
@@ -3348,6 +3620,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         } else {
             modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
         }
+
+        // A transform layer contributes only its transform and per-child opacity.
+        // Its own 2D compositing, mask, shadow, filter, rasterization, and backface
+        // properties do not create a drawable plane.
+        if presentationLayer is CATransformLayer {
+            renderTransformLayerSublayers(
+                layer,
+                presentationLayer: presentationLayer,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+            return
+        }
+
         if filterPrerenderRootLayer !== layer,
            presentationLayer.filters?.isEmpty == false,
            failedLayerFilterKeys.contains(renderKey(for: layer)) {
@@ -3441,17 +3727,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 presentationLayer: presentationLayer,
                 texture: cachedTexture,
                 device: device,
-                renderPass: renderPass,
-                modelMatrix: modelMatrix
-            )
-            return
-        }
-
-        // CATransformLayer: Only render sublayers, skip own properties
-        if presentationLayer is CATransformLayer {
-            renderTransformLayerSublayers(
-                layer,
-                presentationLayer: presentationLayer,
                 renderPass: renderPass,
                 modelMatrix: modelMatrix
             )
@@ -4132,9 +4407,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             uniformBuffer: uniformBuffer,
             uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
         )
-        let selectedPipeline = maskNestingDepth > 0
-            ? premultipliedTexturedStencilPipeline
-            : premultipliedTexturedPipeline
+        let selectedPipeline: GPURenderPipeline?
+        if transformDepthNesting > 0 {
+            selectedPipeline = maskNestingDepth > 0
+                ? premultipliedTexturedDepthStencilPipeline
+                : premultipliedTexturedDepthPipeline
+        } else {
+            selectedPipeline = maskNestingDepth > 0
+                ? premultipliedTexturedStencilPipeline
+                : premultipliedTexturedPipeline
+        }
         guard let selectedPipeline else { return }
         renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
@@ -4302,6 +4584,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Used by background and border rendering so solid-colored quads respect CALayer.mask
     /// and rounded-corner masksToBounds clipping.
     private func stencilAwarePipeline() -> GPURenderPipeline {
+        if transformDepthNesting > 0 {
+            if maskNestingDepth > 0, let depthStencilTestPipeline {
+                return depthStencilTestPipeline
+            }
+            if let depthPipeline {
+                return depthPipeline
+            }
+        }
         if maskNestingDepth > 0, let stencilTestPipeline = stencilTestPipeline {
             return stencilTestPipeline
         }
@@ -8093,6 +8383,26 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let key = renderKey(for: layer)
         let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
+        if presentation is CATransformLayer {
+            forEachPrepassSublayer(
+                of: layer,
+                presentationLayer: presentation,
+                modelMatrix: modelMatrix
+            ) { sublayer, sublayerParentMatrix in
+                collectBackdropCompositionTargets(
+                    sublayer,
+                    parentMatrix: sublayerParentMatrix,
+                    ancestorBackdropScopes: ancestorBackdropScopes,
+                    ancestorClipTargets: ancestorClipTargets,
+                    ancestorContentMaskTargets: ancestorContentMaskTargets,
+                    hasUnsupportedAncestorRasterization: hasUnsupportedAncestorRasterization,
+                    inheritedOpacity: inheritedOpacity * presentation.opacity,
+                    targets: &targets,
+                    structurallyInvalidKeys: &structurallyInvalidKeys
+                )
+            }
+            return
+        }
         let hasComposition = presentation.compositingFilter != nil
             || presentation.backgroundFilters?.isEmpty == false
         let createsBackdropScope = hasComposition
@@ -8230,7 +8540,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
-        if presentationLayer.shouldRasterize {
+        if !(presentationLayer is CATransformLayer), presentationLayer.shouldRasterize {
             captureRasterizedLayer(
                 layer,
                 device: device,
@@ -8736,7 +9046,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         }
 
-        if presentationLayer.filters?.isEmpty == false
+        if !(presentationLayer is CATransformLayer),
+           presentationLayer.filters?.isEmpty == false
             || requiresGroupOpacity(presentationLayer)
             || presentationLayer.compositingFilter != nil
             || presentationLayer.backgroundFilters?.isEmpty == false {
@@ -8764,7 +9075,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
-        if presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil {
+        if !(presentationLayer is CATransformLayer),
+           presentationLayer.shadowOpacity > 0,
+           presentationLayer.shadowColor != nil {
             result.append(LayerPrepassTarget(
                 layer: layer,
                 presentationLayer: presentationLayer,
@@ -8994,11 +9307,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) {
         guard layer.sublayers != nil else { return }
 
+        let beginsIndependentDepthGroup = transformDepthNesting == 0
+        if beginsIndependentDepthGroup {
+            guard let depthClearPipeline else { return }
+            renderPass.setPipeline(depthClearPipeline)
+            renderPass.draw(vertexCount: 3)
+        }
+        transformDepthNesting += 1
+        defer { transformDepthNesting -= 1 }
+
         // `renderLayer` already applied this transform layer's presentation transform.
         // Only the sublayer transform and bounds origin remain before traversing children.
         let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
-        for sublayer in orderedSublayers(for: layer) {
+        for sublayer in depthOrderedSublayers(for: layer, parentMatrix: sublayerMatrix) {
             self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
         }
     }
@@ -9247,9 +9569,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 draw(state.particles[index])
             }
         case .additive:
-            let additivePipeline = maskNestingDepth > 0
-                ? emitterTexturedAdditiveStencilPipeline
-                : emitterTexturedAdditivePipeline
+            let additivePipeline: GPURenderPipeline?
+            if transformDepthNesting > 0 {
+                additivePipeline = maskNestingDepth > 0
+                    ? emitterTexturedAdditiveDepthStencilPipeline
+                    : emitterTexturedAdditiveDepthPipeline
+            } else {
+                additivePipeline = maskNestingDepth > 0
+                    ? emitterTexturedAdditiveStencilPipeline
+                    : emitterTexturedAdditivePipeline
+            }
             guard additivePipeline != nil else {
                 emitterRenderFailureCount += 1
                 return
@@ -9454,11 +9783,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               ),
               let sampler = emitterTextureSamplers[sampling],
               let texturedBindGroupLayout,
-              let selectedPipeline = additive
-                ? (maskNestingDepth > 0
-                    ? emitterTexturedAdditiveStencilPipeline
-                    : emitterTexturedAdditivePipeline)
-                : (maskNestingDepth > 0 ? texturedStencilPipeline : texturedPipeline),
+              let selectedPipeline = selectedEmitterPipeline(additive: additive),
               let texture = textureManager?.getOrCreateTexture(
                 for: image,
                 width: image.width,
@@ -9548,6 +9873,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
         return true
+    }
+
+    private func selectedEmitterPipeline(additive: Bool) -> GPURenderPipeline? {
+        if additive {
+            if transformDepthNesting > 0 {
+                return maskNestingDepth > 0
+                    ? emitterTexturedAdditiveDepthStencilPipeline
+                    : emitterTexturedAdditiveDepthPipeline
+            }
+            return maskNestingDepth > 0
+                ? emitterTexturedAdditiveStencilPipeline
+                : emitterTexturedAdditivePipeline
+        }
+        if transformDepthNesting > 0 {
+            return maskNestingDepth > 0
+                ? texturedDepthStencilPipeline
+                : texturedDepthPipeline
+        }
+        return maskNestingDepth > 0 ? texturedStencilPipeline : texturedPipeline
     }
 
     private func particleStateIsFinite(_ particle: EmitterParticle) -> Bool {

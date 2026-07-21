@@ -50,6 +50,25 @@ import Foundation
 /// Solid color rendering does NOT flip V because texCoord is used for
 /// position-based calculations (corner radius, gradients), not texture sampling.
 public enum CAWebGPUShaders {
+    /// Full-screen depth reset used to isolate independent CATransformLayer groups.
+    /// Color writes are disabled by the matching render pipeline.
+    public static let depthClear = """
+    @vertex
+    fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
+        let positions = array<vec2<f32>, 3>(
+            vec2<f32>(-1.0, -1.0),
+            vec2<f32>(3.0, -1.0),
+            vec2<f32>(-1.0, 3.0)
+        );
+        return vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+    }
+
+    @fragment
+    fn fragmentMain() -> @location(0) vec4<f32> {
+        return vec4<f32>(0.0);
+    }
+    """
+
 
     // MARK: - Main Layer Shader
 
@@ -223,6 +242,9 @@ public enum CAWebGPUShaders {
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
         // Handle case where layer size is zero
         if (uniforms.layerSize.x <= 0.0 || uniforms.layerSize.y <= 0.0) {
+            if (input.color.a <= 0.0) {
+                discard;
+            }
             return input.color;
         }
 
@@ -259,6 +281,9 @@ public enum CAWebGPUShaders {
                 gradientColor.a *= alpha;
             }
 
+            if (gradientColor.a <= 0.0) {
+                discard;
+            }
             return gradientColor;
         }
 
@@ -282,11 +307,18 @@ public enum CAWebGPUShaders {
             let innerAlpha = 1.0 - smoothstep(-1.0, 1.0, innerDist);
             let borderAlpha = outerAlpha - innerAlpha;
 
-            return vec4<f32>(input.color.rgb, input.color.a * borderAlpha);
+            let borderColor = vec4<f32>(input.color.rgb, input.color.a * borderAlpha);
+            if (borderColor.a <= 0.0) {
+                discard;
+            }
+            return borderColor;
         }
 
         // Fill rendering mode (default)
         if (!hasAnyCornerRadius) {
+            if (input.color.a <= 0.0) {
+                discard;
+            }
             return input.color;
         }
 
@@ -296,7 +328,11 @@ public enum CAWebGPUShaders {
         // Anti-aliased edge (smooth over 1 pixel)
         let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
 
-        return vec4<f32>(input.color.rgb, input.color.a * alpha);
+        let fillColor = vec4<f32>(input.color.rgb, input.color.a * alpha);
+        if (fillColor.a <= 0.0) {
+            discard;
+        }
+        return fillColor;
     }
 
     // Stencil clip fragment shader: discards fragments outside the rounded rectangle
@@ -420,6 +456,9 @@ public enum CAWebGPUShaders {
             texColor.a *= alpha;
         }
 
+        if (texColor.a <= 0.0) {
+            discard;
+        }
         return texColor;
     }
     """
@@ -461,9 +500,13 @@ public enum CAWebGPUShaders {
 
     @fragment
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
-        return textureSample(textureData, textureSampler, input.texCoord)
+        let color = textureSample(textureData, textureSampler, input.texCoord)
             * input.color
             * uniforms.opacity;
+        if (color.a <= 0.0) {
+            discard;
+        }
+        return color;
     }
     """
 

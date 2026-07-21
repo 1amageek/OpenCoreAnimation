@@ -42,6 +42,7 @@ nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
 nonisolated(unsafe) var replicatorProbeResult: String = "pending"
 nonisolated(unsafe) var compositionProbeResult: String = "pending"
+nonisolated(unsafe) var transformDepthProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -90,6 +91,7 @@ public func setup() {
             emitterProbeResult = "pending"
             replicatorProbeResult = "pending"
             compositionProbeResult = "pending"
+            transformDepthProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -272,6 +274,9 @@ func installHarness() {
         })
         h.expose("getCompositionProbeResult", returning: {
             .string(compositionProbeResult)
+        })
+        h.expose("getTransformDepthProbeResult", returning: {
+            .string(transformDepthProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -685,6 +690,173 @@ func installHarness() {
                 rejected.removeFromSuperlayer()
                 alphaFiltered.removeFromSuperlayer()
                 engine.renderFrame()
+            }
+        })
+        h.expose("beginTransformDepthProbe", action: {
+            Task { @MainActor in
+                transformDepthProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    transformDepthProbeResult = "error: transform depth dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                let crossingGroup = CATransformLayer()
+                crossingGroup.bounds = root.bounds
+                crossingGroup.anchorPoint = .zero
+                crossingGroup.position = .zero
+                crossingGroup.backgroundColor = CGColor(red: 1, green: 1, blue: 0, alpha: 1)
+                crossingGroup.filters = [CAFilter.colorInvert()]
+                crossingGroup.mask = CALayer()
+                crossingGroup.shadowColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                crossingGroup.shadowOpacity = 1
+                crossingGroup.shouldRasterize = true
+
+                let flatPlane = CALayer()
+                flatPlane.bounds = CGRect(x: 0, y: 0, width: 120, height: 80)
+                flatPlane.position = CGPoint(x: 200, y: 220)
+                flatPlane.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                crossingGroup.addSublayer(flatPlane)
+
+                let crossingPlane = CALayer()
+                crossingPlane.bounds = flatPlane.bounds
+                crossingPlane.position = flatPlane.position
+                crossingPlane.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                crossingPlane.transform = CATransform3DMakeRotation(.pi / 3, 0, 1, 0)
+                crossingGroup.addSublayer(crossingPlane)
+                root.addSublayer(crossingGroup)
+
+                let transparencyGroup = CATransformLayer()
+                transparencyGroup.bounds = root.bounds
+                transparencyGroup.anchorPoint = .zero
+                transparencyGroup.position = .zero
+
+                let imageData = Data([
+                    255, 255, 255, 255,
+                    0, 0, 0, 0,
+                    255, 255, 255, 255,
+                ])
+                guard let transparentImage = CGImage(
+                    width: 3,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 12,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                    provider: CGDataProvider(data: imageData),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    crossingGroup.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    transformDepthProbeResult = "error: transparent depth image unavailable"
+                    return
+                }
+
+                let transparentFront = CALayer()
+                transparentFront.bounds = CGRect(x: 0, y: 0, width: 90, height: 30)
+                transparentFront.position = CGPoint(x: 100, y: 80)
+                transparentFront.contents = transparentImage
+                transparentFront.magnificationFilter = .nearest
+                transparentFront.transform = CATransform3DMakeTranslation(0, 0, 100)
+                transparencyGroup.addSublayer(transparentFront)
+
+                let transparentBack = CALayer()
+                transparentBack.bounds = transparentFront.bounds
+                transparentBack.position = transparentFront.position
+                transparentBack.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                transparencyGroup.addSublayer(transparentBack)
+                root.addSublayer(transparencyGroup)
+
+                let firstIndependentGroup = CATransformLayer()
+                firstIndependentGroup.bounds = root.bounds
+                firstIndependentGroup.anchorPoint = .zero
+                firstIndependentGroup.position = .zero
+                let firstIndependentPlane = CALayer()
+                firstIndependentPlane.bounds = CGRect(x: 0, y: 0, width: 50, height: 50)
+                firstIndependentPlane.position = CGPoint(x: 330, y: 100)
+                firstIndependentPlane.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                firstIndependentPlane.transform = CATransform3DMakeTranslation(0, 0, 500)
+                firstIndependentGroup.addSublayer(firstIndependentPlane)
+                root.addSublayer(firstIndependentGroup)
+
+                let secondIndependentGroup = CATransformLayer()
+                secondIndependentGroup.bounds = root.bounds
+                secondIndependentGroup.anchorPoint = .zero
+                secondIndependentGroup.position = .zero
+                let secondIndependentPlane = CALayer()
+                secondIndependentPlane.bounds = firstIndependentPlane.bounds
+                secondIndependentPlane.position = firstIndependentPlane.position
+                secondIndependentPlane.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                secondIndependentPlane.transform = CATransform3DMakeTranslation(0, 0, -500)
+                secondIndependentGroup.addSublayer(secondIndependentPlane)
+                root.addSublayer(secondIndependentGroup)
+                CATransaction.commit()
+
+                do {
+                    engine.renderFrame()
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 185, y: 80),
+                        CGPoint(x: 215, y: 80),
+                        CGPoint(x: 70, y: 220),
+                        CGPoint(x: 100, y: 220),
+                        CGPoint(x: 130, y: 220),
+                        CGPoint(x: 330, y: 200),
+                    ])
+                    crossingGroup.removeFromSuperlayer()
+                    transparencyGroup.removeFromSuperlayer()
+                    firstIndependentGroup.removeFromSuperlayer()
+                    secondIndependentGroup.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                    let crossingIsDepthCorrect = pixels[0] == [255, 0, 0, 255]
+                        && pixels[1] == [0, 0, 255, 255]
+                    let transparentPixelsAreCorrect = pixels[2][0] >= 240
+                        && pixels[2][1] >= 240
+                        && pixels[2][2] >= 240
+                        && pixels[2][3] == 255
+                        && pixels[3][0] == 0
+                        && pixels[3][1] >= 245
+                        && pixels[3][2] == 0
+                        && pixels[3][3] == 255
+                        && pixels[4] == [255, 255, 255, 255]
+                    let independentGroupsAreIsolated = pixels[5] == [0, 255, 0, 255]
+                    transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
+                        + ",transparent=\(transparentPixelsAreCorrect)"
+                        + ",isolated=\(independentGroupsAreIsolated)"
+                } catch {
+                    crossingGroup.removeFromSuperlayer()
+                    transparencyGroup.removeFromSuperlayer()
+                    firstIndependentGroup.removeFromSuperlayer()
+                    secondIndependentGroup.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                    transformDepthProbeResult = "error: \(error)"
+                }
             }
         })
         h.expose("beginCompositionProbe", action: {

@@ -63,17 +63,15 @@ extension CALayer {
 
     /// Calculates the model matrix for this layer.
     ///
-    /// Uses painter's algorithm (back-to-front draw order) for z-ordering.
-    /// zPosition is handled by sorting sublayers before rendering, not by
-    /// depth buffer values. All z-coordinates are zero in the transform.
+    /// Normal layer trees still use stable painter ordering, while transform-layer
+    /// descendants additionally consume the generated z coordinate in the depth buffer.
     internal func modelMatrix(parentMatrix: Matrix4x4 = .identity) -> Matrix4x4 {
         var matrix = parentMatrix
 
-        // zPosition handled by painter's algorithm sorting, not depth buffer
         let translation = Matrix4x4(translation: SIMD3<Float>(
             Float(position.x),
             Float(position.y),
-            0
+            Float(zPosition)
         ))
         matrix = matrix * translation
 
@@ -82,11 +80,10 @@ extension CALayer {
             matrix = matrix * layerTransform
         }
 
-        // Anchor point offset (z=0, anchorPointZ unused in painter's algorithm)
         let anchorOffset = Matrix4x4(translation: SIMD3<Float>(
             Float(-bounds.width * anchorPoint.x),
             Float(-bounds.height * anchorPoint.y),
-            0
+            Float(-anchorPointZ)
         ))
         matrix = matrix * anchorOffset
 
