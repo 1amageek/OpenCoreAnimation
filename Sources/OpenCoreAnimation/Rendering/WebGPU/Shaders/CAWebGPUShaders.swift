@@ -947,6 +947,55 @@ public enum CAWebGPUShaders {
     }
     """
 
+    /// Reprojects a viewport-sized composition while rendering into a local capture.
+    public static let capturedComposition = """
+    struct Uniforms {
+        mvpMatrix: mat4x4<f32>,
+        opacity: f32,
+        cornerRadius: f32,
+        viewportSize: vec2<f32>,
+        cornerRadii: vec4<f32>,
+        samplingBias: f32,
+        padding0: f32,
+        padding1: f32,
+        padding2: f32,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+    @group(0) @binding(1) var compositionTexture: texture_2d<f32>;
+    @group(0) @binding(2) var textureSampler: sampler;
+
+    struct VertexInput {
+        @location(0) position: vec2<f32>,
+        @location(1) viewportNumerator: vec2<f32>,
+        @location(2) homogeneousCoordinate: vec4<f32>,
+    }
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) @interpolate(linear) viewportNumerator: vec2<f32>,
+        @location(1) @interpolate(linear) homogeneousW: f32,
+    }
+
+    @vertex
+    fn vertexMain(input: VertexInput) -> VertexOutput {
+        var output: VertexOutput;
+        output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
+        output.viewportNumerator = input.viewportNumerator;
+        output.homogeneousW = input.homogeneousCoordinate.x;
+        return output;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        if (abs(input.homogeneousW) <= 0.000001) {
+            discard;
+        }
+        let viewportCoordinate = input.viewportNumerator / input.homogeneousW;
+        return textureSample(compositionTexture, textureSampler, viewportCoordinate);
+    }
+    """
+
     /// Combines a filtered backdrop with its unmodified source through a layer-shape mask.
     public static let backdropFilterMix = """
     @group(0) @binding(0) var originalBackdrop: texture_2d<f32>;

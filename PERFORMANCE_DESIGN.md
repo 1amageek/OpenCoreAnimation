@@ -715,7 +715,8 @@ For a layer with `shouldRasterize == true`:
 
 1. If cache hit AND no descendant of the layer is dirty
    (`layer._subtreeDirtyCount == 0`) AND
-   `layer.contentBoundsHash == cached.contentBoundsHash`:
+   `layer.contentBoundsHash == cached.contentBoundsHash` AND the captured
+   subtree does not contain backdrop-dependent composition:
     - Composite the cached texture as a single textured quad at `layer`'s
       transform.
     - Apply `layer.opacity` at composite time (R3.3 — opacity excluded from
@@ -727,6 +728,11 @@ For a layer with `shouldRasterize == true`:
       the existing `renderLayer` with a redirected render-pass target).
     - Replace cache entry.
     - Composite as in (1).
+
+A captured subtree containing `compositingFilter` or `backgroundFilters`
+depends on pixels outside that subtree. Its ancestor rasterization is therefore
+deferred until backdrop composition completes and is recaptured every frame;
+ordinary layer dirty state cannot prove that the external backdrop is unchanged.
 
 #### Eviction (R3.4)
 
@@ -778,6 +784,7 @@ contributor's `_dirtyMask` before re-running the blur passes.
 |---|---|
 | `shouldRasterize` toggled mid-animation | `.rasterization` bit set; cache evicted on next render. |
 | Rasterized layer's child mutates | `_subtreeDirtyCount > 0` at the rasterized root → recapture. |
+| Rasterized subtree contains backdrop composition | Resolve the descendant composition first, then recapture every frame because external backdrop pixels are outside the subtree dirty contract. |
 | Layer scrolls (transform-only change) | Transform is a uniform, so cached texture is reused; `contentBoundsHash` excludes the parent's transform — only the *self* transform that affects internal layout matters, which is captured in `bounds`. |
 | `rasterizationScale` change | `.rasterization` bit; cache evicted. |
 | Off-screen layer | Optimization opportunity (skip capture) but out of scope; cache still works. |

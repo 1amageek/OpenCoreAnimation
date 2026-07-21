@@ -855,7 +855,8 @@ func installHarness() {
                 compositionPlane.bounds = compositionBackdropPlane.bounds
                 compositionPlane.position = compositionBackdropPlane.position
                 compositionPlane.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
-                guard let compositionScreenFilter = CIFilter(name: "CIScreenCompositing") else {
+                guard let compositionScreenFilter = CIFilter(name: "CIScreenCompositing"),
+                      let nestedCompositionFilter = CIFilter(name: "CIScreenCompositing") else {
                     crossingGroup.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
@@ -875,6 +876,25 @@ func installHarness() {
                 compositionCrossingPlane.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                 compositionCrossingPlane.transform = CATransform3DMakeRotation(.pi / 3, 0, 1, 0)
                 crossingGroup.addSublayer(compositionCrossingPlane)
+
+                let nestedCompositionGroup = CALayer()
+                nestedCompositionGroup.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                nestedCompositionGroup.position = CGPoint(x: 150, y: 250)
+                nestedCompositionGroup.zPosition = 200
+                var nestedCompositionPerspective = CATransform3DMakeRotation(.pi / 6, 0, 1, 0)
+                nestedCompositionPerspective.m14 = -1 / 500
+                nestedCompositionGroup.transform = nestedCompositionPerspective
+                let explicitCompositionGroup = CALayer()
+                explicitCompositionGroup.frame = nestedCompositionGroup.bounds
+                explicitCompositionGroup.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                explicitCompositionGroup.shouldRasterize = true
+                let nestedCompositionChild = CALayer()
+                nestedCompositionChild.frame = CGRect(x: 0, y: 0, width: 20, height: 40)
+                nestedCompositionChild.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                nestedCompositionChild.compositingFilter = nestedCompositionFilter
+                explicitCompositionGroup.addSublayer(nestedCompositionChild)
+                nestedCompositionGroup.addSublayer(explicitCompositionGroup)
+                crossingGroup.addSublayer(nestedCompositionGroup)
                 root.addSublayer(crossingGroup)
 
                 let transparencyGroup = CATransformLayer()
@@ -973,6 +993,8 @@ func installHarness() {
                         CGPoint(x: 185, y: 160),
                         CGPoint(x: 285, y: 260),
                         CGPoint(x: 315, y: 260),
+                        CGPoint(x: 140, y: 50),
+                        CGPoint(x: 160, y: 50),
                     ])
                     let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
@@ -1029,12 +1051,17 @@ func installHarness() {
                         && pixels[15] == [0, 0, 0, 255]
                     let compositionPlaneWritesDepth = pixels[17] == [0, 0, 255, 255]
                         && pixels[18] == [255, 255, 0, 255]
+                    let nestedCompositionSurvivesFlattening = pixels[19] == [255, 255, 0, 255]
+                        && pixels[20] == [255, 0, 0, 255]
+                    // The composition-dependent flattened group is recaptured every frame
+                    // because its pixels depend on an external backdrop, while unrelated
+                    // flattened groups remain reusable.
                     let changedSubtreeWasRecaptured = updatedFlattenedPixel == [0, 0, 255, 255]
-                        && flatteningRecaptureCount == 1
-                        && flatteningUpdatedCompositeCount == 7
+                        && flatteningRecaptureCount == 2
+                        && flatteningUpdatedCompositeCount == 8
                     let unchangedSubtreeWasReused = reusedFlattenedPixel == [0, 0, 255, 255]
-                        && flatteningReuseCaptureCount == 0
-                        && flatteningReuseCompositeCount == 7
+                        && flatteningReuseCaptureCount == 1
+                        && flatteningReuseCompositeCount == 8
                     transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
                         + ",transparent=\(transparentPixelsAreCorrect)"
                         + ",isolated=\(independentGroupsAreIsolated)"
@@ -1049,6 +1076,7 @@ func installHarness() {
                         + ",shadow=\(expandedShadowIsVisible)"
                         + ",shadowPath=\(customShadowPathIsRespected)"
                         + ",compositionDepth=\(compositionPlaneWritesDepth)"
+                        + ",nestedComposition=\(nestedCompositionSurvivesFlattening)"
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
                 } catch {
