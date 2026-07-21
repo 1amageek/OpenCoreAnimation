@@ -24,6 +24,7 @@ interface OCA extends Harness {
     getLayerFilterProbeResult: () => string;
     getShadowProbeResult: () => string;
     getDisplayLinkProbeResult: () => string;
+    getEmitterProbeResult: () => string;
     getTransitionSourceCaptureCount: () => number;
     getTransitionTargetCaptureCount: () => number;
     getActiveTransitionTextureCount: () => number;
@@ -38,6 +39,7 @@ interface OCA extends Harness {
     beginLayerFilterProbe: () => void;
     beginShadowProbe: () => void;
     beginDisplayLinkProbe: () => void;
+    beginEmitterProbe: () => void;
     removeTransition: () => void;
     beginPixelReadback: () => void;
 }
@@ -111,6 +113,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         );
         expect(await h.getActiveShadowResourceCount()).toBe(0);
         expect(await h.getShadowRenderFailureCount()).toBe(0);
+
+        await h.beginEmitterProbe();
+        await expect.poll(() => h.getEmitterProbeResult(), { timeout: 10_000 }).toBe(
+            "before=1,1,states=2;after=0,1,states=1;final=0"
+        );
 
         await h.beginDisplayLinkProbe();
         await expect.poll(() => h.getDisplayLinkProbeResult(), { timeout: 10_000 }).toBe(

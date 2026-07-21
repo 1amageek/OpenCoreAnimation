@@ -281,6 +281,22 @@ private struct PrerenderedShadow {
     let resources: ShadowLayerResources
 }
 
+private final class EmitterLayerState {
+    weak var owner: CAEmitterLayer?
+    var particles: [EmitterParticle] = []
+    var birthRemainders: [ObjectIdentifier: Float] = [:]
+    var randomState: UInt32
+    var configuredSeed: UInt32
+    var lastUpdateTime: CFTimeInterval = 0
+    var lastUpdatedFrame: UInt64 = 0
+
+    init(owner: CAEmitterLayer, seed: UInt32) {
+        self.owner = owner
+        randomState = seed
+        configuredSeed = seed
+    }
+}
+
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
 ///
 /// This is the primary renderer for OpenCoreAnimation in production.
@@ -382,6 +398,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public var activeShadowResourceCount: Int {
         shadowLayerResources.count
+    }
+
+    /// Number of emitter-layer simulations retained after the latest frame.
+    @_spi(RendererDiagnostics)
+    public var activeEmitterStateCount: Int {
+        emitterLayerStates.count
+    }
+
+    /// Number of live particles owned by one emitter layer.
+    @_spi(RendererDiagnostics)
+    public func activeParticleCount(for layer: CAEmitterLayer) -> Int {
+        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+            return 0
+        }
+        return state.particles.count
     }
 
     /// Number of visible shadows that could not complete the GPU render path.
@@ -802,8 +833,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Maximum number of particles.
     private static let maxParticles = 10000
 
-    /// Active particle data.
-    private var activeParticles: [EmitterParticle] = []
+    /// Simulation state owned independently by each emitter layer.
+    private var emitterLayerStates: [ObjectIdentifier: EmitterLayerState] = [:]
+
+    /// Emitter layers reached by rendering or offscreen capture this frame.
+    private var activeEmitterLayerIDs: Set<ObjectIdentifier> = []
 
     // MARK: - Initialization
 
@@ -2008,6 +2042,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
+        activeEmitterLayerIDs.removeAll(keepingCapacity: true)
+        collectEmitterLayerIDs(rootLayer, into: &activeEmitterLayerIDs)
 
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
@@ -2181,6 +2217,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cache.evictToBudget()
         }
         prerasterizedTextures.removeAll(keepingCapacity: true)
+        emitterLayerStates = emitterLayerStates.filter {
+            activeEmitterLayerIDs.contains($0.key)
+        }
+    }
+
+    private func collectEmitterLayerIDs(
+        _ layer: CALayer,
+        into result: inout Set<ObjectIdentifier>
+    ) {
+        if layer is CAEmitterLayer {
+            result.insert(ObjectIdentifier(layer))
+        }
+        for sublayer in layer.sublayers ?? [] {
+            collectEmitterLayerIDs(sublayer, into: &result)
+        }
     }
 
     /// Reads one pixel from the most recently submitted canvas texture.
@@ -2365,7 +2416,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Particle resources
         particleBuffer = nil
         particlePipeline = nil
-        activeParticles.removeAll()
+        emitterLayerStates.removeAll(keepingCapacity: false)
+        activeEmitterLayerIDs.removeAll(keepingCapacity: false)
 
         // Textured bind group / view caches (release JS-side handles)
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: false)
@@ -2571,9 +2623,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // CAEmitterLayer: Render particle system
-        if let emitterLayer = presentationLayer as? CAEmitterLayer {
-            renderEmitterLayer(emitterLayer, device: device, renderPass: renderPass,
-                             modelMatrix: modelMatrix, bindGroup: bindGroup)
+        if let emitterPresentation = presentationLayer as? CAEmitterLayer,
+           let emitterModel = layer as? CAEmitterLayer {
+            renderEmitterLayer(
+                emitterModel,
+                presentation: emitterPresentation,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup
+            )
             // Render sublayers after particles
             if let sublayers = layer.sublayers, !sublayers.isEmpty {
                 // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
@@ -7006,27 +7065,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - CAEmitterLayer Rendering
 
-    /// Last update time for particle simulation.
-    private var lastParticleUpdateTime: CFTimeInterval = 0
-
-    /// Random number generator state for particles.
-    private var particleRandomSeed: UInt32 = 12345
-
-    /// Tracks the last seed used to detect seed changes.
-    private var lastEmitterSeed: UInt32 = 0
-
-    /// Whether the random seed has been initialized.
-    private var randomSeedInitialized: Bool = false
-
     /// Generates a random float in [0, 1).
-    private func randomFloat() -> Float {
-        particleRandomSeed = particleRandomSeed &* 1103515245 &+ 12345
-        return Float(particleRandomSeed % 65536) / 65536.0
+    private func randomFloat(state: inout UInt32) -> Float {
+        state = state &* 1103515245 &+ 12345
+        return Float(state % 65536) / 65536.0
     }
 
     /// Generates a random float in [-1, 1).
-    private func randomSignedFloat() -> Float {
-        return randomFloat() * 2.0 - 1.0
+    private func randomSignedFloat(state: inout UInt32) -> Float {
+        randomFloat(state: &state) * 2.0 - 1.0
     }
 
     /// Rotates a 2D point around the center (0.5, 0.5) by the given angle in radians.
@@ -7044,97 +7091,120 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Renders a CAEmitterLayer with its particle system.
     private func renderEmitterLayer(
-        _ emitterLayer: CAEmitterLayer,
+        _ modelLayer: CAEmitterLayer,
+        presentation emitterLayer: CAEmitterLayer,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4,
         bindGroup: GPUBindGroup
     ) {
-        guard let emitterCells = emitterLayer.emitterCells, !emitterCells.isEmpty,
-              let pipeline = pipeline,
+        guard let pipeline = pipeline,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
+        let emitterCells = emitterLayer.emitterCells ?? []
 
-        // Initialize or update random seed only when seed changes
-        if !randomSeedInitialized || emitterLayer.seed != lastEmitterSeed {
-            particleRandomSeed = emitterLayer.seed
-            lastEmitterSeed = emitterLayer.seed
-            randomSeedInitialized = true
-        }
-
-        // Calculate delta time
-        let currentTime = CACurrentMediaTime()
-        let deltaTime: Float
-        if lastParticleUpdateTime > 0 {
-            deltaTime = min(Float(currentTime - lastParticleUpdateTime), 0.1)
+        let layerID = ObjectIdentifier(modelLayer)
+        activeEmitterLayerIDs.insert(layerID)
+        let state: EmitterLayerState
+        if let existing = emitterLayerStates[layerID], existing.owner === modelLayer {
+            state = existing
         } else {
-            deltaTime = 1.0 / 60.0
+            state = EmitterLayerState(owner: modelLayer, seed: emitterLayer.seed)
+            emitterLayerStates[layerID] = state
         }
-        lastParticleUpdateTime = currentTime
-
-        // Update existing particles
-        for i in 0..<activeParticles.count {
-            activeParticles[i].update(deltaTime: deltaTime)
+        if state.configuredSeed != emitterLayer.seed {
+            state.randomState = emitterLayer.seed
+            state.configuredSeed = emitterLayer.seed
         }
+        let currentCellIDs = Set(emitterCells.map(ObjectIdentifier.init))
+        state.birthRemainders = state.birthRemainders.filter { currentCellIDs.contains($0.key) }
 
-        // Remove dead particles
-        activeParticles.removeAll { !$0.isAlive }
+        let frameToken = CALayer._currentFrameToken
+        if state.lastUpdatedFrame != frameToken {
+            let currentTime = CACurrentMediaTime()
+            let deltaTime = state.lastUpdateTime > 0
+                ? min(max(Float(currentTime - state.lastUpdateTime), 0), 0.1)
+                : 1.0 / 60.0
+            state.lastUpdateTime = currentTime
+            state.lastUpdatedFrame = frameToken
 
-        // Spawn new particles
-        for cell in emitterCells where cell.isEnabled {
-            let birthRate = cell.birthRate * emitterLayer.birthRate
-            let particlesToSpawn = Int(birthRate * deltaTime + 0.5)
+            for index in state.particles.indices {
+                state.particles[index].update(deltaTime: deltaTime)
+            }
+            state.particles.removeAll { !$0.isAlive }
 
-            for _ in 0..<particlesToSpawn {
-                guard activeParticles.count < Self.maxParticles else { break }
+            for cell in emitterCells where cell.isEnabled {
+                let cellID = ObjectIdentifier(cell)
+                let birthRate = max(0, cell.birthRate * emitterLayer.birthRate)
+                let accumulated = birthRate * deltaTime
+                    + state.birthRemainders[cellID, default: 0]
+                let particlesToSpawn = Int(accumulated.rounded(.down))
+                state.birthRemainders[cellID] = accumulated - Float(particlesToSpawn)
 
-                var particle = EmitterParticle()
-                particle.position = calculateEmissionPosition(
-                    shape: emitterLayer.emitterShape,
-                    position: emitterLayer.emitterPosition,
-                    zPosition: emitterLayer.emitterZPosition,
-                    size: emitterLayer.emitterSize,
-                    depth: emitterLayer.emitterDepth
-                )
-
-                // Calculate velocity
-                let angle = Float(cell.emissionLongitude) + randomSignedFloat() * Float(cell.emissionRange)
-                let velocity = Float(cell.velocity + CGFloat(randomSignedFloat()) * CGFloat(cell.velocityRange)) * emitterLayer.velocity
-                particle.velocity = SIMD3(velocity * cos(angle), velocity * sin(angle), 0)
-                particle.acceleration = SIMD3(Float(cell.xAcceleration), Float(cell.yAcceleration), Float(cell.zAcceleration))
-
-                // Set lifetime
-                let lifetime = cell.lifetime + randomSignedFloat() * cell.lifetimeRange
-                particle.lifetime = lifetime * emitterLayer.lifetime
-                particle.maxLifetime = particle.lifetime
-
-                // Set scale
-                particle.scale = Float(cell.scale + CGFloat(randomSignedFloat()) * CGFloat(cell.scaleRange)) * emitterLayer.scale
-                particle.scaleSpeed = Float(cell.scaleSpeed)
-
-                // Set rotation
-                particle.rotationSpeed = Float(cell.spin + CGFloat(randomSignedFloat()) * CGFloat(cell.spinRange)) * emitterLayer.spin
-
-                // Set color
-                if let cellColor = cell.color, let components = cellColor.components, components.count >= 3 {
-                    particle.color = SIMD4(
-                        Float(components[0]) + randomSignedFloat() * cell.redRange,
-                        Float(components[1]) + randomSignedFloat() * cell.greenRange,
-                        Float(components[2]) + randomSignedFloat() * cell.blueRange,
-                        (components.count > 3 ? Float(components[3]) : 1.0) + randomSignedFloat() * cell.alphaRange
+                for _ in 0..<particlesToSpawn {
+                    guard state.particles.count < Self.maxParticles else { break }
+                    var particle = EmitterParticle()
+                    particle.position = calculateEmissionPosition(
+                        shape: emitterLayer.emitterShape,
+                        position: emitterLayer.emitterPosition,
+                        zPosition: emitterLayer.emitterZPosition,
+                        size: emitterLayer.emitterSize,
+                        depth: emitterLayer.emitterDepth,
+                        randomState: &state.randomState
                     )
-                } else {
-                    particle.color = SIMD4(1, 1, 1, 1)
-                }
 
-                particle.colorSpeed = SIMD4(cell.redSpeed, cell.greenSpeed, cell.blueSpeed, cell.alphaSpeed)
-                particle.isAlive = true
-                activeParticles.append(particle)
+                    let angle = Float(cell.emissionLongitude)
+                        + randomSignedFloat(state: &state.randomState) * Float(cell.emissionRange)
+                    let velocityVariation = CGFloat(
+                        randomSignedFloat(state: &state.randomState)
+                    ) * cell.velocityRange
+                    let velocity = Float(cell.velocity + velocityVariation) * emitterLayer.velocity
+                    particle.velocity = SIMD3(velocity * cos(angle), velocity * sin(angle), 0)
+                    particle.acceleration = SIMD3(
+                        Float(cell.xAcceleration),
+                        Float(cell.yAcceleration),
+                        Float(cell.zAcceleration)
+                    )
+
+                    particle.lifetime = (
+                        cell.lifetime
+                            + randomSignedFloat(state: &state.randomState) * cell.lifetimeRange
+                    ) * emitterLayer.lifetime
+                    particle.maxLifetime = particle.lifetime
+                    particle.scale = Float(
+                        cell.scale
+                            + CGFloat(randomSignedFloat(state: &state.randomState)) * cell.scaleRange
+                    ) * emitterLayer.scale
+                    particle.scaleSpeed = Float(cell.scaleSpeed)
+                    particle.rotationSpeed = Float(
+                        cell.spin
+                            + CGFloat(randomSignedFloat(state: &state.randomState)) * cell.spinRange
+                    ) * emitterLayer.spin
+
+                    if let components = cell.color?.components, components.count >= 3 {
+                        particle.color = SIMD4(
+                            Float(components[0]) + randomSignedFloat(state: &state.randomState) * cell.redRange,
+                            Float(components[1]) + randomSignedFloat(state: &state.randomState) * cell.greenRange,
+                            Float(components[2]) + randomSignedFloat(state: &state.randomState) * cell.blueRange,
+                            (components.count > 3 ? Float(components[3]) : 1)
+                                + randomSignedFloat(state: &state.randomState) * cell.alphaRange
+                        )
+                    }
+                    particle.colorSpeed = SIMD4(
+                        cell.redSpeed,
+                        cell.greenSpeed,
+                        cell.blueSpeed,
+                        cell.alphaSpeed
+                    )
+                    particle.isAlive = particle.lifetime > 0
+                    if particle.isAlive {
+                        state.particles.append(particle)
+                    }
+                }
             }
         }
-
         // Render particles
-        for particle in activeParticles where particle.isAlive {
+        for particle in state.particles where particle.isAlive {
             let scale = particle.scale * 20
 
             // Apply rotation to vertices
@@ -7198,7 +7268,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         position: CGPoint,
         zPosition: CGFloat,
         size: CGSize,
-        depth: CGFloat
+        depth: CGFloat,
+        randomState: inout UInt32
     ) -> SIMD3<Float> {
         let x = Float(position.x)
         let y = Float(position.y)
@@ -7210,17 +7281,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         case .point:
             return SIMD3(x, y, z)
         case .line:
-            return SIMD3(x - w/2 + w * randomFloat(), y, z)
+            return SIMD3(x - w/2 + w * randomFloat(state: &randomState), y, z)
         case .rectangle:
-            return SIMD3(x - w/2 + w * randomFloat(), y - h/2 + h * randomFloat(), z)
+            return SIMD3(
+                x - w/2 + w * randomFloat(state: &randomState),
+                y - h/2 + h * randomFloat(state: &randomState),
+                z
+            )
         case .circle:
-            let angle = randomFloat() * 2 * .pi
-            let radius = sqrt(randomFloat()) * min(w, h) / 2
+            let angle = randomFloat(state: &randomState) * 2 * .pi
+            let radius = sqrt(randomFloat(state: &randomState)) * min(w, h) / 2
             return SIMD3(x + radius * cos(angle), y + radius * sin(angle), z)
         case .sphere:
-            let theta = randomFloat() * 2 * .pi
-            let phi = acos(2 * randomFloat() - 1)
-            let r = cbrt(randomFloat()) * min(w, h, Float(depth)) / 2
+            let theta = randomFloat(state: &randomState) * 2 * .pi
+            let phi = acos(2 * randomFloat(state: &randomState) - 1)
+            let r = cbrt(randomFloat(state: &randomState)) * min(w, h, Float(depth)) / 2
             return SIMD3(x + r * sin(phi) * cos(theta), y + r * sin(phi) * sin(theta), z + r * cos(phi))
         default:
             return SIMD3(x, y, z)

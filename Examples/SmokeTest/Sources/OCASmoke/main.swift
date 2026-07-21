@@ -37,6 +37,7 @@ nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
+nonisolated(unsafe) var emitterProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -80,6 +81,7 @@ public func setup() {
             layerFilterProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
+            emitterProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -253,6 +255,9 @@ func installHarness() {
         })
         h.expose("getDisplayLinkProbeResult", returning: {
             .string(displayLinkProbeResult)
+        })
+        h.expose("getEmitterProbeResult", returning: {
+            .string(emitterProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -728,6 +733,69 @@ func installHarness() {
                 imageContent.removeFromSuperlayer()
                 engine.renderFrame()
                 shadowProbeResult = result
+            }
+        })
+        h.expose("beginEmitterProbe", action: {
+            Task { @MainActor in
+                emitterProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    emitterProbeResult = "error: root layer or renderer unavailable"
+                    return
+                }
+
+                func makeEmitter(x: CGFloat, color: CGColor) -> CAEmitterLayer {
+                    let cell = CAEmitterCell()
+                    cell.birthRate = 10
+                    cell.lifetime = 5
+                    cell.velocity = 0
+                    cell.scale = 1
+                    cell.color = color
+
+                    let layer = CAEmitterLayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = CGPoint(x: x, y: 140)
+                    layer.zPosition = 100
+                    layer.emitterPosition = CGPoint(x: 10, y: 10)
+                    layer.emitterCells = [cell]
+                    return layer
+                }
+
+                let first = makeEmitter(
+                    x: 70,
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                )
+                let second = makeEmitter(
+                    x: 170,
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                )
+                root.addSublayer(first)
+                root.addSublayer(second)
+
+                engine.renderFrame()
+                do {
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let firstCount = renderer.activeParticleCount(for: first)
+                    let secondCount = renderer.activeParticleCount(for: second)
+                    var result = "before=\(firstCount),\(secondCount),states=\(renderer.activeEmitterStateCount)"
+
+                    first.removeFromSuperlayer()
+                    engine.renderFrame()
+                    result += ";after=\(renderer.activeParticleCount(for: first)),\(renderer.activeParticleCount(for: second)),states=\(renderer.activeEmitterStateCount)"
+
+                    second.removeFromSuperlayer()
+                    engine.renderFrame()
+                    result += ";final=\(renderer.activeEmitterStateCount)"
+                    emitterProbeResult = result
+                } catch {
+                    first.removeFromSuperlayer()
+                    second.removeFromSuperlayer()
+                    engine.renderFrame()
+                    emitterProbeResult = "error: \(error)"
+                }
             }
         })
         h.expose("beginDisplayLinkProbe", action: {
