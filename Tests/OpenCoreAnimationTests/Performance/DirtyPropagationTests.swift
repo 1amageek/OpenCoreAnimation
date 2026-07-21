@@ -225,6 +225,29 @@ struct DirtyPropagationTests {
         #expect(leaf._subtreeDirtyCount == 0)
     }
 
+    @Test func detachedMaskChangesAdvanceContentRevisionAndClearAfterCommit() {
+        let target = CALayer()
+        let maskRoot = CALayer()
+        let maskLeaf = CALayer()
+        maskRoot.addSublayer(maskLeaf)
+        target.mask = maskRoot
+        target.recursivelyClearDirtyAfterCommit()
+
+        let originalRevision = maskLeaf._contentRevision
+        maskLeaf.opacity = 0.5
+
+        #expect(maskLeaf._contentRevision == originalRevision &+ 1)
+        #expect(maskLeaf._dirtyMask.contains(.appearance))
+        #expect(target._subtreeDirtyCount == 0)
+
+        target.recursivelyClearDirtyAfterCommit()
+
+        #expect(maskRoot._dirtyMask.isEmpty)
+        #expect(maskLeaf._dirtyMask.isEmpty)
+        #expect(maskRoot._subtreeDirtyCount == 0)
+        #expect(maskLeaf._subtreeDirtyCount == 0)
+    }
+
     // 1.12 — setNeedsDisplay() sets BOTH axes; bounds= touches NEITHER.
     @Test func setNeedsDisplaySetsBothAxes() {
         let layer = CALayer()

@@ -4123,6 +4123,10 @@ open class CALayer: CAMediaTiming, Hashable {
 
     internal var _dirtyMask: DirtyFlags = CALayer._initialDirtyMask
     internal var _subtreeDirtyCount: Int = 1
+    /// Monotonically identifies model-state changes even after dirty bits are
+    /// cleared. The renderer uses this for detached dependency trees such as
+    /// `mask`, whose mutations do not propagate through `superlayer`.
+    internal var _contentRevision: UInt64 = 0
     internal var _presentationCacheToken: UInt64 = 0
     internal var _presentationCacheIsValid: Bool = false
 
@@ -4145,6 +4149,10 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Bridge accessor — the extension in CALayer+Dirty.swift cannot see
     /// `_sublayers` directly (it is `private`).
     internal var _sublayersForDirty: [CALayer]? { _sublayers }
+
+    /// Detached mask trees are not represented by `_subtreeDirtyCount` on the
+    /// masked layer, but their dirty state must still be cleared after commit.
+    internal var _maskForDirty: CALayer? { mask }
 
     /// Test-only accessor for the `_needsDisplay` boolean axis (B7).
     internal var _needsDisplayForTest: Bool { _needsDisplay }

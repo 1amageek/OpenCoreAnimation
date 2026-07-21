@@ -98,6 +98,7 @@ extension CALayer {
     /// (PERFORMANCE_DESIGN.md §3.5).
     internal func markDirty(_ flags: DirtyFlags) {
         if _isPresentationLayer { return }
+        _contentRevision &+= 1
         let wasClean = _dirtyMask.isEmpty
         _dirtyMask.formUnion(flags)
         if wasClean && !_dirtyMask.isEmpty {
@@ -130,11 +131,23 @@ extension CALayer {
     /// `device.queue.submit(...)` and BEFORE any user-visible
     /// completion blocks fire (PERFORMANCE_DESIGN.md §3.8 / §6.5).
     internal func recursivelyClearDirtyAfterCommit() {
-        guard _subtreeDirtyCount > 0 else { return }
-        if !_dirtyMask.isEmpty {
-            _dirtyMask = []
-            CALayer.propagateDirtyDeltaPublic(-1, startingAt: self)
+        var visited: Set<ObjectIdentifier> = []
+        recursivelyClearDirtyAfterCommit(visited: &visited)
+    }
+
+    private func recursivelyClearDirtyAfterCommit(
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(self)).inserted else { return }
+        if _subtreeDirtyCount > 0 {
+            if !_dirtyMask.isEmpty {
+                _dirtyMask = []
+                CALayer.propagateDirtyDeltaPublic(-1, startingAt: self)
+            }
+            _sublayersForDirty?.forEach {
+                $0.recursivelyClearDirtyAfterCommit(visited: &visited)
+            }
         }
-        _sublayersForDirty?.forEach { $0.recursivelyClearDirtyAfterCommit() }
+        _maskForDirty?.recursivelyClearDirtyAfterCommit(visited: &visited)
     }
 }

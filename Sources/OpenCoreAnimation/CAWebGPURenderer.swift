@@ -276,6 +276,7 @@ private struct PrerenderedFilter {
     let resources: FilterLayerResources
     let outputTexture: GPUTexture
     let outputView: GPUTextureView
+    let appliedContentMask: Bool
 }
 
 private final class CompositionLayerResources {
@@ -1320,6 +1321,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// While set, filter compositing is suppressed so the subtree can be captured raw.
     private weak var filterPrerenderRootLayer: CALayer?
 
+    /// The root layer whose own content mask is deferred until its captured subtree and
+    /// filter chain have been combined. Descendant masks remain active during capture.
+    private weak var contentMaskCaptureSuppressedRootLayer: CALayer?
+
     /// The root layer whose rendered alpha is being captured as a shadow silhouette.
     private weak var shadowCaptureRootLayer: CALayer?
 
@@ -1422,16 +1427,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// applied at composite, not at capture).
     private weak var rasterizePrerenderRootLayer: CALayer?
 
-    // MARK: - Mask Rendering (Stencil-based)
-
-    /// Mask texture for layer masking (texture-based approach).
-    private var maskTexture: GPUTexture?
-
-    /// Masked rendering pipeline (texture-based).
-    private var maskedPipeline: GPURenderPipeline?
-
-    /// Mask bind group layout.
-    private var maskBindGroupLayout: GPUBindGroupLayout?
+    // MARK: - Mask Rendering
 
     /// Pipeline for writing mask to stencil buffer (stencil-based approach).
     /// Writes to stencil where mask alpha > 0, no color output.
@@ -2527,6 +2523,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return texturedPipeline
     }
 
+    /// Selects the source-over pipeline for textures whose color channels
+    /// already contain alpha. Captured layer and transition textures are
+    /// premultiplied render targets, so sampling them through the regular
+    /// textured pipeline would multiply RGB by alpha a second time.
+    private func selectPremultipliedTexturedPipeline() -> GPURenderPipeline? {
+        if transformDepthNesting > 0 {
+            return maskNestingDepth > 0
+                ? premultipliedTexturedDepthStencilPipeline
+                : premultipliedTexturedDepthPipeline
+        }
+        return maskNestingDepth > 0
+            ? premultipliedTexturedStencilPipeline
+            : premultipliedTexturedPipeline
+    }
+
     /// Creates shadow and blur pipelines.
     private func createShadowPipelines(device: GPUDevice) throws {
         // Create blur sampler
@@ -3255,6 +3266,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transientRasterizationShadowResources.removeAll(keepingCapacity: true)
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
+        contentMaskCaptureSuppressedRootLayer = nil
         shadowCaptureRootLayer = nil
         activeEmitterLayerIDs.removeAll(keepingCapacity: true)
         collectEmitterLayerIDs(rootLayer, into: &activeEmitterLayerIDs)
@@ -3705,15 +3717,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerasterizedTextures.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
+        contentMaskCaptureSuppressedRootLayer = nil
         for request in pendingTileDraws {
             request.tiledLayer.loadingTiles.remove(request.tileKey)
         }
         pendingTileDraws.removeAll(keepingCapacity: false)
 
-        // Mask resources
-        maskTexture = nil
-        maskedPipeline = nil
-        maskBindGroupLayout = nil
         filterReplacementPipeline = nil
         transformedCompositionPipeline = nil
         transformedCompositionStencilPipeline = nil
@@ -3917,7 +3926,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         if filterPrerenderRootLayer !== layer,
            rasterizePrerenderRootLayer !== layer,
-           presentationLayer.filters?.isEmpty == false,
            failedLayerFilterKeys.contains(renderKey(for: layer)) {
             return
         }
@@ -3934,7 +3942,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // Handle CALayer.mask if set
+        let preparedFilter = prerenderedFilters[currentRenderKey]
+        let hasPreparedContentMask = filterPrerenderRootLayer !== layer
+            && preparedFilter?.appliedContentMask == true
         let hasMask = presentationLayer.mask != nil
+            && contentMaskCaptureSuppressedRootLayer !== layer
+            && !hasPreparedContentMask
         if hasMask, let maskLayer = presentationLayer.mask {
             // Render mask to stencil buffer
             renderMaskToStencil(maskLayer, renderPass: renderPass, parentMatrix: modelMatrix)
@@ -3981,8 +3994,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let shouldCompositeAsGroup = requiresGroupOpacity(presentationLayer)
         if filterPrerenderRootLayer !== layer,
            rasterizePrerenderRootLayer !== layer,
-           (hasRequestedFilters || shouldCompositeAsGroup) {
-            if let prerendered = prerenderedFilters[currentRenderKey] {
+           !compositionCapturePassThroughKeys.contains(currentRenderKey),
+           (hasRequestedFilters || shouldCompositeAsGroup || hasPreparedContentMask) {
+            if let prerendered = preparedFilter {
                 // Composite the pre-rendered filtered texture.
                 renderFilteredLayerComposite(
                     layer,
@@ -4669,17 +4683,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             uniformBuffer: uniformBuffer,
             uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
         )
-        let selectedPipeline: GPURenderPipeline?
-        if transformDepthNesting > 0 {
-            selectedPipeline = maskNestingDepth > 0
-                ? premultipliedTexturedDepthStencilPipeline
-                : premultipliedTexturedDepthPipeline
-        } else {
-            selectedPipeline = maskNestingDepth > 0
-                ? premultipliedTexturedStencilPipeline
-                : premultipliedTexturedPipeline
-        }
-        guard let selectedPipeline else { return }
+        guard let selectedPipeline = selectPremultipliedTexturedPipeline() else { return }
         renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
@@ -7538,7 +7542,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let depthTextureView = depthTextureView else { return }
 
         var targets: [LayerPrepassTarget] = []
-        collectFilteredLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
+        var visitedRenderKeys: Set<LayerRenderKey> = []
+        collectFilteredLayers(
+            rootLayer,
+            parentMatrix: projectionMatrix,
+            visitedRenderKeys: &visitedRenderKeys,
+            into: &targets
+        )
         var activeRenderKeys: Set<LayerRenderKey> = []
         var failedRenderKeys: Set<LayerRenderKey> = []
 
@@ -7548,7 +7558,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let requiresGroup = requiresGroupOpacity(target.presentationLayer)
             let requiresCompositionSource = target.presentationLayer.compositingFilter != nil
                 || target.presentationLayer.backgroundFilters?.isEmpty == false
-            guard !requestedFilters.isEmpty || requiresGroup || requiresCompositionSource else { continue }
+            let requiresContentMask = target.presentationLayer.mask != nil
+            let compositionOwnsAncestorMask = requiresContentMask
+                && requestedFilters.isEmpty
+                && !requiresGroup
+                && !requiresCompositionSource
+                && descendantsContainBackdropComposition(filteredLayer)
+            if compositionOwnsAncestorMask {
+                // Descendant backdrop-composition targets already receive this
+                // ancestor mask through `contentMaskAncestors`. Capturing the
+                // whole ancestor again would either hide the composition before
+                // it is prepared or multiply partial mask alpha twice.
+                continue
+            }
+            guard !requestedFilters.isEmpty
+                    || requiresGroup
+                    || requiresCompositionSource
+                    || requiresContentMask else { continue }
 
             let filteredRenderKey = target.renderKey
             guard let stages = layerFilterStages(from: requestedFilters) else {
@@ -7601,15 +7627,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 maxDepth: 1
             )
 
+            let previousFilterRoot = filterPrerenderRootLayer
+            let previousSuppressedMaskRoot = contentMaskCaptureSuppressedRootLayer
             withPrepassContext(target) {
                 filterPrerenderRootLayer = filteredLayer
+                if requiresContentMask {
+                    contentMaskCaptureSuppressedRootLayer = filteredLayer
+                }
                 renderLayer(
                     filteredLayer,
                     renderPass: contentRenderPass,
                     parentMatrix: target.parentMatrix
                 )
-                filterPrerenderRootLayer = nil
             }
+            filterPrerenderRootLayer = previousFilterRoot
+            contentMaskCaptureSuppressedRootLayer = previousSuppressedMaskRoot
             contentRenderPass.end()
 
             var currentTexture = resources.sourceTexture
@@ -7741,16 +7773,85 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 continue
             }
 
+            if requiresContentMask {
+                guard let maskLayer = target.presentationLayer.mask,
+                      let compositionMaskApplyPipeline else {
+                    failedRenderKeys.insert(filteredRenderKey)
+                    if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
+                        layerFilterFailureCount += 1
+                    }
+                    continue
+                }
+                let maskTarget = LayerPrepassTarget(
+                    layer: maskLayer,
+                    presentationLayer: renderPresentation(for: maskLayer),
+                    parentMatrix: target.presentationLayer.modelMatrix(
+                        parentMatrix: target.parentMatrix
+                    ),
+                    renderKey: renderKey(for: maskLayer),
+                    timeOffset: target.timeOffset
+                )
+                guard renderRawCompositionContentMask(
+                    maskTarget,
+                    outputView: resources.intermediateView,
+                    suppressRootFilters: false,
+                    encoder: encoder
+                ) else {
+                    failedRenderKeys.insert(filteredRenderKey)
+                    if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
+                        layerFilterFailureCount += 1
+                    }
+                    continue
+                }
+                let maskedTexture = currentTexture === resources.resultTexture
+                    ? resources.sourceTexture
+                    : resources.resultTexture
+                guard let maskedView = resources.view(for: maskedTexture),
+                      encodeCompositionMaskOperation(
+                        pipeline: compositionMaskApplyPipeline,
+                        firstView: currentView,
+                        secondView: resources.intermediateView,
+                        outputView: maskedView,
+                        encoder: encoder
+                      ) else {
+                    failedRenderKeys.insert(filteredRenderKey)
+                    if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
+                        layerFilterFailureCount += 1
+                    }
+                    continue
+                }
+                currentTexture = maskedTexture
+                currentView = maskedView
+            }
+
             failedLayerFilterKeys.remove(filteredRenderKey)
             prerenderedFilters[filteredRenderKey] = PrerenderedFilter(
                 resources: resources,
                 outputTexture: currentTexture,
-                outputView: currentView
+                outputView: currentView,
+                appliedContentMask: requiresContentMask
             )
         }
 
         failedLayerFilterKeys.formIntersection(failedRenderKeys)
         evictFilterResources(except: activeRenderKeys)
+    }
+
+    private func descendantsContainBackdropComposition(_ layer: CALayer) -> Bool {
+        var visited: Set<ObjectIdentifier> = []
+
+        func visit(_ candidate: CALayer) -> Bool {
+            let identifier = ObjectIdentifier(candidate)
+            guard visited.insert(identifier).inserted else { return false }
+            let presentation = renderPresentation(for: candidate)
+            if presentation.compositingFilter != nil
+                || presentation.backgroundFilters?.isEmpty == false {
+                return true
+            }
+            return (candidate.sublayers ?? []).contains(where: visit)
+        }
+
+        return (layer.sublayers ?? []).contains(where: visit)
     }
 
     private func layerFilterStages(from filters: [Any]) -> [LayerFilterStage]? {
@@ -8041,10 +8142,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         isRoot: Bool = true
     ) -> Bool {
         let presentation = renderPresentation(for: layer)
-        if (!isRoot && presentation.filters?.isEmpty == false)
+        let hasPreparedFilteredContent = prerenderedFilters[renderKey(for: layer)] != nil
+        if (!isRoot
+                && presentation.filters?.isEmpty == false
+                && !hasPreparedFilteredContent)
             || presentation.compositingFilter != nil
             || presentation.backgroundFilters?.isEmpty == false
-            || presentation.shouldRasterize
             || presentation._transitionRenderState != nil {
             return false
         }
@@ -8061,11 +8164,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         _ target: LayerPrepassTarget,
         outputView: GPUTextureView,
         suppressRootFilters: Bool,
+        renderSize: CGSize? = nil,
+        depthStencilView: GPUTextureView? = nil,
         encoder: GPUCommandEncoder
     ) -> Bool {
         guard let pipeline,
-              let depthTextureView,
+              let activeDepthStencilView = depthStencilView ?? depthTextureView,
               compositionContentMaskTreeIsDirectlyRenderable(target.layer) else { return false }
+
+        let activeRenderSize = renderSize ?? size
 
         let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
@@ -8077,7 +8184,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 ),
             ],
             depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTextureView,
+                view: activeDepthStencilView,
                 depthClearValue: 1,
                 depthLoadOp: .clear,
                 depthStoreOp: .store,
@@ -8090,8 +8197,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass.setViewport(
             x: 0,
             y: 0,
-            width: Float(size.width),
-            height: Float(size.height),
+            width: Float(activeRenderSize.width),
+            height: Float(activeRenderSize.height),
             minDepth: 0,
             maxDepth: 1
         )
@@ -8106,6 +8213,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let savedStopKey = compositionCaptureStopKey
         let savedDidReachStop = compositionCaptureDidReachStop
         let savedFilterPrerenderRoot = filterPrerenderRootLayer
+        let savedRenderTargetSize = renderTargetSizeOverride
 
         opacityStack.removeAll(keepingCapacity: true)
         replicatorColorStack.removeAll(keepingCapacity: true)
@@ -8116,6 +8224,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentStencilValue = 0
         compositionCaptureStopKey = nil
         compositionCaptureDidReachStop = false
+        renderTargetSizeOverride = activeRenderSize
         if suppressRootFilters {
             filterPrerenderRootLayer = target.layer
         }
@@ -8138,6 +8247,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         compositionCaptureStopKey = savedStopKey
         compositionCaptureDidReachStop = savedDidReachStop
         filterPrerenderRootLayer = savedFilterPrerenderRoot
+        renderTargetSizeOverride = savedRenderTargetSize
         renderPass.end()
         return true
     }
@@ -8659,7 +8769,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
         }
 
-        if let finalDepth = previousDepth, finalDepth > 0 {
+        if previousDepth != nil {
+            // Refresh isolated filter, group-opacity, and content-mask captures
+            // after the final depth-zero compositions become available. A
+            // mask-only ancestor is not itself a backdrop scope, but its
+            // captured subtree can still contain a depth-zero composition.
             prerenderFilteredLayers(
                 rootLayer,
                 encoder: encoder,
@@ -8837,6 +8951,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         parentMatrix: Matrix4x4,
         parentIsTransformLayer: Bool,
         isInsideFlattenedSubtree: Bool,
+        isMaskTreeRoot: Bool = false,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         cache: RasterizationCache<GPUTexture>,
@@ -8857,13 +8972,30 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 presentationLayer: presentationLayer
             )
         let requiresEffectFlattening = isInsideFlattenedSubtree
+            && !isMaskTreeRoot
             && !isTransformLayer
             && !presentationLayer.shouldRasterize
             && !requiresTransformFlattening
             && requiresEffectFlattening(presentationLayer)
         let descendantsAreInsideFlattenedSubtree = isInsideFlattenedSubtree
+            || isMaskTreeRoot
             || presentationLayer.shouldRasterize
             || requiresTransformFlattening
+
+        if let maskLayer = presentationLayer.mask {
+            collectAndCaptureRasterizedLayers(
+                maskLayer,
+                parentMatrix: modelMatrix,
+                parentIsTransformLayer: false,
+                isInsideFlattenedSubtree: true,
+                isMaskTreeRoot: true,
+                device: device,
+                pipeline: pipeline,
+                cache: cache,
+                encoder: encoder,
+                frameToken: frameToken
+            )
+        }
 
         // Capture descendants first so a parent capture composites already-finalized
         // nested rasterization entries instead of baking their uncached live paths.
@@ -9118,6 +9250,26 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cachedTexture = filteredTexture
         }
 
+        if let maskLayer = presentationLayer.mask {
+            guard let maskedTexture = executeRasterizedContentMask(
+                maskLayer,
+                contentTexture: cachedTexture,
+                projectionMatrix: captureProjection,
+                renderSize: captureSize,
+                depthStencilView: captureDepthView,
+                width: pixelWidth,
+                height: pixelHeight,
+                encoder: encoder
+            ) else {
+                if failedLayerFilterKeys.insert(layerRenderKey).inserted {
+                    layerFilterFailureCount += 1
+                }
+                return
+            }
+            failedLayerFilterKeys.remove(layerRenderKey)
+            cachedTexture = maskedTexture
+        }
+
         if hasVisibleShadow(presentationLayer) {
             transientRasterizationTextures.append(cachedTexture)
             guard let shadowedTexture = executeRasterizedShadow(
@@ -9161,6 +9313,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         purpose: RasterizationCachePurpose,
         contentBoundsHash: Int
     ) -> Bool {
+        if let mask = layer.mask, subtreeHasAnimations(mask) {
+            return false
+        }
         if purpose == .explicit {
             return RasterizationDecisions.canReuseRasterizedTexture(
                 layer: layer,
@@ -9399,6 +9554,81 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return nil
         }
         return finalTexture
+    }
+
+    private func executeRasterizedContentMask(
+        _ maskLayer: CALayer,
+        contentTexture: GPUTexture,
+        projectionMatrix: Matrix4x4,
+        renderSize: CGSize,
+        depthStencilView: GPUTextureView,
+        width: Int,
+        height: Int,
+        encoder: GPUCommandEncoder
+    ) -> GPUTexture? {
+        guard let device,
+              let compositionMaskApplyPipeline,
+              let maskStages = layerFilterStages(
+                from: renderPresentation(for: maskLayer).filters ?? []
+              ) else { return nil }
+
+        let resources = FilterLayerResources(
+            device: device,
+            width: width,
+            height: height,
+            format: preferredFormat
+        )
+        transientRasterizationFilterResources.append(resources)
+        let target = LayerPrepassTarget(
+            layer: maskLayer,
+            presentationLayer: renderPresentation(for: maskLayer),
+            parentMatrix: projectionMatrix,
+            renderKey: renderKey(for: maskLayer),
+            timeOffset: currentReplicatorTimeOffset
+        )
+        let usesPrerasterizedMaskRoot = prerasterizedTextures[target.renderKey] != nil
+        let executesRootMaskStages = !usesPrerasterizedMaskRoot && !maskStages.isEmpty
+        guard renderRawCompositionContentMask(
+            target,
+            outputView: resources.sourceView,
+            suppressRootFilters: executesRootMaskStages,
+            renderSize: renderSize,
+            depthStencilView: depthStencilView,
+            encoder: encoder
+        ) else { return nil }
+
+        let maskTexture: GPUTexture
+        if !executesRootMaskStages {
+            maskTexture = resources.sourceTexture
+        } else {
+            guard let filteredMask = executeRasterizedFilterStages(
+                maskStages,
+                inputTexture: resources.sourceTexture,
+                width: width,
+                height: height,
+                encoder: encoder
+            ) else { return nil }
+            transientRasterizationTextures.append(filteredMask)
+            maskTexture = filteredMask
+        }
+
+        let outputTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: preferredFormat,
+            usage: [.renderAttachment, .textureBinding]
+        ))
+        guard encodeCompositionMaskOperation(
+            pipeline: compositionMaskApplyPipeline,
+            firstView: contentTexture.createView(),
+            secondView: maskTexture.createView(),
+            outputView: outputTexture.createView(),
+            encoder: encoder
+        ) else {
+            outputTexture.destroy()
+            return nil
+        }
+        transientRasterizationTextures.append(contentTexture)
+        return outputTexture
     }
 
     private func executeRasterizedShadow(
@@ -9642,6 +9872,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         hasher.combine(captureBounds.minY)
         hasher.combine(captureBounds.width)
         hasher.combine(captureBounds.height)
+        if let mask = layer.mask {
+            var visited: Set<ObjectIdentifier> = []
+            combineDetachedContentRevision(
+                of: mask,
+                into: &hasher,
+                visited: &visited
+            )
+        }
         if hasVisibleShadow(presentationLayer) {
             hasher.combine(presentationLayer.shadowOpacity)
             hasher.combine(presentationLayer.shadowOffset.width)
@@ -9661,13 +9899,35 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return hasher.finalize()
     }
 
+    /// Adds every identity and model mutation in a detached dependency tree.
+    /// A mask has no superlayer, so ordinary subtree dirty propagation cannot
+    /// invalidate the masked layer's raster cache when the mask changes.
+    private func combineDetachedContentRevision(
+        of layer: CALayer,
+        into hasher: inout Hasher,
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        let identifier = ObjectIdentifier(layer)
+        guard visited.insert(identifier).inserted else {
+            hasher.combine(identifier)
+            return
+        }
+        hasher.combine(identifier)
+        hasher.combine(layer._contentRevision)
+        if let mask = layer.mask {
+            combineDetachedContentRevision(of: mask, into: &hasher, visited: &visited)
+        }
+        for sublayer in layer.sublayers ?? [] {
+            combineDetachedContentRevision(of: sublayer, into: &hasher, visited: &visited)
+        }
+    }
+
     /// Composites a captured rasterization texture as a quad placed at
     /// the layer's transform, sized to the layer's bounds, with the
     /// layer's *current* opacity (R3.3 composite path).
     ///
-    /// Reuses the `texturedPipeline` (same shader path as `contents`
-    /// rendering) so that R3.5 `isOpaque` / blending and stencil-mask
-    /// state are honoured by `selectTexturedPipeline`. The quad
+    /// Uses the premultiplied textured pipeline because the capture is a
+    /// render-target texture whose RGB channels already contain alpha. The quad
     /// vertices are emitted in normalised layer-bounds coordinates
     /// `[0, 1]`; the MVP matrix scales them by `bounds.size` and
     /// applies the layer's `modelMatrix` to land at the right screen
@@ -9768,13 +10028,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
         )
 
-        // R3.5 / mask-stencil aware pipeline selection.
-        let contentBounds = CGRect(origin: .zero, size: presentationLayer.bounds.size)
-        if let selected = selectTexturedPipeline(
-            for: presentationLayer,
-            forceBlending: prerasterized.purpose != .explicit
-                || captureBounds != contentBounds
-        ) {
+        // Captured render-target textures are premultiplied. Using the regular
+        // contents pipeline here would multiply RGB by alpha a second time.
+        if let selected = selectPremultipliedTexturedPipeline() {
             renderPass.setPipeline(selected)
         }
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
@@ -9984,6 +10240,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func collectFilteredLayers(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
+        visitedRenderKeys: inout Set<LayerRenderKey>,
         into result: inout [LayerPrepassTarget]
     ) {
         let presentationLayer = renderPresentation(for: layer)
@@ -9992,7 +10249,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
+        let key = renderKey(for: layer)
+        guard visitedRenderKeys.insert(key).inserted else { return }
+
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+        if let maskLayer = presentationLayer.mask {
+            collectFilteredLayers(
+                maskLayer,
+                parentMatrix: modelMatrix,
+                visitedRenderKeys: &visitedRenderKeys,
+                into: &result
+            )
+        }
         forEachPrepassSublayer(
             of: layer,
             presentationLayer: presentationLayer,
@@ -10001,6 +10269,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             collectFilteredLayers(
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
+                visitedRenderKeys: &visitedRenderKeys,
                 into: &result
             )
         }
@@ -10009,12 +10278,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
            presentationLayer.filters?.isEmpty == false
             || requiresGroupOpacity(presentationLayer)
             || presentationLayer.compositingFilter != nil
-            || presentationLayer.backgroundFilters?.isEmpty == false {
+            || presentationLayer.backgroundFilters?.isEmpty == false
+            || presentationLayer.mask != nil {
             result.append(LayerPrepassTarget(
                 layer: layer,
                 presentationLayer: presentationLayer,
                 parentMatrix: parentMatrix,
-                renderKey: renderKey(for: layer),
+                renderKey: key,
                 timeOffset: currentReplicatorTimeOffset
             ))
         }

@@ -807,19 +807,44 @@ func installHarness() {
                 nestedEffectGroup.addSublayer(nestedFilteredChild)
                 crossingGroup.addSublayer(nestedEffectGroup)
 
-                let maskedGroup = CALayer()
-                maskedGroup.bounds = flattenedContainer.bounds
-                maskedGroup.position = CGPoint(x: 30, y: 110)
-                let maskedRedChild = CALayer()
-                maskedRedChild.frame = maskedGroup.bounds
-                maskedRedChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
-                maskedGroup.addSublayer(maskedRedChild)
-                let halfMask = CALayer()
-                halfMask.bounds = CGRect(x: 0, y: 0, width: 20, height: 40)
-                halfMask.position = CGPoint(x: 10, y: 20)
-                halfMask.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
-                maskedGroup.mask = halfMask
+                func makeAlphaMaskedGroup(
+                    position: CGPoint,
+                    shouldRasterize: Bool = false
+                ) -> CALayer {
+                    let group = CALayer()
+                    group.bounds = flattenedContainer.bounds
+                    group.position = position
+                    group.shouldRasterize = shouldRasterize
+                    let redChild = CALayer()
+                    redChild.frame = group.bounds
+                    redChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                    group.addSublayer(redChild)
+
+                    let maskRoot = CALayer()
+                    maskRoot.bounds = group.bounds
+                    maskRoot.position = CGPoint(x: 20, y: 20)
+                    let translucentHalf = CALayer()
+                    translucentHalf.bounds = CGRect(x: 0, y: 0, width: 20, height: 40)
+                    translucentHalf.position = CGPoint(x: 10, y: 20)
+                    translucentHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                    translucentHalf.opacity = 0.5
+                    translucentHalf.filters = [CAFilter.brightness(0)]
+                    maskRoot.addSublayer(translucentHalf)
+                    group.mask = maskRoot
+                    return group
+                }
+
+                let maskedGroup = makeAlphaMaskedGroup(position: CGPoint(x: 30, y: 110))
                 crossingGroup.addSublayer(maskedGroup)
+
+                let directMaskedGroup = makeAlphaMaskedGroup(position: CGPoint(x: 370, y: 110))
+                root.addSublayer(directMaskedGroup)
+
+                let rasterizedMaskedGroup = makeAlphaMaskedGroup(
+                    position: CGPoint(x: 370, y: 50),
+                    shouldRasterize: true
+                )
+                root.addSublayer(rasterizedMaskedGroup)
 
                 let shadowGroup = CALayer()
                 shadowGroup.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
@@ -1020,9 +1045,16 @@ func installHarness() {
                         CGPoint(x: 160, y: 50),
                         CGPoint(x: 120, y: 260),
                         CGPoint(x: 180, y: 260),
+                        CGPoint(x: 360, y: 190),
+                        CGPoint(x: 385, y: 190),
+                        CGPoint(x: 360, y: 250),
+                        CGPoint(x: 385, y: 250),
                     ])
                     let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
+                    rasterizedMaskedGroup.mask?.sublayers?.first?.opacity = 1
+                    engine.renderFrame()
+                    let updatedRasterizedMaskPixel = try await renderer.readbackPixel(x: 360, y: 250)
                     flattenedRedChild.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                     flattenedOccluder.isHidden = true
                     engine.renderFrame()
@@ -1034,6 +1066,8 @@ func installHarness() {
                     let flatteningReuseCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningReuseCompositeCount = renderer.transformFlatteningCompositeCount
                     crossingGroup.removeFromSuperlayer()
+                    directMaskedGroup.removeFromSuperlayer()
+                    rasterizedMaskedGroup.removeFromSuperlayer()
                     transparencyGroup.removeFromSuperlayer()
                     firstIndependentGroup.removeFromSuperlayer()
                     secondIndependentGroup.removeFromSuperlayer()
@@ -1061,8 +1095,22 @@ func installHarness() {
                         && pixels[8][2] <= 1
                         && pixels[8][3] == 255
                     let filterUsesLocalPixels = pixels[9] == [0, 255, 255, 255]
-                    let contentMaskUsesLocalBounds = pixels[10] == [255, 0, 0, 255]
+                    let contentMaskUsesLocalBounds = (127...128).contains(pixels[10][0])
+                        && pixels[10][1] == 0
+                        && pixels[10][2] == 0
+                        && pixels[10][3] == 255
                         && pixels[11] == [0, 0, 0, 255]
+                    let directMaskUsesTreeAlpha = (127...128).contains(pixels[23][0])
+                        && pixels[23][1] == 0
+                        && pixels[23][2] == 0
+                        && pixels[23][3] == 255
+                        && pixels[24] == [0, 0, 0, 255]
+                    let rasterizedMaskUsesTreeAlpha = (127...128).contains(pixels[25][0])
+                        && pixels[25][1] == 0
+                        && pixels[25][2] == 0
+                        && pixels[25][3] == 255
+                        && pixels[26] == [0, 0, 0, 255]
+                    let rasterizedMaskMutationInvalidatesCache = updatedRasterizedMaskPixel == [255, 0, 0, 255]
                     let nestedFilterUsesLocalPixels = pixels[12] == [0, 255, 255, 255]
                     let expandedShadowIsVisible = pixels[13][0] >= 240
                         && pixels[13][1] >= 240
@@ -1100,6 +1148,9 @@ func installHarness() {
                         + ",groupOpacity=\(groupOpacityIsAppliedOnce)"
                         + ",filter=\(filterUsesLocalPixels)"
                         + ",mask=\(contentMaskUsesLocalBounds)"
+                        + ",directMask=\(directMaskUsesTreeAlpha)"
+                        + ",rasterMask=\(rasterizedMaskUsesTreeAlpha)"
+                        + ",maskUpdated=\(rasterizedMaskMutationInvalidatesCache)"
                         + ",nestedFilter=\(nestedFilterUsesLocalPixels)"
                         + ",shadow=\(expandedShadowIsVisible)"
                         + ",shadowPath=\(customShadowPathIsRespected)"
@@ -1110,6 +1161,8 @@ func installHarness() {
                         + ",reused=\(unchangedSubtreeWasReused)"
                 } catch {
                     crossingGroup.removeFromSuperlayer()
+                    directMaskedGroup.removeFromSuperlayer()
+                    rasterizedMaskedGroup.removeFromSuperlayer()
                     transparencyGroup.removeFromSuperlayer()
                     firstIndependentGroup.removeFromSuperlayer()
                     secondIndependentGroup.removeFromSuperlayer()
