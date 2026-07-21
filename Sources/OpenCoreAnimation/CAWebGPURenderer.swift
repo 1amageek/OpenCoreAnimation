@@ -639,6 +639,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var transitionFilterFailureCount: Int = 0
 
+    /// Number of unknown built-in transition types rejected before capture.
+    @_spi(RendererDiagnostics)
+    public private(set) var transitionRenderFailureCount: Int = 0
+
     /// Number of requested layer filters rejected before GPU dispatch.
     @_spi(RendererDiagnostics)
     public private(set) var layerFilterFailureCount: Int = 0
@@ -3173,6 +3177,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transitionTargetCaptureCount = 0
         transitionFilterDispatchCount = 0
         transitionFilterFailureCount = 0
+        transitionRenderFailureCount = 0
         transitionFilterProcessor?.invalidate()
         transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
@@ -3641,7 +3646,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                             pipeline: pipeline,
                             encoder: encoder
                         )
-                    } else {
+                    } else if supportsBuiltInTransition(state.type) {
                         capture = createBuiltInTransitionCapture(
                             sourceLayer: state.sourceLayer,
                             targetLayer: layer,
@@ -3649,6 +3654,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                             pipeline: pipeline,
                             encoder: encoder
                         )
+                    } else {
+                        failedTransitionSourceIDs.insert(sourceID)
+                        transitionRenderFailureCount += 1
+                        return
                     }
                     guard let capture else {
                         failedTransitionSourceIDs.insert(sourceID)
@@ -3687,6 +3696,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             destroyTransitionCapture(for: sourceID)
         }
         failedTransitionSourceIDs = failedTransitionSourceIDs.intersection(activeTransitionSourceIDs)
+    }
+
+    private func supportsBuiltInTransition(_ type: CATransitionType) -> Bool {
+        switch type {
+        case .fade, .moveIn, .push, .reveal:
+            return true
+        default:
+            return false
+        }
     }
 
     private func createBuiltInTransitionCapture(
@@ -4013,7 +4031,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
 
         default:
-            renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: 1)
+            return
         }
     }
 

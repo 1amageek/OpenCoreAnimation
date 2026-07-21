@@ -32,6 +32,7 @@ interface OCA extends Harness {
     getActiveTransitionTextureCount: () => number;
     getTransitionFilterDispatchCount: () => number;
     getTransitionFilterFailureCount: () => number;
+    getTransitionRenderFailureCount: () => number;
     getActiveFilterResourceCount: () => number;
     getLayerFilterFailureCount: () => number;
     getCompositionFilterFailureCount: () => number;
@@ -40,6 +41,7 @@ interface OCA extends Harness {
     getShadowRenderFailureCount: () => number;
     mutateTransitionTarget: () => void;
     exerciseUnsupportedTransitionFilter: () => void;
+    exerciseUnsupportedBuiltInTransition: () => void;
     beginTransitionFilterProbes: () => void;
     beginLayerFilterProbe: () => void;
     beginCompositionProbe: () => void;
@@ -88,6 +90,7 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getActiveTransitionTextureCount()).toBe(5);
         await expect.poll(() => h.getTransitionFilterDispatchCount()).toBeGreaterThan(0);
         expect(await h.getTransitionFilterFailureCount()).toBe(0);
+        expect(await h.getTransitionRenderFailureCount()).toBe(0);
         await h.mutateTransitionTarget();
         expect(await h.getTransitionSourceCaptureCount()).toBe(2);
         expect(await h.getTransitionTargetCaptureCount()).toBe(2);
@@ -146,6 +149,10 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.exerciseUnsupportedTransitionFilter();
         await expect.poll(() => h.getTransitionFilterFailureCount()).toBe(1);
+        expect(await h.getActiveTransitionTextureCount()).toBe(2);
+
+        await h.exerciseUnsupportedBuiltInTransition();
+        await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(1);
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.removeTransition();
