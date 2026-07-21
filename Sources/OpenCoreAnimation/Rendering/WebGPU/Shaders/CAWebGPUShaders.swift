@@ -100,7 +100,7 @@ public enum CAWebGPUShaders {
         var output: VertexOutput;
         output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
         output.texCoord = input.texCoord;
-        output.color = input.color * uniforms.opacity;
+        output.color = vec4<f32>(input.color.rgb, input.color.a * uniforms.opacity);
         return output;
     }
 
@@ -352,7 +352,7 @@ public enum CAWebGPUShaders {
         var output: VertexOutput;
         output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
         output.texCoord = input.texCoord;
-        output.color = input.color * uniforms.opacity;
+        output.color = vec4<f32>(input.color.rgb, input.color.a * uniforms.opacity);
         return output;
     }
 
@@ -729,7 +729,7 @@ public enum CAWebGPUShaders {
         var output: VertexOutput;
         output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
         output.texCoord = input.texCoord;
-        output.color = input.color * uniforms.opacity;
+        output.color = vec4<f32>(input.color.rgb, input.color.a * uniforms.opacity);
         return output;
     }
 

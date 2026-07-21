@@ -1,4 +1,5 @@
 #if arch(wasm32)
+@_spi(SoftwareBitmapContext) import OpenCoreGraphics
 import Foundation
 import JavaScriptKit
 import SwiftWebGPU
@@ -71,6 +72,16 @@ import SwiftWebGPU
 fileprivate enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier)
     case layer(ObjectIdentifier)
+}
+
+private struct PendingTileDraw {
+    let tiledLayer: CATiledLayer
+    let delegate: any CALayerDelegate
+    let tileKey: CATiledLayer.TileKey
+    let tileRect: CGRect
+    let scale: CGFloat
+    let pixelWidth: Int
+    let pixelHeight: Int
 }
 
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
@@ -231,6 +242,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// CoreAnimation multiplies opacity through the tree:
     /// effectiveOpacity = parent.effectiveOpacity * layer.opacity
     private var opacityStack: [Float] = []
+
+    /// Tile delegate calls are deferred until the next frame boundary so layer-tree
+    /// rendering never re-enters CGContext setup from inside an active render pass.
+    private var pendingTileDraws: [PendingTileDraw] = []
+
+    /// Prevents the live side of a transition from recursively re-entering its compositor.
+    private var transitionSuppressedLayer: CALayer?
 
     /// Returns the current effective opacity from the stack.
     /// Defaults to 1.0 when empty (root level).
@@ -1852,6 +1870,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               bindGroup != nil,
               let depthTexture = depthTexture else { return }
 
+        processPendingTileDraws()
+
         // Phase 1 (PERFORMANCE_DESIGN.md §3.6): bump the per-frame token
         // before any presentation cache lookup so this frame is distinct
         // from the previous one. The process-wide token is synchronized.
@@ -1862,6 +1882,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentVertexOffset = 0
         droppedLayerCount = 0
         opacityStack.removeAll()
+        transitionSuppressedLayer = nil
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
 
@@ -2197,6 +2218,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         rasterizationCache = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
+        for request in pendingTileDraws {
+            request.tiledLayer.loadingTiles.remove(request.tileKey)
+        }
+        pendingTileDraws.removeAll(keepingCapacity: false)
 
         // Mask resources
         maskTexture = nil
@@ -2303,6 +2328,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Skip hidden layers (using presentation layer values)
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
+
+        if transitionSuppressedLayer !== layer,
+           let transitionState = presentationLayer._transitionRenderState {
+            renderTransition(
+                layer,
+                presentationLayer: presentationLayer,
+                state: transitionState,
+                renderPass: renderPass,
+                parentMatrix: parentMatrix
+            )
+            return
+        }
 
         // Push effective opacity (parent * layer) for this subtree.
         // R3.3: when capturing into a rasterization texture or filter
@@ -2548,6 +2585,106 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Clear stencil mask if we used one
         if hasMask {
             clearStencilMask(renderPass: renderPass)
+        }
+    }
+
+    /// Composites the captured and current layer trees for a built-in transition.
+    private func renderTransition(
+        _ layer: CALayer,
+        presentationLayer: CALayer,
+        state: CATransitionRenderState,
+        renderPass: GPURenderPassEncoder,
+        parentMatrix: Matrix4x4
+    ) {
+        let progress = CGFloat(max(0, min(1, state.progress)))
+        let direction = transitionDirection(
+            subtype: state.subtype,
+            bounds: presentationLayer.bounds
+        )
+        let baseModelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+        let transitionClip = calculateClipRect(layer: presentationLayer, modelMatrix: baseModelMatrix)
+        clipRectStack.append(currentClipRect.intersection(with: transitionClip))
+        applyScissorRect(renderPass)
+        defer {
+            _ = clipRectStack.popLast()
+            applyScissorRect(renderPass)
+        }
+
+        func renderParticipant(
+            _ participant: CALayer,
+            offset: CGPoint,
+            opacityMultiplier: Float,
+            suppressing liveLayer: CALayer? = nil
+        ) {
+            guard opacityMultiplier > 0 else { return }
+            let participantPresentation = participant._renderTimePresentation()
+            let originalPosition = participantPresentation.position
+            let originalOpacity = participantPresentation.opacity
+            participantPresentation.position = CGPoint(
+                x: originalPosition.x + offset.x,
+                y: originalPosition.y + offset.y
+            )
+            participantPresentation.opacity = originalOpacity * opacityMultiplier
+            let previousSuppression = transitionSuppressedLayer
+            transitionSuppressedLayer = liveLayer
+            renderLayer(participant, renderPass: renderPass, parentMatrix: parentMatrix)
+            transitionSuppressedLayer = previousSuppression
+            participantPresentation.position = originalPosition
+            participantPresentation.opacity = originalOpacity
+        }
+
+        switch state.type {
+        case .fade:
+            renderParticipant(state.sourceLayer, offset: .zero, opacityMultiplier: 1)
+            renderParticipant(layer, offset: .zero, opacityMultiplier: Float(progress), suppressing: layer)
+
+        case .moveIn:
+            renderParticipant(state.sourceLayer, offset: .zero, opacityMultiplier: 1)
+            renderParticipant(
+                layer,
+                offset: CGPoint(x: direction.x * (1 - progress), y: direction.y * (1 - progress)),
+                opacityMultiplier: 1,
+                suppressing: layer
+            )
+
+        case .push:
+            renderParticipant(
+                state.sourceLayer,
+                offset: CGPoint(x: -direction.x * progress, y: -direction.y * progress),
+                opacityMultiplier: 1
+            )
+            renderParticipant(
+                layer,
+                offset: CGPoint(x: direction.x * (1 - progress), y: direction.y * (1 - progress)),
+                opacityMultiplier: 1,
+                suppressing: layer
+            )
+
+        case .reveal:
+            renderParticipant(layer, offset: .zero, opacityMultiplier: 1, suppressing: layer)
+            renderParticipant(
+                state.sourceLayer,
+                offset: CGPoint(x: -direction.x * progress, y: -direction.y * progress),
+                opacityMultiplier: 1
+            )
+
+        default:
+            renderParticipant(layer, offset: .zero, opacityMultiplier: 1, suppressing: layer)
+        }
+    }
+
+    private func transitionDirection(subtype: CATransitionSubtype?, bounds: CGRect) -> CGPoint {
+        switch subtype {
+        case .fromRight:
+            return CGPoint(x: bounds.width, y: 0)
+        case .fromTop:
+            return CGPoint(x: 0, y: -bounds.height)
+        case .fromBottom:
+            return CGPoint(x: 0, y: bounds.height)
+        case .fromLeft, nil:
+            return CGPoint(x: -bounds.width, y: 0)
+        default:
+            return CGPoint(x: -bounds.width, y: 0)
         }
     }
 
@@ -6473,28 +6610,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         tiledLayer: CATiledLayer,
         modelMatrix: Matrix4x4
     ) -> Int {
-        // Extract scale from the model matrix (approximate using column magnitudes)
-        let scaleX = sqrt(modelMatrix.columns.0.x * modelMatrix.columns.0.x +
-                         modelMatrix.columns.0.y * modelMatrix.columns.0.y)
-        let scaleY = sqrt(modelMatrix.columns.1.x * modelMatrix.columns.1.x +
-                         modelMatrix.columns.1.y * modelMatrix.columns.1.y)
-        let scale = max(scaleX, scaleY)
-
-        // Calculate LOD based on scale
-        // scale > 1: zoomed in (use higher detail, lower LOD number)
-        // scale < 1: zoomed out (use lower detail, higher LOD number)
-        let maxLOD = tiledLayer.levelsOfDetail - 1
-        let lodBias = tiledLayer.levelsOfDetailBias
-
-        if scale >= 1.0 {
-            // Zoomed in: use LOD 0 (highest detail)
-            return max(0, -lodBias)
-        } else {
-            // Zoomed out: calculate LOD based on scale
-            // Each LOD level represents a 2x reduction in detail
-            let lodFromScale = Int(-log2(Double(scale)))
-            return max(0, min(maxLOD, lodFromScale - lodBias))
-        }
+        // The model matrix already contains the orthographic projection. Convert its
+        // normalized-device-coordinate scale back to pixels before selecting an LOD.
+        let viewportScaleX = Float(size.width) * 0.5
+        let viewportScaleY = Float(size.height) * 0.5
+        let xInPixels = SIMD2<Float>(
+            modelMatrix.columns.0.x * viewportScaleX,
+            modelMatrix.columns.0.y * viewportScaleY
+        )
+        let yInPixels = SIMD2<Float>(
+            modelMatrix.columns.1.x * viewportScaleX,
+            modelMatrix.columns.1.y * viewportScaleY
+        )
+        let scaleX = sqrt(xInPixels.x * xInPixels.x + xInPixels.y * xInPixels.y)
+        let scaleY = sqrt(yInPixels.x * yInPixels.x + yInPixels.y * yInPixels.y)
+        let screenScale = CGFloat(max(scaleX, scaleY))
+        return tiledLayer.lodLevel(forScreenScale: screenScale)
     }
 
     /// Renders a CATiledLayer with tile-based rendering and LOD support.
@@ -6505,35 +6636,67 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
+        defer {
+            if let sublayers = tiledLayer.sublayers, !sublayers.isEmpty {
+                let sublayerMatrix = presentation.sublayerMatrix(modelMatrix: modelMatrix)
+                for sublayer in tiledLayer.sortedSublayers() {
+                    self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
+                }
+            }
+        }
+
         // Calculate current LOD level
         let lodLevel = calculateLODLevel(tiledLayer: presentation, modelMatrix: modelMatrix)
 
         // Adjust tile size based on LOD level
         // Higher LOD = larger tiles (covering more area with less detail)
         let lodScale = pow(2.0, CGFloat(lodLevel))
+        let pixelScale = presentation.contentsScale / lodScale
+        guard pixelScale.isFinite, pixelScale > 0 else { return }
+        let maximumTextureDimension = max(1, Int(device.limits.maxTextureDimension2D))
+        let maximumLogicalTileDimension = CGFloat(maximumTextureDimension) / pixelScale
         let adjustedTileSize = CGSize(
-            width: presentation.tileSize.width * lodScale,
-            height: presentation.tileSize.height * lodScale
+            width: min(presentation.tileSize.width * lodScale, maximumLogicalTileDimension),
+            height: min(presentation.tileSize.height * lodScale, maximumLogicalTileDimension)
         )
 
         let bounds = presentation.bounds
-        let tilesX = Int(ceil(bounds.width / adjustedTileSize.width))
-        let tilesY = Int(ceil(bounds.height / adjustedTileSize.height))
+        guard bounds.width > 0,
+              bounds.height > 0,
+              bounds.width.isFinite,
+              bounds.height.isFinite,
+              adjustedTileSize.width.isFinite,
+              adjustedTileSize.height.isFinite,
+              adjustedTileSize.width > 0,
+              adjustedTileSize.height > 0 else {
+            return
+        }
+        let tileCountX = ceil(bounds.width / adjustedTileSize.width)
+        let tileCountY = ceil(bounds.height / adjustedTileSize.height)
+        guard tileCountX.isFinite,
+              tileCountY.isFinite,
+              tileCountX <= CGFloat(Int.max),
+              tileCountY <= CGFloat(Int.max) else {
+            return
+        }
+        let tilesX = Int(tileCountX)
+        let tilesY = Int(tileCountY)
+        let tileMediaTime = CACurrentMediaTime()
 
         // Render tiles
         for ty in 0..<tilesY {
             for tx in 0..<tilesX {
                 let tileKey = CATiledLayer.TileKey(column: tx, row: ty, lodLevel: lodLevel)
-                let tileX = CGFloat(tx) * adjustedTileSize.width
-                let tileY = CGFloat(ty) * adjustedTileSize.height
-                let tileW = min(adjustedTileSize.width, bounds.width - tileX)
-                let tileH = min(adjustedTileSize.height, bounds.height - tileY)
+                let localTileX = CGFloat(tx) * adjustedTileSize.width
+                let localTileY = CGFloat(ty) * adjustedTileSize.height
+                let tileW = min(adjustedTileSize.width, bounds.width - localTileX)
+                let tileH = min(adjustedTileSize.height, bounds.height - localTileY)
 
                 let tileTranslate = Matrix4x4(columns: (
                     SIMD4<Float>(1, 0, 0, 0),
                     SIMD4<Float>(0, 1, 0, 0),
                     SIMD4<Float>(0, 0, 1, 0),
-                    SIMD4<Float>(Float(tileX), Float(tileY), 0, 1)
+                    SIMD4<Float>(Float(localTileX), Float(localTileY), 0, 1)
                 ))
 
                 let tileScale = Matrix4x4(columns: (
@@ -6547,6 +6710,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
                 // Check if tile has cached content
                 if let cachedImage = tiledLayer.cachedImage(for: tileKey) {
+                    let fadeOpacity = tiledLayer.tileOpacity(for: tileKey, at: tileMediaTime)
+                    if fadeOpacity < 1 {
+                        tiledLayer.markDirty(.contents)
+                    }
                     // Render cached tile as texture
                     renderTileWithImage(
                         cachedImage,
@@ -6555,7 +6722,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         renderPass: renderPass,
                         tileMatrix: tileMatrix,
                         tileSize: CGSize(width: tileW, height: tileH),
-                        opacity: currentEffectiveOpacity
+                        opacity: currentEffectiveOpacity * fadeOpacity
                     )
                 } else {
                     // Request tile from delegate if not already loading
@@ -6563,22 +6730,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         requestTileFromDelegate(
                             tiledLayer: tiledLayer,
                             tileKey: tileKey,
-                            tileRect: CGRect(x: tileX, y: tileY, width: tileW, height: tileH),
-                            lodScale: lodScale
+                            tileRect: CGRect(
+                                x: bounds.minX + localTileX,
+                                y: bounds.minY + localTileY,
+                                width: tileW,
+                                height: tileH
+                            ),
+                            scale: pixelScale,
+                            maximumTextureDimension: maximumTextureDimension
                         )
                     }
                 }
             }
         }
 
-        // Render sublayers
-        if let sublayers = tiledLayer.sublayers, !sublayers.isEmpty {
-            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
-            let sublayerMatrix = presentation.sublayerMatrix(modelMatrix: modelMatrix)
-            for sublayer in tiledLayer.sortedSublayers() {
-                self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
-            }
-        }
     }
 
     /// Renders a tile with a cached image texture.
@@ -6673,42 +6838,53 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         tiledLayer: CATiledLayer,
         tileKey: CATiledLayer.TileKey,
         tileRect: CGRect,
-        lodScale: CGFloat
+        scale: CGFloat,
+        maximumTextureDimension: Int
     ) {
-        guard tiledLayer.delegate != nil else { return }
+        guard let delegate = tiledLayer.delegate else { return }
 
-        // Mark tile as loading
+        let pixelWidth = min(maximumTextureDimension, max(1, Int(ceil(tileRect.width * scale))))
+        let pixelHeight = min(maximumTextureDimension, max(1, Int(ceil(tileRect.height * scale))))
         tiledLayer.loadingTiles.insert(tileKey)
 
-        let scale = max(tiledLayer.contentsScale / lodScale, 0.000_001)
-        let pixelWidth = max(1, Int(ceil(tileRect.width * scale)))
-        let pixelHeight = max(1, Int(ceil(tileRect.height * scale)))
+        pendingTileDraws.append(PendingTileDraw(
+            tiledLayer: tiledLayer,
+            delegate: delegate,
+            tileKey: tileKey,
+            tileRect: tileRect,
+            scale: scale,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        ))
+    }
 
-        let callback = JSOneshotClosure { _ in
+    private func processPendingTileDraws() {
+        let requests = pendingTileDraws
+        pendingTileDraws.removeAll(keepingCapacity: true)
+        for request in requests {
             Self.beginTileDraw(
-                tiledLayer: tiledLayer,
-                tileKey: tileKey,
-                tileRect: tileRect,
-                scale: scale,
-                pixelWidth: pixelWidth,
-                pixelHeight: pixelHeight
+                tiledLayer: request.tiledLayer,
+                delegate: request.delegate,
+                tileKey: request.tileKey,
+                tileRect: request.tileRect,
+                scale: request.scale,
+                pixelWidth: request.pixelWidth,
+                pixelHeight: request.pixelHeight
             )
-            return .undefined
         }
-        _ = JSObject.global.queueMicrotask.function!(callback)
     }
 
     private static func beginTileDraw(
         tiledLayer: CATiledLayer,
+        delegate: any CALayerDelegate,
         tileKey: CATiledLayer.TileKey,
         tileRect: CGRect,
         scale: CGFloat,
         pixelWidth: Int,
         pixelHeight: Int
     ) {
-        guard let delegate = tiledLayer.delegate,
-              let context = CGContext(
-                data: nil,
+        guard let context = CGContext(
+                softwareData: nil,
                 width: pixelWidth,
                 height: pixelHeight,
                 bitsPerComponent: 8,

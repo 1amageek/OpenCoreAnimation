@@ -44,6 +44,10 @@ public struct CATransitionSubtype: Hashable, Equatable, RawRepresentable, Sendab
 /// An object that provides an animated transition between a layer's states.
 open class CATransition: CAAnimation {
 
+    /// The layer tree captured when this transition was attached.
+    /// The renderer owns no model state; the animation copy carries its source state.
+    internal var sourceLayerSnapshot: CALayer?
+
     /// The name of the transition.
     open var type: CATransitionType = .fade
 
@@ -71,6 +75,7 @@ open class CATransition: CAAnimation {
             self.startProgress = source.startProgress
             self.endProgress = source.endProgress
             self.filter = source.filter
+            self.sourceLayerSnapshot = source.sourceLayerSnapshot
         }
     }
 }

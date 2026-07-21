@@ -126,6 +126,9 @@ open class CALayer: CAMediaTiming, Hashable {
     /// The model layer if this is a presentation layer.
     private weak var _modelLayer: CALayer?
 
+    /// Set only on a presentation layer while a built-in CATransition is active.
+    internal var _transitionRenderState: CATransitionRenderState?
+
     /// Returns a copy of the presentation layer object that represents the state of the layer
     /// as it currently appears onscreen.
     ///
@@ -260,6 +263,8 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Updates a presentation layer with animated values at a specific time.
     private func updatePresentationLayer(_ presentation: CALayer, at currentTime: CFTimeInterval) {
+
+        presentation._transitionRenderState = nil
 
         // Copy current property values
         presentation._bounds = _bounds
@@ -501,104 +506,19 @@ open class CALayer: CAMediaTiming, Hashable {
         let endProgress = CFTimeInterval(transition.endProgress)
         let rangedProgress = startProgress + adjustedProgress * (endProgress - startProgress)
 
-        // Apply the transition effect
-        applyTransitionEffect(transition, to: layer, progress: rangedProgress)
-    }
-
-    /// Applies the visual effect of a transition at a given progress.
-    private func applyTransitionEffect(_ transition: CATransition, to layer: CALayer, progress: CFTimeInterval) {
-        let clampedProgress = max(0, min(1, progress))
-
-        switch transition.type {
-        case .fade:
-            // Fade: animate opacity from 0 to 1
-            layer._opacity = Float(clampedProgress)
-
-        case .push:
-            // Push: new content pushes old content out
-            // The direction determines which way the content moves
-            let offset = calculateTransitionOffset(
-                transition: transition,
-                layerBounds: layer.bounds,
-                progress: clampedProgress,
-                isPush: true
-            )
-            layer._position = CGPoint(
-                x: layer._position.x + offset.x,
-                y: layer._position.y + offset.y
-            )
-
-        case .moveIn:
-            // MoveIn: new content slides in over old content
-            // Similar to push but old content stays in place
-            let offset = calculateTransitionOffset(
-                transition: transition,
-                layerBounds: layer.bounds,
-                progress: clampedProgress,
-                isPush: false
-            )
-            layer._position = CGPoint(
-                x: layer._position.x + offset.x,
-                y: layer._position.y + offset.y
-            )
-            // Also fade in slightly for smoother effect
-            layer._opacity = Float(clampedProgress)
-
-        case .reveal:
-            // Reveal: content is gradually revealed from a direction
-            // Apply the directional reveal to the presentation snapshot.
-            layer._opacity = Float(clampedProgress)
-            let offset = calculateTransitionOffset(
-                transition: transition,
-                layerBounds: layer.bounds,
-                progress: clampedProgress,
-                isPush: false
-            )
-            // Move content in opposite direction during reveal
-            layer._position = CGPoint(
-                x: layer._position.x - offset.x * 0.3,  // Subtle movement
-                y: layer._position.y - offset.y * 0.3
-            )
-
-        default:
-            // Custom transition identifiers have no defined built-in effect.
-            break
-        }
-    }
-
-    /// Calculates the position offset for push/moveIn/reveal transitions.
-    private func calculateTransitionOffset(
-        transition: CATransition,
-        layerBounds: CGRect,
-        progress: CFTimeInterval,
-        isPush: Bool
-    ) -> CGPoint {
-        // Calculate the offset based on subtype (direction)
-        let width = layerBounds.width
-        let height = layerBounds.height
-
-        // For push, content moves from off-screen to on-screen
-        // Progress 0 = fully off-screen, Progress 1 = fully on-screen
-        let offsetMultiplier = CGFloat(1 - progress)
-
-        var offsetX: CGFloat = 0
-        var offsetY: CGFloat = 0
-
-        switch transition.subtype {
-        case .fromLeft:
-            offsetX = -width * offsetMultiplier
-        case .fromRight:
-            offsetX = width * offsetMultiplier
-        case .fromTop:
-            offsetY = -height * offsetMultiplier
-        case .fromBottom:
-            offsetY = height * offsetMultiplier
-        default:
-            // Default to fromLeft if no subtype specified
-            offsetX = -width * offsetMultiplier
-        }
-
-        return CGPoint(x: offsetX, y: offsetY)
+        // Filter-driven transitions are not complete: `CATransition.filter` exposes `Any`
+        // and the current renderer has no typed source/target-image contract for executing it.
+        // The active path therefore creates render state only for built-in transition types.
+        // A non-nil filter must not be considered rendered until an offscreen filter bridge can
+        // provide and validate the filtered output texture.
+        guard transition.filter == nil,
+              let sourceLayer = transition.sourceLayerSnapshot else { return }
+        layer._transitionRenderState = CATransitionRenderState(
+            sourceLayer: sourceLayer,
+            type: transition.type,
+            subtype: transition.subtype,
+            progress: max(0, min(1, rangedProgress))
+        )
     }
 
     /// Applies an animation group to the presentation layer.
@@ -4170,10 +4090,27 @@ open class CALayer: CAMediaTiming, Hashable {
         copied.attachedLayer = self
         copied.animationKey = animKey
 
+        if let transition = copied as? CATransition {
+            transition.sourceLayerSnapshot = makeTransitionSnapshot()
+        }
+
         _animations[animKey] = copied
         CATransaction.registerAnimation(copied)
         markDirty(.animations)
 
+    }
+
+    /// Captures the renderable model tree without animations or ownership links.
+    private func makeTransitionSnapshot() -> CALayer {
+        let snapshot = type(of: self).init(layer: self)
+        if let mask {
+            snapshot.mask = mask.makeTransitionSnapshot()
+        }
+        for sublayer in _sublayers ?? [] {
+            snapshot.addSublayer(sublayer.makeTransitionSnapshot())
+        }
+        snapshot.recursivelyClearDirtyAfterCommit()
+        return snapshot
     }
 
     /// Resolves inherited durations throughout an animation group.

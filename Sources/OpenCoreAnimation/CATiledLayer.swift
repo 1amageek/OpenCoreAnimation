@@ -107,6 +107,9 @@ open class CATiledLayer: CALayer {
     /// The renderer uses this cache to avoid re-rendering tiles unnecessarily.
     internal var tileCache: [TileKey: CGImage] = [:]
 
+    /// Media times at which cached tiles became available for display.
+    internal var tileFadeStartTimes: [TileKey: CFTimeInterval] = [:]
+
     /// Set of tiles currently being loaded.
     internal var loadingTiles: Set<TileKey> = []
 
@@ -116,6 +119,7 @@ open class CATiledLayer: CALayer {
     /// such as when the underlying data changes.
     internal func clearTileCache() {
         tileCache.removeAll()
+        tileFadeStartTimes.removeAll()
         loadingTiles.removeAll()
         setNeedsDisplay()
     }
@@ -125,6 +129,7 @@ open class CATiledLayer: CALayer {
     /// Use this to invalidate individual tiles when only part of the content changes.
     internal func clearTile(at key: TileKey) {
         tileCache.removeValue(forKey: key)
+        tileFadeStartTimes.removeValue(forKey: key)
         loadingTiles.remove(key)
     }
 
@@ -134,8 +139,44 @@ open class CATiledLayer: CALayer {
     }
 
     /// Stores a rendered tile image in the cache.
-    internal func cacheImage(_ image: CGImage, for key: TileKey) {
+    internal func cacheImage(
+        _ image: CGImage,
+        for key: TileKey,
+        at mediaTime: CFTimeInterval = CACurrentMediaTime()
+    ) {
         tileCache[key] = image
+        tileFadeStartTimes[key] = mediaTime
         loadingTiles.remove(key)
+    }
+
+    /// Returns the opacity for a newly cached tile at the supplied media time.
+    internal func tileOpacity(for key: TileKey, at mediaTime: CFTimeInterval) -> Float {
+        guard let startTime = tileFadeStartTimes[key] else { return 1 }
+        let duration = type(of: self).fadeDuration()
+        guard duration > 0 else { return 1 }
+        return Float(min(max((mediaTime - startTime) / duration, 0), 1))
+    }
+
+    /// Selects a signed detail level for a screen-space scale.
+    /// Negative levels represent magnified detail supplied by `levelsOfDetailBias`.
+    internal func lodLevel(forScreenScale screenScale: CGFloat) -> Int {
+        let safeScale = screenScale.isFinite && screenScale > 0 ? screenScale : 1
+        let requestedLevel = Int(floor(-log2(safeScale)))
+        let minimumLevel = -max(0, levelsOfDetailBias)
+
+        let pixelWidth = max(0, bounds.width * max(contentsScale, 0))
+        let pixelHeight = max(0, bounds.height * max(contentsScale, 0))
+        let minimumPixelDimension = min(pixelWidth, pixelHeight)
+        let requestedMaximum = max(0, levelsOfDetail - 1)
+        let dimensionLimit: Int
+        if minimumPixelDimension.isFinite, minimumPixelDimension >= 1 {
+            dimensionLimit = max(0, Int(floor(log2(minimumPixelDimension))))
+        } else if minimumPixelDimension == .infinity {
+            dimensionLimit = requestedMaximum
+        } else {
+            dimensionLimit = 0
+        }
+        let maximumLevel = min(requestedMaximum, dimensionLimit)
+        return min(max(requestedLevel, minimumLevel), maximumLevel)
     }
 }

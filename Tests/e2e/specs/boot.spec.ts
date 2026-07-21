@@ -16,6 +16,8 @@ interface OCA extends Harness {
     getCanvasWidth: () => number;
     getCanvasHeight: () => number;
     getSublayerCount: () => number;
+    getTileDrawCount: () => number;
+    getTileState: () => string;
     isEngineRunning: () => boolean;
     getPixelReadback: () => string;
     beginPixelReadback: () => void;
@@ -32,7 +34,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         expect(await h.getCanvasWidth(), "canvas width").toBe(400);
         expect(await h.getCanvasHeight(), "canvas height").toBe(300);
-        expect(await h.getSublayerCount(), "root sublayer count").toBe(3);
+        expect(await h.getSublayerCount(), "root sublayer count").toBe(5);
     });
 
     test("engine: display link is running", async ({ harness }) => {
@@ -51,11 +53,13 @@ test.describe("OpenCoreAnimation smoke", () => {
             [K in keyof OCA]: (...a: Parameters<OCA[K]>) => Promise<ReturnType<OCA[K]>>;
         };
         expect(await h.getStatus()).toBe("ready");
+        expect(await h.getTileState()).toBe("delegate=true,bounds=80.0x80.0");
+        await expect.poll(() => h.getTileDrawCount(), { timeout: 2_000 }).toBeGreaterThan(0);
         await h.beginPixelReadback();
 
         await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
         expect(await h.getPixelReadback()).toBe(
-            "255,0,0,255;0,255,0,255;26,26,38,255"
+            "255,0,0,255;0,255,0,255;26,26,38,255;255,0,255,255;128,0,128,255"
         );
     });
 });

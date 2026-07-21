@@ -25,7 +25,18 @@ nonisolated(unsafe) var canvasHeight: Int = 0
 nonisolated(unsafe) var sublayerCount: Int = 0
 nonisolated(unsafe) var rootLayerRef: CALayer?
 nonisolated(unsafe) var rasterizedGroupRef: CALayer?
+nonisolated(unsafe) var tiledLayerRef: CATiledLayer?
+nonisolated(unsafe) var tileDelegateRef: SmokeTileDelegate?
+nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
+
+final class SmokeTileDelegate: CALayerDelegate {
+    func draw(_ layer: CALayer, in context: CGContext) {
+        tileDrawCount += 1
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
+        context.fill(layer.bounds)
+    }
+}
 
 // MARK: - WASM entry point
 
@@ -41,6 +52,9 @@ public func setup() {
             canvasHeight = 0
             sublayerCount = 0
             rootLayerRef = nil
+            tiledLayerRef = nil
+            tileDelegateRef = nil
+            tileDrawCount = 0
             pixelReadbackResult = "pending"
         },
         then: { await performSetup() }
@@ -117,10 +131,35 @@ func performSetup() async {
     root.addSublayer(blue)
     rasterizedGroupRef = blue
 
+    let tileDelegate = SmokeTileDelegate()
+    let tiled = CATiledLayer()
+    tiled.bounds = CGRect(x: 0, y: 0, width: 80, height: 80)
+    tiled.position = CGPoint(x: 200, y: 220)
+    tiled.tileSize = CGSize(width: 80, height: 80)
+    tiled.delegate = tileDelegate
+    root.addSublayer(tiled)
+    tiledLayerRef = tiled
+    tileDelegateRef = tileDelegate
+
+    let transitioning = CALayer()
+    transitioning.bounds = CGRect(x: 0, y: 0, width: 80, height: 80)
+    transitioning.position = CGPoint(x: 320, y: 220)
+    transitioning.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+    root.addSublayer(transitioning)
+
+    let transition = CATransition()
+    transition.type = .fade
+    transition.duration = 1
+    transition.speed = 0
+    transition.timeOffset = 0.5
+    transitioning.add(transition, forKey: "browserCrossfade")
+    transitioning.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+
     rootLayerRef = root
     sublayerCount = root.sublayers?.count ?? 0
 
     engine.rootLayer = root
+    engine.renderFrame()
     engine.renderFrame()
     engine.start()
 
@@ -149,11 +188,25 @@ func installHarness() {
         h.expose("isRasterizedGroupEnabled", returning: {
             .boolean(rasterizedGroupRef?.shouldRasterize ?? false)
         })
+        h.expose("getTileDrawCount", returning: {
+            .number(Double(tileDrawCount))
+        })
+        h.expose("getTileState", returning: {
+            let layer = tiledLayerRef
+            return .string("delegate=\(layer?.delegate != nil),bounds=\(layer?.bounds.width ?? -1)x\(layer?.bounds.height ?? -1)")
+        })
         h.expose("getPixelReadback", returning: {
             .string(pixelReadbackResult)
         })
         h.expose("beginPixelReadback", action: {
             Task { @MainActor in
+                do {
+                    try await Task.sleep(for: .milliseconds(300))
+                } catch {
+                    pixelReadbackResult = "error: fade wait failed: \(error)"
+                    return
+                }
+
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 engine.renderFrame()
@@ -168,6 +221,8 @@ func installHarness() {
                         CGPoint(x: 80, y: 220),
                         CGPoint(x: 200, y: 220),
                         CGPoint(x: 10, y: 10),
+                        CGPoint(x: 200, y: 80),
+                        CGPoint(x: 320, y: 80),
                     ])
                     pixelReadbackResult = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
