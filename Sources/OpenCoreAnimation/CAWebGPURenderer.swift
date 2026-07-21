@@ -640,6 +640,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// effectiveOpacity = parent.effectiveOpacity * layer.opacity
     private var opacityStack: [Float] = []
 
+    /// Multiplicative color inherited from enclosing replicator instances.
+    private var replicatorColorStack: [SIMD4<Float>] = []
+
+    /// Animation-time offset inherited from enclosing replicator instances.
+    private var replicatorTimeOffsetStack: [CFTimeInterval] = []
+
     /// Tile delegate calls are deferred until the next frame boundary so layer-tree
     /// rendering never re-enters CGContext setup from inside an active render pass.
     private var pendingTileDraws: [PendingTileDraw] = []
@@ -658,6 +664,36 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Defaults to 1.0 when empty (root level).
     private var currentEffectiveOpacity: Float {
         opacityStack.last ?? 1.0
+    }
+
+    private var currentReplicatorColor: SIMD4<Float> {
+        replicatorColorStack.last ?? SIMD4(1, 1, 1, 1)
+    }
+
+    private var currentReplicatorTimeOffset: CFTimeInterval {
+        replicatorTimeOffsetStack.last ?? 0
+    }
+
+    private func renderPresentation(for layer: CALayer) -> CALayer {
+        let timeOffset = currentReplicatorTimeOffset
+        return timeOffset == 0
+            ? layer._renderTimePresentation()
+            : layer.presentationAtTimeOffset(timeOffset)
+    }
+
+    private func replicatedColor(_ color: SIMD4<Float>) -> SIMD4<Float> {
+        color * currentReplicatorColor
+    }
+
+    private func orderedSublayers(for layer: CALayer) -> [CALayer] {
+        guard currentReplicatorTimeOffset != 0 else {
+            return layer.sortedSublayers()
+        }
+        return (layer.sublayers ?? []).enumerated().sorted { lhs, rhs in
+            let lhsZ = renderPresentation(for: lhs.element).zPosition
+            let rhsZ = renderPresentation(for: rhs.element).zPosition
+            return lhsZ == rhsZ ? lhs.offset < rhs.offset : lhsZ < rhsZ
+        }.map(\.element)
     }
 
     /// The full viewport clip rect.
@@ -2278,6 +2314,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentVertexOffset = 0
         droppedLayerCount = 0
         opacityStack.removeAll()
+        replicatorColorStack.removeAll()
+        replicatorTimeOffsetStack.removeAll()
         transitionSuppressedLayer = nil
         renderTargetSizeOverride = nil
         activeTransitionSourceIDs.removeAll(keepingCapacity: true)
@@ -2747,7 +2785,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Get the presentation layer for animated values, fall back to model layer
         // This is critical for animations to be visible - the presentation layer
         // reflects the current animated state of all properties
-        let presentationLayer = layer._renderTimePresentation()
+        let presentationLayer = renderPresentation(for: layer)
 
         // Skip hidden layers (using presentation layer values)
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
@@ -2791,7 +2829,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         } else {
             modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
         }
-
         // Backface culling: skip rendering when layer faces away from camera
         if !presentationLayer.isDoubleSided {
             // The 2x2 determinant of the upper-left submatrix indicates face direction.
@@ -2867,7 +2904,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // CATransformLayer: Only render sublayers, skip own properties
         if presentationLayer is CATransformLayer {
-            renderTransformLayerSublayers(layer, renderPass: renderPass, parentMatrix: modelMatrix)
+            renderTransformLayerSublayers(
+                layer,
+                presentationLayer: presentationLayer,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
             return
         }
 
@@ -2885,7 +2927,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             if let sublayers = layer.sublayers, !sublayers.isEmpty {
                 // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
                 let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-                for sublayer in layer.sortedSublayers() {
+                for sublayer in orderedSublayers(for: layer) {
                     self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
                 }
             }
@@ -2952,7 +2994,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // Render sublayers (use model layer hierarchy, but presentation layer's sublayerTransform)
-        if let sublayers = layer.sublayers {
+        if layer.sublayers != nil {
             // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
@@ -2977,16 +3019,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // `sortedSublayers()` is cached on the model parent (`layer`); a
             // CAReplicatorLayer's presentation copy has no sublayers of its
             // own, so the cache must be read off the model side.
-            let sortedSubs = layer.sortedSublayers()
             if let replicatorLayer = presentationLayer as? CAReplicatorLayer {
                 renderReplicatorSublayers(
                     replicatorLayer: replicatorLayer,
-                    sublayers: sortedSubs,
+                    sublayers: layer.sublayers ?? [],
                     renderPass: renderPass,
                     parentMatrix: sublayerMatrix
                 )
             } else {
-                for sublayer in sortedSubs {
+                for sublayer in orderedSublayers(for: layer) {
                     self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
                 }
             }
@@ -3462,7 +3503,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
         presentation.position = originalPosition
 
-        let white = SIMD4<Float>(1, 1, 1, 1)
+        let white = currentReplicatorColor
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
@@ -3550,7 +3591,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
 
-        let color = presentationLayer.backgroundColorComponents
+        let color = replicatedColor(presentationLayer.backgroundColorComponents)
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
@@ -3616,7 +3657,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
 
-        let color = presentationLayer.borderColorComponents
+        let color = replicatedColor(presentationLayer.borderColorComponents)
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
@@ -3707,7 +3748,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass.setStencilReference(currentStencilValue)
 
         // Render the mask layer (this writes to stencil buffer)
-        let maskPresentationLayer = maskLayer._renderTimePresentation()
+        let maskPresentationLayer = renderPresentation(for: maskLayer)
         let maskModelMatrix = maskPresentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
         // Render mask layer content to stencil - use dynamic vertex allocation
@@ -3871,23 +3912,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
     ) {
-        let instanceCount = max(1, replicatorLayer.instanceCount)
+        let instanceCount = max(0, replicatorLayer.instanceCount)
+        guard instanceCount > 0 else { return }
         let instanceTransform = replicatorLayer.instanceTransform
         let instanceDelay = replicatorLayer.instanceDelay
 
-        // Get base instance color (defaults to white if not set)
-        let baseColor: SIMD4<Float>
-        if let color = replicatorLayer.instanceColor,
-           let components = color.components, components.count >= 4 {
-            baseColor = SIMD4<Float>(
-                Float(components[0]),
-                Float(components[1]),
-                Float(components[2]),
-                Float(components[3])
-            )
-        } else {
-            baseColor = SIMD4<Float>(1, 1, 1, 1)
-        }
+        let baseColor = replicatorLayer.instanceColor.map(rgbaComponents)
+            ?? SIMD4<Float>(1, 1, 1, 1)
 
         // Color offsets per instance
         let redOffset = replicatorLayer.instanceRedOffset
@@ -3899,13 +3930,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         var cumulativeTransform = CATransform3DIdentity
         for instanceIndex in 0..<instanceCount {
             // Calculate color multiplier for this instance
-            let colorMultiplier = SIMD4<Float>(
+            let instanceColor = SIMD4<Float>(
                 clamp(baseColor.x + Float(instanceIndex) * redOffset, 0, 1),
                 clamp(baseColor.y + Float(instanceIndex) * greenOffset, 0, 1),
                 clamp(baseColor.z + Float(instanceIndex) * blueOffset, 0, 1),
                 clamp(baseColor.w + Float(instanceIndex) * alphaOffset, 0, 1)
             )
-
             // Calculate instance matrix
             let instanceMatrix = parentMatrix * cumulativeTransform.matrix4x4
 
@@ -3914,230 +3944,63 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // So instance N's animations are evaluated at (currentTime - N * instanceDelay)
             let timeOffset = CFTimeInterval(instanceIndex) * instanceDelay
 
-            // Render all sublayers with this instance's transform, color, and time offset
-            // (caller is responsible for passing `sublayers` already sorted by zPosition).
-            for sublayer in sublayers {
-                renderLayerWithColorMultiplierAndTimeOffset(
+            let inheritedColor = currentReplicatorColor
+            let inheritedTimeOffset = currentReplicatorTimeOffset
+            replicatorColorStack.append(inheritedColor * instanceColor)
+            replicatorTimeOffsetStack.append(inheritedTimeOffset + timeOffset)
+
+            let orderedSublayers = sublayers.enumerated().sorted { lhs, rhs in
+                let lhsZ = renderPresentation(for: lhs.element).zPosition
+                let rhsZ = renderPresentation(for: rhs.element).zPosition
+                return lhsZ == rhsZ ? lhs.offset < rhs.offset : lhsZ < rhsZ
+            }.map(\.element)
+            for sublayer in orderedSublayers {
+                renderLayer(
                     sublayer,
                     renderPass: renderPass,
-                    parentMatrix: instanceMatrix,
-                    colorMultiplier: colorMultiplier,
-                    timeOffset: timeOffset
+                    parentMatrix: instanceMatrix
                 )
             }
+
+            _ = replicatorTimeOffsetStack.popLast()
+            _ = replicatorColorStack.popLast()
 
             // Apply instance transform for next iteration
             cumulativeTransform = CATransform3DConcat(cumulativeTransform, instanceTransform)
         }
     }
 
-    /// Renders a layer with a color multiplier applied (for replicator instances).
-    private func renderLayerWithColorMultiplier(
-        _ layer: CALayer,
-        renderPass: GPURenderPassEncoder,
-        parentMatrix: Matrix4x4,
-        colorMultiplier: SIMD4<Float>
-    ) {
-        guard let device = device,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup else { return }
-
-        let presentationLayer = layer._renderTimePresentation()
-        guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
-
-        // Push effective opacity for this replicator instance subtree
-        let effectiveOpacity = currentEffectiveOpacity * presentationLayer.opacity
-        opacityStack.append(effectiveOpacity)
-        defer { _ = opacityStack.popLast() }
-
-        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
-
-        // For now, render background color with the color multiplier applied
-        if presentationLayer.backgroundColor != nil {
-            // Apply color multiplier to the layer's background color
-            var baseColor = presentationLayer.backgroundColorComponents
-            baseColor.x *= colorMultiplier.x
-            baseColor.y *= colorMultiplier.y
-            baseColor.z *= colorMultiplier.z
-            baseColor.w *= colorMultiplier.w
-
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-            ]
-
-            guard let allocation = allocateVertices(count: vertices.count) else { return }
-            let (vertexOffset, layerIndex) = allocation
-
-            let scaleMatrix = Matrix4x4(columns: (
-                SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
-                SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
-                SIMD4<Float>(0, 0, 1, 0),
-                SIMD4<Float>(0, 0, 0, 1)
-            ))
-
-            let finalMatrix = modelMatrix * scaleMatrix
-
-            var uniforms = CARendererUniforms(
-                mvpMatrix: finalMatrix,
-                opacity: currentEffectiveOpacity,
-                cornerRadius: Float(presentationLayer.cornerRadius),
-                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
-                cornerRadii: presentationLayer.cornerRadiiComponents
-            )
-
-            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-            let uniformData = createFloat32Array(from: &uniforms)
-            device.queue.writeBuffer(
-                uniformBuffer,
-                bufferOffset: uniformOffset,
-                data: uniformData
-            )
-
-            let vertexData = createFloat32Array(from: &vertices)
-            device.queue.writeBuffer(
-                vertexBuffer,
-                bufferOffset: vertexOffset,
-                data: vertexData
-            )
-
-            renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-            renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-            renderPass.draw(vertexCount: 6)
-        }
-
-        // Recursively render sublayers
-        if let sublayers = layer.sublayers {
-            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
-            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-
-            for sublayer in layer.sortedSublayers() {
-                renderLayerWithColorMultiplier(
-                    sublayer,
-                    renderPass: renderPass,
-                    parentMatrix: sublayerMatrix,
-                    colorMultiplier: colorMultiplier
-                )
-            }
-        }
-    }
-
-    /// Renders a layer with a color multiplier and time offset applied (for replicator instances with instanceDelay).
-    ///
-    /// The time offset is used to evaluate animations at a different point in time,
-    /// creating staggered animation effects across replicator instances.
-    private func renderLayerWithColorMultiplierAndTimeOffset(
-        _ layer: CALayer,
-        renderPass: GPURenderPassEncoder,
-        parentMatrix: Matrix4x4,
-        colorMultiplier: SIMD4<Float>,
-        timeOffset: CFTimeInterval
-    ) {
-        guard let device = device,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup else { return }
-
-        // Get presentation layer at the specified time offset
-        let presentationLayer: CALayer
-        if timeOffset != 0 {
-            presentationLayer = layer.presentationAtTimeOffset(timeOffset)
-        } else {
-            presentationLayer = layer._renderTimePresentation()
-        }
-
-        guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
-
-        // Push effective opacity for this replicator instance subtree
-        let effectiveOpacityForInstance = currentEffectiveOpacity * presentationLayer.opacity
-        opacityStack.append(effectiveOpacityForInstance)
-        defer { _ = opacityStack.popLast() }
-
-        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
-
-        // Render background color with the color multiplier applied
-        if presentationLayer.backgroundColor != nil {
-            // Apply color multiplier to the layer's background color
-            var baseColor = presentationLayer.backgroundColorComponents
-            baseColor.x *= colorMultiplier.x
-            baseColor.y *= colorMultiplier.y
-            baseColor.z *= colorMultiplier.z
-            baseColor.w *= colorMultiplier.w
-
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: baseColor),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: baseColor),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: baseColor),
-            ]
-
-            guard let allocation = allocateVertices(count: vertices.count) else { return }
-            let (vertexOffset, layerIndex) = allocation
-
-            let scaleMatrix = Matrix4x4(columns: (
-                SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
-                SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
-                SIMD4<Float>(0, 0, 1, 0),
-                SIMD4<Float>(0, 0, 0, 1)
-            ))
-
-            let finalMatrix = modelMatrix * scaleMatrix
-
-            var uniforms = CARendererUniforms(
-                mvpMatrix: finalMatrix,
-                opacity: currentEffectiveOpacity,
-                cornerRadius: Float(presentationLayer.cornerRadius),
-                layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
-                cornerRadii: presentationLayer.cornerRadiiComponents
-            )
-
-            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-            let uniformData = createFloat32Array(from: &uniforms)
-            device.queue.writeBuffer(
-                uniformBuffer,
-                bufferOffset: uniformOffset,
-                data: uniformData
-            )
-
-            let vertexData = createFloat32Array(from: &vertices)
-            device.queue.writeBuffer(
-                vertexBuffer,
-                bufferOffset: vertexOffset,
-                data: vertexData
-            )
-
-            renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-            renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-            renderPass.draw(vertexCount: 6)
-        }
-
-        // Recursively render sublayers with the same time offset
-        if let sublayers = layer.sublayers {
-            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
-            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-
-            for sublayer in layer.sortedSublayers() {
-                renderLayerWithColorMultiplierAndTimeOffset(
-                    sublayer,
-                    renderPass: renderPass,
-                    parentMatrix: sublayerMatrix,
-                    colorMultiplier: colorMultiplier,
-                    timeOffset: timeOffset
-                )
-            }
-        }
-    }
-
     /// Clamps a float value between min and max.
     private func clamp(_ value: Float, _ minVal: Float, _ maxVal: Float) -> Float {
         return min(max(value, minVal), maxVal)
+    }
+
+    private func rgbaComponents(_ color: CGColor) -> SIMD4<Float> {
+        let components = color.components ?? []
+        switch components.count {
+        case 4...:
+            return SIMD4(
+                Float(components[0]),
+                Float(components[1]),
+                Float(components[2]),
+                Float(components[3])
+            )
+        case 3:
+            return SIMD4(
+                Float(components[0]),
+                Float(components[1]),
+                Float(components[2]),
+                1
+            )
+        case 2:
+            let gray = Float(components[0])
+            return SIMD4(gray, gray, gray, Float(components[1]))
+        case 1:
+            let gray = Float(components[0])
+            return SIMD4(gray, gray, gray, 1)
+        default:
+            return SIMD4(0, 0, 0, 0)
+        }
     }
 
     // MARK: - Contents Layer Rendering (CGImage)
@@ -4366,7 +4229,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadii: effectiveCornerRadii
         )
 
-        let white = SIMD4<Float>(1, 1, 1, 1)
+        let white = currentReplicatorColor
 
         // Define the 9 patches as (posXMin, posXMax, posYMin, posYMax, uvXMin, uvXMax, uvYMin, uvYMax)
         // Note: In Y-up screen coordinates, posYMin < posYMax (bottom to top)
@@ -4544,7 +4407,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         //   - Screen top (posMaxY) → Texture top (uvMinY)
         //
         // Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
-        let white = SIMD4<Float>(1, 1, 1, 1)
+        let white = currentReplicatorColor
         var vertices: [CARendererVertex] = [
             // Triangle 1: bottom-left, bottom-right, top-left
             // posMinY (screen bottom) uses uvMaxY (texture bottom) - V-flipped
@@ -5173,7 +5036,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         //   - Screen top (Y=1) → Texture top (V=0)
         //
         // Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
-        let white = SIMD4<Float>(1, 1, 1, 1)
+        let white = currentReplicatorColor
         var vertices: [CARendererVertex] = [
             // Triangle 1: bottom-left, bottom-right, top-left
             // Y=0 (screen bottom) uses V=1 (texture bottom) - V-flipped
@@ -6061,15 +5924,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Converts CGColor to SIMD4<Float>.
     private func cgColorToSIMD4(_ color: CGColor) -> SIMD4<Float> {
-        guard let components = color.components, components.count >= 4 else {
-            return SIMD4<Float>(0, 0, 0, 1)
-        }
-        return SIMD4<Float>(
-            Float(components[0]),
-            Float(components[1]),
-            Float(components[2]),
-            Float(components[3])
-        )
+        replicatedColor(rgbaComponents(color))
     }
 
     // MARK: - Gradient Layer Rendering
@@ -6113,15 +5968,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Extract gradient colors
         var gradientColors: [SIMD4<Float>] = []
         for colorAny in colors.prefix(kMaxGradientStops) {
-            if let cgColor = colorAny as? CGColor,
-               let components = cgColor.components,
-               components.count >= 4 {
-                gradientColors.append(SIMD4<Float>(
-                    Float(components[0]),
-                    Float(components[1]),
-                    Float(components[2]),
-                    Float(components[3])
-                ))
+            if let cgColor = colorAny as? CGColor {
+                gradientColors.append(replicatedColor(rgbaComponents(cgColor)))
             } else {
                 gradientColors.append(SIMD4<Float>(0, 0, 0, 1))
             }
@@ -6943,7 +6791,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Quad in normalised layer-bounds space. UVs V-flip to convert
         // between Y-up world coords and Y-down texture rows — same
         // convention used by `renderContentsLayer`.
-        let white = SIMD4<Float>(1, 1, 1, 1)
+        let white = currentReplicatorColor
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
@@ -7175,7 +7023,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
         if let sublayers = layer.sublayers, !sublayers.isEmpty {
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-            for sublayer in layer.sortedSublayers() {
+            for sublayer in orderedSublayers(for: layer) {
                 collectFilteredLayers(
                     sublayer,
                     parentMatrix: sublayerMatrix,
@@ -7209,7 +7057,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         if let sublayers = layer.sublayers, !sublayers.isEmpty {
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-            for sublayer in layer.sortedSublayers() {
+            for sublayer in orderedSublayers(for: layer) {
                 collectShadowLayers(
                     sublayer,
                     parentMatrix: sublayerMatrix,
@@ -7241,14 +7089,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let effectiveOpacity = currentEffectiveOpacity
         let colorComponents: SIMD4<Float>
         if let components = shadowColor.components, components.count >= 3 {
-            colorComponents = SIMD4<Float>(
+            colorComponents = replicatedColor(SIMD4<Float>(
                 Float(components[0]),
                 Float(components[1]),
                 Float(components[2]),
                 (components.count > 3 ? Float(components[3]) * shadowOpacity : shadowOpacity) * effectiveOpacity
-            )
+            ))
         } else {
-            colorComponents = SIMD4<Float>(0, 0, 0, shadowOpacity * effectiveOpacity)
+            colorComponents = replicatedColor(
+                SIMD4<Float>(0, 0, 0, shadowOpacity * effectiveOpacity)
+            )
         }
 
         var shadowUniforms = ShadowUniforms(
@@ -7327,7 +7177,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             opacity: currentEffectiveOpacity,
             filterType: 0,
             parameter0: 0,
-            parameter1: 0
+            parameter1: 0,
+            colorMultiplier: currentReplicatorColor
         )
         let filterUniformData = createFloat32Array(from: &filterUniforms)
         device.queue.writeBuffer(
@@ -7371,23 +7222,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// transformed z-coordinates of each sublayer.
     private func renderTransformLayerSublayers(
         _ layer: CALayer,
+        presentationLayer: CALayer,
         renderPass: GPURenderPassEncoder,
-        parentMatrix: Matrix4x4
+        modelMatrix: Matrix4x4
     ) {
-        let presentationLayer = layer._renderTimePresentation()
+        guard layer.sublayers != nil else { return }
 
-        guard let sublayers = layer.sublayers else { return }
-
-        // Apply the CATransformLayer's own transform (but not its content)
-        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
-
-        // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
+        // `renderLayer` already applied this transform layer's presentation transform.
+        // Only the sublayer transform and bounds origin remain before traversing children.
         let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
-        // Render sublayers in array order.
-        // The depth buffer handles z-ordering correctly - no pre-sorting needed.
-        // Sublayers sorted by zPosition (painter's algorithm, back-to-front).
-        for sublayer in layer.sortedSublayers() {
+        for sublayer in orderedSublayers(for: layer) {
             self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
         }
     }
@@ -7877,13 +7722,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let uvMaxX = Float(contentsRect.maxX)
         let uvMaxY = Float(contentsRect.maxY)
 
+        let replicatedParticleColor = replicatedColor(particle.color)
         var vertices: [CARendererVertex] = [
-            CARendererVertex(position: p0, texCoord: SIMD2(uvMinX, uvMaxY), color: particle.color),
-            CARendererVertex(position: p1, texCoord: SIMD2(uvMaxX, uvMaxY), color: particle.color),
-            CARendererVertex(position: p2, texCoord: SIMD2(uvMinX, uvMinY), color: particle.color),
-            CARendererVertex(position: p1, texCoord: SIMD2(uvMaxX, uvMaxY), color: particle.color),
-            CARendererVertex(position: p3, texCoord: SIMD2(uvMaxX, uvMinY), color: particle.color),
-            CARendererVertex(position: p2, texCoord: SIMD2(uvMinX, uvMinY), color: particle.color),
+            CARendererVertex(position: p0, texCoord: SIMD2(uvMinX, uvMaxY), color: replicatedParticleColor),
+            CARendererVertex(position: p1, texCoord: SIMD2(uvMaxX, uvMaxY), color: replicatedParticleColor),
+            CARendererVertex(position: p2, texCoord: SIMD2(uvMinX, uvMinY), color: replicatedParticleColor),
+            CARendererVertex(position: p1, texCoord: SIMD2(uvMaxX, uvMaxY), color: replicatedParticleColor),
+            CARendererVertex(position: p3, texCoord: SIMD2(uvMaxX, uvMinY), color: replicatedParticleColor),
+            CARendererVertex(position: p2, texCoord: SIMD2(uvMinX, uvMinY), color: replicatedParticleColor),
         ]
         guard let (vertexOffset, layerIndex) = allocateVertices(count: vertices.count) else {
             return false
@@ -8021,7 +7867,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         defer {
             if let sublayers = tiledLayer.sublayers, !sublayers.isEmpty {
                 let sublayerMatrix = presentation.sublayerMatrix(modelMatrix: modelMatrix)
-                for sublayer in tiledLayer.sortedSublayers() {
+                for sublayer in orderedSublayers(for: tiledLayer) {
                     self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
                 }
             }
@@ -8161,7 +8007,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create vertices with white color (texture provides color)
         // V-flip: in Y-up system, bottom vertices (y=0) get V=1, top vertices (y=1) get V=0
-        let white = SIMD4<Float>(1, 1, 1, 1)
+        let white = currentReplicatorColor
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),

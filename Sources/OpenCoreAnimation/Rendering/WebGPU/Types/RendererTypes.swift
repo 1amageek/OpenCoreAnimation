@@ -106,17 +106,20 @@ public struct FilterCompositeUniforms {
     public var filterType: Float
     public var parameter0: Float
     public var parameter1: Float
+    public var colorMultiplier: SIMD4<Float>
 
     public init(
         opacity: Float = 1.0,
         filterType: Float = 0.0,
         parameter0: Float = 0.0,
-        parameter1: Float = 0.0
+        parameter1: Float = 0.0,
+        colorMultiplier: SIMD4<Float> = SIMD4(1, 1, 1, 1)
     ) {
         self.opacity = opacity
         self.filterType = filterType
         self.parameter0 = parameter0
         self.parameter1 = parameter1
+        self.colorMultiplier = colorMultiplier
     }
 }
 

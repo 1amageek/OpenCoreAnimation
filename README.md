@@ -10,11 +10,12 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 
 | Evidence | Result |
 |---|---|
-| Native package | 349 tests passed |
-| Browser | 3 checks passed, including rasterized/tiled pixels, frozen transition pairs, filters, and multiple shadows read back from WebGPU |
+| Native package | 350 tests passed |
+| Browser | 3 checks passed, including rasterized/tiled pixels, frozen transition pairs, filters, multiple shadows, and replicated background/border/shape/image/gradient pixels read back from WebGPU |
 | Filters | Sibling and nested `CAFilter` chains use per-layer WebGPU resources with browser pixel and cleanup evidence; all 7 executable OpenCoreImage transition pipelines also have filter-specific browser pixel evidence, while unsupported transition filter objects are rejected without built-in fallback |
 | Shadows | Every visible shadow owns an independent mask, blur target, and uniform set; a nil `shadowPath` derives its silhouette from the rendered subtree alpha, while an explicit path uses direct tessellation. Browser evidence covers transparent image pixels, sublayer-only content, empty content, multiple shadows, inherited opacity, animated `shadowOpacity` from a zero model value, ancestor transform invalidation, empty `shadowPath`, and resource cleanup |
 | Emitters | Particle simulation state, fractional birth accumulation, random state, and cleanup are isolated per model `CAEmitterLayer`. All documented shape/mode combinations and uniform 3D emission cones honor emitter geometry, latitude, longitude, and range. Every render mode is active, including z-sorted back-to-front rendering, source-additive compositing, and stencil-aware masked particles. `CGImage` cells snapshot `contentsRect`, `contentsScale`, tint, magnification/minification filters, and mip bias at birth; nil contents remain simulated but invisible, while unsupported content is rejected. Nested child cells honor their media-timing window, emit from the parent's moving position, orient relative to its current direction, inherit its animated color and scale, and support later generations. Browser evidence covers these child-cell semantics plus image cropping/scaling, linear versus trilinear pixels, ordering, additive pixel readback, concurrent low-rate emitters, rectangle-outline and sphere-surface geometry, orthogonal 3D velocities, and independent removal |
+| Replicators | Instances traverse the normal layer renderer, with cumulative transforms, color multiplication/offsets, nested inherited state, `instanceDelay` animation evaluation, and a true zero-instance result. Browser pixels cover background, border, shape, image, and gradient content plus delayed opacity |
 | Display link | `duration` tracks display refresh cadence independently from preferred callback frequency; run-loop mode registrations are removed independently and verified through browser rAF delivery |
 | Remaining boundary | Core Image transition types without executable WGSL remain unavailable; complete QuartzCore parity is not claimed |
 
@@ -42,7 +43,7 @@ layer.cornerRadius = 10
 | `CAShapeLayer` | Vector shape rendering with paths, stroke, and fill |
 | `CAGradientLayer` | Linear and radial gradients |
 | `CATextLayer` | Text rendering with font and alignment |
-| `CAReplicatorLayer` | Instance replication with transforms and color offsets |
+| `CAReplicatorLayer` | Instance replication with cumulative transforms, color offsets, and animation delay |
 | `CAScrollLayer` | Scrollable content with bounds.origin-based scrolling |
 | `CATransformLayer` | 3D transform container (does not flatten sublayers) |
 | `CATiledLayer` | Tiled content rendering with level-of-detail support |

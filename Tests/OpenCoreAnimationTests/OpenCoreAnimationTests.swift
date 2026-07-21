@@ -1,4 +1,5 @@
 import Testing
+import simd
 @testable import OpenCoreAnimation
 // OpenCoreAnimation's umbrella `@_exported import`s OpenCoreGraphics. Importing
 // CoreGraphics here in addition would collide with OpenCoreGraphics' retroactive
@@ -50,6 +51,14 @@ struct CATransform3DTests {
         #expect(t.m22 == 1)
         #expect(t.m33 == 1)
         #expect(t.m44 == 1)
+    }
+
+    @Test("Renderer matrix applies CATransform3D translation to positions")
+    func rendererTranslationMatrix() {
+        let matrix = CATransform3DMakeTranslation(10, 20, 30).simdMatrix
+        let transformed = simd_mul(matrix, SIMD4<Float>(1, 2, 3, 1))
+
+        #expect(transformed == SIMD4<Float>(11, 22, 33, 1))
     }
 
     @Test("Chained translation works correctly")

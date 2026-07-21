@@ -38,6 +38,7 @@ nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
+nonisolated(unsafe) var replicatorProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -82,6 +83,7 @@ public func setup() {
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
             emitterProbeResult = "pending"
+            replicatorProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -258,6 +260,9 @@ func installHarness() {
         })
         h.expose("getEmitterProbeResult", returning: {
             .string(emitterProbeResult)
+        })
+        h.expose("getReplicatorProbeResult", returning: {
+            .string(replicatorProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -733,6 +738,180 @@ func installHarness() {
                 imageContent.removeFromSuperlayer()
                 engine.renderFrame()
                 shadowProbeResult = result
+            }
+        })
+        h.expose("beginReplicatorProbe", action: {
+            Task { @MainActor in
+                replicatorProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    replicatorProbeResult = "error: root layer or renderer unavailable"
+                    return
+                }
+
+                let replicator = CAReplicatorLayer()
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                replicator.bounds = root.bounds
+                replicator.position = root.position
+                replicator.zPosition = 100
+                replicator.instanceCount = 2
+                replicator.instanceTransform = CATransform3DMakeTranslation(40, 0, 0)
+                replicator.instanceColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                replicator.instanceRedOffset = -1
+                replicator.instanceGreenOffset = 1
+
+                let background = CALayer()
+                background.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                background.position = CGPoint(x: 30, y: 140)
+                background.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                replicator.addSublayer(background)
+
+                let bordered = CALayer()
+                bordered.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                bordered.position = CGPoint(x: 100, y: 140)
+                bordered.borderColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                bordered.borderWidth = 3
+                replicator.addSublayer(bordered)
+
+                let shape = CAShapeLayer()
+                shape.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                shape.position = CGPoint(x: 170, y: 140)
+                let path = CGMutablePath()
+                path.addRect(shape.bounds)
+                shape.path = path
+                shape.fillColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                replicator.addSublayer(shape)
+
+                let imageData = Data(repeating: 255, count: 8 * 8 * 4)
+                guard let image = CGImage(
+                    width: 8,
+                    height: 8,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 8 * 4,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(
+                        rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                    ),
+                    provider: CGDataProvider(data: imageData),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    CATransaction.commit()
+                    replicatorProbeResult = "error: image unavailable"
+                    return
+                }
+                let imageLayer = CALayer()
+                imageLayer.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                imageLayer.position = CGPoint(x: 240, y: 140)
+                imageLayer.contents = image
+                replicator.addSublayer(imageLayer)
+
+                let gradient = CAGradientLayer()
+                gradient.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                gradient.position = CGPoint(x: 310, y: 140)
+                gradient.colors = [
+                    CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+                    CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+                ]
+                replicator.addSublayer(gradient)
+
+                root.addSublayer(replicator)
+                CATransaction.commit()
+                engine.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 30, y: 160),
+                        CGPoint(x: 70, y: 160),
+                        CGPoint(x: 95, y: 160),
+                        CGPoint(x: 135, y: 160),
+                        CGPoint(x: 170, y: 160),
+                        CGPoint(x: 210, y: 160),
+                        CGPoint(x: 240, y: 160),
+                        CGPoint(x: 280, y: 160),
+                        CGPoint(x: 310, y: 160),
+                        CGPoint(x: 350, y: 160),
+                    ])
+                    let colorsMatch = pixels == [
+                        [255, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [255, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [255, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [255, 0, 0, 255],
+                        [0, 255, 0, 255],
+                        [255, 0, 0, 255],
+                        [0, 255, 0, 255],
+                    ]
+
+                    replicator.instanceCount = 0
+                    engine.renderFrame()
+                    let emptyPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 30, y: 160),
+                        CGPoint(x: 70, y: 160),
+                        CGPoint(x: 95, y: 160),
+                        CGPoint(x: 135, y: 160),
+                        CGPoint(x: 170, y: 160),
+                        CGPoint(x: 210, y: 160),
+                        CGPoint(x: 240, y: 160),
+                        CGPoint(x: 280, y: 160),
+                        CGPoint(x: 310, y: 160),
+                        CGPoint(x: 350, y: 160),
+                    ])
+                    let zeroCountMatches = emptyPixels.allSatisfy { pixel in
+                        pixel == [26, 26, 38, 255]
+                    }
+
+                    replicator.removeFromSuperlayer()
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    let delayedReplicator = CAReplicatorLayer()
+                    delayedReplicator.bounds = root.bounds
+                    delayedReplicator.position = root.position
+                    delayedReplicator.zPosition = 100
+                    delayedReplicator.instanceCount = 2
+                    delayedReplicator.instanceDelay = 0.5
+                    delayedReplicator.instanceTransform = CATransform3DMakeTranslation(40, 0, 0)
+
+                    let animatedLayer = CALayer()
+                    animatedLayer.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                    animatedLayer.position = CGPoint(x: 40, y: 200)
+                    animatedLayer.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                    delayedReplicator.addSublayer(animatedLayer)
+                    root.addSublayer(delayedReplicator)
+                    CATransaction.commit()
+
+                    let opacity = CABasicAnimation(keyPath: "opacity")
+                    opacity.fromValue = Float(0)
+                    opacity.toValue = Float(1)
+                    opacity.duration = 2
+                    opacity.beginTime = animatedLayer.convertTime(
+                        CACurrentMediaTime(),
+                        from: nil
+                    ) - 1
+                    opacity.fillMode = .both
+                    opacity.isRemovedOnCompletion = false
+                    animatedLayer.add(opacity, forKey: "replicatorDelayOpacity")
+
+                    engine.renderFrame()
+                    let delayedPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 40, y: 100),
+                        CGPoint(x: 80, y: 100),
+                    ])
+                    let delayMatches = Int(delayedPixels[0][0]) > Int(delayedPixels[1][0]) + 40
+                        && delayedPixels.allSatisfy { $0[3] == 255 }
+                    delayedReplicator.removeFromSuperlayer()
+                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches)"
+                } catch {
+                    replicatorProbeResult = "error: \(error)"
+                }
+                replicator.removeFromSuperlayer()
+                engine.renderFrame()
             }
         })
         h.expose("beginEmitterProbe", action: {

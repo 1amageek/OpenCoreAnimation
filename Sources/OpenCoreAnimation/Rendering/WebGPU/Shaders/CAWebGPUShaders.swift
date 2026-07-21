@@ -447,6 +447,7 @@ public enum CAWebGPUShaders {
     struct VertexOutput {
         @builtin(position) position: vec4<f32>,
         @location(0) texCoord: vec2<f32>,
+        @location(1) color: vec4<f32>,
     }
 
     @vertex
@@ -454,12 +455,15 @@ public enum CAWebGPUShaders {
         var output: VertexOutput;
         output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
         output.texCoord = input.texCoord;
+        output.color = input.color;
         return output;
     }
 
     @fragment
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
-        return textureSample(textureData, textureSampler, input.texCoord) * uniforms.opacity;
+        return textureSample(textureData, textureSampler, input.texCoord)
+            * input.color
+            * uniforms.opacity;
     }
     """
 
@@ -725,6 +729,7 @@ public enum CAWebGPUShaders {
         filterType: f32,
         parameter0: f32,
         parameter1: f32,
+        colorMultiplier: vec4<f32>,
     }
 
     @group(0) @binding(0) var<uniform> uniforms: FilterUniforms;
@@ -785,6 +790,7 @@ public enum CAWebGPUShaders {
             color.rgb = applyColorInvert(color.rgb);
         }
 
+        color *= uniforms.colorMultiplier;
         color.a *= uniforms.opacity;
         return color;
     }

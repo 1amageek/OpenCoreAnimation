@@ -130,11 +130,13 @@ extension CALayer {
 extension CATransform3D {
     /// Converts CATransform3D to Matrix4x4.
     internal var matrix4x4: Matrix4x4 {
+        // CATransform3D uses row-vector semantics (translation is m41/m42/m43).
+        // Transpose its rows into WebGPU columns so matrix * columnVector is equivalent.
         return Matrix4x4(columns: (
-            SIMD4<Float>(Float(m11), Float(m21), Float(m31), Float(m41)),
-            SIMD4<Float>(Float(m12), Float(m22), Float(m32), Float(m42)),
-            SIMD4<Float>(Float(m13), Float(m23), Float(m33), Float(m43)),
-            SIMD4<Float>(Float(m14), Float(m24), Float(m34), Float(m44))
+            SIMD4<Float>(Float(m11), Float(m12), Float(m13), Float(m14)),
+            SIMD4<Float>(Float(m21), Float(m22), Float(m23), Float(m24)),
+            SIMD4<Float>(Float(m31), Float(m32), Float(m33), Float(m34)),
+            SIMD4<Float>(Float(m41), Float(m42), Float(m43), Float(m44))
         ))
     }
 }
