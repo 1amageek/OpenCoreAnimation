@@ -836,6 +836,53 @@ func installHarness() {
                 filteredScopeSource.compositingFilter = multiply
                 filteredScopeParent.addSublayer(filteredScopeSource)
                 root.addSublayer(filteredScopeParent)
+
+                let clippedBackdrop = CALayer()
+                clippedBackdrop.bounds = CGRect(x: 0, y: 0, width: 100, height: 60)
+                clippedBackdrop.position = CGPoint(x: 250, y: 250)
+                clippedBackdrop.zPosition = 193
+                clippedBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(clippedBackdrop)
+
+                let clippingParent = CALayer()
+                clippingParent.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                clippingParent.position = CGPoint(x: 250, y: 250)
+                clippingParent.zPosition = 213
+                clippingParent.cornerRadius = 10
+                clippingParent.masksToBounds = true
+                let innerClippingParent = CALayer()
+                innerClippingParent.bounds = CGRect(x: 0, y: 0, width: 30, height: 40)
+                innerClippingParent.position = CGPoint(x: 25, y: 20)
+                innerClippingParent.cornerRadius = 5
+                innerClippingParent.masksToBounds = true
+                let clippedSource = CALayer()
+                clippedSource.bounds = CGRect(x: 0, y: 0, width: 80, height: 40)
+                clippedSource.position = CGPoint(x: 15, y: 20)
+                clippedSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                clippedSource.compositingFilter = screen
+                innerClippingParent.addSublayer(clippedSource)
+                clippingParent.addSublayer(innerClippingParent)
+                root.addSublayer(clippingParent)
+
+                let clippedFilterBackdrop = CALayer()
+                clippedFilterBackdrop.bounds = clippedBackdrop.bounds
+                clippedFilterBackdrop.position = CGPoint(x: 350, y: 250)
+                clippedFilterBackdrop.zPosition = 192
+                clippedFilterBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(clippedFilterBackdrop)
+
+                let filterClippingParent = CALayer()
+                filterClippingParent.bounds = clippingParent.bounds
+                filterClippingParent.position = CGPoint(x: 350, y: 250)
+                filterClippingParent.zPosition = 214
+                filterClippingParent.cornerRadius = 10
+                filterClippingParent.masksToBounds = true
+                let clippedBackdropFilter = CALayer()
+                clippedBackdropFilter.bounds = clippedSource.bounds
+                clippedBackdropFilter.position = CGPoint(x: 20, y: 20)
+                clippedBackdropFilter.backgroundFilters = [CAFilter.colorInvert()]
+                filterClippingParent.addSublayer(clippedBackdropFilter)
+                root.addSublayer(filterClippingParent)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -856,6 +903,13 @@ func installHarness() {
                         CGPoint(x: 50, y: 260),
                         CGPoint(x: 85, y: 260),
                         CGPoint(x: 160, y: 260),
+                        CGPoint(x: 250, y: 50),
+                        CGPoint(x: 215, y: 50),
+                        CGPoint(x: 232, y: 68),
+                        CGPoint(x: 235, y: 50),
+                        CGPoint(x: 350, y: 50),
+                        CGPoint(x: 315, y: 50),
+                        CGPoint(x: 332, y: 68),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -872,6 +926,13 @@ func installHarness() {
                         && pixels[12] == [127, 0, 0, 255]
                         && pixels[13] == [128, 128, 0, 255]
                         && pixels[14] == [255, 0, 255, 255]
+                        && pixels[15] == [255, 255, 0, 255]
+                        && pixels[16] == [255, 0, 0, 255]
+                        && pixels[17] == [255, 0, 0, 255]
+                        && pixels[18] == [255, 0, 0, 255]
+                        && pixels[19] == [0, 255, 255, 255]
+                        && pixels[20] == [255, 0, 0, 255]
+                        && pixels[21] == [255, 0, 0, 255]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -891,6 +952,10 @@ func installHarness() {
                     groupOpacityParent.removeFromSuperlayer()
                     filteredScopeBackdrop.removeFromSuperlayer()
                     filteredScopeParent.removeFromSuperlayer()
+                    clippedBackdrop.removeFromSuperlayer()
+                    clippingParent.removeFromSuperlayer()
+                    clippedFilterBackdrop.removeFromSuperlayer()
+                    filterClippingParent.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden

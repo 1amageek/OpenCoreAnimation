@@ -158,6 +158,7 @@ private struct BackdropCompositionTarget {
     let prepass: LayerPrepassTarget
     let scope: LayerPrepassTarget?
     let depth: Int
+    let clipAncestors: [LayerPrepassTarget]
     let sourceOpacity: Float
     let sourceColor: SIMD4<Float>
 }
@@ -267,6 +268,16 @@ private final class CompositionLayerResources {
     let backdropMaskView: GPUTextureView
     let mixedBackdropStraightTexture: GPUTexture
     let mixedBackdropStraightView: GPUTextureView
+    let clipShapeTexture: GPUTexture
+    let clipShapeView: GPUTextureView
+    let clipCumulativeTextureA: GPUTexture
+    let clipCumulativeViewA: GPUTextureView
+    let clipCumulativeTextureB: GPUTexture
+    let clipCumulativeViewB: GPUTextureView
+    let clippedSourceTexture: GPUTexture
+    let clippedSourceView: GPUTextureView
+    let combinedBackdropMaskTexture: GPUTexture
+    let combinedBackdropMaskView: GPUTextureView
     let backgroundFilterResources: FilterLayerResources
     let sourceUniformBuffer: GPUBuffer
     let sourceOpacityUniformBuffer: GPUBuffer
@@ -275,6 +286,7 @@ private final class CompositionLayerResources {
     let displayUniformBuffer: GPUBuffer
     let backdropMaskUniformBuffer: GPUBuffer
     let backdropMaskVertexBuffer: GPUBuffer
+    private(set) var clipUniformBuffers: [GPUBuffer] = []
 
     init(device: GPUDevice, width: Int, height: Int, format: GPUTextureFormat) {
         func makeTexture(_ format: GPUTextureFormat) -> GPUTexture {
@@ -305,6 +317,16 @@ private final class CompositionLayerResources {
         backdropMaskView = backdropMaskTexture.createView()
         mixedBackdropStraightTexture = makeTexture(format)
         mixedBackdropStraightView = mixedBackdropStraightTexture.createView()
+        clipShapeTexture = makeTexture(format)
+        clipShapeView = clipShapeTexture.createView()
+        clipCumulativeTextureA = makeTexture(format)
+        clipCumulativeViewA = clipCumulativeTextureA.createView()
+        clipCumulativeTextureB = makeTexture(format)
+        clipCumulativeViewB = clipCumulativeTextureB.createView()
+        clippedSourceTexture = makeTexture(format)
+        clippedSourceView = clippedSourceTexture.createView()
+        combinedBackdropMaskTexture = makeTexture(format)
+        combinedBackdropMaskView = combinedBackdropMaskTexture.createView()
         backgroundFilterResources = FilterLayerResources(
             device: device,
             width: width,
@@ -326,6 +348,16 @@ private final class CompositionLayerResources {
         ))
     }
 
+    func clipUniformBuffer(at index: Int, device: GPUDevice) -> GPUBuffer {
+        while clipUniformBuffers.count <= index {
+            clipUniformBuffers.append(device.createBuffer(descriptor: GPUBufferDescriptor(
+                size: caRendererAlignedUniformSize,
+                usage: [.uniform, .copyDst]
+            )))
+        }
+        return clipUniformBuffers[index]
+    }
+
     func destroy() {
         backdropTexture.destroy()
         sourcePremultipliedTexture.destroy()
@@ -334,6 +366,11 @@ private final class CompositionLayerResources {
         resultPremultipliedTexture.destroy()
         backdropMaskTexture.destroy()
         mixedBackdropStraightTexture.destroy()
+        clipShapeTexture.destroy()
+        clipCumulativeTextureA.destroy()
+        clipCumulativeTextureB.destroy()
+        clippedSourceTexture.destroy()
+        combinedBackdropMaskTexture.destroy()
         backgroundFilterResources.destroy()
         sourceUniformBuffer.destroy()
         sourceOpacityUniformBuffer.destroy()
@@ -342,6 +379,10 @@ private final class CompositionLayerResources {
         displayUniformBuffer.destroy()
         backdropMaskUniformBuffer.destroy()
         backdropMaskVertexBuffer.destroy()
+        for buffer in clipUniformBuffers {
+            buffer.destroy()
+        }
+        clipUniformBuffers.removeAll(keepingCapacity: false)
     }
 }
 
@@ -1075,6 +1116,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// Restricts filtered backdrop pixels to the transformed layer shape.
     private var backdropFilterMixPipeline: GPURenderPipeline?
+
+    /// Multiplies two full-viewport alpha coverage masks.
+    private var compositionMaskIntersectPipeline: GPURenderPipeline?
+
+    /// Applies a full-viewport alpha coverage mask to premultiplied color.
+    private var compositionMaskApplyPipeline: GPURenderPipeline?
 
     /// Stencil-aware filter composite pipeline.
     private var filterCompositeStencilPipeline: GPURenderPipeline?
@@ -2471,6 +2518,50 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: .layout(backdropMixPipelineLayout)
         ))
 
+        let compositionMaskBindGroupLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
+            entries: [
+                GPUBindGroupLayoutEntry(
+                    binding: 0,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 1,
+                    visibility: .fragment,
+                    texture: GPUTextureBindingLayout(sampleType: .float, viewDimension: .type2D)
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 2,
+                    visibility: .fragment,
+                    sampler: GPUSamplerBindingLayout(type: .filtering)
+                ),
+            ]
+        ))
+        let compositionMaskPipelineLayout = device.createPipelineLayout(descriptor: GPUPipelineLayoutDescriptor(
+            bindGroupLayouts: [compositionMaskBindGroupLayout]
+        ))
+        let compositionMaskShaderModule = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
+            code: CAWebGPUShaders.compositionMaskOperation
+        ))
+        compositionMaskIntersectPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(module: compositionMaskShaderModule, entryPoint: "vertexMain"),
+            fragment: GPUFragmentState(
+                module: compositionMaskShaderModule,
+                entryPoint: "intersectMasks",
+                targets: [GPUColorTargetState(format: preferredFormat)]
+            ),
+            layout: .layout(compositionMaskPipelineLayout)
+        ))
+        compositionMaskApplyPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(module: compositionMaskShaderModule, entryPoint: "vertexMain"),
+            fragment: GPUFragmentState(
+                module: compositionMaskShaderModule,
+                entryPoint: "applyMask",
+                targets: [GPUColorTargetState(format: preferredFormat)]
+            ),
+            layout: .layout(compositionMaskPipelineLayout)
+        ))
+
         filterOperationPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
             vertex: GPUVertexState(
                 module: filterCompositeShaderModule,
@@ -3068,6 +3159,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         maskBindGroupLayout = nil
         filterReplacementPipeline = nil
         backdropFilterMixPipeline = nil
+        compositionMaskIntersectPipeline = nil
+        compositionMaskApplyPipeline = nil
 
         // Stencil resources
         stencilWritePipeline = nil
@@ -7182,6 +7275,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         resources: CompositionLayerResources,
         encoder: GPUCommandEncoder
     ) -> Bool {
+        renderCompositionClipShape(
+            target,
+            outputView: resources.backdropMaskView,
+            uniformBuffer: resources.backdropMaskUniformBuffer,
+            vertexBuffer: resources.backdropMaskVertexBuffer,
+            encoder: encoder
+        )
+    }
+
+    private func renderCompositionClipShape(
+        _ target: LayerPrepassTarget,
+        outputView: GPUTextureView,
+        uniformBuffer: GPUBuffer,
+        vertexBuffer: GPUBuffer,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
         guard let device,
               let bindGroupLayout,
               let shadowMaskPipeline else { return false }
@@ -7205,7 +7314,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadii: presentation.cornerRadiiComponents
         )
         device.queue.writeBuffer(
-            resources.backdropMaskUniformBuffer,
+            uniformBuffer,
             bufferOffset: 0,
             data: createFloat32Array(from: &uniforms)
         )
@@ -7220,7 +7329,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: white),
         ]
         device.queue.writeBuffer(
-            resources.backdropMaskVertexBuffer,
+            vertexBuffer,
             bufferOffset: 0,
             data: createFloat32Array(from: &vertices)
         )
@@ -7228,7 +7337,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: bindGroupLayout,
             entries: [
                 GPUBindGroupEntry(binding: 0, resource: .buffer(
-                    resources.backdropMaskUniformBuffer,
+                    uniformBuffer,
                     offset: 0,
                     size: Self.alignedUniformSize
                 )),
@@ -7237,7 +7346,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
-                    view: resources.backdropMaskView,
+                    view: outputView,
                     clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
                     loadOp: .clear,
                     storeOp: .store
@@ -7246,15 +7355,87 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
         renderPass.setPipeline(shadowMaskPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [0])
-        renderPass.setVertexBuffer(0, buffer: resources.backdropMaskVertexBuffer, offset: 0)
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: 0)
         renderPass.draw(vertexCount: 6)
         renderPass.end()
         return true
     }
 
+    private func encodeCompositionMaskOperation(
+        pipeline: GPURenderPipeline,
+        firstView: GPUTextureView,
+        secondView: GPUTextureView,
+        outputView: GPUTextureView,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
+        guard let device, let blurSampler else { return false }
+        let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: pipeline.getBindGroupLayout(index: 0),
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .textureView(firstView)),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(secondView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler)),
+            ]
+        ))
+        let renderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: outputView,
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                ),
+            ]
+        ))
+        renderPass.setPipeline(pipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup)
+        renderPass.draw(vertexCount: 6)
+        renderPass.end()
+        return true
+    }
+
+    private func buildCompositionClipMask(
+        _ clipTargets: [LayerPrepassTarget],
+        resources: CompositionLayerResources,
+        encoder: GPUCommandEncoder
+    ) -> GPUTextureView? {
+        guard let device,
+              let compositionMaskIntersectPipeline,
+              !clipTargets.isEmpty else { return nil }
+
+        var currentView = resources.clipCumulativeViewA
+        for (index, clipTarget) in clipTargets.enumerated() {
+            let outputView = index == 0
+                ? resources.clipCumulativeViewA
+                : resources.clipShapeView
+            guard renderCompositionClipShape(
+                clipTarget,
+                outputView: outputView,
+                uniformBuffer: resources.clipUniformBuffer(at: index, device: device),
+                vertexBuffer: resources.backdropMaskVertexBuffer,
+                encoder: encoder
+            ) else { return nil }
+
+            guard index > 0 else { continue }
+            let intersectionView = currentView === resources.clipCumulativeViewA
+                ? resources.clipCumulativeViewB
+                : resources.clipCumulativeViewA
+            guard encodeCompositionMaskOperation(
+                pipeline: compositionMaskIntersectPipeline,
+                firstView: currentView,
+                secondView: resources.clipShapeView,
+                outputView: intersectionView,
+                encoder: encoder
+            ) else { return nil }
+            currentView = intersectionView
+        }
+        return currentView
+    }
+
     private func mixFilteredBackdrop(
         originalView: GPUTextureView,
         filteredView: GPUTextureView,
+        maskView: GPUTextureView,
         resources: CompositionLayerResources,
         encoder: GPUCommandEncoder
     ) -> Bool {
@@ -7267,7 +7448,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             entries: [
                 GPUBindGroupEntry(binding: 0, resource: .textureView(originalView)),
                 GPUBindGroupEntry(binding: 1, resource: .textureView(filteredView)),
-                GPUBindGroupEntry(binding: 2, resource: .textureView(resources.backdropMaskView)),
+                GPUBindGroupEntry(binding: 2, resource: .textureView(maskView)),
                 GPUBindGroupEntry(binding: 3, resource: .sampler(blurSampler)),
             ]
         ))
@@ -7305,6 +7486,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             rootLayer,
             parentMatrix: projectionMatrix,
             ancestorBackdropScopes: [],
+            ancestorClipTargets: [],
             hasUnsupportedAncestorClip: false,
             hasUnsupportedAncestorRasterization: false,
             inheritedOpacity: 1,
@@ -7363,7 +7545,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
             guard prefixIsValid,
                   !structurallyInvalidKeys.contains(key),
-                  presentation.mask == nil,
+                  (backgroundStages.isEmpty || presentation.mask == nil),
                   processor.supports(compositionFilter, inputMode: .foregroundAndBackground),
                   let source = prerenderedFilters[key] else {
                 recordFailure(key)
@@ -7463,7 +7645,27 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             filterPrerenderRootLayer = savedFilterPrerenderRoot
             backdropPass.end()
 
+            let clipMaskView = buildCompositionClipMask(
+                compositionTarget.clipAncestors,
+                resources: resources,
+                encoder: encoder
+            )
             var premultipliedSourceTexture = source.outputTexture
+            if !compositionTarget.clipAncestors.isEmpty {
+                guard let clipMaskView,
+                      let compositionMaskApplyPipeline,
+                      encodeCompositionMaskOperation(
+                        pipeline: compositionMaskApplyPipeline,
+                        firstView: source.outputView,
+                        secondView: clipMaskView,
+                        outputView: resources.clippedSourceView,
+                        encoder: encoder
+                      ) else {
+                    recordFailure(key)
+                    continue
+                }
+                premultipliedSourceTexture = resources.clippedSourceTexture
+            }
             if compositionTarget.sourceOpacity < 1
                 || compositionTarget.sourceColor != SIMD4<Float>(repeating: 1) {
                 guard applyFilterOperation(
@@ -7471,7 +7673,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         opacity: compositionTarget.sourceOpacity,
                         colorMultiplier: compositionTarget.sourceColor
                     ),
-                    inputTexture: source.outputTexture,
+                    inputTexture: premultipliedSourceTexture,
                     outputView: resources.sourcePremultipliedView,
                     uniformBuffer: resources.sourceOpacityUniformBuffer,
                     encoder: encoder
@@ -7514,10 +7716,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     for: target,
                     resources: resources,
                     encoder: encoder
-                ),
-                mixFilteredBackdrop(
+                ) else {
+                    recordFailure(key)
+                    continue
+                }
+                var backgroundMaskView = resources.backdropMaskView
+                if let clipMaskView {
+                    guard let compositionMaskIntersectPipeline,
+                          encodeCompositionMaskOperation(
+                            pipeline: compositionMaskIntersectPipeline,
+                            firstView: resources.backdropMaskView,
+                            secondView: clipMaskView,
+                            outputView: resources.combinedBackdropMaskView,
+                            encoder: encoder
+                          ) else {
+                        recordFailure(key)
+                        continue
+                    }
+                    backgroundMaskView = resources.combinedBackdropMaskView
+                }
+                guard mixFilteredBackdrop(
                     originalView: resources.backdropStraightView,
                     filteredView: filteredBackdrop.view,
+                    maskView: backgroundMaskView,
                     resources: resources,
                     encoder: encoder
                 ) else {
@@ -7579,6 +7800,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
         ancestorBackdropScopes: [LayerPrepassTarget],
+        ancestorClipTargets: [LayerPrepassTarget],
         hasUnsupportedAncestorClip: Bool,
         hasUnsupportedAncestorRasterization: Bool,
         inheritedOpacity: Float,
@@ -7602,11 +7824,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             timeOffset: currentReplicatorTimeOffset
         )
         var descendantScopes = ancestorBackdropScopes
+        var descendantClipTargets = ancestorClipTargets
         if hasComposition {
             targets.append(BackdropCompositionTarget(
                 prepass: prepass,
                 scope: ancestorBackdropScopes.last,
                 depth: ancestorBackdropScopes.count,
+                clipAncestors: ancestorClipTargets,
                 sourceOpacity: inheritedOpacity * presentation.opacity,
                 sourceColor: ancestorBackdropScopes.isEmpty
                     ? currentReplicatorColor
@@ -7622,6 +7846,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if createsBackdropScope {
             descendantScopes.append(prepass)
         }
+        if presentation.masksToBounds {
+            descendantClipTargets.append(prepass)
+        }
 
         let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
         forEachPrepassSublayer(
@@ -7633,9 +7860,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
                 ancestorBackdropScopes: descendantScopes,
+                ancestorClipTargets: descendantClipTargets,
                 hasUnsupportedAncestorClip: hasUnsupportedAncestorClip
-                    || presentation.mask != nil
-                    || presentation.masksToBounds,
+                    || presentation.mask != nil,
                 hasUnsupportedAncestorRasterization: hasUnsupportedAncestorRasterization
                     || presentation.shouldRasterize,
                 inheritedOpacity: createsBackdropScope

@@ -848,6 +848,49 @@ public enum CAWebGPUShaders {
     }
     """
 
+    /// Intersects coverage masks or applies one to a premultiplied source texture.
+    public static let compositionMaskOperation = """
+    @group(0) @binding(0) var firstTexture: texture_2d<f32>;
+    @group(0) @binding(1) var secondTexture: texture_2d<f32>;
+    @group(0) @binding(2) var texSampler: sampler;
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) texCoord: vec2<f32>,
+    }
+
+    @vertex
+    fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+        let positions = array<vec2<f32>, 6>(
+            vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+            vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+        );
+        let texCoords = array<vec2<f32>, 6>(
+            vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+            vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
+        );
+        var output: VertexOutput;
+        output.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+        output.texCoord = texCoords[vertexIndex];
+        return output;
+    }
+
+    @fragment
+    fn intersectMasks(input: VertexOutput) -> @location(0) vec4<f32> {
+        let firstCoverage = textureSample(firstTexture, texSampler, input.texCoord).a;
+        let secondCoverage = textureSample(secondTexture, texSampler, input.texCoord).a;
+        let coverage = clamp(firstCoverage * secondCoverage, 0.0, 1.0);
+        return vec4<f32>(coverage);
+    }
+
+    @fragment
+    fn applyMask(input: VertexOutput) -> @location(0) vec4<f32> {
+        let color = textureSample(firstTexture, texSampler, input.texCoord);
+        let coverage = clamp(textureSample(secondTexture, texSampler, input.texCoord).a, 0.0, 1.0);
+        return color * coverage;
+    }
+    """
+
     // MARK: - Masked Rendering Shader
 
     /// Shader code for masked rendering.
