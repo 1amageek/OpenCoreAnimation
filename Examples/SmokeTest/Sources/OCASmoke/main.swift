@@ -1786,9 +1786,17 @@ func installHarness() {
                 let shadowMaskHalf = CALayer()
                 shadowMaskHalf.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
                 shadowMaskHalf.position = CGPoint(x: 10, y: 10)
-                shadowMaskHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
-                shadowMaskHalf.opacity = 0.5
+                shadowMaskHalf.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0)
                 shadowMaskHalf.filters = [CAFilter.brightness(0)]
+                let maskTransition = CATransition()
+                maskTransition.type = .fade
+                maskTransition.duration = 1
+                maskTransition.speed = 0
+                maskTransition.timeOffset = 0.5
+                maskTransition.fillMode = .both
+                maskTransition.isRemovedOnCompletion = false
+                shadowMaskHalf.add(maskTransition, forKey: "maskFade")
+                shadowMaskHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
                 shadowMask.addSublayer(shadowMaskHalf)
                 maskedShadow.mask = shadowMask
                 root.addSublayer(silhouetteParent)
@@ -1824,11 +1832,12 @@ func installHarness() {
                         && abs(Int(pixels[6][2]) - Int(emptyBaselines[6][2]) / 2) <= 1
                         && pixels[6][3] == 255
                     let maskOutsideCleared = pixels[7] == emptyBaselines[7]
-                    shadowMaskHalf.opacity = 1
+                    shadowMaskHalf.removeAnimation(forKey: "maskFade")
+                    shadowMaskHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
                     engine.renderFrame()
                     let updatedMaskShadow = try await renderer.readbackPixel(x: 310, y: 275)
                     let maskMutationUpdatedShadow = updatedMaskShadow == [255, 0, 0, 255]
-                    result += ";maskedShadow=\(partialMaskShadow && maskOutsideCleared && maskMutationUpdatedShadow)"
+                    result += ";maskTransition=\(partialMaskShadow && maskOutsideCleared && maskMutationUpdatedShadow)"
 
                     if let storedAnimation = silhouetteChild.animation(
                         forKey: "shadowSilhouettePosition"

@@ -135,7 +135,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginShadowProbe();
         await expect.poll(() => h.getShadowProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;13,140,19,255;13,13,146,255;26,26,38,255;255,0,0,255;255,0,0,255;emptyRegion=true;emptyLayer=true;imageEdges=true;imageCenter=true;maskedShadow=true;animatedSilhouette=true"
+            "255,0,0,255;13,140,19,255;13,13,146,255;26,26,38,255;255,0,0,255;255,0,0,255;emptyRegion=true;emptyLayer=true;imageEdges=true;imageCenter=true;maskTransition=true;animatedSilhouette=true"
         );
         expect(await h.getActiveShadowResourceCount()).toBe(0);
         expect(await h.getShadowRenderFailureCount()).toBe(0);

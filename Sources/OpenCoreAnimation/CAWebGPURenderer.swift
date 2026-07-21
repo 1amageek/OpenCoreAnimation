@@ -4188,15 +4188,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         encoder: GPUCommandEncoder
     ) {
         guard let device, let pipeline else { return }
+        var visited: Set<ObjectIdentifier> = []
 
         func collect(_ layer: CALayer) {
+            let identifier = ObjectIdentifier(layer)
+            guard visited.insert(identifier).inserted else { return }
+
             // Capture descendants first so a nested active transition is available
             // when its parent subtree is frozen into the target texture.
+            let presentation = layer._renderTimePresentation()
+            if let mask = presentation.mask {
+                collect(mask)
+            }
             for sublayer in layer.sublayers ?? [] {
                 collect(sublayer)
             }
 
-            let presentation = layer._renderTimePresentation()
             if let state = presentation._transitionRenderState {
                 let sourceID = ObjectIdentifier(state.sourceLayer)
                 activeTransitionSourceIDs.insert(sourceID)
@@ -8213,12 +8220,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) -> Bool {
         let presentation = renderPresentation(for: layer)
         let hasPreparedFilteredContent = prerenderedFilters[renderKey(for: layer)] != nil
+        let hasUnpreparedTransition: Bool
+        if let transitionState = presentation._transitionRenderState {
+            hasUnpreparedTransition = transitionCaptures[
+                ObjectIdentifier(transitionState.sourceLayer)
+            ] == nil
+        } else {
+            hasUnpreparedTransition = false
+        }
         if (!isRoot
                 && presentation.filters?.isEmpty == false
                 && !hasPreparedFilteredContent)
             || presentation.compositingFilter != nil
             || presentation.backgroundFilters?.isEmpty == false
-            || presentation._transitionRenderState != nil {
+            || hasUnpreparedTransition {
             return false
         }
         if let nestedMask = presentation.mask,
