@@ -44,12 +44,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     // MARK: - Properties
 
     /// The time interval between screen refresh updates.
-    open var duration: CFTimeInterval {
-        if let frameRate = preferredFrameRateRange.effectiveFrameRate {
-            return 1.0 / CFTimeInterval(frameRate)
-        }
-        return 1.0 / 60.0
-    }
+    open private(set) var duration: CFTimeInterval = 1.0 / 60.0
 
     /// The time value associated with the last frame that was displayed.
     open private(set) var timestamp: CFTimeInterval = 0
@@ -82,36 +77,33 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         }
     }
 
-    /// The preferred frame rate in frames per second.
-    ///
-    /// Setting this to 0 (Apple: "use the native refresh rate") clears any
-    /// throttling that was set by a previous non-zero value.
-    open var preferredFramesPerSecond: Int = 0 {
-        didSet {
-            if preferredFramesPerSecond > 0 {
-                preferredFrameRateRange = CAFrameRateRange(
-                    minimum: Float(preferredFramesPerSecond),
-                    maximum: Float(preferredFramesPerSecond),
-                    preferred: Float(preferredFramesPerSecond)
-                )
-            } else {
-                // Reset to the default (all zeros) so minimumFrameInterval
-                // evaluates to "no throttling" and every rAF tick fires.
-                preferredFrameRateRange = .default
-            }
-        }
-    }
-
     // MARK: - Private Properties
 
-    private weak var target: AnyObject?
+    private struct Registration: Hashable {
+        let runLoopID: ObjectIdentifier
+        let mode: RunLoop.Mode
+    }
+
+    private var target: AnyObject?
     private var selector: Selector
-    private var isRunning: Bool = false
+    private var registrations: Set<Registration> = []
+    private var isInvalidated = false
     private var animationFrameCallback: JSClosure?
     private var animationFrameId: Int = 0
 
+    private var isRunning: Bool {
+        !isInvalidated && !registrations.isEmpty
+    }
+
+    internal var _registrationCount: Int { registrations.count }
+    internal var _hasTarget: Bool { target != nil }
+    internal var _isInvalidated: Bool { isInvalidated }
+
     /// The timestamp of the last frame that was dispatched to the delegate.
     private var lastDispatchedTimestamp: CFTimeInterval = 0
+
+    /// Browser refresh timestamp used to measure the physical rAF cadence.
+    private var previousRefreshTimestamp: CFTimeInterval?
 
     /// The minimum time interval between frame dispatches based on preferred frame rate.
     private var minimumFrameInterval: CFTimeInterval {
@@ -137,17 +129,20 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
 
     /// Registers the display link with a run loop.
     ///
-    /// On WASM, the run loop and mode parameters are accepted for API compatibility but
-    /// are not used. This method starts the `requestAnimationFrame` loop, which is
-    /// equivalent to running in `.common` mode on Apple platforms.
+    /// Browser scheduling uses one event loop, but registrations remain distinct so
+    /// removing one mode does not invalidate registrations in other modes.
     ///
     /// - Parameters:
-    ///   - runloop: The run loop to associate with the display link. Ignored on WASM.
-    ///   - mode: The run loop mode. Ignored on WASM.
+    ///   - runloop: Identifies the browser run-loop registration.
+    ///   - mode: Identifies an independent registration lifetime.
     open func add(to runloop: RunLoop, forMode mode: RunLoop.Mode) {
-        guard !isRunning else { return }
-        isRunning = true
-        if !isPaused {
+        guard !isInvalidated else { return }
+        let wasRunning = isRunning
+        registrations.insert(Registration(
+            runLoopID: ObjectIdentifier(runloop),
+            mode: mode
+        ))
+        if !wasRunning && isRunning && !isPaused {
             startAnimationLoop()
         }
     }
@@ -156,20 +151,27 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     ///
     /// This stops the `requestAnimationFrame` loop and releases resources.
     open func invalidate() {
-        isRunning = false
+        guard !isInvalidated else { return }
+        isInvalidated = true
+        registrations.removeAll(keepingCapacity: false)
         stopAnimationLoop()
+        target = nil
     }
 
     /// Removes the display link from the run loop for the given mode.
     ///
-    /// On WASM, this is equivalent to calling `invalidate()` since there is only
-    /// one animation loop per display link.
-    ///
     /// - Parameters:
-    ///   - runloop: The run loop to remove from. Ignored on WASM.
-    ///   - mode: The run loop mode to remove. Ignored on WASM.
+    ///   - runloop: Identifies the browser run-loop registration.
+    ///   - mode: Identifies the registration to remove.
     open func remove(from runloop: RunLoop, forMode mode: RunLoop.Mode) {
-        invalidate()
+        guard !isInvalidated else { return }
+        registrations.remove(Registration(
+            runLoopID: ObjectIdentifier(runloop),
+            mode: mode
+        ))
+        if registrations.isEmpty {
+            stopAnimationLoop()
+        }
     }
 
     // MARK: - Private Methods
@@ -192,6 +194,13 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         guard isRunning && !isPaused else { return }
 
         let currentTimestamp = timestampMilliseconds / 1000.0
+        if let previousRefreshTimestamp {
+            let measuredDuration = currentTimestamp - previousRefreshTimestamp
+            if measuredDuration > 0 {
+                duration = measuredDuration
+            }
+        }
+        previousRefreshTimestamp = currentTimestamp
         timestamp = currentTimestamp
         targetTimestamp = currentTimestamp + duration
 
@@ -223,6 +232,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
             animationFrameId = 0
         }
         animationFrameCallback = nil
+        previousRefreshTimestamp = nil
     }
 }
 

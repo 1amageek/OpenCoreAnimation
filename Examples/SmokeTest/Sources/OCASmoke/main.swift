@@ -36,12 +36,22 @@ nonisolated(unsafe) var pixelReadbackResult: String = "pending"
 nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
+nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
         tileDrawCount += 1
         context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
         context.fill(layer.bounds)
+    }
+}
+
+@MainActor
+final class DisplayLinkProbeTarget: CADisplayLinkDelegate {
+    private(set) var callbackCount = 0
+
+    func displayLinkDidFire(_ displayLink: CADisplayLink) {
+        callbackCount += 1
     }
 }
 
@@ -69,6 +79,7 @@ public func setup() {
             transitionFilterProbeResult = "pending"
             layerFilterProbeResult = "pending"
             shadowProbeResult = "pending"
+            displayLinkProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -239,6 +250,9 @@ func installHarness() {
         })
         h.expose("getShadowProbeResult", returning: {
             .string(shadowProbeResult)
+        })
+        h.expose("getDisplayLinkProbeResult", returning: {
+            .string(displayLinkProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -582,6 +596,42 @@ func installHarness() {
                 movingContainer.removeFromSuperlayer()
                 engine.renderFrame()
                 shadowProbeResult = result
+            }
+        })
+        h.expose("beginDisplayLinkProbe", action: {
+            Task { @MainActor in
+                displayLinkProbeResult = "running"
+                let target = DisplayLinkProbeTarget()
+                let displayLink = CADisplayLink(
+                    target: target,
+                    selector: Selector("displayLinkDidFire")
+                )
+                displayLink.add(to: .main, forMode: .default)
+                displayLink.add(to: .main, forMode: .common)
+
+                do {
+                    try await Task.sleep(for: .milliseconds(100))
+                    let initialCount = target.callbackCount
+
+                    displayLink.remove(from: .main, forMode: .default)
+                    try await Task.sleep(for: .milliseconds(100))
+                    let retainedModeCount = target.callbackCount
+
+                    displayLink.remove(from: .main, forMode: .common)
+                    let stoppedCount = target.callbackCount
+                    try await Task.sleep(for: .milliseconds(100))
+                    let finalCount = target.callbackCount
+
+                    displayLinkProbeResult = [
+                        "started=\(initialCount > 0)",
+                        "retained=\(retainedModeCount > initialCount)",
+                        "stopped=\(finalCount == stoppedCount)",
+                        "duration=\(displayLink.duration > 0)",
+                    ].joined(separator: ",")
+                } catch {
+                    displayLinkProbeResult = "error: \(error)"
+                }
+                displayLink.invalidate()
             }
         })
         h.expose("removeTransition", action: {

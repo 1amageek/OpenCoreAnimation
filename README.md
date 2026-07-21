@@ -10,10 +10,11 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 
 | Evidence | Result |
 |---|---|
-| Native package | 337 tests passed |
+| Native package | 334 tests passed |
 | Browser | 3 checks passed, including rasterized/tiled pixels, frozen transition pairs, filters, and multiple shadows read back from WebGPU |
 | Filters | Sibling and nested `CAFilter` chains use per-layer WebGPU resources with browser pixel and cleanup evidence; all 7 executable OpenCoreImage transition pipelines also have filter-specific browser pixel evidence, while unsupported transition filter objects are rejected without built-in fallback |
 | Shadows | Every visible shadow owns an independent mask, blur target, and uniform set; browser evidence covers multiple shadows, inherited opacity, animated `shadowOpacity` from a zero model value, ancestor transform invalidation, empty `shadowPath`, and resource cleanup |
+| Display link | `duration` tracks display refresh cadence independently from preferred callback frequency; run-loop mode registrations are removed independently and verified through browser rAF delivery |
 | Remaining boundary | Core Image transition types without executable WGSL remain unavailable; complete QuartzCore parity is not claimed |
 
 ```swift

@@ -27,12 +27,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     // MARK: - Properties
 
     /// The time interval between screen refresh updates.
-    open var duration: CFTimeInterval {
-        if let frameRate = preferredFrameRateRange.effectiveFrameRate {
-            return 1.0 / CFTimeInterval(frameRate)
-        }
-        return 1.0 / 60.0
-    }
+    open private(set) var duration: CFTimeInterval = 1.0 / 60.0
 
     /// The time value associated with the last frame that was displayed.
     open private(set) var timestamp: CFTimeInterval = 0
@@ -61,27 +56,33 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         }
     }
 
-    /// The preferred frame rate in frames per second.
-    open var preferredFramesPerSecond: Int = 0 {
-        didSet {
-            if preferredFramesPerSecond > 0 {
-                preferredFrameRateRange = CAFrameRateRange(
-                    minimum: Float(preferredFramesPerSecond),
-                    maximum: Float(preferredFramesPerSecond),
-                    preferred: Float(preferredFramesPerSecond)
-                )
-            } else {
-                preferredFrameRateRange = .default
-            }
-        }
-    }
-
     // MARK: - Private Properties
 
-    private weak var target: AnyObject?
+    private struct Registration: Hashable {
+        let runLoopID: ObjectIdentifier
+        let mode: RunLoop.Mode
+    }
+
+    private var target: AnyObject?
     private var selector: Selector
-    private var isRunning: Bool = false
+    private var registrations: [Registration: RunLoop] = [:]
+    private var isInvalidated = false
     private var timer: Timer?
+
+    private var isRunning: Bool {
+        !isInvalidated && !registrations.isEmpty
+    }
+
+    internal var _registrationCount: Int { registrations.count }
+    internal var _hasTarget: Bool { target != nil }
+    internal var _isInvalidated: Bool { isInvalidated }
+
+    private var callbackInterval: CFTimeInterval {
+        if let frameRate = preferredFrameRateRange.effectiveFrameRate {
+            return 1.0 / CFTimeInterval(frameRate)
+        }
+        return duration
+    }
 
     // MARK: - Initialization
 
@@ -99,11 +100,6 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         timer?.invalidate()
     }
 
-    /// The run loop to which the timer is attached.
-    private var attachedRunLoop: RunLoop?
-    /// The run loop mode used for scheduling.
-    private var attachedMode: RunLoop.Mode?
-
     // MARK: - Scheduling
 
     /// Registers the display link with a run loop.
@@ -112,10 +108,13 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     ///   - runloop: The run loop to add the display link to.
     ///   - mode: The run loop mode.
     open func add(to runloop: RunLoop, forMode mode: RunLoop.Mode) {
-        guard !isRunning else { return }
-        isRunning = true
-        attachedRunLoop = runloop
-        attachedMode = mode
+        guard !isInvalidated else { return }
+        let registration = Registration(
+            runLoopID: ObjectIdentifier(runloop),
+            mode: mode
+        )
+        guard registrations[registration] == nil else { return }
+        registrations[registration] = runloop
         if !isPaused {
             startTimer()
         }
@@ -123,10 +122,11 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
 
     /// Removes the display link from all run loop modes.
     open func invalidate() {
-        isRunning = false
+        guard !isInvalidated else { return }
+        isInvalidated = true
+        registrations.removeAll(keepingCapacity: false)
         stopTimer()
-        attachedRunLoop = nil
-        attachedMode = nil
+        target = nil
     }
 
     /// Removes the display link from the run loop for the given mode.
@@ -135,7 +135,16 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     ///   - runloop: The run loop to remove from.
     ///   - mode: The run loop mode to remove.
     open func remove(from runloop: RunLoop, forMode mode: RunLoop.Mode) {
-        invalidate()
+        guard !isInvalidated else { return }
+        registrations.removeValue(forKey: Registration(
+            runLoopID: ObjectIdentifier(runloop),
+            mode: mode
+        ))
+        if registrations.isEmpty || isPaused {
+            stopTimer()
+        } else {
+            startTimer()
+        }
     }
 
     // MARK: - Private Methods
@@ -143,7 +152,8 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     private func startTimer() {
         stopTimer()
 
-        let interval = duration
+        guard isRunning else { return }
+        let interval = callbackInterval
         let newTimer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
@@ -159,10 +169,9 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         }
         timer = newTimer
 
-        // Add the timer to the stored run loop and mode
-        let runloop = attachedRunLoop ?? .main
-        let mode = attachedMode ?? .common
-        runloop.add(newTimer, forMode: mode)
+        for (registration, runLoop) in registrations {
+            runLoop.add(newTimer, forMode: registration.mode)
+        }
     }
 
     private func stopTimer() {
