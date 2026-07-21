@@ -5,6 +5,7 @@ import Foundation
 
 /// Represents a single particle in the emitter system.
 public struct EmitterParticle {
+    public var birthSequence: UInt64 = 0
     public var position: SIMD3<Float> = .zero
     public var velocity: SIMD3<Float> = .zero
     public var acceleration: SIMD3<Float> = .zero

@@ -289,6 +289,9 @@ private final class EmitterLayerState {
     var configuredSeed: UInt32
     var lastUpdateTime: CFTimeInterval = 0
     var lastUpdatedFrame: UInt64 = 0
+    var nextBirthSequence: UInt64 = 0
+    var lastRenderedBirthSequences: [UInt64] = []
+    var lastRenderUsedAdditiveBlending = false
 
     init(owner: CAEmitterLayer, seed: UInt32) {
         self.owner = owner
@@ -433,9 +436,31 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return state.particles.map(\.velocity)
     }
 
+    /// Birth sequences in the order submitted to WebGPU during the latest frame.
+    @_spi(RendererDiagnostics)
+    public func lastRenderedParticleSequences(for layer: CAEmitterLayer) -> [UInt64] {
+        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+            return []
+        }
+        return state.lastRenderedBirthSequences
+    }
+
+    /// Whether the latest particle submission used source-additive blending.
+    @_spi(RendererDiagnostics)
+    public func lastEmitterRenderUsedAdditiveBlending(for layer: CAEmitterLayer) -> Bool {
+        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+            return false
+        }
+        return state.lastRenderUsedAdditiveBlending
+    }
+
     /// Number of particles rejected because their emitter configuration was unsupported or non-finite.
     @_spi(RendererDiagnostics)
     public private(set) var emitterSpawnFailureCount: Int = 0
+
+    /// Number of emitter frames rejected because their render mode was unsupported.
+    @_spi(RendererDiagnostics)
+    public private(set) var emitterRenderFailureCount: Int = 0
 
     /// Number of visible shadows that could not complete the GPU render path.
     @_spi(RendererDiagnostics)
@@ -846,11 +871,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Particle System (CAEmitterLayer)
 
-    /// Particle instance buffer.
-    private var particleBuffer: GPUBuffer?
+    /// Source-additive particle pipeline without stencil testing.
+    private var emitterAdditivePipeline: GPURenderPipeline?
 
-    /// Particle pipeline.
-    private var particlePipeline: GPURenderPipeline?
+    /// Source-additive particle pipeline constrained by the active stencil mask.
+    private var emitterAdditiveStencilPipeline: GPURenderPipeline?
 
     /// Maximum number of particles.
     private static let maxParticles = 10000
@@ -986,6 +1011,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(pipelineLayout)
         ))
+        createEmitterAdditivePipelines(
+            device: device,
+            shaderModule: shaderModule,
+            pipelineLayout: pipelineLayout
+        )
 
         // Create triple-buffered vertex buffer pool
         // Use maxVertexBufferSize (1MB) to accommodate complex shapes with many vertices
@@ -1047,6 +1077,81 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create stencil pipelines for CALayer.mask
         try createStencilPipelines(device: device)
+    }
+
+    private func createEmitterAdditivePipelines(
+        device: GPUDevice,
+        shaderModule: GPUShaderModule,
+        pipelineLayout: GPUPipelineLayout
+    ) {
+        let vertexState = GPUVertexState(
+            module: shaderModule,
+            entryPoint: "vertexMain",
+            buffers: [
+                GPUVertexBufferLayout(
+                    arrayStride: UInt64(MemoryLayout<CARendererVertex>.stride),
+                    attributes: [
+                        GPUVertexAttribute(format: .float32x2, offset: 0, shaderLocation: 0),
+                        GPUVertexAttribute(
+                            format: .float32x2,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride),
+                            shaderLocation: 1
+                        ),
+                        GPUVertexAttribute(
+                            format: .float32x4,
+                            offset: UInt64(MemoryLayout<SIMD2<Float>>.stride * 2),
+                            shaderLocation: 2
+                        ),
+                    ]
+                )
+            ]
+        )
+        let additiveBlend = GPUBlendState(
+            color: GPUBlendComponent(
+                srcFactor: .srcAlpha,
+                dstFactor: .one,
+                operation: .add
+            ),
+            alpha: GPUBlendComponent(
+                srcFactor: .one,
+                dstFactor: .one,
+                operation: .add
+            )
+        )
+
+        func makePipeline(stencilCompare: GPUCompareFunction) -> GPURenderPipeline {
+            device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+                vertex: vertexState,
+                depthStencil: GPUDepthStencilState(
+                    format: .depth24plusStencil8,
+                    depthWriteEnabled: false,
+                    depthCompare: .always,
+                    stencilFront: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    ),
+                    stencilBack: GPUStencilFaceState(
+                        compare: stencilCompare,
+                        failOp: .keep,
+                        depthFailOp: .keep,
+                        passOp: .keep
+                    )
+                ),
+                fragment: GPUFragmentState(
+                    module: shaderModule,
+                    entryPoint: "fragmentMain",
+                    targets: [
+                        GPUColorTargetState(format: preferredFormat, blend: additiveBlend)
+                    ]
+                ),
+                layout: .layout(pipelineLayout)
+            ))
+        }
+
+        emitterAdditivePipeline = makePipeline(stencilCompare: .always)
+        emitterAdditiveStencilPipeline = makePipeline(stencilCompare: .equal)
     }
 
     /// Creates stencil pipelines for CALayer.mask functionality.
@@ -2436,11 +2541,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentStencilValue = 0
 
         // Particle resources
-        particleBuffer = nil
-        particlePipeline = nil
+        emitterAdditivePipeline = nil
+        emitterAdditiveStencilPipeline = nil
         emitterLayerStates.removeAll(keepingCapacity: false)
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
         emitterSpawnFailureCount = 0
+        emitterRenderFailureCount = 0
 
         // Textured bind group / view caches (release JS-side handles)
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: false)
@@ -7110,8 +7216,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         modelMatrix: Matrix4x4,
         bindGroup: GPUBindGroup
     ) {
-        guard let pipeline = pipeline,
-              let vertexBuffer = vertexBuffer,
+        guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
         let emitterCells = emitterLayer.emitterCells ?? []
 
@@ -7231,68 +7336,135 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     }
                     particle.isAlive = particle.lifetime > 0
                     if particle.isAlive {
+                        particle.birthSequence = state.nextBirthSequence
+                        state.nextBirthSequence &+= 1
                         state.particles.append(particle)
                     }
                 }
             }
         }
-        // Render particles
-        for particle in state.particles where particle.isAlive {
-            let scale = particle.scale * 20
+        let standardPipeline = maskNestingDepth > 0 ? stencilTestPipeline : pipeline
+        guard let standardPipeline else { return }
+        state.lastRenderedBirthSequences.removeAll(keepingCapacity: true)
+        state.lastRenderUsedAdditiveBlending = false
 
-            // Apply rotation to vertices
-            let rotation = particle.rotation
-            let p0 = rotatePoint(SIMD2(0, 0), angle: rotation)
-            let p1 = rotatePoint(SIMD2(1, 0), angle: rotation)
-            let p2 = rotatePoint(SIMD2(0, 1), angle: rotation)
-            let p3 = rotatePoint(SIMD2(1, 1), angle: rotation)
-
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: p0, texCoord: SIMD2(0, 0), color: particle.color),
-                CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
-                CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
-                CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
-                CARendererVertex(position: p3, texCoord: SIMD2(1, 1), color: particle.color),
-                CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
-            ]
-
-            guard let allocation = allocateVertices(count: vertices.count) else { break }
-            let (vertexOffset, layerIndex) = allocation
-
-            let scaleMatrix = Matrix4x4(columns: (
-                SIMD4<Float>(scale, 0, 0, 0),
-                SIMD4<Float>(0, scale, 0, 0),
-                SIMD4<Float>(0, 0, 1, 0),
-                SIMD4<Float>(0, 0, 0, 1)
-            ))
-
-            let translateMatrix = Matrix4x4(columns: (
-                SIMD4<Float>(1, 0, 0, 0),
-                SIMD4<Float>(0, 1, 0, 0),
-                SIMD4<Float>(0, 0, 1, 0),
-                SIMD4<Float>(particle.position.x, particle.position.y, particle.position.z, 1)
-            ))
-
-            let particleMatrix = modelMatrix * translateMatrix * scaleMatrix
-
-            var uniforms = CARendererUniforms(
-                mvpMatrix: particleMatrix,
-                opacity: 1.0,
-                cornerRadius: scale * 0.5,
-                layerSize: SIMD2<Float>(scale, scale)
-            )
-
-            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-            let uniformData = createFloat32Array(from: &uniforms)
-            device.queue.writeBuffer(uniformBuffer, bufferOffset: uniformOffset, data: uniformData)
-            let vertexData = createFloat32Array(from: &vertices)
-            device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
-
-            renderPass.setPipeline(pipeline)
-            renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-            renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-            renderPass.draw(vertexCount: 6)
+        func draw(_ particle: EmitterParticle, using pipeline: GPURenderPipeline) {
+            guard particle.isAlive else { return }
+            if renderEmitterParticle(
+                particle,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup,
+                pipeline: pipeline,
+                vertexBuffer: vertexBuffer,
+                uniformBuffer: uniformBuffer
+            ) {
+                state.lastRenderedBirthSequences.append(particle.birthSequence)
+            }
         }
+
+        switch emitterLayer.renderMode {
+        case .unordered, .oldestFirst:
+            for particle in state.particles {
+                draw(particle, using: standardPipeline)
+            }
+        case .oldestLast:
+            for particle in state.particles.reversed() {
+                draw(particle, using: standardPipeline)
+            }
+        case .backToFront:
+            let indices = state.particles.indices.sorted { lhs, rhs in
+                let lhsParticle = state.particles[lhs]
+                let rhsParticle = state.particles[rhs]
+                if lhsParticle.position.z == rhsParticle.position.z {
+                    return lhsParticle.birthSequence < rhsParticle.birthSequence
+                }
+                return lhsParticle.position.z < rhsParticle.position.z
+            }
+            for index in indices {
+                draw(state.particles[index], using: standardPipeline)
+            }
+        case .additive:
+            let additivePipeline = maskNestingDepth > 0
+                ? emitterAdditiveStencilPipeline
+                : emitterAdditivePipeline
+            guard let additivePipeline else {
+                emitterRenderFailureCount += 1
+                return
+            }
+            state.lastRenderUsedAdditiveBlending = true
+            for particle in state.particles {
+                draw(particle, using: additivePipeline)
+            }
+        default:
+            emitterRenderFailureCount += 1
+        }
+    }
+
+    private func renderEmitterParticle(
+        _ particle: EmitterParticle,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline,
+        vertexBuffer: GPUBuffer,
+        uniformBuffer: GPUBuffer
+    ) -> Bool {
+        let scale = particle.scale * 20
+        let rotation = particle.rotation
+        let p0 = rotatePoint(SIMD2(0, 0), angle: rotation)
+        let p1 = rotatePoint(SIMD2(1, 0), angle: rotation)
+        let p2 = rotatePoint(SIMD2(0, 1), angle: rotation)
+        let p3 = rotatePoint(SIMD2(1, 1), angle: rotation)
+
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: p0, texCoord: SIMD2(0, 0), color: particle.color),
+            CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
+            CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
+            CARendererVertex(position: p1, texCoord: SIMD2(1, 0), color: particle.color),
+            CARendererVertex(position: p3, texCoord: SIMD2(1, 1), color: particle.color),
+            CARendererVertex(position: p2, texCoord: SIMD2(0, 1), color: particle.color),
+        ]
+        guard let (vertexOffset, layerIndex) = allocateVertices(count: vertices.count) else {
+            return false
+        }
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(scale, 0, 0, 0),
+            SIMD4<Float>(0, scale, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let translateMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(1, 0, 0, 0),
+            SIMD4<Float>(0, 1, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(particle.position.x, particle.position.y, particle.position.z, 1)
+        ))
+        var uniforms = CARendererUniforms(
+            mvpMatrix: modelMatrix * translateMatrix * scaleMatrix,
+            opacity: 1,
+            cornerRadius: scale * 0.5,
+            layerSize: SIMD2<Float>(scale, scale)
+        )
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+        renderPass.setPipeline(pipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.draw(vertexCount: 6)
+        return true
     }
 
     private func particleStateIsFinite(_ particle: EmitterParticle) -> Bool {

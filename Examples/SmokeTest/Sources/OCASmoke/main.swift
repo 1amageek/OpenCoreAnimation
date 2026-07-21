@@ -754,7 +754,7 @@ func installHarness() {
                     size: CGSize,
                     latitude: CGFloat,
                     longitude: CGFloat
-                ) -> CAEmitterLayer {
+                ) -> (layer: CAEmitterLayer, cell: CAEmitterCell) {
                     let cell = CAEmitterCell()
                     cell.birthRate = 10
                     cell.lifetime = 5
@@ -773,19 +773,19 @@ func installHarness() {
                     layer.emitterMode = mode
                     layer.emitterSize = size
                     layer.emitterCells = [cell]
-                    return layer
+                    return (layer, cell)
                 }
 
-                let first = makeEmitter(
+                let firstEmitter = makeEmitter(
                     x: 70,
                     color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
                     shape: .rectangle,
                     mode: .outline,
                     size: CGSize(width: 20, height: 12),
-                    latitude: .pi / 2,
+                    latitude: 0,
                     longitude: 0
                 )
-                let second = makeEmitter(
+                let secondEmitter = makeEmitter(
                     x: 170,
                     color: CGColor(red: 0, green: 1, blue: 0, alpha: 1),
                     shape: .sphere,
@@ -794,6 +794,9 @@ func installHarness() {
                     latitude: .pi / 2,
                     longitude: .pi / 2
                 )
+                let first = firstEmitter.layer
+                let second = secondEmitter.layer
+                var blendLayers: [CAEmitterLayer] = []
                 root.addSublayer(first)
                 root.addSublayer(second)
 
@@ -822,13 +825,39 @@ func installHarness() {
                             + sphereOffset.z * sphereOffset.z
                     )
                     let geometryMatches = firstOnOutline && abs(sphereRadius - 10) < 0.001
-                    let directionsMatch = firstVelocity.x > 9.999
+                    let directionsMatch = abs(firstVelocity.x) < 0.001
                         && abs(firstVelocity.y) < 0.001
-                        && abs(firstVelocity.z) < 0.001
+                        && firstVelocity.z > 9.999
                         && abs(secondVelocity.x) < 0.001
                         && secondVelocity.y > 9.999
                         && abs(secondVelocity.z) < 0.001
                     var result = "before=\(firstCount),\(secondCount),states=\(renderer.activeEmitterStateCount),geometry=\(geometryMatches),directions=\(directionsMatch),failures=\(renderer.emitterSpawnFailureCount)"
+
+                    firstEmitter.cell.emissionLatitude = .pi / 2
+                    firstEmitter.cell.emissionLongitude = 0
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    firstEmitter.cell.birthRate = 0
+                    secondEmitter.cell.birthRate = 0
+
+                    first.renderMode = .oldestFirst
+                    engine.renderFrame()
+                    let oldestFirst = renderer.lastRenderedParticleSequences(for: first) == [0, 1]
+                    first.renderMode = .oldestLast
+                    engine.renderFrame()
+                    let oldestLast = renderer.lastRenderedParticleSequences(for: first) == [1, 0]
+                    first.renderMode = .backToFront
+                    engine.renderFrame()
+                    let backToFront = renderer.lastRenderedParticleSequences(for: first) == [1, 0]
+                    first.renderMode = .additive
+                    engine.renderFrame()
+                    let additive = renderer.lastEmitterRenderUsedAdditiveBlending(for: first)
+                        && renderer.lastRenderedParticleSequences(for: first) == [0, 1]
+                    first.renderMode = CAEmitterLayerRenderMode(rawValue: "unsupported")
+                    engine.renderFrame()
+                    let unknownRejected = renderer.lastRenderedParticleSequences(for: first).isEmpty
+                        && renderer.emitterRenderFailureCount == 1
+                    result += ";orders=\(oldestFirst && oldestLast && backToFront),additive=\(additive),unknown=\(unknownRejected)"
 
                     first.removeFromSuperlayer()
                     engine.renderFrame()
@@ -836,11 +865,54 @@ func installHarness() {
 
                     second.removeFromSuperlayer()
                     engine.renderFrame()
-                    result += ";final=\(renderer.activeEmitterStateCount)"
+                    let sourceBlendEmitter = makeEmitter(
+                        x: 250,
+                        color: CGColor(red: 1, green: 0, blue: 0, alpha: 0.5),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    let additiveBlendEmitter = makeEmitter(
+                        x: 310,
+                        color: CGColor(red: 1, green: 0, blue: 0, alpha: 0.5),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    sourceBlendEmitter.cell.birthRate = 20
+                    sourceBlendEmitter.cell.velocity = 0
+                    additiveBlendEmitter.cell.birthRate = 20
+                    additiveBlendEmitter.cell.velocity = 0
+                    additiveBlendEmitter.layer.renderMode = .additive
+                    blendLayers = [sourceBlendEmitter.layer, additiveBlendEmitter.layer]
+                    root.addSublayer(sourceBlendEmitter.layer)
+                    root.addSublayer(additiveBlendEmitter.layer)
+                    engine.renderFrame()
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let blendPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 250, y: 160),
+                        CGPoint(x: 310, y: 160),
+                    ])
+                    let blendPixelsMatch = blendPixels.count == 2
+                        && blendPixels.allSatisfy { $0.count >= 4 }
+                        && blendPixels[1][0] > blendPixels[0][0] + 30
+                    for layer in blendLayers {
+                        layer.removeFromSuperlayer()
+                    }
+                    engine.renderFrame()
+                    result += ";blend=\(blendPixelsMatch),final=\(renderer.activeEmitterStateCount)"
                     emitterProbeResult = result
                 } catch {
                     first.removeFromSuperlayer()
                     second.removeFromSuperlayer()
+                    for layer in blendLayers {
+                        layer.removeFromSuperlayer()
+                    }
                     engine.renderFrame()
                     emitterProbeResult = "error: \(error)"
                 }
