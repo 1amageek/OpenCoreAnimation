@@ -763,6 +763,51 @@ public enum CAWebGPUShaders {
     }
     """
 
+    /// Combines a layer-local blurred alpha mask behind premultiplied content.
+    public static let rasterizedShadowComposite = """
+    struct RasterShadowUniforms {
+        shadowColor: vec4<f32>,
+        shadowOffsetUV: vec2<f32>,
+        padding: vec2<f32>,
+    }
+
+    @group(0) @binding(0) var<uniform> uniforms: RasterShadowUniforms;
+    @group(0) @binding(1) var contentTexture: texture_2d<f32>;
+    @group(0) @binding(2) var shadowTexture: texture_2d<f32>;
+    @group(0) @binding(3) var textureSampler: sampler;
+
+    struct VertexOutput {
+        @builtin(position) position: vec4<f32>,
+        @location(0) texCoord: vec2<f32>,
+    }
+
+    @vertex
+    fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+        let positions = array<vec2<f32>, 6>(
+            vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+            vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
+        );
+        let texCoords = array<vec2<f32>, 6>(
+            vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+            vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
+        );
+        var output: VertexOutput;
+        output.position = vec4<f32>(positions[vertexIndex], 0.0, 1.0);
+        output.texCoord = texCoords[vertexIndex];
+        return output;
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        let content = textureSample(contentTexture, textureSampler, input.texCoord);
+        let shadowCoordinate = input.texCoord - uniforms.shadowOffsetUV;
+        let shadowMask = textureSample(shadowTexture, textureSampler, shadowCoordinate).r;
+        let shadowAlpha = uniforms.shadowColor.a * shadowMask;
+        let shadow = vec4<f32>(uniforms.shadowColor.rgb * shadowAlpha, shadowAlpha);
+        return content + shadow * (1.0 - content.a);
+    }
+    """
+
     // MARK: - Filter Composite Shader
 
     /// Shader code for filter compositing and color adjustments.

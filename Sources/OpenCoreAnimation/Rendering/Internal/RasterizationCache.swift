@@ -87,7 +87,7 @@ internal struct RasterizationCacheKey: Hashable, Sendable {
 /// renderer's responsibility to release if it holds GPU resources.
 internal struct RasterizedEntry<TextureRef> {
     internal var texture: TextureRef
-    /// Captured pixel dimensions (`bounds.size × rasterizationScale`).
+    /// Captured pixel dimensions (`captureBounds.size × rasterizationScale`).
     internal var pixelSize: CGSize
     /// Hash of the inputs that determine the captured pixels (typically
     /// `bounds + transform`). The renderer compares this to detect

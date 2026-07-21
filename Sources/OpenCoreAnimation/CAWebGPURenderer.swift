@@ -149,6 +149,13 @@ private struct PendingTileDraw {
 private struct PrerasterizedTexture {
     let texture: GPUTexture
     let purpose: RasterizationCachePurpose
+    let captureBounds: CGRect
+}
+
+private struct RasterShadowCompositeUniforms {
+    var shadowColor: SIMD4<Float>
+    var shadowOffsetUV: SIMD2<Float>
+    var padding: SIMD2<Float> = .zero
 }
 
 private struct LayerPrepassTarget {
@@ -922,11 +929,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             || requiresGroupOpacity(presentationLayer)
             || presentationLayer.mask != nil
             || presentationLayer.masksToBounds
+            || hasVisibleShadow(presentationLayer)
     }
 
     private func requiresEffectFlattening(_ presentationLayer: CALayer) -> Bool {
         presentationLayer.filters?.isEmpty == false
             || requiresGroupOpacity(presentationLayer)
+            || hasVisibleShadow(presentationLayer)
+    }
+
+    private func hasVisibleShadow(_ presentationLayer: CALayer) -> Bool {
+        presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil
     }
 
     private func orderedSublayers(for layer: CALayer) -> [CALayer] {
@@ -1197,6 +1210,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Shadow composite pipeline.
     private var shadowCompositePipeline: GPURenderPipeline?
 
+    /// Combines a local shadow mask and local premultiplied layer capture.
+    private var rasterizedShadowCompositePipeline: GPURenderPipeline?
+
     /// Shadow mask pipeline.
     private var shadowMaskPipeline: GPURenderPipeline?
 
@@ -1305,6 +1321,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// has been submitted. The final filtered texture is owned by rasterizationCache.
     private var transientRasterizationTextures: [GPUTexture] = []
     private var transientRasterizationFilterResources: [FilterLayerResources] = []
+    private var transientRasterizationShadowResources: [ShadowLayerResources] = []
 
     /// Per-frame scratch storage: layers whose subtree has been captured
     /// (or had a fresh cache hit) this frame, mapped to the texture used
@@ -2458,8 +2475,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// R3.5: pick the textured pipeline based on stencil state and the
     /// `blendEnabled` decision for the layer. Falls back to the alpha-blended
     /// variant when an opaque pipeline isn't created (test fallback).
-    private func selectTexturedPipeline(for layer: CALayer) -> GPURenderPipeline? {
-        let blendOff = !RasterizationDecisions.blendEnabled(for: layer)
+    private func selectTexturedPipeline(
+        for layer: CALayer,
+        forceBlending: Bool = false
+    ) -> GPURenderPipeline? {
+        let blendOff = !forceBlending && !RasterizationDecisions.blendEnabled(for: layer)
         if transformDepthNesting > 0 {
             if maskNestingDepth > 0 {
                 if blendOff, let opaque = texturedDepthStencilOpaquePipeline { return opaque }
@@ -2582,6 +2602,26 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             ),
             layout: .layout(blurPipelineLayout)
         ))
+
+        let rasterizedShadowCompositeModule = device.createShaderModule(
+            descriptor: GPUShaderModuleDescriptor(
+                code: CAWebGPUShaders.rasterizedShadowComposite
+            )
+        )
+        rasterizedShadowCompositePipeline = device.createRenderPipeline(
+            descriptor: GPURenderPipelineDescriptor(
+                vertex: GPUVertexState(
+                    module: rasterizedShadowCompositeModule,
+                    entryPoint: "vertexMain"
+                ),
+                fragment: GPUFragmentState(
+                    module: rasterizedShadowCompositeModule,
+                    entryPoint: "fragmentMain",
+                    targets: [GPUColorTargetState(format: preferredFormat)]
+                ),
+                layout: .auto
+            )
+        )
 
         // Create shadow composite pipeline
         let shadowCompositeLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
@@ -3099,6 +3139,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             resources.destroy()
         }
         transientRasterizationFilterResources.removeAll(keepingCapacity: true)
+        for resources in transientRasterizationShadowResources {
+            resources.destroy()
+        }
+        transientRasterizationShadowResources.removeAll(keepingCapacity: true)
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
@@ -3444,6 +3488,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         filterBlurHorizontalPipeline = nil
         filterBlurVerticalPipeline = nil
         shadowCompositePipeline = nil
+        rasterizedShadowCompositePipeline = nil
         shadowMaskPipeline = nil
         shadowBindGroupLayout = nil
         blurSampler = nil
@@ -3512,6 +3557,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             resources.destroy()
         }
         transientRasterizationFilterResources.removeAll(keepingCapacity: false)
+        for resources in transientRasterizationShadowResources {
+            resources.destroy()
+        }
+        transientRasterizationShadowResources.removeAll(keepingCapacity: false)
         transitionSourceCaptureCount = 0
         transitionTargetCaptureCount = 0
         transitionFilterDispatchCount = 0
@@ -8677,10 +8726,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// `shouldRasterize` layer.
     ///
     /// Per PERFORMANCE_DESIGN.md §5.2 the offscreen texture is sized to
-    /// `bounds.size × rasterizationScale` (the layer's own pixel grid),
-    /// not the canvas — so the composite path can place it as a partial
-    /// quad at the layer's transform without burning canvas-sized memory
-    /// per cached entry. The capture pass uses a bounds-local
+    /// the layer's local capture extent × `rasterizationScale`, not the canvas.
+    /// The extent is normally the layer bounds and expands only for a visible
+    /// shadow, so the composite path preserves blur/offset pixels without
+    /// burning canvas-sized memory per cached entry. The capture pass uses a local
     /// orthographic projection so the layer's own `position`, `transform`
     /// and `anchorPoint` are *excluded* from the bake — those land at
     /// composite time. `renderLayer` recognises the capture root via
@@ -8697,6 +8746,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) {
         let layerRenderKey = renderKey(for: layer)
         let key = RasterizationCacheKey(layerRenderKey, purpose: purpose)
+        let presentationLayer = renderPresentation(for: layer)
+        let captureBounds = rasterizationCaptureBounds(for: presentationLayer)
         let contentBoundsHash = rasterizationContentBoundsHash(for: layer)
 
         // Cache lookup updates `lastUsedFrame` on a hit so the idle
@@ -8710,19 +8761,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
            ) {
             prerasterizedTextures[layerRenderKey] = PrerasterizedTexture(
                 texture: entry.texture,
-                purpose: purpose
+                purpose: purpose,
+                captureBounds: captureBounds
             )
             return
         }
 
         // Miss — allocate a layer-sized texture (`bounds × scale`) and
         // render the subtree into it under a bounds-local projection.
-        let presentationLayer = renderPresentation(for: layer)
-        let bounds = presentationLayer.bounds
         let scale = max(1.0, CGFloat(presentationLayer.rasterizationScale))
-        let pixelWidth = max(1, Int((bounds.width * scale).rounded(.up)))
-        let pixelHeight = max(1, Int((bounds.height * scale).rounded(.up)))
-        guard bounds.width > 0, bounds.height > 0 else { return }
+        let pixelWidth = max(1, Int((captureBounds.width * scale).rounded(.up)))
+        let pixelHeight = max(1, Int((captureBounds.height * scale).rounded(.up)))
+        guard captureBounds.width > 0, captureBounds.height > 0 else { return }
 
         let requestedFilters = presentationLayer.filters ?? []
         let filterStages: [LayerFilterStage]
@@ -8756,7 +8806,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // value only shows through where the layer doesn't draw at all
         // (a flat-rasterized `shouldRasterize` layer is treated as an
         // opaque image, mirroring CoreAnimation's WWDC 2014 #419 model).
-        let clearAlpha: Float = purpose == .explicit
+        let clearAlpha: Float = purpose == .explicit && !hasVisibleShadow(presentationLayer)
             ? RasterizationDecisions.captureClearAlpha()
             : 0
         let capturePass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
@@ -8795,10 +8845,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // this places the layer's bounds-local content directly into the
         // texture's pixel grid.
         let captureProjection = Matrix4x4.orthographic(
-            left: Float(bounds.minX),
-            right: Float(bounds.maxX),
-            bottom: Float(bounds.minY),
-            top: Float(bounds.maxY),
+            left: Float(captureBounds.minX),
+            right: Float(captureBounds.maxX),
+            bottom: Float(captureBounds.minY),
+            top: Float(captureBounds.maxY),
             near: -1000,
             far: 1000
         )
@@ -8831,7 +8881,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         capturePass.end()
 
-        let cachedTexture: GPUTexture
+        var cachedTexture: GPUTexture
         if filterStages.isEmpty {
             cachedTexture = captureTexture
         } else {
@@ -8852,6 +8902,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cachedTexture = filteredTexture
         }
 
+        if hasVisibleShadow(presentationLayer) {
+            transientRasterizationTextures.append(cachedTexture)
+            guard let shadowedTexture = executeRasterizedShadow(
+                layer: presentationLayer,
+                contentTexture: cachedTexture,
+                captureBounds: captureBounds,
+                width: pixelWidth,
+                height: pixelHeight,
+                encoder: encoder
+            ) else {
+                shadowRenderFailureCount += 1
+                return
+            }
+            cachedTexture = shadowedTexture
+        }
+
         // Insert the entry. The cache enforces the byte budget only
         // when `evictToBudget` is called (post-submit), so an oversized
         // single insert is allowed to land here.
@@ -8865,7 +8931,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
         prerasterizedTextures[layerRenderKey] = PrerasterizedTexture(
             texture: cachedTexture,
-            purpose: purpose
+            purpose: purpose,
+            captureBounds: captureBounds
         )
         if purpose == .transformFlattening {
             transformFlatteningCaptureCount += 1
@@ -8890,6 +8957,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return false
         }
         return entry.contentBoundsHash == contentBoundsHash
+    }
+
+    private func rasterizationCaptureBounds(for layer: CALayer) -> CGRect {
+        let contentBounds = CGRect(origin: .zero, size: layer.bounds.size)
+        guard hasVisibleShadow(layer) else { return contentBounds }
+
+        let shadowSourceBounds = layer.shadowPath?.boundingBox ?? contentBounds
+        let blurPadding = max(0, layer.shadowRadius * 2)
+        let shadowBounds = shadowSourceBounds
+            .offsetBy(dx: layer.shadowOffset.width, dy: layer.shadowOffset.height)
+            .insetBy(dx: -blurPadding, dy: -blurPadding)
+        return contentBounds.union(shadowBounds)
     }
 
     private func executeRasterizedFilterStages(
@@ -9016,6 +9095,223 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return finalTexture
     }
 
+    private func executeRasterizedShadow(
+        layer: CALayer,
+        contentTexture: GPUTexture,
+        captureBounds: CGRect,
+        width: Int,
+        height: Int,
+        encoder: GPUCommandEncoder
+    ) -> GPUTexture? {
+        guard let device,
+              let bindGroupLayout,
+              let shadowMaskPipeline,
+              let shadowBlurHorizontalPipeline,
+              let shadowBlurVerticalPipeline,
+              let shadowBindGroupLayout,
+              let rasterizedShadowCompositePipeline,
+              let blurSampler else { return nil }
+
+        let resources = ShadowLayerResources(
+            device: device,
+            width: width,
+            height: height,
+            format: preferredFormat
+        )
+        transientRasterizationShadowResources.append(resources)
+
+        let horizontalInputView: GPUTextureView
+        if let shadowPath = layer.shadowPath {
+            var maskUniforms = CARendererUniforms(
+                mvpMatrix: Matrix4x4.orthographic(
+                    left: Float(captureBounds.minX),
+                    right: Float(captureBounds.maxX),
+                    bottom: Float(captureBounds.minY),
+                    top: Float(captureBounds.maxY),
+                    near: -1000,
+                    far: 1000
+                ),
+                opacity: 1,
+                layerSize: SIMD2(Float(captureBounds.width), Float(captureBounds.height))
+            )
+            device.queue.writeBuffer(
+                resources.maskUniformBuffer,
+                bufferOffset: 0,
+                data: createFloat32Array(from: &maskUniforms)
+            )
+            let maskBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                layout: bindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .buffer(
+                            resources.maskUniformBuffer,
+                            offset: 0,
+                            size: Self.alignedUniformSize
+                        )
+                    )
+                ]
+            ))
+            let white = SIMD4<Float>(repeating: 1)
+            var vertices: [CARendererVertex] = []
+            for polyline in flattenPath(shadowPath) where polyline.count >= 3 {
+                for index in triangulatePolygon(polyline) {
+                    let point = polyline[index]
+                    vertices.append(CARendererVertex(
+                        position: SIMD2(Float(point.x), Float(point.y)),
+                        texCoord: .zero,
+                        color: white
+                    ))
+                }
+            }
+            let vertexBuffer = resources.ensureMaskVertexCapacity(vertices.count, device: device)
+            if !vertices.isEmpty {
+                device.queue.writeBuffer(
+                    vertexBuffer,
+                    bufferOffset: 0,
+                    data: createFloat32Array(from: &vertices)
+                )
+            }
+            let maskPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.maskView,
+                        clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ]
+            ))
+            maskPass.setPipeline(shadowMaskPipeline)
+            maskPass.setBindGroup(0, bindGroup: maskBindGroup, dynamicOffsets: [0])
+            if !vertices.isEmpty {
+                maskPass.setVertexBuffer(0, buffer: vertexBuffer, offset: 0)
+                maskPass.draw(vertexCount: UInt32(vertices.count))
+            }
+            maskPass.end()
+            horizontalInputView = resources.maskView
+        } else {
+            horizontalInputView = contentTexture.createView()
+        }
+
+        var blurUniforms = BlurUniforms(
+            texelSize: SIMD2<Float>(1 / Float(width), 1 / Float(height)),
+            blurRadius: max(0, Float(layer.shadowRadius)) * 0.5
+        )
+        device.queue.writeBuffer(
+            resources.blurUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &blurUniforms)
+        )
+        let horizontalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(
+                    resources.blurUniformBuffer,
+                    offset: 0,
+                    size: UInt64(MemoryLayout<BlurUniforms>.stride)
+                )),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(horizontalInputView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+        let verticalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(
+                    resources.blurUniformBuffer,
+                    offset: 0,
+                    size: UInt64(MemoryLayout<BlurUniforms>.stride)
+                )),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(resources.intermediateView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+        let horizontalPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: resources.intermediateView,
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ]
+        ))
+        horizontalPass.setPipeline(shadowBlurHorizontalPipeline)
+        horizontalPass.setBindGroup(0, bindGroup: horizontalBindGroup)
+        horizontalPass.draw(vertexCount: 6)
+        horizontalPass.end()
+
+        let verticalPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: resources.maskView,
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ]
+        ))
+        verticalPass.setPipeline(shadowBlurVerticalPipeline)
+        verticalPass.setBindGroup(0, bindGroup: verticalBindGroup)
+        verticalPass.draw(vertexCount: 6)
+        verticalPass.end()
+
+        let colorComponents = layer.shadowColor?.components ?? []
+        let color = SIMD4<Float>(
+            colorComponents.count > 0 ? Float(colorComponents[0]) : 0,
+            colorComponents.count > 1 ? Float(colorComponents[1]) : 0,
+            colorComponents.count > 2 ? Float(colorComponents[2]) : 0,
+            (colorComponents.count > 3 ? Float(colorComponents[3]) : 1) * layer.shadowOpacity
+        )
+        var compositeUniforms = RasterShadowCompositeUniforms(
+            shadowColor: color,
+            shadowOffsetUV: SIMD2<Float>(
+                Float(layer.shadowOffset.width / captureBounds.width),
+                Float(-layer.shadowOffset.height / captureBounds.height)
+            )
+        )
+        device.queue.writeBuffer(
+            resources.compositeUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &compositeUniforms)
+        )
+
+        let finalTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: preferredFormat,
+            usage: [.renderAttachment, .textureBinding]
+        ))
+        let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: rasterizedShadowCompositePipeline.getBindGroupLayout(index: 0),
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(
+                    resources.compositeUniformBuffer,
+                    offset: 0,
+                    size: UInt64(MemoryLayout<RasterShadowCompositeUniforms>.stride)
+                )),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(contentTexture.createView())),
+                GPUBindGroupEntry(binding: 2, resource: .textureView(resources.maskView)),
+                GPUBindGroupEntry(binding: 3, resource: .sampler(blurSampler))
+            ]
+        ))
+        let compositePass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+            colorAttachments: [
+                GPURenderPassColorAttachment(
+                    view: finalTexture.createView(),
+                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                    loadOp: .clear,
+                    storeOp: .store
+                )
+            ]
+        ))
+        compositePass.setPipeline(rasterizedShadowCompositePipeline)
+        compositePass.setBindGroup(0, bindGroup: compositeBindGroup)
+        compositePass.draw(vertexCount: 6)
+        compositePass.end()
+        return finalTexture
+    }
+
     /// Hash of the inputs that determine the captured pixels. Used by
     /// `RasterizationDecisions.canReuseRasterizedTexture` to detect
     /// content invalidation independent of the dirty-bit pathway.
@@ -9026,12 +9322,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// every transform-only change (e.g. scrolling), defeating the
     /// cache. Internal layout is captured by `bounds` alone.
     private func rasterizationContentBoundsHash(for layer: CALayer) -> Int {
+        let presentationLayer = renderPresentation(for: layer)
         var hasher = Hasher()
-        hasher.combine(layer.bounds.origin.x)
-        hasher.combine(layer.bounds.origin.y)
-        hasher.combine(layer.bounds.size.width)
-        hasher.combine(layer.bounds.size.height)
-        hasher.combine(layer.rasterizationScale)
+        hasher.combine(presentationLayer.bounds.origin.x)
+        hasher.combine(presentationLayer.bounds.origin.y)
+        hasher.combine(presentationLayer.bounds.size.width)
+        hasher.combine(presentationLayer.bounds.size.height)
+        hasher.combine(presentationLayer.rasterizationScale)
+        if hasVisibleShadow(presentationLayer) {
+            hasher.combine(presentationLayer.shadowOpacity)
+            hasher.combine(presentationLayer.shadowOffset.width)
+            hasher.combine(presentationLayer.shadowOffset.height)
+            hasher.combine(presentationLayer.shadowRadius)
+            if let shadowPath = presentationLayer.shadowPath {
+                let pathBounds = shadowPath.boundingBox
+                hasher.combine(pathBounds.origin.x)
+                hasher.combine(pathBounds.origin.y)
+                hasher.combine(pathBounds.size.width)
+                hasher.combine(pathBounds.size.height)
+            }
+            for component in presentationLayer.shadowColor?.components ?? [] {
+                hasher.combine(component)
+            }
+        }
         return hasher.finalize()
     }
 
@@ -9060,9 +9373,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
 
-        let boundsWidth = presentationLayer.bounds.width
-        let boundsHeight = presentationLayer.bounds.height
-        guard boundsWidth > 0, boundsHeight > 0 else { return }
+        let captureBounds = prerasterized.captureBounds
+        guard captureBounds.width > 0, captureBounds.height > 0 else { return }
 
         // The opacity stack already contains parent opacity × this layer's current
         // opacity. Capture baked the root at 1.0, so applying the stack once here
@@ -9090,13 +9402,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Scale the [0, 1] quad to bounds.size, then apply the layer's
         // own modelMatrix to position/rotate/scale it into the world.
+        let originMatrix = Matrix4x4(translation: SIMD3<Float>(
+            Float(captureBounds.minX),
+            Float(captureBounds.minY),
+            0
+        ))
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(boundsWidth), 0, 0, 0),
-            SIMD4<Float>(0, Float(boundsHeight), 0, 0),
+            SIMD4<Float>(Float(captureBounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(captureBounds.height), 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
-        let finalMatrix = modelMatrix * scaleMatrix
+        let finalMatrix = modelMatrix * originMatrix * scaleMatrix
 
         // cornerRadius is already baked into the captured texture by
         // the capture pass — passing 0 here avoids double-applying it.
@@ -9104,7 +9421,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             mvpMatrix: finalMatrix,
             opacity: composite,
             cornerRadius: 0,
-            layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
+            layerSize: SIMD2<Float>(Float(captureBounds.width), Float(captureBounds.height)),
             cornerRadii: .zero
         )
 
@@ -9139,7 +9456,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         // R3.5 / mask-stencil aware pipeline selection.
-        if let selected = selectTexturedPipeline(for: presentationLayer) {
+        let contentBounds = CGRect(origin: .zero, size: presentationLayer.bounds.size)
+        if let selected = selectTexturedPipeline(
+            for: presentationLayer,
+            forceBlending: prerasterized.purpose != .explicit
+                || captureBounds != contentBounds
+        ) {
             renderPass.setPipeline(selected)
         }
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])

@@ -820,6 +820,29 @@ func installHarness() {
                 halfMask.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
                 maskedGroup.mask = halfMask
                 crossingGroup.addSublayer(maskedGroup)
+
+                let shadowGroup = CALayer()
+                shadowGroup.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                shadowGroup.position = CGPoint(x: 150, y: 140)
+                shadowGroup.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                shadowGroup.shadowColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                shadowGroup.shadowOpacity = 1
+                shadowGroup.shadowOffset = CGSize(width: 20, height: 0)
+                shadowGroup.shadowRadius = 4
+                crossingGroup.addSublayer(shadowGroup)
+
+                let pathShadowGroup = CALayer()
+                pathShadowGroup.bounds = shadowGroup.bounds
+                pathShadowGroup.position = CGPoint(x: 220, y: 140)
+                pathShadowGroup.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                pathShadowGroup.shadowColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                pathShadowGroup.shadowOpacity = 1
+                pathShadowGroup.shadowOffset = CGSize(width: 20, height: 0)
+                pathShadowGroup.shadowRadius = 0
+                let narrowShadowPath = CGMutablePath()
+                narrowShadowPath.addRect(CGRect(x: 0, y: 0, width: 10, height: 20))
+                pathShadowGroup.shadowPath = narrowShadowPath
+                crossingGroup.addSublayer(pathShadowGroup)
                 root.addSublayer(crossingGroup)
 
                 let transparencyGroup = CATransformLayer()
@@ -912,6 +935,10 @@ func installHarness() {
                         CGPoint(x: 20, y: 190),
                         CGPoint(x: 45, y: 190),
                         CGPoint(x: 90, y: 120),
+                        CGPoint(x: 170, y: 160),
+                        CGPoint(x: 235, y: 160),
+                        CGPoint(x: 245, y: 160),
+                        CGPoint(x: 185, y: 160),
                     ])
                     let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
@@ -956,12 +983,22 @@ func installHarness() {
                     let contentMaskUsesLocalBounds = pixels[10] == [255, 0, 0, 255]
                         && pixels[11] == [0, 0, 0, 255]
                     let nestedFilterUsesLocalPixels = pixels[12] == [0, 255, 255, 255]
+                    let expandedShadowIsVisible = pixels[13][0] >= 240
+                        && pixels[13][1] >= 240
+                        && pixels[13][2] >= 240
+                        && pixels[13][3] == 255
+                        && pixels[16][0] > 0
+                        && pixels[16][1] > 0
+                        && pixels[16][2] > 0
+                        && pixels[16][3] == 255
+                    let customShadowPathIsRespected = pixels[14] == [255, 255, 255, 255]
+                        && pixels[15] == [0, 0, 0, 255]
                     let changedSubtreeWasRecaptured = updatedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningRecaptureCount == 1
-                        && flatteningUpdatedCompositeCount == 5
+                        && flatteningUpdatedCompositeCount == 7
                     let unchangedSubtreeWasReused = reusedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningReuseCaptureCount == 0
-                        && flatteningReuseCompositeCount == 5
+                        && flatteningReuseCompositeCount == 7
                     transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
                         + ",transparent=\(transparentPixelsAreCorrect)"
                         + ",isolated=\(independentGroupsAreIsolated)"
@@ -973,6 +1010,8 @@ func installHarness() {
                         + ",filter=\(filterUsesLocalPixels)"
                         + ",mask=\(contentMaskUsesLocalBounds)"
                         + ",nestedFilter=\(nestedFilterUsesLocalPixels)"
+                        + ",shadow=\(expandedShadowIsVisible)"
+                        + ",shadowPath=\(customShadowPathIsRespected)"
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
                 } catch {
