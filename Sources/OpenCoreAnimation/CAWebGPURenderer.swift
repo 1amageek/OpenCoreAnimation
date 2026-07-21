@@ -157,6 +157,7 @@ private struct LayerPrepassTarget {
 private struct BackdropCompositionTarget {
     let prepass: LayerPrepassTarget
     let sourceOpacity: Float
+    let sourceColor: SIMD4<Float>
 }
 
 private struct TransitionParticipantCapture {
@@ -854,9 +855,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         let instanceCount = max(0, replicatorPresentation.instanceCount)
+        let baseColor = replicatorPresentation.instanceColor.map(rgbaComponents)
+            ?? SIMD4<Float>(repeating: 1)
         var cumulativeTransform = CATransform3DIdentity
         for instanceIndex in 0..<instanceCount {
             let inheritedTimeOffset = currentReplicatorTimeOffset
+            let inheritedColor = currentReplicatorColor
+            let instanceColor = SIMD4<Float>(
+                clamp(baseColor.x + Float(instanceIndex) * replicatorPresentation.instanceRedOffset, 0, 1),
+                clamp(baseColor.y + Float(instanceIndex) * replicatorPresentation.instanceGreenOffset, 0, 1),
+                clamp(baseColor.z + Float(instanceIndex) * replicatorPresentation.instanceBlueOffset, 0, 1),
+                clamp(baseColor.w + Float(instanceIndex) * replicatorPresentation.instanceAlphaOffset, 0, 1)
+            )
+            replicatorColorStack.append(inheritedColor * instanceColor)
             replicatorTimeOffsetStack.append(
                 inheritedTimeOffset
                     + CFTimeInterval(instanceIndex) * replicatorPresentation.instanceDelay
@@ -873,6 +884,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
             _ = replicatorInstancePath.popLast()
             _ = replicatorTimeOffsetStack.popLast()
+            _ = replicatorColorStack.popLast()
             cumulativeTransform = CATransform3DConcat(
                 cumulativeTransform,
                 replicatorPresentation.instanceTransform
@@ -7332,7 +7344,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
             guard prefixIsValid,
                   !structurallyInvalidKeys.contains(key),
-                  key.replicatorPath.isEmpty,
                   presentation.mask == nil,
                   processor.supports(compositionFilter, inputMode: .foregroundAndBackground),
                   let source = prerenderedFilters[key] else {
@@ -7418,9 +7429,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             backdropPass.end()
 
             var premultipliedSourceTexture = source.outputTexture
-            if compositionTarget.sourceOpacity < 1 {
+            if compositionTarget.sourceOpacity < 1
+                || compositionTarget.sourceColor != SIMD4<Float>(repeating: 1) {
                 guard applyFilterOperation(
-                    uniforms: FilterCompositeUniforms(opacity: compositionTarget.sourceOpacity),
+                    uniforms: FilterCompositeUniforms(
+                        opacity: compositionTarget.sourceOpacity,
+                        colorMultiplier: compositionTarget.sourceColor
+                    ),
                     inputTexture: source.outputTexture,
                     outputView: resources.sourcePremultipliedView,
                     uniformBuffer: resources.sourceOpacityUniformBuffer,
@@ -7542,7 +7557,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     renderKey: key,
                     timeOffset: currentReplicatorTimeOffset
                 ),
-                sourceOpacity: presentation.opacity
+                sourceOpacity: presentation.opacity,
+                sourceColor: currentReplicatorColor
             ))
             if !ancestorCompositionKeys.isEmpty {
                 structurallyInvalidKeys.insert(key)

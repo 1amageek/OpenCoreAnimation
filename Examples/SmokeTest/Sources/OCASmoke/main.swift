@@ -729,6 +729,30 @@ func installHarness() {
                 opacitySource.opacity = 0.5
                 opacitySource.compositingFilter = multiply
                 root.addSublayer(opacitySource)
+
+                let replicatorBackdrop = CALayer()
+                replicatorBackdrop.bounds = CGRect(x: 0, y: 0, width: 100, height: 30)
+                replicatorBackdrop.position = CGPoint(x: 240, y: 40)
+                replicatorBackdrop.zPosition = 198
+                replicatorBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(replicatorBackdrop)
+
+                let compositionReplicator = CAReplicatorLayer()
+                compositionReplicator.bounds = root.bounds
+                compositionReplicator.anchorPoint = .zero
+                compositionReplicator.position = .zero
+                compositionReplicator.zPosition = 208
+                compositionReplicator.instanceCount = 2
+                compositionReplicator.instanceTransform = CATransform3DMakeTranslation(40, 0, 0)
+                compositionReplicator.instanceColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                compositionReplicator.instanceGreenOffset = -1
+                let replicatedSource = CALayer()
+                replicatedSource.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+                replicatedSource.position = CGPoint(x: 220, y: 40)
+                replicatedSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                replicatedSource.compositingFilter = screen
+                compositionReplicator.addSublayer(replicatedSource)
+                root.addSublayer(compositionReplicator)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -742,6 +766,8 @@ func installHarness() {
                         CGPoint(x: 52, y: 188),
                         CGPoint(x: 50, y: 60),
                         CGPoint(x: 120, y: 220),
+                        CGPoint(x: 220, y: 260),
+                        CGPoint(x: 260, y: 260),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -751,6 +777,8 @@ func installHarness() {
                         && pixels[5] == [255, 0, 0, 255]
                         && pixels[6] == [7, 135, 10, 192]
                         && pixels[7] == [127, 0, 0, 255]
+                        && pixels[8] == [255, 255, 0, 255]
+                        && pixels[9] == [255, 0, 0, 255]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -760,6 +788,8 @@ func installHarness() {
                     backdropFiltered.removeFromSuperlayer()
                     transparentSource.removeFromSuperlayer()
                     opacitySource.removeFromSuperlayer()
+                    replicatorBackdrop.removeFromSuperlayer()
+                    compositionReplicator.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
