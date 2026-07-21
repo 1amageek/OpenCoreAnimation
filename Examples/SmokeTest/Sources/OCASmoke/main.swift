@@ -1696,6 +1696,8 @@ func installHarness() {
                         CGPoint(x: 165, y: 275),
                         CGPoint(x: 160, y: 160),
                         CGPoint(x: 200, y: 160),
+                        CGPoint(x: 310, y: 275),
+                        CGPoint(x: 330, y: 275),
                     ])
                 } catch {
                     shadowProbeResult = "error: \(error)"
@@ -1768,9 +1770,31 @@ func installHarness() {
                 imageContent.shadowOpacity = 1
                 imageContent.shadowOffset = CGSize(width: 40, height: 0)
                 imageContent.shadowRadius = 0
+
+                let maskedShadow = CALayer()
+                maskedShadow.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
+                maskedShadow.position = CGPoint(x: 240, y: 25)
+                maskedShadow.zPosition = 100
+                maskedShadow.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                maskedShadow.shadowColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                maskedShadow.shadowOpacity = 1
+                maskedShadow.shadowOffset = CGSize(width: 80, height: 0)
+                maskedShadow.shadowRadius = 0
+                let shadowMask = CALayer()
+                shadowMask.bounds = maskedShadow.bounds
+                shadowMask.position = CGPoint(x: 20, y: 10)
+                let shadowMaskHalf = CALayer()
+                shadowMaskHalf.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                shadowMaskHalf.position = CGPoint(x: 10, y: 10)
+                shadowMaskHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                shadowMaskHalf.opacity = 0.5
+                shadowMaskHalf.filters = [CAFilter.brightness(0)]
+                shadowMask.addSublayer(shadowMaskHalf)
+                maskedShadow.mask = shadowMask
                 root.addSublayer(silhouetteParent)
                 root.addSublayer(emptyContent)
                 root.addSublayer(imageContent)
+                root.addSublayer(maskedShadow)
 
                 engine.renderFrame()
                 do {
@@ -1781,6 +1805,8 @@ func installHarness() {
                         CGPoint(x: 75, y: 275),
                         CGPoint(x: 140, y: 275),
                         CGPoint(x: 165, y: 275),
+                        CGPoint(x: 310, y: 275),
+                        CGPoint(x: 330, y: 275),
                     ])
                     result += ";" + pixels[0].map(String.init).joined(separator: ",")
                     result += ";emptyRegion=\(pixels[1] == emptyBaselines[0])"
@@ -1791,6 +1817,18 @@ func installHarness() {
                         && pixels[4][2] <= 5
                         && pixels[4][3] == 255
                     result += ";imageCenter=\(imageCenterIsShadow)"
+                    let partialMaskShadow = abs(
+                        Int(pixels[6][0]) - (255 + Int(emptyBaselines[6][0])) / 2
+                    ) <= 1
+                        && abs(Int(pixels[6][1]) - Int(emptyBaselines[6][1]) / 2) <= 1
+                        && abs(Int(pixels[6][2]) - Int(emptyBaselines[6][2]) / 2) <= 1
+                        && pixels[6][3] == 255
+                    let maskOutsideCleared = pixels[7] == emptyBaselines[7]
+                    shadowMaskHalf.opacity = 1
+                    engine.renderFrame()
+                    let updatedMaskShadow = try await renderer.readbackPixel(x: 310, y: 275)
+                    let maskMutationUpdatedShadow = updatedMaskShadow == [255, 0, 0, 255]
+                    result += ";maskedShadow=\(partialMaskShadow && maskOutsideCleared && maskMutationUpdatedShadow)"
 
                     if let storedAnimation = silhouetteChild.animation(
                         forKey: "shadowSilhouettePosition"
@@ -1817,6 +1855,7 @@ func installHarness() {
                 silhouetteParent.removeFromSuperlayer()
                 emptyContent.removeFromSuperlayer()
                 imageContent.removeFromSuperlayer()
+                maskedShadow.removeFromSuperlayer()
                 engine.renderFrame()
                 shadowProbeResult = result
             }

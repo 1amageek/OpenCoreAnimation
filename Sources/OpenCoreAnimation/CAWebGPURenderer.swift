@@ -464,13 +464,15 @@ private struct ShadowCaptureState: Equatable {
     let cornerRadius: Float
     let cornerRadii: SIMD4<Float>
     let blurRadius: Float
+    let detachedMaskRevisionHash: Int
 
     init(
         matrix: Matrix4x4,
         layerSize: SIMD2<Float>,
         cornerRadius: Float,
         cornerRadii: SIMD4<Float>,
-        blurRadius: Float
+        blurRadius: Float,
+        detachedMaskRevisionHash: Int
     ) {
         matrixColumns = [
             matrix.columns.0,
@@ -482,6 +484,7 @@ private struct ShadowCaptureState: Equatable {
         self.cornerRadius = cornerRadius
         self.cornerRadii = cornerRadii
         self.blurRadius = blurRadius
+        self.detachedMaskRevisionHash = detachedMaskRevisionHash
     }
 }
 
@@ -1327,6 +1330,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     /// The root layer whose rendered alpha is being captured as a shadow silhouette.
     private weak var shadowCaptureRootLayer: CALayer?
+
+    /// Suppresses shadow draws while mask-dependent filter resources are prepared
+    /// ahead of the shadow silhouette pass.
+    private var suppressShadowRendering = false
 
     // MARK: - Rasterization Cache (R3.2 / R3.4)
 
@@ -3268,6 +3275,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         filterPrerenderRootLayer = nil
         contentMaskCaptureSuppressedRootLayer = nil
         shadowCaptureRootLayer = nil
+        suppressShadowRendering = false
         activeEmitterLayerIDs.removeAll(keepingCapacity: true)
         collectEmitterLayerIDs(rootLayer, into: &activeEmitterLayerIDs)
 
@@ -3352,7 +3360,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         prerenderTransitions(rootLayer, encoder: encoder)
 
-        // Pre-render shadows with 2-pass Gaussian blur
+        // A shadow silhouette can depend on rendered mask-tree alpha. Prepare
+        // those filtered/masked captures without recursively drawing shadows,
+        // then run the normal shadow pass and rebuild final filter captures.
+        if shadowPrepassRequiresContentMasks(rootLayer) {
+            suppressShadowRendering = true
+            prerenderFilteredLayers(
+                rootLayer,
+                encoder: encoder,
+                projectionMatrix: projectionMatrix
+            )
+            suppressShadowRendering = false
+        }
+
+        // Pre-render shadows with 2-pass Gaussian blur.
         prerenderShadows(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
 
         // Pre-render layers with blur filters
@@ -3717,6 +3738,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerasterizedTextures.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
+        suppressShadowRendering = false
         contentMaskCaptureSuppressedRootLayer = nil
         for request in pendingTileDraws {
             request.tiledLayer.loadingTiles.remove(request.tileKey)
@@ -3963,6 +3985,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if filterPrerenderRootLayer !== layer,
            rasterizePrerenderRootLayer !== layer,
            shadowCaptureRootLayer == nil,
+           !suppressShadowRendering,
            presentationLayer.shadowOpacity > 0 && presentationLayer.shadowColor != nil {
             renderLayerShadow(
                 layer,
@@ -7192,6 +7215,55 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Shadow Rendering (2-Pass Gaussian Blur)
 
+    private func shadowPrepassRequiresContentMasks(_ rootLayer: CALayer) -> Bool {
+        var visited: Set<ObjectIdentifier> = []
+
+        func subtreeContainsMask(_ layer: CALayer) -> Bool {
+            if layer.mask != nil { return true }
+            return (layer.sublayers ?? []).contains(where: subtreeContainsMask)
+        }
+
+        func visit(_ layer: CALayer) -> Bool {
+            let identifier = ObjectIdentifier(layer)
+            guard visited.insert(identifier).inserted else { return false }
+            let presentation = renderPresentation(for: layer)
+            guard !presentation.isHidden, presentation.opacity > 0 else { return false }
+            if presentation.shadowOpacity > 0,
+               presentation.shadowColor != nil,
+               presentation.shadowPath == nil,
+               subtreeContainsMask(layer) {
+                return true
+            }
+            return (layer.sublayers ?? []).contains(where: visit)
+        }
+
+        return visit(rootLayer)
+    }
+
+    private func shadowDetachedMaskRevisionHash(of rootLayer: CALayer) -> Int {
+        var hasher = Hasher()
+        var mainTreeVisited: Set<ObjectIdentifier> = []
+        var detachedTreeVisited: Set<ObjectIdentifier> = []
+
+        func visit(_ layer: CALayer) {
+            let identifier = ObjectIdentifier(layer)
+            guard mainTreeVisited.insert(identifier).inserted else { return }
+            if let mask = layer.mask {
+                combineDetachedContentRevision(
+                    of: mask,
+                    into: &hasher,
+                    visited: &detachedTreeVisited
+                )
+            }
+            for sublayer in layer.sublayers ?? [] {
+                visit(sublayer)
+            }
+        }
+
+        visit(rootLayer)
+        return detachedTreeVisited.isEmpty ? 0 : hasher.finalize()
+    }
+
     /// Pre-renders every visible shadow with independently-owned GPU resources.
     private func prerenderShadows(
         _ rootLayer: CALayer,
@@ -7241,15 +7313,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
 
             let presentationLayer = target.presentationLayer
-            let shadowOffset = presentationLayer.shadowOffset
-            let shadowOffsetParentMatrix = target.parentMatrix * Matrix4x4(
-                translation: SIMD3<Float>(
-                    Float(shadowOffset.width),
-                    Float(shadowOffset.height),
-                    0
-                )
-            )
-            let finalMatrix = presentationLayer.modelMatrix(parentMatrix: shadowOffsetParentMatrix)
+            // Capture the silhouette at the layer's actual position. The display
+            // shader applies `shadowOffset` uniformly for raw, filtered, masked,
+            // and explicit-path silhouettes.
+            let finalMatrix = presentationLayer.modelMatrix(parentMatrix: target.parentMatrix)
             let layerSize = SIMD2<Float>(
                 Float(presentationLayer.bounds.width),
                 Float(presentationLayer.bounds.height)
@@ -7262,7 +7329,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 layerSize: layerSize,
                 cornerRadius: cornerRadius,
                 cornerRadii: cornerRadii,
-                blurRadius: blurRadius
+                blurRadius: blurRadius,
+                detachedMaskRevisionHash: shadowDetachedMaskRevisionHash(
+                    of: shadowLayer
+                )
             )
 
             let usesShadowPath = RasterizationDecisions.useShadowPathFastPath(
@@ -7360,7 +7430,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 withPrepassContext(target) {
                     captureShadowContent(
                         shadowLayer,
-                        parentMatrix: shadowOffsetParentMatrix,
+                        parentMatrix: target.parentMatrix,
                         resources: resources,
                         pipeline: pipeline,
                         depthTextureView: depthTextureView,

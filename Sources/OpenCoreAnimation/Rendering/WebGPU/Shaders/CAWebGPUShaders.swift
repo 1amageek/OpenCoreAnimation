@@ -758,7 +758,17 @@ public enum CAWebGPUShaders {
 
     @fragment
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
-        let shadowAlpha = textureSample(shadowTexture, texSampler, input.texCoord).r;
+        let safeSize = max(uniforms.layerSize, vec2<f32>(1.0));
+        let shadowOffsetUV = vec2<f32>(
+            uniforms.shadowOffset.x / safeSize.x,
+            uniforms.shadowOffset.y / safeSize.y
+        );
+        // Texture V points down while layer-space Y points up.
+        let shadowCoordinate = input.texCoord + vec2<f32>(-shadowOffsetUV.x, shadowOffsetUV.y);
+        let lowerCoverage = step(vec2<f32>(0.0), shadowCoordinate);
+        let upperCoverage = step(shadowCoordinate, vec2<f32>(1.0));
+        let inBounds = lowerCoverage.x * lowerCoverage.y * upperCoverage.x * upperCoverage.y;
+        let shadowAlpha = textureSample(shadowTexture, texSampler, shadowCoordinate).r * inBounds;
         return vec4<f32>(uniforms.shadowColor.rgb, uniforms.shadowColor.a * shadowAlpha);
     }
     """
