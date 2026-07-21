@@ -39,6 +39,7 @@ nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var textProbeResult: String = "pending"
 nonisolated(unsafe) var edgeAntialiasingProbeResult: String = "pending"
+nonisolated(unsafe) var booleanAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -153,6 +154,7 @@ public func setup() {
             layerFilterProbeResult = "pending"
             textProbeResult = "pending"
             edgeAntialiasingProbeResult = "pending"
+            booleanAnimationProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -333,6 +335,9 @@ func installHarness() {
         })
         h.expose("getEdgeAntialiasingProbeResult", returning: {
             .string(edgeAntialiasingProbeResult)
+        })
+        h.expose("getBooleanAnimationProbeResult", returning: {
+            .string(booleanAnimationProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1030,6 +1035,115 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     edgeAntialiasingProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginBooleanAnimationProbe", action: {
+            Task { @MainActor in
+                booleanAnimationProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    booleanAnimationProbeResult = "error: Boolean animation dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func addBooleanAnimation(
+                    to layer: CALayer,
+                    keyPath: String,
+                    key: String
+                ) {
+                    let animation = CABasicAnimation(keyPath: keyPath)
+                    animation.fromValue = false
+                    animation.toValue = true
+                    animation.duration = 1
+                    animation.speed = 0
+                    animation.timeOffset = 0.5
+                    animation.fillMode = .both
+                    animation.isRemovedOnCompletion = false
+                    layer.add(animation, forKey: key)
+                }
+
+                let hiddenLayer = CALayer()
+                hiddenLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                hiddenLayer.position = CGPoint(x: 50, y: 160)
+                hiddenLayer.zPosition = 100
+                hiddenLayer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                addBooleanAnimation(to: hiddenLayer, keyPath: "hidden", key: "browserHidden")
+                root.addSublayer(hiddenLayer)
+
+                let clippingLayer = CALayer()
+                clippingLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                clippingLayer.position = CGPoint(x: 130, y: 160)
+                clippingLayer.zPosition = 100
+                let overflowingChild = CALayer()
+                overflowingChild.bounds = CGRect(x: 0, y: 0, width: 80, height: 40)
+                overflowingChild.position = CGPoint(x: 20, y: 20)
+                overflowingChild.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                clippingLayer.addSublayer(overflowingChild)
+                addBooleanAnimation(to: clippingLayer, keyPath: "masksToBounds", key: "browserClip")
+                root.addSublayer(clippingLayer)
+
+                let backfaceLayer = CALayer()
+                backfaceLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                backfaceLayer.position = CGPoint(x: 210, y: 160)
+                backfaceLayer.zPosition = 100
+                backfaceLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                backfaceLayer.isDoubleSided = false
+                backfaceLayer.transform = CATransform3DMakeRotation(.pi, 0, 1, 0)
+                addBooleanAnimation(to: backfaceLayer, keyPath: "doubleSided", key: "browserDoubleSided")
+                root.addSublayer(backfaceLayer)
+
+                let rasterizedLayer = CALayer()
+                rasterizedLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                rasterizedLayer.position = CGPoint(x: 290, y: 160)
+                rasterizedLayer.zPosition = 100
+                rasterizedLayer.backgroundColor = CGColor(red: 1, green: 1, blue: 0, alpha: 1)
+                addBooleanAnimation(to: rasterizedLayer, keyPath: "shouldRasterize", key: "browserRasterize")
+                root.addSublayer(rasterizedLayer)
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    hiddenLayer.removeFromSuperlayer()
+                    clippingLayer.removeFromSuperlayer()
+                    backfaceLayer.removeFromSuperlayer()
+                    rasterizedLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                let explicitCaptureCount = renderer.explicitRasterizationCaptureCount
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 50, y: 140),
+                        CGPoint(x: 100, y: 140),
+                        CGPoint(x: 130, y: 140),
+                        CGPoint(x: 210, y: 140),
+                        CGPoint(x: 290, y: 140),
+                    ])
+                    restoreScene()
+                    booleanAnimationProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                        + ",captures=\(explicitCaptureCount)"
+                } catch {
+                    restoreScene()
+                    booleanAnimationProbeResult = "error: \(error)"
                 }
             }
         })

@@ -671,9 +671,58 @@ open class CALayer: CAMediaTiming, Hashable {
         case "path", "shadowPath":
             applyPathAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
+        case "hidden", "isHidden", "masksToBounds", "doubleSided", "isDoubleSided", "shouldRasterize":
+            applyBooleanAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+
         // Array properties (locations, colors, etc.)
         default:
             applyArrayAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
+        }
+    }
+
+    /// Core Animation represents Boolean animation endpoints numerically. The
+    /// presentation value is false only when the interpolated scalar is exactly
+    /// zero, matching QuartzCore's asymmetric false→true / true→false behavior.
+    private func applyBooleanAnimation(
+        _ animation: CABasicAnimation,
+        to layer: CALayer,
+        keyPath: String,
+        progress: CFTimeInterval
+    ) {
+        guard let current = booleanAnimationValue(for: keyPath) else { return }
+        let from = (animation.fromValue as? Bool) ?? current
+        let to = (animation.toValue as? Bool) ?? current
+        guard animation.fromValue != nil || animation.toValue != nil else { return }
+        let fromScalar: CFTimeInterval = from ? 1 : 0
+        let toScalar: CFTimeInterval = to ? 1 : 0
+        applyBooleanAnimationValue(
+            fromScalar + progress * (toScalar - fromScalar) != 0,
+            to: layer,
+            keyPath: keyPath
+        )
+    }
+
+    private func booleanAnimationValue(for keyPath: String) -> Bool? {
+        switch keyPath {
+        case "hidden", "isHidden": return _isHidden
+        case "masksToBounds": return _masksToBounds
+        case "doubleSided", "isDoubleSided": return _isDoubleSided
+        case "shouldRasterize": return _shouldRasterize
+        default: return nil
+        }
+    }
+
+    private func applyBooleanAnimationValue(
+        _ value: Bool,
+        to layer: CALayer,
+        keyPath: String
+    ) {
+        switch keyPath {
+        case "hidden", "isHidden": layer._isHidden = value
+        case "masksToBounds": layer._masksToBounds = value
+        case "doubleSided", "isDoubleSided": layer._isDoubleSided = value
+        case "shouldRasterize": layer._shouldRasterize = value
+        default: break
         }
     }
 
@@ -929,6 +978,10 @@ open class CALayer: CAMediaTiming, Hashable {
     private func currentAnimationValue(for keyPath: String) -> Any? {
         switch keyPath {
         case "opacity": return _opacity
+        case "hidden", "isHidden": return _isHidden
+        case "masksToBounds": return _masksToBounds
+        case "doubleSided", "isDoubleSided": return _isDoubleSided
+        case "shouldRasterize": return _shouldRasterize
         case "bounds": return _bounds
         case "bounds.origin": return _bounds.origin
         case "bounds.size": return _bounds.size
@@ -2039,7 +2092,11 @@ open class CALayer: CAMediaTiming, Hashable {
             return
         }
 
-        guard let values = animation.values, values.count > 1 else { return }
+        guard let values = animation.values, !values.isEmpty else { return }
+        if values.count == 1 {
+            applyKeyframeValue(values[0], layer: layer, keyPath: keyPath)
+            return
+        }
 
         // For paced modes, remap progress based on arc length
         let effectiveProgress: CFTimeInterval
@@ -2060,8 +2117,29 @@ open class CALayer: CAMediaTiming, Hashable {
             effectiveKeyTimes = animation.keyTimes ?? defaultKeyTimes(for: values.count)
         }
 
+        guard effectiveKeyTimes.count == values.count,
+              effectiveKeyTimes.allSatisfy(\.isFinite),
+              zip(effectiveKeyTimes, effectiveKeyTimes.dropFirst()).allSatisfy({ $0 <= $1 }) else {
+            return
+        }
+
+        let clampedProgress = CGFloat(effectiveProgress)
+        if clampedProgress <= effectiveKeyTimes[0] {
+            applyKeyframeValue(values[0], layer: layer, keyPath: keyPath)
+            return
+        }
+        if clampedProgress >= effectiveKeyTimes[values.count - 1] {
+            applyKeyframeValue(values[values.count - 1], layer: layer, keyPath: keyPath)
+            return
+        }
+        if animation.calculationMode == .discrete {
+            let valueIndex = effectiveKeyTimes.lastIndex(where: { $0 <= clampedProgress }) ?? 0
+            applyKeyframeValue(values[valueIndex], layer: layer, keyPath: keyPath)
+            return
+        }
+
         // Determine which keyframe segment we're in
-        let segmentIndex = findSegmentIndex(for: CGFloat(effectiveProgress), in: effectiveKeyTimes)
+        let segmentIndex = findSegmentIndex(for: clampedProgress, in: effectiveKeyTimes)
         let startIndex = segmentIndex
         let endIndex = min(segmentIndex + 1, values.count - 1)
 
@@ -2188,6 +2266,10 @@ open class CALayer: CAMediaTiming, Hashable {
         // Float distance (absolute)
         if let fromFloat = from as? Float, let toFloat = to as? Float {
             return CGFloat(abs(toFloat - fromFloat))
+        }
+
+        if let fromBool = from as? Bool, let toBool = to as? Bool {
+            return fromBool == toBool ? 0 : 1
         }
 
         // CGRect distance (sum of component distances)
@@ -2318,6 +2400,10 @@ open class CALayer: CAMediaTiming, Hashable {
             if let v = value as? Float { layer._opacity = v }
         case "position":
             if let v = value as? CGPoint { layer._position = v }
+        case "position.x":
+            if let v = value as? CGFloat { layer._position.x = v }
+        case "position.y":
+            if let v = value as? CGFloat { layer._position.y = v }
         case "bounds":
             if let v = value as? CGRect { layer._bounds = v }
         case "cornerRadius":
@@ -2328,6 +2414,10 @@ open class CALayer: CAMediaTiming, Hashable {
             if let v = value as? CGFloat { layer._zPosition = v }
         case "transform":
             if let v = value as? CATransform3D { layer._transform = v }
+        case "hidden", "isHidden", "masksToBounds", "doubleSided", "isDoubleSided", "shouldRasterize":
+            if let v = value as? Bool {
+                applyBooleanAnimationValue(v, to: layer, keyPath: keyPath)
+            }
 
         // Color properties
         case "backgroundColor":
@@ -2464,6 +2554,12 @@ open class CALayer: CAMediaTiming, Hashable {
                     y: f.y + CGFloat(progress) * (t.y - f.y)
                 )
             }
+        case "position.x", "position.y":
+            if let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
+                let value = f + CGFloat(progress) * (t - f)
+                if keyPath == "position.x" { layer._position.x = value }
+                else { layer._position.y = value }
+            }
         case "bounds":
             if let f = fromValue as? CGRect, let t = toValue as? CGRect {
                 layer._bounds = CGRect(
@@ -2491,6 +2587,16 @@ open class CALayer: CAMediaTiming, Hashable {
         case "shadowOpacity":
             if let f = fromValue as? Float, let t = toValue as? Float {
                 layer._shadowOpacity = f + Float(progress) * (t - f)
+            }
+        case "hidden", "isHidden", "masksToBounds", "doubleSided", "isDoubleSided", "shouldRasterize":
+            if let f = fromValue as? Bool, let t = toValue as? Bool {
+                let fromScalar: CFTimeInterval = f ? 1 : 0
+                let toScalar: CFTimeInterval = t ? 1 : 0
+                applyBooleanAnimationValue(
+                    fromScalar + progress * (toScalar - fromScalar) != 0,
+                    to: layer,
+                    keyPath: keyPath
+                )
             }
         case "anchorPoint":
             if let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
@@ -2807,6 +2913,17 @@ open class CALayer: CAMediaTiming, Hashable {
            let v2 = p2 as? Float,
            let v3 = p3 as? Float {
             return Float(scalar(CGFloat(v0), CGFloat(v1), CGFloat(v2), CGFloat(v3)))
+        }
+        if let v0 = p0 as? Bool,
+           let v1 = p1 as? Bool,
+           let v2 = p2 as? Bool,
+           let v3 = p3 as? Bool {
+            return scalar(
+                v0 ? 1 : 0,
+                v1 ? 1 : 0,
+                v2 ? 1 : 0,
+                v3 ? 1 : 0
+            ) != 0
         }
         if let v0 = p0 as? CGPoint,
            let v1 = p1 as? CGPoint,
@@ -3435,9 +3552,16 @@ open class CALayer: CAMediaTiming, Hashable {
     open var shouldRasterize: Bool {
         get { return _shouldRasterize }
         set {
-            guard _shouldRasterize != newValue else { return }
+            let oldValue = _shouldRasterize
+            guard oldValue != newValue else { return }
             _shouldRasterize = newValue
             markDirty(.rasterization)
+            CATransaction.registerChange(
+                layer: self,
+                keyPath: "shouldRasterize",
+                oldValue: oldValue,
+                newValue: newValue
+            )
         }
     }
 

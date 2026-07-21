@@ -24,6 +24,7 @@ interface OCA extends Harness {
     getLayerFilterProbeResult: () => string;
     getTextProbeResult: () => string;
     getDelegateDrawProbeResult: () => string;
+    getBooleanAnimationProbeResult: () => string;
     getShadowProbeResult: () => string;
     getDisplayLinkProbeResult: () => string;
     getEmitterProbeResult: () => string;
@@ -51,6 +52,7 @@ interface OCA extends Harness {
     beginLayerFilterProbe: () => void;
     beginTextProbe: () => void;
     beginDelegateDrawProbe: () => void;
+    beginBooleanAnimationProbe: () => void;
     beginCompositionProbe: () => void;
     beginTransformDepthProbe: () => void;
     beginShadowProbe: () => void;
@@ -140,6 +142,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         await h.beginEdgeAntialiasingProbe();
         await expect.poll(() => h.getEdgeAntialiasingProbeResult(), { timeout: 10_000 }).toBe(
             "initial=255,255,255,255;40,40,40,255;255,255,255,255;255,255,255,255;215,215,215,255;40,40,40,255,mutated=255,255,255,255;215,215,215,255,bottom=40,40,40,255;255,255,255,255,top=255,255,255,255;215,215,215,255"
+        );
+
+        await h.beginBooleanAnimationProbe();
+        await expect.poll(() => h.getBooleanAnimationProbeResult(), { timeout: 10_000 }).toBe(
+            "0,0,0,255;0,0,0,255;0,255,0,255;0,0,255,255;255,255,0,255,captures=1"
         );
 
         await h.beginTransformDepthProbe();
