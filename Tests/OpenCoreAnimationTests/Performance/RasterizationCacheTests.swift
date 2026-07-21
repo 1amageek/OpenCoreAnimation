@@ -102,6 +102,33 @@ struct RasterizationCacheTests {
         #expect(cache.entry(secondKey)?.texture == StubTexture(id: 2))
     }
 
+    @Test func explicitAndTransformFlatteningUseDistinctCacheEntries() {
+        let cache = RasterizationCache<StubTexture>(maxBytes: 1024)
+        let layer = CALayer()
+        let renderKey = LayerRenderKey(layer: ObjectIdentifier(layer))
+        let explicitKey = RasterizationCacheKey(renderKey, purpose: .explicit)
+        let flatteningKey = RasterizationCacheKey(renderKey, purpose: .transformFlattening)
+
+        cache.insert(
+            explicitKey,
+            texture: StubTexture(id: 1),
+            pixelSize: CGSize(width: 4, height: 4),
+            contentBoundsHash: 0,
+            atFrame: 0
+        )
+        cache.insert(
+            flatteningKey,
+            texture: StubTexture(id: 2),
+            pixelSize: CGSize(width: 4, height: 4),
+            contentBoundsHash: 0,
+            atFrame: 0
+        )
+
+        #expect(cache.count == 2)
+        #expect(cache.entry(explicitKey)?.texture == StubTexture(id: 1))
+        #expect(cache.entry(flatteningKey)?.texture == StubTexture(id: 2))
+    }
+
     // C.3 — Inserting with a known per-pixel byte cost updates `bytes`.
     @Test func bytesAccountedOnInsert() {
         let cache = RasterizationCache<StubTexture>(maxBytes: 1_000_000)
@@ -136,6 +163,8 @@ struct RasterizationCacheTests {
     // 3.5 — Idle eviction: an entry untouched for >6 frames is dropped.
     @Test func evictIdleDropsStaleEntries() {
         let cache = RasterizationCache<StubTexture>(maxBytes: 1024)
+        var evicted: [StubTexture] = []
+        cache.onEvict = { _, texture in evicted.append(texture) }
         cache.insert(
             makeKey(1),
             texture: StubTexture(id: 1),
@@ -155,6 +184,7 @@ struct RasterizationCacheTests {
         cache.evictIdle(currentFrame: 7, olderThan: 6)
         #expect(cache.entry(makeKey(1)) == nil)
         #expect(cache.entry(makeKey(2)) != nil)
+        #expect(evicted == [StubTexture(id: 1)])
     }
 
     // 3.6 — Byte-budget eviction: when `bytes > maxBytes` after an insert,
@@ -165,6 +195,8 @@ struct RasterizationCacheTests {
         // Budget = 128 bytes. Each 4x4 entry is 64 bytes. Inserting three
         // of them puts the cache at 192 bytes — over budget.
         let cache = RasterizationCache<StubTexture>(maxBytes: 128)
+        var evicted: [StubTexture] = []
+        cache.onEvict = { _, texture in evicted.append(texture) }
         let pix = CGSize(width: 4, height: 4)
         cache.insert(makeKey(1), texture: .init(id: 1),
                      pixelSize: pix, contentBoundsHash: 0, atFrame: 0)
@@ -179,12 +211,15 @@ struct RasterizationCacheTests {
         // Oldest (lastUsedFrame == 0) must go first.
         #expect(cache.entry(makeKey(1)) == nil)
         #expect(cache.entry(makeKey(3)) != nil)
+        #expect(evicted == [StubTexture(id: 1)])
     }
 
     // C.5 — Re-inserting at the same key replaces the entry and keeps the
     // byte accounting consistent (no double-count).
     @Test func reinsertReplacesNotAccumulates() {
         let cache = RasterizationCache<StubTexture>(maxBytes: 1024)
+        var evicted: [StubTexture] = []
+        cache.onEvict = { _, texture in evicted.append(texture) }
         let key = makeKey(1)
         cache.insert(
             key,
@@ -202,17 +237,21 @@ struct RasterizationCacheTests {
         )
         #expect(cache.bytes == 8 * 8 * 4)
         #expect(cache.entry(key)?.texture == StubTexture(id: 2))
+        #expect(evicted == [StubTexture(id: 1)])
     }
 
     // C.6 — `removeAll()` drops every entry and zeros the byte counter.
     @Test func removeAllClearsCacheAndBytes() {
         let cache = RasterizationCache<StubTexture>(maxBytes: 1024)
+        var evicted: [StubTexture] = []
+        cache.onEvict = { _, texture in evicted.append(texture) }
         cache.insert(makeKey(1), texture: .init(id: 1),
                      pixelSize: CGSize(width: 4, height: 4),
                      contentBoundsHash: 0, atFrame: 0)
         cache.removeAll()
         #expect(cache.bytes == 0)
         #expect(cache.entry(makeKey(1)) == nil)
+        #expect(evicted == [StubTexture(id: 1)])
     }
 }
 }

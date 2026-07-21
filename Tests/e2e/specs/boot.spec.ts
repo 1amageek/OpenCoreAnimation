@@ -123,7 +123,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginTransformDepthProbe();
         await expect.poll(() => h.getTransformDepthProbeResult(), { timeout: 10_000 }).toBe(
-            "crossing=true,transparent=true,isolated=true"
+            "crossing=true,transparent=true,isolated=true,flattened=true,nested=true,captures=1,composites=1,updated=true,reused=true"
         );
 
         await h.beginCompositionProbe();

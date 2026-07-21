@@ -130,7 +130,7 @@ fileprivate enum EmitterTextureSampling: CaseIterable, Hashable {
 fileprivate enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier)
     case emitterImage(ObjectIdentifier, EmitterTextureSampling)
-    case layer(LayerRenderKey)
+    case rasterizedLayer(LayerRenderKey, RasterizationCachePurpose)
     case transitionSource(ObjectIdentifier)
     case transitionTarget(ObjectIdentifier)
     case transitionFilter(ObjectIdentifier)
@@ -144,6 +144,11 @@ private struct PendingTileDraw {
     let scale: CGFloat
     let pixelWidth: Int
     let pixelHeight: Int
+}
+
+private struct PrerasterizedTexture {
+    let texture: GPUTexture
+    let purpose: RasterizationCachePurpose
 }
 
 private struct LayerPrepassTarget {
@@ -1280,7 +1285,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// (or had a fresh cache hit) this frame, mapped to the texture used
     /// for compositing. Populated by `prerenderRasterizedLayers`,
     /// consumed by `renderLayer`, cleared after submit.
-    private var prerasterizedTextures: [LayerRenderKey: GPUTexture] = [:]
+    private var prerasterizedTextures: [LayerRenderKey: PrerasterizedTexture] = [:]
+
+    /// Normal-layer subtrees captured as one plane for a CATransformLayer parent.
+    private var transformFlattenedLayerKeys: Set<LayerRenderKey> = []
+
+    @_spi(RendererDiagnostics)
+    public private(set) var transformFlatteningCaptureCount: Int = 0
+
+    @_spi(RendererDiagnostics)
+    public private(set) var transformFlatteningCompositeCount: Int = 0
+
 
     /// Persistent cache of `GPUTextureView`s keyed by `TexturedCacheKey`.
     ///
@@ -1290,8 +1305,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ///
     /// **Identity contract**: keyed by either `.image(OID(cgImage))` for
     /// regular content layers (eviction wired to `GPUTextureManager.onEvict`)
-    /// or `.layer(renderKey)` for rasterized composites of `shouldRasterize`
-    /// subtrees. Tagging the kind keeps the two
+    /// or `.rasterizedLayer(renderKey, purpose)` for rasterized subtree
+    /// composites. Tagging the kind keeps the two
     /// namespaces disjoint — a raw `ObjectIdentifier` would let a freed
     /// layer's address be reused by a fresh `CGImage` (or vice versa) and
     /// return a stale view. See `TextureManager.swift` for the broader
@@ -1658,6 +1673,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Create depth texture
         createDepthTexture(width: Int(width), height: Int(height))
+        configureRasterizationCache(width: Int(width), height: Int(height))
 
         // Create textured pipeline
         try createTexturedPipeline(device: device)
@@ -2998,13 +3014,31 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // R3.2/R3.4: size the rasterization cache to viewport × 4 × 2.5
         // per PERFORMANCE_DESIGN.md §5.2 (WWDC 2014 #419 budget).
-        // Recreating the cache on resize drops every entry — the
-        // captured textures are canvas-sized and would render at the
-        // wrong dimensions otherwise.
-        let budget = max(0, Int((Double(width) * Double(height) * 4.0 * 2.5).rounded()))
-        rasterizationCache = RasterizationCache<GPUTexture>(maxBytes: budget)
+        // Recreating the cache on resize applies the new viewport-derived
+        // immutable byte budget. The eviction callback releases every old
+        // capture and its dependent texture view before replacement.
+        configureRasterizationCache(width: width, height: height)
         prerasterizedTextures.removeAll(keepingCapacity: true)
+        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
+    }
+
+    private func configureRasterizationCache(width: Int, height: Int) {
+        let budget = max(0, Int((Double(width) * Double(height) * 4.0 * 2.5).rounded()))
+        rasterizationCache?.removeAll()
+        let cache = RasterizationCache<GPUTexture>(maxBytes: budget)
+        cache.onEvict = { [weak self] key, texture in
+            if let identity = key.layerIdentity, let self = self {
+                let cacheKey = TexturedCacheKey.rasterizedLayer(
+                    identity.renderKey,
+                    identity.purpose
+                )
+                self.texturedTextureViewCache.removeValue(forKey: cacheKey)
+                self.perFrameTexturedBindGroupCache.removeValue(forKey: cacheKey)
+            }
+            texture.destroy()
+        }
+        rasterizationCache = cache
     }
 
     public func render(layer rootLayer: CALayer) {
@@ -3064,9 +3098,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         compositionCaptureStopKey = nil
         compositionCaptureDidReachStop = false
         transformDepthNesting = 0
+        transformFlatteningCaptureCount = 0
+        transformFlatteningCompositeCount = 0
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
+        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
 
         // Drop the previous frame's textured bind groups: the buffer pool has
@@ -3237,6 +3274,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cache.evictToBudget()
         }
         prerasterizedTextures.removeAll(keepingCapacity: true)
+        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         emitterLayerStates = emitterLayerStates.filter {
             activeEmitterLayerIDs.contains($0.key)
         }
@@ -3447,6 +3485,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transitionFilterProcessor?.invalidate()
         transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
+        transformFlattenedLayerKeys.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
         for request in pendingTileDraws {
@@ -3624,10 +3663,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // A transform layer contributes only its transform and per-child opacity.
         // Its own 2D compositing, mask, shadow, filter, rasterization, and backface
         // properties do not create a drawable plane.
-        if presentationLayer is CATransformLayer {
+        if layer is CATransformLayer {
             renderTransformLayerSublayers(
                 layer,
                 presentationLayer: presentationLayer,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+            return
+        }
+
+        if transformFlattenedLayerKeys.contains(currentRenderKey),
+           let flattenedTexture = prerasterizedTextures[currentRenderKey] {
+            transformFlatteningCompositeCount += 1
+            renderRasterizedLayerComposite(
+                layer,
+                presentationLayer: presentationLayer,
+                prerasterized: flattenedTexture,
+                device: device,
                 renderPass: renderPass,
                 modelMatrix: modelMatrix
             )
@@ -3725,7 +3778,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             renderRasterizedLayerComposite(
                 layer,
                 presentationLayer: presentationLayer,
-                texture: cachedTexture,
+                prerasterized: cachedTexture,
                 device: device,
                 renderPass: renderPass,
                 modelMatrix: modelMatrix
@@ -5385,7 +5438,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ///   persistent `GPUTextureView` cache and the per-frame
     ///   `GPUBindGroup` cache. Use `.image(OID(cgImage))` for content
     ///   textures (the `GPUTextureManager` retains the CGImage and
-    ///   notifies eviction via `onEvict`), or `.layer(renderKey)` for
+    ///   notifies eviction via `onEvict`), or
+    ///   `.rasterizedLayer(renderKey, purpose)` for
     ///   layer-owned rasterization composites. The case discriminator
     ///   keeps the two identity namespaces disjoint so a freed layer's
     ///   reused address cannot alias a fresh CGImage.
@@ -5660,6 +5714,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// manager (e.g. layer-keyed rasterization composites).
     public func clearTextureCache() {
         textureManager?.clearAll()
+        rasterizationCache?.removeAll()
+        prerasterizedTextures.removeAll(keepingCapacity: true)
+        transformFlattenedLayerKeys.removeAll(keepingCapacity: true)
         for resources in shadowLayerResources.values {
             resources.destroy()
         }
@@ -8383,7 +8440,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let key = renderKey(for: layer)
         let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
-        if presentation is CATransformLayer {
+        if layer is CATransformLayer {
             forEachPrepassSublayer(
                 of: layer,
                 presentationLayer: presentation,
@@ -8488,10 +8545,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// On a cache hit the existing texture is reused — no GPU work — and
     /// `lookup` updates the entry's `lastUsedFrame` to keep the idle
     /// eviction pass honest. On a miss the renderer allocates a fresh
-    /// canvas-sized texture, redirects `renderLayer` into it with
+    /// layer-sized texture, redirects `renderLayer` into it with
     /// `rasterizePrerenderRootLayer` set so this same layer's composite
     /// branch in `renderLayer` is suppressed during the capture pass,
-    /// and inserts the new entry. Capture clears with α = 1.0 (R3.3).
+    /// and inserts the new entry. Explicit rasterization preserves its
+    /// opaque-clear contract; automatic transform flattening clears transparent.
     private func prerenderRasterizedLayers(
         _ rootLayer: CALayer,
         encoder: GPUCommandEncoder,
@@ -8499,7 +8557,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) {
         guard let device = device,
               let pipeline = pipeline,
-              let depthTextureView = depthTextureView,
               let cache = rasterizationCache else { return }
 
         // Frame token already bumped at the top of `render`; use it for
@@ -8509,9 +8566,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         collectAndCaptureRasterizedLayers(
             rootLayer,
             parentMatrix: projectionMatrix,
+            parentIsTransformLayer: false,
             device: device,
             pipeline: pipeline,
-            depthTextureView: depthTextureView,
             cache: cache,
             encoder: encoder,
             frameToken: frameToken
@@ -8526,9 +8583,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func collectAndCaptureRasterizedLayers(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
+        parentIsTransformLayer: Bool,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
-        depthTextureView: GPUTextureView,
         cache: RasterizationCache<GPUTexture>,
         encoder: GPUCommandEncoder,
         frameToken: UInt64
@@ -8539,13 +8596,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+        let isTransformLayer = layer is CATransformLayer
+        let requiresTransformFlattening = parentIsTransformLayer
+            && !isTransformLayer
+            && layer.sublayers?.isEmpty == false
 
-        if !(presentationLayer is CATransformLayer), presentationLayer.shouldRasterize {
+        if !isTransformLayer,
+           presentationLayer.shouldRasterize || requiresTransformFlattening {
+            let purpose: RasterizationCachePurpose = requiresTransformFlattening
+                ? .transformFlattening
+                : .explicit
             captureRasterizedLayer(
                 layer,
+                purpose: purpose,
                 device: device,
                 pipeline: pipeline,
-                depthTextureView: depthTextureView,
                 cache: cache,
                 encoder: encoder,
                 frameToken: frameToken
@@ -8560,9 +8625,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             collectAndCaptureRasterizedLayers(
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
+                parentIsTransformLayer: isTransformLayer,
                 device: device,
                 pipeline: pipeline,
-                depthTextureView: depthTextureView,
                 cache: cache,
                 encoder: encoder,
                 frameToken: frameToken
@@ -8585,25 +8650,33 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// computation accordingly.
     private func captureRasterizedLayer(
         _ layer: CALayer,
+        purpose: RasterizationCachePurpose,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
-        depthTextureView: GPUTextureView,
         cache: RasterizationCache<GPUTexture>,
         encoder: GPUCommandEncoder,
         frameToken: UInt64
     ) {
         let layerRenderKey = renderKey(for: layer)
-        let key = RasterizationCacheKey(layerRenderKey)
+        let key = RasterizationCacheKey(layerRenderKey, purpose: purpose)
         let contentBoundsHash = rasterizationContentBoundsHash(for: layer)
 
         // Cache lookup updates `lastUsedFrame` on a hit so the idle
         // eviction pass treats it as live.
         if let entry = cache.lookup(key, atFrame: frameToken),
-           RasterizationDecisions.canReuseRasterizedTexture(
+           canReuseRasterizedTexture(
                layer: layer,
-               cached: entry,
-               currentContentBoundsHash: contentBoundsHash) {
-            prerasterizedTextures[layerRenderKey] = entry.texture
+               entry: entry,
+               purpose: purpose,
+               contentBoundsHash: contentBoundsHash
+           ) {
+            prerasterizedTextures[layerRenderKey] = PrerasterizedTexture(
+                texture: entry.texture,
+                purpose: purpose
+            )
+            if purpose == .transformFlattening {
+                transformFlattenedLayerKeys.insert(layerRenderKey)
+            }
             return
         }
 
@@ -8622,6 +8695,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             usage: [.renderAttachment, .textureBinding]
         ))
         let captureView = captureTexture.createView()
+        let captureDepthTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(pixelWidth), height: UInt32(pixelHeight)),
+            format: .depth24plusStencil8,
+            usage: .renderAttachment
+        ))
+        transientCaptureDepthTextures.append(captureDepthTexture)
+        let captureDepthView = captureDepthTexture.createView()
 
         // R3.3 / R3.4a: clear α is 1.0 regardless of `layer.opacity`; the
         // composite pass applies `layer.opacity` at draw time. With the
@@ -8630,7 +8710,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // value only shows through where the layer doesn't draw at all
         // (a flat-rasterized `shouldRasterize` layer is treated as an
         // opaque image, mirroring CoreAnimation's WWDC 2014 #419 model).
-        let clearAlpha = RasterizationDecisions.captureClearAlpha()
+        let clearAlpha: Float = purpose == .transformFlattening
+            ? 0
+            : RasterizationDecisions.captureClearAlpha()
         let capturePass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
@@ -8641,8 +8723,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 )
             ],
             depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTextureView,
-                depthClearValue: 1.0,
+                view: captureDepthView,
+                depthClearValue: 0.0,
                 depthLoadOp: .clear,
                 depthStoreOp: .store,
                 stencilClearValue: 0,
@@ -8692,7 +8774,34 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             contentBoundsHash: contentBoundsHash,
             atFrame: frameToken
         )
-        prerasterizedTextures[layerRenderKey] = captureTexture
+        prerasterizedTextures[layerRenderKey] = PrerasterizedTexture(
+            texture: captureTexture,
+            purpose: purpose
+        )
+        if purpose == .transformFlattening {
+            transformFlatteningCaptureCount += 1
+            transformFlattenedLayerKeys.insert(layerRenderKey)
+        }
+    }
+
+    private func canReuseRasterizedTexture(
+        layer: CALayer,
+        entry: RasterizedEntry<GPUTexture>,
+        purpose: RasterizationCachePurpose,
+        contentBoundsHash: Int
+    ) -> Bool {
+        if purpose == .explicit {
+            return RasterizationDecisions.canReuseRasterizedTexture(
+                layer: layer,
+                cached: entry,
+                currentContentBoundsHash: contentBoundsHash
+            )
+        }
+        guard !layer._dirtyMask.contains(.rasterization),
+              layer._subtreeDirtyCount == 0 else {
+            return false
+        }
+        return entry.contentBoundsHash == contentBoundsHash
     }
 
     /// Hash of the inputs that determine the captured pixels. Used by
@@ -8729,7 +8838,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func renderRasterizedLayerComposite(
         _ layer: CALayer,
         presentationLayer: CALayer,
-        texture: GPUTexture,
+        prerasterized: PrerasterizedTexture,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
@@ -8743,10 +8852,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let boundsHeight = presentationLayer.bounds.height
         guard boundsWidth > 0, boundsHeight > 0 else { return }
 
-        // Composite opacity = parent-stack effective × this layer's
-        // current opacity. Capture deliberately baked the layer at 1.0
-        // (see `renderLayer`'s `isCaptureRoot` branch); reapply here.
-        let composite = currentEffectiveOpacity * RasterizationDecisions.compositeOpacity(for: presentationLayer)
+        // The opacity stack already contains parent opacity × this layer's current
+        // opacity. Capture baked the root at 1.0, so applying the stack once here
+        // restores the model value without squaring the layer opacity.
+        let composite = currentEffectiveOpacity
 
         // Quad in normalised layer-bounds space. UVs V-flip to convert
         // between Y-up world coords and Y-down texture rows — same
@@ -8804,12 +8913,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Rasterized textures are owned by the layer's entry in
         // `prerasterizedTextures`/`rasterizationCache`, so key the bind
         // group cache by the layer's identity rather than the texture's.
-        // The `.layer(...)` tag keeps this entry from aliasing a CGImage
+        // The `.rasterizedLayer(...)` tag keeps this entry from aliasing a CGImage
         // entry whose `ObjectIdentifier` happens to match this layer's
         // (post-dealloc) heap address.
         let texturedBindGroup = cachedTexturedBindGroup(
-            cacheKey: .layer(renderKey(for: layer)),
-            gpuTexture: texture,
+            cacheKey: .rasterizedLayer(renderKey(for: layer), prerasterized.purpose),
+            gpuTexture: prerasterized.texture,
             device: device,
             layout: texturedBindGroupLayout,
             sampler: textureSampler,
@@ -9046,7 +9155,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         }
 
-        if !(presentationLayer is CATransformLayer),
+        if !(layer is CATransformLayer),
            presentationLayer.filters?.isEmpty == false
             || requiresGroupOpacity(presentationLayer)
             || presentationLayer.compositingFilter != nil
@@ -9075,7 +9184,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
-        if !(presentationLayer is CATransformLayer),
+        if !(layer is CATransformLayer),
            presentationLayer.shadowOpacity > 0,
            presentationLayer.shadowColor != nil {
             result.append(LayerPrepassTarget(

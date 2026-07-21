@@ -35,24 +35,47 @@ internal struct LayerRenderKey: Hashable, Sendable {
     }
 }
 
+internal enum RasterizationCachePurpose: Hashable, Sendable {
+    case explicit
+    case transformFlattening
+}
+
 /// A stable identity for a cache entry. Production keys combine model-layer
 /// identity with the enclosing replicator instance path; tests can construct
 /// keys from raw integers without manufacturing CALayers.
 internal struct RasterizationCacheKey: Hashable, Sendable {
     private enum Storage: Hashable {
-        case layer(LayerRenderKey)
+        case layer(LayerRenderKey, RasterizationCachePurpose)
         case raw(Int)
     }
     private let storage: Storage
 
     internal init(_ identifier: ObjectIdentifier) {
-        self.storage = .layer(LayerRenderKey(layer: identifier))
+        self.storage = .layer(LayerRenderKey(layer: identifier), .explicit)
     }
     internal init(_ renderKey: LayerRenderKey) {
-        self.storage = .layer(renderKey)
+        self.storage = .layer(renderKey, .explicit)
+    }
+    internal init(
+        _ renderKey: LayerRenderKey,
+        purpose: RasterizationCachePurpose
+    ) {
+        self.storage = .layer(renderKey, purpose)
     }
     internal init(raw: Int) {
         self.storage = .raw(raw)
+    }
+
+    internal var layerIdentity: (
+        renderKey: LayerRenderKey,
+        purpose: RasterizationCachePurpose
+    )? {
+        switch storage {
+        case .layer(let renderKey, let purpose):
+            return (renderKey, purpose)
+        case .raw:
+            return nil
+        }
     }
 }
 
@@ -79,9 +102,9 @@ internal struct RasterizedEntry<TextureRef> {
 
 // MARK: - Cache
 
-/// LRU + byte-budget cache for `shouldRasterize` captures. Generic over
-/// the renderer's texture handle type — `GPUTexture` for the WebGPU
-/// renderer, a stub struct for unit tests.
+/// LRU + byte-budget cache for explicit rasterization and transform-flattening
+/// captures. Generic over the renderer's texture handle type — `GPUTexture`
+/// for the WebGPU renderer, a stub struct for unit tests.
 ///
 /// The cache is **not thread-safe by itself**. WASM is single-threaded
 /// and OpenCoreAnimation runs all rendering on the main actor in native
@@ -91,6 +114,11 @@ internal final class RasterizationCache<TextureRef> {
     // MARK: Storage
 
     private var entries: [RasterizationCacheKey: RasterizedEntry<TextureRef>] = [:]
+
+    /// Called whenever the cache relinquishes ownership of a texture,
+    /// including replacement and every eviction path. Renderers use this
+    /// hook to release the GPU texture and any dependent views/bind groups.
+    internal var onEvict: ((RasterizationCacheKey, TextureRef) -> Void)?
     /// The byte-cost ceiling. The cache enforces this only when the
     /// caller invokes `evictToBudget()`; inserts past the ceiling are
     /// allowed (so a single oversize entry can still land before an
@@ -157,18 +185,26 @@ internal final class RasterizationCache<TextureRef> {
             lastUsedFrame: frame,
             byteCost: byteCost
         )
-        entries[key] = entry
+        if let replaced = entries.updateValue(entry, forKey: key) {
+            onEvict?(key, replaced.texture)
+        }
     }
 
     /// Drop a single entry; no-op if absent.
     internal func remove(_ key: RasterizationCacheKey) {
-        entries.removeValue(forKey: key)
+        guard let removed = entries.removeValue(forKey: key) else { return }
+        onEvict?(key, removed.texture)
     }
 
     /// Drop every entry. Counters are preserved (they are observability
     /// data, not state). Tests that need pristine counters reset the
     /// whole instance.
     internal func removeAll() {
+        if let onEvict = onEvict {
+            for (key, entry) in entries {
+                onEvict(key, entry.texture)
+            }
+        }
         entries.removeAll(keepingCapacity: true)
     }
 
@@ -177,8 +213,11 @@ internal final class RasterizationCache<TextureRef> {
     internal func evictIdle(currentFrame: UInt64, olderThan threshold: UInt64) {
         guard currentFrame > threshold else { return }
         let cutoff = currentFrame - threshold
-        entries = entries.filter { _, entry in
-            entry.lastUsedFrame >= cutoff
+        let staleKeys = entries.compactMap { key, entry in
+            entry.lastUsedFrame < cutoff ? key : nil
+        }
+        for key in staleKeys {
+            remove(key)
         }
     }
 
@@ -193,7 +232,7 @@ internal final class RasterizationCache<TextureRef> {
         let ordered = entries.sorted { $0.value.lastUsedFrame < $1.value.lastUsedFrame }
         for (key, entry) in ordered {
             if live <= maxBytes { break }
-            entries.removeValue(forKey: key)
+            remove(key)
             live -= entry.byteCost
         }
     }

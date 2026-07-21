@@ -735,6 +735,42 @@ func installHarness() {
                 crossingPlane.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
                 crossingPlane.transform = CATransform3DMakeRotation(.pi / 3, 0, 1, 0)
                 crossingGroup.addSublayer(crossingPlane)
+
+                let flattenedContainer = CALayer()
+                flattenedContainer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                flattenedContainer.position = CGPoint(x: 280, y: 250)
+                let flattenedRedChild = CALayer()
+                flattenedRedChild.frame = flattenedContainer.bounds
+                flattenedRedChild.zPosition = 100
+                flattenedRedChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                flattenedContainer.addSublayer(flattenedRedChild)
+                crossingGroup.addSublayer(flattenedContainer)
+
+                let flattenedOccluder = CALayer()
+                flattenedOccluder.bounds = flattenedContainer.bounds
+                flattenedOccluder.position = flattenedContainer.position
+                flattenedOccluder.zPosition = 50
+                flattenedOccluder.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                crossingGroup.addSublayer(flattenedOccluder)
+
+                let nestedTransform = CATransformLayer()
+                nestedTransform.bounds = root.bounds
+                nestedTransform.anchorPoint = .zero
+                nestedTransform.position = .zero
+                let nestedRedChild = CALayer()
+                nestedRedChild.bounds = flattenedContainer.bounds
+                nestedRedChild.position = CGPoint(x: 350, y: 250)
+                nestedRedChild.zPosition = 100
+                nestedRedChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                nestedTransform.addSublayer(nestedRedChild)
+                crossingGroup.addSublayer(nestedTransform)
+
+                let nestedOccluder = CALayer()
+                nestedOccluder.bounds = nestedRedChild.bounds
+                nestedOccluder.position = nestedRedChild.position
+                nestedOccluder.zPosition = 50
+                nestedOccluder.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                crossingGroup.addSublayer(nestedOccluder)
                 root.addSublayer(crossingGroup)
 
                 let transparencyGroup = CATransformLayer()
@@ -820,7 +856,21 @@ func installHarness() {
                         CGPoint(x: 100, y: 220),
                         CGPoint(x: 130, y: 220),
                         CGPoint(x: 330, y: 200),
+                        CGPoint(x: 280, y: 50),
+                        CGPoint(x: 350, y: 50),
                     ])
+                    let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
+                    let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
+                    flattenedRedChild.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                    flattenedOccluder.isHidden = true
+                    engine.renderFrame()
+                    let updatedFlattenedPixel = try await renderer.readbackPixel(x: 280, y: 50)
+                    let flatteningRecaptureCount = renderer.transformFlatteningCaptureCount
+                    let flatteningUpdatedCompositeCount = renderer.transformFlatteningCompositeCount
+                    engine.renderFrame()
+                    let reusedFlattenedPixel = try await renderer.readbackPixel(x: 280, y: 50)
+                    let flatteningReuseCaptureCount = renderer.transformFlatteningCaptureCount
+                    let flatteningReuseCompositeCount = renderer.transformFlatteningCompositeCount
                     crossingGroup.removeFromSuperlayer()
                     transparencyGroup.removeFromSuperlayer()
                     firstIndependentGroup.removeFromSuperlayer()
@@ -842,9 +892,23 @@ func installHarness() {
                         && pixels[3][3] == 255
                         && pixels[4] == [255, 255, 255, 255]
                     let independentGroupsAreIsolated = pixels[5] == [0, 255, 0, 255]
+                    let normalSubtreeIsFlattened = pixels[6] == [0, 255, 0, 255]
+                    let nestedTransformPreservesDepth = pixels[7] == [255, 0, 0, 255]
+                    let changedSubtreeWasRecaptured = updatedFlattenedPixel == [0, 0, 255, 255]
+                        && flatteningRecaptureCount == 1
+                        && flatteningUpdatedCompositeCount == 1
+                    let unchangedSubtreeWasReused = reusedFlattenedPixel == [0, 0, 255, 255]
+                        && flatteningReuseCaptureCount == 0
+                        && flatteningReuseCompositeCount == 1
                     transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
                         + ",transparent=\(transparentPixelsAreCorrect)"
                         + ",isolated=\(independentGroupsAreIsolated)"
+                        + ",flattened=\(normalSubtreeIsFlattened)"
+                        + ",nested=\(nestedTransformPreservesDepth)"
+                        + ",captures=\(flatteningCaptureCount)"
+                        + ",composites=\(flatteningCompositeCount)"
+                        + ",updated=\(changedSubtreeWasRecaptured)"
+                        + ",reused=\(unchangedSubtreeWasReused)"
                 } catch {
                     crossingGroup.removeFromSuperlayer()
                     transparencyGroup.removeFromSuperlayer()
