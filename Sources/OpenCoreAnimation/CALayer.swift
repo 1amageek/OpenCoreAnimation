@@ -2432,6 +2432,8 @@ open class CALayer: CAMediaTiming, Hashable {
             if let v = value as? CGFloat { layer._zPosition = v }
         case "transform":
             if let v = value as? CATransform3D { layer._transform = v }
+        case "shadowPath":
+            if let v = extractPath(value) { layer._shadowPath = v }
         case "hidden", "isHidden", "masksToBounds", "doubleSided", "isDoubleSided", "shouldRasterize":
             if let v = value as? Bool {
                 applyBooleanAnimationValue(v, to: layer, keyPath: keyPath)

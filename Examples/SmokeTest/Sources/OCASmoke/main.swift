@@ -42,6 +42,7 @@ nonisolated(unsafe) var edgeAntialiasingProbeResult: String = "pending"
 nonisolated(unsafe) var booleanAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var contentsAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var rasterizationScaleProbeResult: String = "pending"
+nonisolated(unsafe) var shadowPathKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -159,6 +160,7 @@ public func setup() {
             booleanAnimationProbeResult = "pending"
             contentsAnimationProbeResult = "pending"
             rasterizationScaleProbeResult = "pending"
+            shadowPathKeyframeProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -348,6 +350,9 @@ func installHarness() {
         })
         h.expose("getRasterizationScaleProbeResult", returning: {
             .string(rasterizationScaleProbeResult)
+        })
+        h.expose("getShadowPathKeyframeProbeResult", returning: {
+            .string(shadowPathKeyframeProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1346,6 +1351,99 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     rasterizationScaleProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginShadowPathKeyframeProbe", action: {
+            Task { @MainActor in
+                shadowPathKeyframeProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    shadowPathKeyframeProbeResult = "error: shadow path keyframe dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func makeShadowLayer(x: CGFloat) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = CGPoint(x: x, y: 150)
+                    layer.zPosition = 100
+                    layer.shadowColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                    layer.shadowOpacity = 1
+                    layer.shadowRadius = 0
+                    layer.shadowOffset = .zero
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                func configure(_ animation: CAAnimation, offset: CFTimeInterval) {
+                    animation.duration = 1
+                    animation.speed = 0
+                    animation.timeOffset = offset
+                    animation.fillMode = .both
+                    animation.isRemovedOnCompletion = false
+                }
+
+                let discreteLayer = makeShadowLayer(x: 100)
+                let discreteLeft = CGPath(rect: CGRect(x: 0, y: 10, width: 15, height: 20))
+                let discreteRight = CGPath(rect: CGRect(x: 25, y: 10, width: 15, height: 20))
+                discreteLayer.shadowPath = discreteRight
+                let discrete = CAKeyframeAnimation(keyPath: "shadowPath")
+                discrete.values = [discreteLeft, discreteRight]
+                discrete.keyTimes = [0, 1]
+                discrete.calculationMode = .discrete
+                configure(discrete, offset: 0.75)
+                discreteLayer.add(discrete, forKey: "browserDiscreteShadowPath")
+
+                let cubicLayer = makeShadowLayer(x: 250)
+                let cubicLeft = CGPath(rect: CGRect(x: 0, y: 10, width: 10, height: 20))
+                let cubicRight = CGPath(rect: CGRect(x: 30, y: 10, width: 10, height: 20))
+                cubicLayer.shadowPath = cubicRight
+                let cubic = CAKeyframeAnimation(keyPath: "shadowPath")
+                cubic.values = [cubicLeft, cubicRight]
+                cubic.calculationMode = .cubic
+                configure(cubic, offset: 0.5)
+                cubicLayer.add(cubic, forKey: "browserCubicShadowPath")
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    discreteLayer.removeFromSuperlayer()
+                    cubicLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 87, y: 150),
+                        CGPoint(x: 112, y: 150),
+                        CGPoint(x: 235, y: 150),
+                        CGPoint(x: 250, y: 150),
+                        CGPoint(x: 265, y: 150),
+                    ])
+                    restoreScene()
+                    shadowPathKeyframeProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                } catch {
+                    restoreScene()
+                    shadowPathKeyframeProbeResult = "error: \(error)"
                 }
             }
         })
