@@ -100,6 +100,77 @@ private struct TransitionCapturePair {
     let filterExecution: CIWebGPUTransitionExecution?
 }
 
+/// GPU resources owned by one filtered layer.
+///
+/// Filter captures are viewport-sized because they preserve the complete transformed
+/// subtree in renderer coordinates. Keeping a resource set per layer prevents sibling
+/// and nested filters from overwriting a shared ping-pong chain before the command
+/// buffer is submitted.
+private final class FilterLayerResources {
+    let sourceTexture: GPUTexture
+    let sourceView: GPUTextureView
+    let intermediateTexture: GPUTexture
+    let intermediateView: GPUTextureView
+    let resultTexture: GPUTexture
+    let resultView: GPUTextureView
+    let compositeUniformBuffer: GPUBuffer
+    private(set) var operationUniformBuffers: [GPUBuffer] = []
+
+    init(device: GPUDevice, width: Int, height: Int, format: GPUTextureFormat) {
+        let descriptor = GPUTextureDescriptor(
+            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+            format: format,
+            usage: [.renderAttachment, .textureBinding]
+        )
+        sourceTexture = device.createTexture(descriptor: descriptor)
+        sourceView = sourceTexture.createView()
+        intermediateTexture = device.createTexture(descriptor: descriptor)
+        intermediateView = intermediateTexture.createView()
+        resultTexture = device.createTexture(descriptor: descriptor)
+        resultView = resultTexture.createView()
+        compositeUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride),
+            usage: [.uniform, .copyDst]
+        ))
+    }
+
+    func uniformBuffer(forOperationAt index: Int, device: GPUDevice) -> GPUBuffer {
+        while operationUniformBuffers.count <= index {
+            operationUniformBuffers.append(device.createBuffer(descriptor: GPUBufferDescriptor(
+                size: UInt64(max(
+                    MemoryLayout<BlurUniforms>.stride,
+                    MemoryLayout<FilterCompositeUniforms>.stride
+                )),
+                usage: [.uniform, .copyDst]
+            )))
+        }
+        return operationUniformBuffers[index]
+    }
+
+    func view(for texture: GPUTexture) -> GPUTextureView? {
+        if texture === sourceTexture { return sourceView }
+        if texture === intermediateTexture { return intermediateView }
+        if texture === resultTexture { return resultView }
+        return nil
+    }
+
+    func destroy() {
+        sourceTexture.destroy()
+        intermediateTexture.destroy()
+        resultTexture.destroy()
+        compositeUniformBuffer.destroy()
+        for buffer in operationUniformBuffers {
+            buffer.destroy()
+        }
+        operationUniformBuffers.removeAll(keepingCapacity: false)
+    }
+}
+
+private struct PrerenderedFilter {
+    let resources: FilterLayerResources
+    let outputView: GPUTextureView
+}
+
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
 ///
 /// This is the primary renderer for OpenCoreAnimation in production.
@@ -193,6 +264,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transitionCaptures.values.reduce(into: 0) { count, capture in
             count += capture.filterExecution == nil ? 2 : 3
         }
+    }
+
+    /// Number of filtered-layer texture sets retained by the renderer.
+    @_spi(RendererDiagnostics)
+    public var activeFilterResourceCount: Int {
+        filterLayerResources.count
     }
 
     /// The preferred texture format.
@@ -434,6 +511,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Shadow blur pipeline (vertical pass).
     private var shadowBlurVerticalPipeline: GPURenderPipeline?
 
+    /// Horizontal blur pipeline targeting the renderer's preferred color format.
+    private var filterBlurHorizontalPipeline: GPURenderPipeline?
+
+    /// Vertical blur pipeline targeting the renderer's preferred color format.
+    private var filterBlurVerticalPipeline: GPURenderPipeline?
+
     /// Shadow composite pipeline.
     private var shadowCompositePipeline: GPURenderPipeline?
 
@@ -460,46 +543,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Filter Rendering (CAFilter)
 
-    /// Filter source texture - layer content is rendered here before blur.
-    private var filterSourceTexture: GPUTexture?
-
-    /// Cached view for `filterSourceTexture`.
-    private var filterSourceTextureView: GPUTextureView?
-
-    /// Filter blur intermediate texture for ping-pong blurring.
-    private var filterBlurTexture: GPUTexture?
-
-    /// Cached view for `filterBlurTexture`.
-    private var filterBlurTextureView: GPUTextureView?
-
-    /// Filter result texture - stores the final filter pass result.
-    private var filterResultTexture: GPUTexture?
-
-    /// Cached view for `filterResultTexture`.
-    private var filterResultTextureView: GPUTextureView?
-
-    /// Bind group for filter horizontal blur (samples from filterSourceTexture).
-    private var filterBlurHorizontalBindGroup: GPUBindGroup?
-
-    /// Bind group for filter vertical blur (samples from filterBlurTexture).
-    private var filterBlurVerticalBindGroup: GPUBindGroup?
-
-    /// applyBlurFilter horizontal-pass bind group reading `filterSourceTexture`.
-    ///
-    /// applyBlurFilter is called once per CIFilter operation per filtered layer.
-    /// Each call previously did two `device.createBindGroup` round-trips to JS
-    /// even though the bind groups only depend on which persistent texture
-    /// (filterSourceTexture / filterBlurTexture / filterResultTexture) they
-    /// sample from. Cache them keyed by texture identity; recreated alongside
-    /// the textures in `createFilterTextures`.
-    private var applyBlurFromSourceBindGroup: GPUBindGroup?
-
-    /// applyBlurFilter horizontal-pass bind group reading `filterResultTexture`.
-    private var applyBlurFromResultBindGroup: GPUBindGroup?
-
-    /// applyBlurFilter vertical-pass bind group reading `filterBlurTexture`.
-    private var applyBlurFromBlurBindGroup: GPUBindGroup?
-
     // MARK: - Pre-Render Dedicated Buffers
 
     /// Dedicated vertex buffer for pre-render passes (shadow mask, filter source).
@@ -520,29 +563,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Pre-allocated uniform buffer for shadow composite rendering.
     private var shadowCompositeUniformBuffer: GPUBuffer?
 
-    /// Pre-allocated vertex buffer for filter composite rendering.
-    private var filterCompositeVertexBuffer: GPUBuffer?
-
-    /// Pre-allocated uniform buffer for filter composite rendering.
-    private var filterCompositeUniformBuffer: GPUBuffer?
-
     /// Filter composite pipeline for blending filtered result with optional tint.
     private var filterCompositePipeline: GPURenderPipeline?
 
     /// Stencil-aware filter composite pipeline.
     private var filterCompositeStencilPipeline: GPURenderPipeline?
 
-    /// Indicates whether a filtered layer has been pre-rendered.
-    private var hasPrerenderredFilter: Bool = false
+    /// Executes color-adjustment operations into preferred-format offscreen textures.
+    private var filterOperationPipeline: GPURenderPipeline?
 
-    /// The layer that has been pre-rendered with filters.
-    private var prerenderredFilterLayer: CALayer?
+    /// Persistent viewport-sized resources keyed by the filtered layer identity.
+    private var filterLayerResources: [ObjectIdentifier: FilterLayerResources] = [:]
 
-    /// The texture that holds the final pre-rendered filter output for this frame.
-    private var prerenderredFilterTexture: GPUTexture?
-
-    /// The blur radius used for the pre-rendered filter.
-    private var prerenderredFilterBlurRadius: CGFloat = 0
+    /// Filter outputs available to capture passes and the main pass this frame.
+    private var prerenderedFilters: [ObjectIdentifier: PrerenderedFilter] = [:]
 
     /// The root layer currently being rendered into the offscreen filter source texture.
     /// While set, filter compositing is suppressed so the subtree can be captured raw.
@@ -915,14 +949,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             usage: [.vertex, .copyDst]
         ))
         shadowCompositeUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: preRenderUniformSize,
-            usage: [.uniform, .copyDst]
-        ))
-        filterCompositeVertexBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
-            size: preRenderVertexSize,
-            usage: [.vertex, .copyDst]
-        ))
-        filterCompositeUniformBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
             size: preRenderUniformSize,
             usage: [.uniform, .copyDst]
         ))
@@ -1540,6 +1566,32 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: .layout(blurPipelineLayout)
         ))
 
+        filterBlurHorizontalPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: blurHShaderModule,
+                entryPoint: "vertexMain"
+            ),
+            fragment: GPUFragmentState(
+                module: blurHShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [GPUColorTargetState(format: preferredFormat)]
+            ),
+            layout: .layout(blurPipelineLayout)
+        ))
+
+        filterBlurVerticalPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: blurVShaderModule,
+                entryPoint: "vertexMain"
+            ),
+            fragment: GPUFragmentState(
+                module: blurVShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [GPUColorTargetState(format: preferredFormat)]
+            ),
+            layout: .layout(blurPipelineLayout)
+        ))
+
         // Create shadow composite pipeline
         let shadowCompositeLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
             entries: [
@@ -1733,6 +1785,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layout: .layout(shadowCompositePipelineLayout)
         ))
 
+        filterOperationPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
+            vertex: GPUVertexState(
+                module: filterCompositeShaderModule,
+                entryPoint: "vertexMain"
+            ),
+            fragment: GPUFragmentState(
+                module: filterCompositeShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [GPUColorTargetState(format: preferredFormat)]
+            ),
+            layout: .layout(shadowCompositePipelineLayout)
+        ))
+
         filterCompositeStencilPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
             vertex: GPUVertexState(
                 module: filterCompositeShaderModule,
@@ -1874,95 +1939,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         ))
     }
 
-    /// Creates or recreates filter textures for the given size.
-    private func createFilterTextures(width: Int, height: Int) {
-        guard let device = device,
-              let shadowBindGroupLayout = shadowBindGroupLayout,
-              let blurSampler = blurSampler,
-              let blurUniformBuffer = blurUniformBuffer,
-              width > 0, height > 0 else { return }
-
-        // Filter source texture (stores layer content before blur)
-        filterSourceTexture = device.createTexture(descriptor: GPUTextureDescriptor(
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
-            format: .rgba8unorm,
-            usage: [.renderAttachment, .textureBinding]
-        ))
-        filterSourceTextureView = filterSourceTexture?.createView()
-
-        // Filter blur texture (for ping-pong blur)
-        filterBlurTexture = device.createTexture(descriptor: GPUTextureDescriptor(
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
-            format: .rgba8unorm,
-            usage: [.renderAttachment, .textureBinding]
-        ))
-        filterBlurTextureView = filterBlurTexture?.createView()
-
-        // Filter result texture (stores final blurred result)
-        filterResultTexture = device.createTexture(descriptor: GPUTextureDescriptor(
-            size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
-            format: .rgba8unorm,
-            usage: [.renderAttachment, .textureBinding]
-        ))
-        filterResultTextureView = filterResultTexture?.createView()
-
-        // Create bind groups for filter blur passes
-        guard let filterSourceTexture = filterSourceTexture,
-              let filterBlurTexture = filterBlurTexture else { return }
-
-        // Horizontal blur: samples from filterSourceTexture, outputs to filterBlurTexture
-        filterBlurHorizontalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(filterSourceTexture.createView())),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-
-        // Vertical blur: samples from filterBlurTexture, outputs to filterResultTexture
-        filterBlurVerticalBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(filterBlurTexture.createView())),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-
-        // Pre-build the per-input bind groups consumed by `applyBlurFilter`.
-        // The chain in prerenderFilteredLayers ping-pongs `currentTexture`
-        // between filterSourceTexture and filterResultTexture as the horizontal
-        // input, with filterBlurTexture always serving as the vertical input.
-        // Caching these three avoids creating two bind groups per CIFilter
-        // operation per frame.
-        guard let filterResultTexture = filterResultTexture else { return }
-        applyBlurFromSourceBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(filterSourceTextureView!)),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-        applyBlurFromResultBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(filterResultTexture.createView())),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-        applyBlurFromBlurBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowBindGroupLayout,
-            entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(blurUniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(filterBlurTextureView!)),
-                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
-            ]
-        ))
-    }
-
     /// Creates or recreates the depth texture for the given size.
     /// Uses depth24plus-stencil8 format to support both depth testing and stencil-based masking.
     private func createDepthTexture(width: Int, height: Int) {
@@ -1998,8 +1974,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Recreate shadow textures
         createShadowTextures(width: width, height: height)
 
-        // Recreate filter textures
-        createFilterTextures(width: width, height: height)
+        // Filter captures are viewport-sized. A resize invalidates every per-layer set.
+        for resources in filterLayerResources.values {
+            resources.destroy()
+        }
+        filterLayerResources.removeAll(keepingCapacity: true)
+        prerenderedFilters.removeAll(keepingCapacity: true)
 
         // R3.2/R3.4: size the rasterization cache to viewport × 4 × 2.5
         // per PERFORMANCE_DESIGN.md §5.2 (WWDC 2014 #419 budget).
@@ -2024,7 +2004,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let context = context,
               let pipeline = pipeline,
               bindGroup != nil,
-              let depthTexture = depthTexture else { return }
+              depthTexture != nil else { return }
 
         processPendingTileDraws()
 
@@ -2055,11 +2035,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         shadowsPrerendered = false
         hasPrerenderredShadow = false
 
-        // Reset filter pre-rendering state
-        hasPrerenderredFilter = false
-        prerenderredFilterLayer = nil
-        prerenderredFilterTexture = nil
-        prerenderredFilterBlurRadius = 0
+        // Reset per-frame filter outputs; persistent resource ownership remains cached.
+        prerenderedFilters.removeAll(keepingCapacity: true)
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
@@ -2131,7 +2108,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // When root layer has cornerRadius, use transparent clear color.
             // The background will be rendered as geometry with corner radius SDF.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
-        } else if hasPrerenderredFilter, prerenderredFilterLayer === rootLayer {
+        } else if prerenderedFilters[ObjectIdentifier(rootLayer)] != nil {
             // The filtered root layer is composited from the offscreen texture, so drawing
             // its background here would double-apply the root background color.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
@@ -2340,6 +2317,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         lastRenderedTexture = nil
         shadowBlurHorizontalPipeline = nil
         shadowBlurVerticalPipeline = nil
+        filterBlurHorizontalPipeline = nil
+        filterBlurVerticalPipeline = nil
         shadowCompositePipeline = nil
         shadowMaskPipeline = nil
         shadowBindGroupLayout = nil
@@ -2357,27 +2336,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         preRenderBindGroup = nil
         shadowCompositeVertexBuffer = nil
         shadowCompositeUniformBuffer = nil
-        filterCompositeVertexBuffer = nil
-        filterCompositeUniformBuffer = nil
-
         // Filter resources
-        filterSourceTexture = nil
-        filterSourceTextureView = nil
-        filterBlurTexture = nil
-        filterBlurTextureView = nil
-        filterResultTexture = nil
-        filterResultTextureView = nil
-        filterBlurHorizontalBindGroup = nil
-        filterBlurVerticalBindGroup = nil
-        applyBlurFromSourceBindGroup = nil
-        applyBlurFromResultBindGroup = nil
-        applyBlurFromBlurBindGroup = nil
         filterCompositePipeline = nil
         filterCompositeStencilPipeline = nil
-        hasPrerenderredFilter = false
-        prerenderredFilterLayer = nil
-        prerenderredFilterTexture = nil
-        prerenderredFilterBlurRadius = 0
+        filterOperationPipeline = nil
+        for resources in filterLayerResources.values {
+            resources.destroy()
+        }
+        filterLayerResources.removeAll(keepingCapacity: false)
+        prerenderedFilters.removeAll(keepingCapacity: false)
 
         // Rasterization cache (R3.2 / R3.4)
         rasterizationCache?.removeAll()
@@ -2584,19 +2551,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Check for layer filters.
         // If this layer has supported filters and was pre-rendered, composite the filtered result.
         let supportedFilterOperations = presentationLayer.supportedFilterOperations
-        if filterPrerenderRootLayer == nil, !supportedFilterOperations.isEmpty {
-            // Check if this specific layer was pre-rendered
-            if hasPrerenderredFilter && prerenderredFilterLayer === layer {
+        if filterPrerenderRootLayer !== layer, !supportedFilterOperations.isEmpty {
+            if let prerendered = prerenderedFilters[ObjectIdentifier(layer)] {
                 // Composite the pre-rendered filtered texture.
                 renderFilteredLayerComposite(
                     layer,
+                    prerendered: prerendered,
                     device: device,
                     renderPass: renderPass,
                     modelMatrix: modelMatrix
                 )
-                // Mark filter as consumed
-                hasPrerenderredFilter = false
-                prerenderredFilterLayer = nil
                 return
             }
         }
@@ -4586,6 +4550,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     public func clearTextureCache() {
         textureManager?.clearAll()
         blurredShadowCache.removeAll()
+        for resources in filterLayerResources.values {
+            resources.destroy()
+        }
+        filterLayerResources.removeAll(keepingCapacity: true)
+        prerenderedFilters.removeAll(keepingCapacity: true)
         textTextureCache.removeAll()
         textTextureAccessOrder.removeAll()
         texturedTextureViewCache.removeAll(keepingCapacity: true)
@@ -6042,108 +6011,149 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         blurredShadowCache[shadowLayerID] = shadowMaskTexture
     }
 
-    /// Pre-renders layers with supported filters into an offscreen texture.
+    /// Pre-renders every visible filtered layer into independently-owned textures.
     ///
-    /// Currently supports one filtered layer per frame due to texture sharing constraints.
+    /// Descendants are captured before ancestors so a filtered parent includes the
+    /// already-filtered output of its filtered descendants.
     private func prerenderFilteredLayers(
         _ rootLayer: CALayer,
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
-        // Fast-path: skip the recursive `findFirstFilteredLayer` walk when no
+        // Fast-path: skip the recursive collection walk when no
         // descendant has a non-empty `filters` array. The counter checks for
         // non-empty content; unsupported filter types are still filtered later
         // by `supportedFilterOperations`.
-        guard rootLayer._subtreeFilterCount > 0 else { return }
-
-        guard let pipeline = pipeline,
-              let depthTexture = depthTexture,
-              let filterSourceTexture = filterSourceTexture,
-              let filterBlurTexture = filterBlurTexture,
-              let filterResultTexture = filterResultTexture else { return }
-
-        // Find first layer with supported filters to pre-render.
-        guard let (filteredLayer, parentMatrix) = findFirstFilteredLayer(rootLayer, parentMatrix: projectionMatrix) else {
+        guard rootLayer._subtreeFilterCount > 0 else {
+            evictFilterResources(except: [])
             return
         }
 
-        let presentationLayer = filteredLayer._renderTimePresentation()
-        let operations = presentationLayer.supportedFilterOperations
-        guard !operations.isEmpty else { return }
-        guard let depthTextureView = depthTextureView,
-              let filterSourceTextureView = filterSourceTextureView else { return }
+        guard let device = device,
+              let pipeline = pipeline,
+              let depthTextureView = depthTextureView else { return }
 
-        // Step 1: Render the filtered layer subtree into the source texture without applying
-        // the layer's own filter. The composite pass will apply the root opacity later.
-        let contentRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
-            colorAttachments: [
-                GPURenderPassColorAttachment(
-                    view: filterSourceTextureView,
-                    clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
-                    loadOp: .clear,
-                    storeOp: .store
+        var targets: [(layer: CALayer, parentMatrix: Matrix4x4)] = []
+        collectFilteredLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
+        var activeLayerIDs: Set<ObjectIdentifier> = []
+
+        for target in targets {
+            let filteredLayer = target.layer
+            let operations = filteredLayer._renderTimePresentation().supportedFilterOperations
+            guard !operations.isEmpty else { continue }
+
+            let layerID = ObjectIdentifier(filteredLayer)
+            activeLayerIDs.insert(layerID)
+            let resources: FilterLayerResources
+            if let existing = filterLayerResources[layerID] {
+                resources = existing
+            } else {
+                resources = FilterLayerResources(
+                    device: device,
+                    width: Int(size.width),
+                    height: Int(size.height),
+                    format: preferredFormat
                 )
-            ],
-            depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTextureView,
-                depthClearValue: 1.0,
-                depthLoadOp: .clear,
-                depthStoreOp: .store,
-                stencilClearValue: 0,
-                stencilLoadOp: .clear,
-                stencilStoreOp: .store
-            )
-        ))
-        contentRenderPass.setPipeline(pipeline)
-        contentRenderPass.setViewport(
-            x: 0,
-            y: 0,
-            width: Float(size.width),
-            height: Float(size.height),
-            minDepth: 0,
-            maxDepth: 1
-        )
-
-        filterPrerenderRootLayer = filteredLayer
-        renderLayer(filteredLayer, renderPass: contentRenderPass, parentMatrix: parentMatrix)
-        filterPrerenderRootLayer = nil
-
-        contentRenderPass.end()
-
-        var currentTexture = filterSourceTexture
-        var useResultTextureAsOutput = true
-
-        for operation in operations {
-            let outputTexture = useResultTextureAsOutput ? filterResultTexture : filterSourceTexture
-
-            switch operation {
-            case let .gaussianBlur(radius):
-                guard radius > 0 else { continue }
-                applyBlurFilter(
-                    inputTexture: currentTexture,
-                    intermediateTexture: filterBlurTexture,
-                    outputTexture: outputTexture,
-                    radius: radius,
-                    encoder: encoder
-                )
-            case .brightness, .contrast, .saturation, .colorInvert:
-                applyColorFilter(
-                    operation,
-                    inputTexture: currentTexture,
-                    outputTexture: outputTexture,
-                    encoder: encoder
-                )
+                filterLayerResources[layerID] = resources
             }
 
-            currentTexture = outputTexture
-            useResultTextureAsOutput.toggle()
+            let contentRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.sourceView,
+                        clearValue: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ],
+                depthStencilAttachment: GPURenderPassDepthStencilAttachment(
+                    view: depthTextureView,
+                    depthClearValue: 1.0,
+                    depthLoadOp: .clear,
+                    depthStoreOp: .store,
+                    stencilClearValue: 0,
+                    stencilLoadOp: .clear,
+                    stencilStoreOp: .store
+                )
+            ))
+            contentRenderPass.setPipeline(pipeline)
+            contentRenderPass.setViewport(
+                x: 0,
+                y: 0,
+                width: Float(size.width),
+                height: Float(size.height),
+                minDepth: 0,
+                maxDepth: 1
+            )
+
+            filterPrerenderRootLayer = filteredLayer
+            renderLayer(
+                filteredLayer,
+                renderPass: contentRenderPass,
+                parentMatrix: target.parentMatrix
+            )
+            filterPrerenderRootLayer = nil
+            contentRenderPass.end()
+
+            var currentTexture = resources.sourceTexture
+            var currentView = resources.sourceView
+            for (operationIndex, operation) in operations.enumerated() {
+                let outputTexture = currentTexture === resources.sourceTexture
+                    ? resources.resultTexture
+                    : resources.sourceTexture
+                guard let outputView = resources.view(for: outputTexture) else { continue }
+                let operationUniformBuffer = resources.uniformBuffer(
+                    forOperationAt: operationIndex,
+                    device: device
+                )
+
+                let applied: Bool
+                switch operation {
+                case let .gaussianBlur(radius):
+                    guard radius > 0 else { continue }
+                    applied = applyBlurFilter(
+                        inputTexture: currentTexture,
+                        intermediateTexture: resources.intermediateTexture,
+                        outputTexture: outputTexture,
+                        radius: radius,
+                        uniformBuffer: operationUniformBuffer,
+                        resources: resources,
+                        encoder: encoder
+                    )
+                case .brightness, .contrast, .saturation, .colorInvert:
+                    applied = applyColorFilter(
+                        operation,
+                        inputTexture: currentTexture,
+                        outputTexture: outputTexture,
+                        uniformBuffer: operationUniformBuffer,
+                        resources: resources,
+                        encoder: encoder
+                    )
+                }
+
+                if applied {
+                    currentTexture = outputTexture
+                    currentView = outputView
+                }
+            }
+
+            prerenderedFilters[layerID] = PrerenderedFilter(
+                resources: resources,
+                outputView: currentView
+            )
         }
 
-        // Mark that filter was pre-rendered
-        hasPrerenderredFilter = true
-        prerenderredFilterLayer = filteredLayer
-        prerenderredFilterTexture = currentTexture
-        prerenderredFilterBlurRadius = presentationLayer.totalBlurRadius
+        evictFilterResources(except: activeLayerIDs)
+    }
+
+    private func evictFilterResources(except activeLayerIDs: Set<ObjectIdentifier>) {
+        let staleLayerIDs = filterLayerResources.keys.filter {
+            !activeLayerIDs.contains($0)
+        }
+        for layerID in staleLayerIDs {
+            filterLayerResources.removeValue(forKey: layerID)?.destroy()
+            prerenderedFilters.removeValue(forKey: layerID)
+        }
     }
 
     // MARK: - Rasterized Layer Pre-render (R3.2 / R3.3)
@@ -6499,31 +6509,42 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         intermediateTexture: GPUTexture,
         outputTexture: GPUTexture,
         radius: CGFloat,
+        uniformBuffer: GPUBuffer,
+        resources: FilterLayerResources,
         encoder: GPUCommandEncoder
-    ) {
+    ) -> Bool {
         guard let device = device,
-              let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
-              let shadowBlurVerticalPipeline = shadowBlurVerticalPipeline,
-              let blurUniformBuffer = blurUniformBuffer,
-              let depthTextureView = depthTextureView else { return }
+              let filterBlurHorizontalPipeline = filterBlurHorizontalPipeline,
+              let filterBlurVerticalPipeline = filterBlurVerticalPipeline,
+              let shadowBindGroupLayout = shadowBindGroupLayout,
+              let blurSampler = blurSampler,
+              let inputView = resources.view(for: inputTexture),
+              let intermediateView = resources.view(for: intermediateTexture),
+              let outputView = resources.view(for: outputTexture) else { return false }
 
-        // Resolve cached views and bind groups by texture identity. The
-        // ping-pong loop in `prerenderFilteredLayers` only ever passes the
-        // three persistent filter textures here, so no fallback path is
-        // needed — if the lookup misses we drop the operation rather than
-        // silently allocating a per-frame view (which would defeat the cache
-        // and hide a real wiring bug behind a slow path).
-        guard let inputBindGroup = applyBlurBindGroup(for: inputTexture),
-              let intermediateView = filterTextureView(for: intermediateTexture),
-              let intermediateBindGroup = applyBlurBindGroup(for: intermediateTexture),
-              let outputView = filterTextureView(for: outputTexture) else { return }
+        let inputBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(inputView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
+        let intermediateBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+            layout: shadowBindGroupLayout,
+            entries: [
+                GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<BlurUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(intermediateView)),
+                GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
+            ]
+        ))
 
         var blurUniforms = BlurUniforms(
             texelSize: SIMD2<Float>(1.0 / Float(size.width), 1.0 / Float(size.height)),
             blurRadius: Float(radius)
         )
         let blurUniformData = createFloat32Array(from: &blurUniforms)
-        device.queue.writeBuffer(blurUniformBuffer, bufferOffset: 0, data: blurUniformData)
+        device.queue.writeBuffer(uniformBuffer, bufferOffset: 0, data: blurUniformData)
 
         let hBlurPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
@@ -6533,19 +6554,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     loadOp: .clear,
                     storeOp: .store
                 )
-            ],
-            depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTextureView,
-                depthClearValue: 1.0,
-                depthLoadOp: .clear,
-                depthStoreOp: .store,
-                stencilClearValue: 0,
-                stencilLoadOp: .clear,
-                stencilStoreOp: .store
-            )
+            ]
         ))
 
-        hBlurPass.setPipeline(shadowBlurHorizontalPipeline)
+        hBlurPass.setPipeline(filterBlurHorizontalPipeline)
         hBlurPass.setBindGroup(0, bindGroup: inputBindGroup)
         hBlurPass.draw(vertexCount: 6)
         hBlurPass.end()
@@ -6558,68 +6570,38 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     loadOp: .clear,
                     storeOp: .store
                 )
-            ],
-            depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTextureView,
-                depthClearValue: 1.0,
-                depthLoadOp: .clear,
-                depthStoreOp: .store,
-                stencilClearValue: 0,
-                stencilLoadOp: .clear,
-                stencilStoreOp: .store
-            )
+            ]
         ))
 
-        vBlurPass.setPipeline(shadowBlurVerticalPipeline)
+        vBlurPass.setPipeline(filterBlurVerticalPipeline)
         vBlurPass.setBindGroup(0, bindGroup: intermediateBindGroup)
         vBlurPass.draw(vertexCount: 6)
         vBlurPass.end()
-    }
-
-    /// Returns the cached view for one of the persistent filter textures.
-    /// Reference equality is used because `GPUTexture` is a class and the
-    /// caller always passes one of the three textures created in
-    /// `createFilterTextures`.
-    private func filterTextureView(for texture: GPUTexture) -> GPUTextureView? {
-        if texture === filterSourceTexture { return filterSourceTextureView }
-        if texture === filterBlurTexture { return filterBlurTextureView }
-        if texture === filterResultTexture { return filterResultTextureView }
-        return nil
-    }
-
-    /// Returns the cached blur-pass bind group for one of the persistent
-    /// filter textures. See `filterTextureView(for:)`.
-    private func applyBlurBindGroup(for texture: GPUTexture) -> GPUBindGroup? {
-        if texture === filterSourceTexture { return applyBlurFromSourceBindGroup }
-        if texture === filterBlurTexture { return applyBlurFromBlurBindGroup }
-        if texture === filterResultTexture { return applyBlurFromResultBindGroup }
-        return nil
+        return true
     }
 
     private func applyColorFilter(
         _ operation: CAFilterOperation,
         inputTexture: GPUTexture,
         outputTexture: GPUTexture,
+        uniformBuffer: GPUBuffer,
+        resources: FilterLayerResources,
         encoder: GPUCommandEncoder
-    ) {
+    ) -> Bool {
         guard let device = device,
-              let depthTextureView = depthTextureView,
-              let filterCompositePipeline = filterCompositePipeline,
-              let filterCompositeUniformBuffer = filterCompositeUniformBuffer,
+              let filterOperationPipeline = filterOperationPipeline,
               let blurSampler = blurSampler,
-              var uniforms = filterCompositeUniforms(for: operation) else { return }
-        // inputTexture / outputTexture are always one of the persistent
-        // filter textures (see prerenderFilteredLayers); use the cached views.
-        guard let inputView = filterTextureView(for: inputTexture),
-              let outputView = filterTextureView(for: outputTexture) else { return }
+              var uniforms = filterCompositeUniforms(for: operation),
+              let inputView = resources.view(for: inputTexture),
+              let outputView = resources.view(for: outputTexture) else { return false }
 
         let filterUniformData = createFloat32Array(from: &uniforms)
-        device.queue.writeBuffer(filterCompositeUniformBuffer, bufferOffset: 0, data: filterUniformData)
+        device.queue.writeBuffer(uniformBuffer, bufferOffset: 0, data: filterUniformData)
 
         let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: filterCompositePipeline.getBindGroupLayout(index: 0),
+            layout: filterOperationPipeline.getBindGroupLayout(index: 0),
             entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(filterCompositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
+                GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
                 GPUBindGroupEntry(binding: 1, resource: .textureView(inputView)),
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
@@ -6633,22 +6615,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     loadOp: .clear,
                     storeOp: .store
                 )
-            ],
-            depthStencilAttachment: GPURenderPassDepthStencilAttachment(
-                view: depthTextureView,
-                depthClearValue: 1.0,
-                depthLoadOp: .clear,
-                depthStoreOp: .store,
-                stencilClearValue: 0,
-                stencilLoadOp: .clear,
-                stencilStoreOp: .store
-            )
+            ]
         ))
 
-        renderPass.setPipeline(filterCompositePipeline)
+        renderPass.setPipeline(filterOperationPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup)
         renderPass.draw(vertexCount: 6)
         renderPass.end()
+        return true
     }
 
     private func filterCompositeUniforms(for operation: CAFilterOperation) -> FilterCompositeUniforms? {
@@ -6666,36 +6640,33 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
     }
 
-    /// Finds the first layer in the hierarchy that has supported filters.
-    private func findFirstFilteredLayer(
+    /// Collects visible filtered layers in descendant-first order.
+    private func collectFilteredLayers(
         _ layer: CALayer,
-        parentMatrix: Matrix4x4
-    ) -> (layer: CALayer, parentMatrix: Matrix4x4)? {
+        parentMatrix: Matrix4x4,
+        into result: inout [(layer: CALayer, parentMatrix: Matrix4x4)]
+    ) {
         let presentationLayer = layer._renderTimePresentation()
 
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else {
-            return nil
+            return
         }
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
-
-        if !presentationLayer.supportedFilterOperations.isEmpty {
-            return (layer, parentMatrix)
-        }
-
-        // Recursively check sublayers in render order so the chosen pre-render target
-        // matches the first filtered layer that will actually be composited.
-        if let sublayers = layer.sublayers {
+        if let sublayers = layer.sublayers, !sublayers.isEmpty {
             let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-
             for sublayer in layer.sortedSublayers() {
-                if let result = findFirstFilteredLayer(sublayer, parentMatrix: sublayerMatrix) {
-                    return result
-                }
+                collectFilteredLayers(
+                    sublayer,
+                    parentMatrix: sublayerMatrix,
+                    into: &result
+                )
             }
         }
 
-        return nil
+        if !presentationLayer.supportedFilterOperations.isEmpty {
+            result.append((layer, parentMatrix))
+        }
     }
 
     /// Finds the first layer in the hierarchy that has a visible shadow.
@@ -6905,14 +6876,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// from the filter pre-rendering pass.
     private func renderFilteredLayerComposite(
         _ layer: CALayer,
+        prerendered: PrerenderedFilter,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
-        guard let filteredTexture = prerenderredFilterTexture ?? filterResultTexture,
-              let filterCompositePipeline = filterCompositePipeline,
-              let blurSampler = blurSampler,
-              let filterCompositeUniformBuffer = filterCompositeUniformBuffer else { return }
+        guard let filterCompositePipeline = filterCompositePipeline,
+              let blurSampler = blurSampler else { return }
 
         var filterUniforms = FilterCompositeUniforms(
             opacity: currentEffectiveOpacity,
@@ -6921,14 +6891,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             parameter1: 0
         )
         let filterUniformData = createFloat32Array(from: &filterUniforms)
-        device.queue.writeBuffer(filterCompositeUniformBuffer, bufferOffset: 0, data: filterUniformData)
+        device.queue.writeBuffer(
+            prerendered.resources.compositeUniformBuffer,
+            bufferOffset: 0,
+            data: filterUniformData
+        )
 
         // Create composite bind group with the filtered texture.
         let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
             layout: filterCompositePipeline.getBindGroupLayout(index: 0),
             entries: [
-                GPUBindGroupEntry(binding: 0, resource: .buffer(filterCompositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
-                GPUBindGroupEntry(binding: 1, resource: .textureView(filteredTexture.createView())),
+                GPUBindGroupEntry(binding: 0, resource: .buffer(prerendered.resources.compositeUniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
+                GPUBindGroupEntry(binding: 1, resource: .textureView(prerendered.outputView)),
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
         ))

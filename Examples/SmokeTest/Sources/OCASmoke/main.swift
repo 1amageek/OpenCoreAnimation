@@ -34,6 +34,7 @@ nonisolated(unsafe) var tileDelegateRef: SmokeTileDelegate?
 nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
 nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
+nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -65,6 +66,7 @@ public func setup() {
             tileDrawCount = 0
             pixelReadbackResult = "pending"
             transitionFilterProbeResult = "pending"
+            layerFilterProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -230,6 +232,9 @@ func installHarness() {
         h.expose("getTransitionFilterProbeResult", returning: {
             .string(transitionFilterProbeResult)
         })
+        h.expose("getLayerFilterProbeResult", returning: {
+            .string(layerFilterProbeResult)
+        })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
@@ -262,6 +267,13 @@ func installHarness() {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
                     .transitionFilterFailureCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getActiveFilterResourceCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .activeFilterResourceCount ?? -1
             }
             return .number(Double(count))
         })
@@ -384,6 +396,69 @@ func installHarness() {
                 } catch {
                     transitionFilterProbeResult = "error: \(error)"
                 }
+            }
+        })
+        h.expose("beginLayerFilterProbe", action: {
+            Task { @MainActor in
+                layerFilterProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    layerFilterProbeResult = "error: root layer or renderer unavailable"
+                    return
+                }
+
+                let chained = CALayer()
+                chained.bounds = CGRect(x: 0, y: 0, width: 70, height: 70)
+                chained.position = CGPoint(x: 40, y: 40)
+                chained.zPosition = 100
+                chained.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                chained.filters = [CAFilter.brightness(-0.5), CAFilter.colorInvert()]
+                root.addSublayer(chained)
+
+                let sibling = CALayer()
+                sibling.bounds = CGRect(x: 0, y: 0, width: 70, height: 70)
+                sibling.position = CGPoint(x: 140, y: 40)
+                sibling.zPosition = 100
+                sibling.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                sibling.filters = [CAFilter.brightness(0.25)]
+                root.addSublayer(sibling)
+
+                let parent = CALayer()
+                parent.bounds = CGRect(x: 0, y: 0, width: 90, height: 70)
+                parent.position = CGPoint(x: 260, y: 40)
+                parent.zPosition = 100
+                parent.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                parent.filters = [CAFilter.colorInvert()]
+
+                let child = CALayer()
+                child.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+                child.position = CGPoint(x: 45, y: 35)
+                child.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                child.filters = [CAFilter.colorInvert()]
+                parent.addSublayer(child)
+                root.addSublayer(parent)
+
+                engine.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 40, y: 260),
+                        CGPoint(x: 140, y: 260),
+                        CGPoint(x: 225, y: 260),
+                        CGPoint(x: 260, y: 260),
+                    ])
+                    layerFilterProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                } catch {
+                    layerFilterProbeResult = "error: \(error)"
+                }
+
+                chained.removeFromSuperlayer()
+                sibling.removeFromSuperlayer()
+                parent.removeFromSuperlayer()
+                engine.renderFrame()
             }
         })
         h.expose("removeTransition", action: {

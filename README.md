@@ -12,7 +12,7 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 |---|---|
 | Native package | 337 tests passed |
 | Browser | 3 checks passed, including rasterized/tiled pixels, frozen transition pairs, and `CIDissolveTransition` output read back from WebGPU |
-| Filter transitions | All 7 executable OpenCoreImage transition pipelines have filter-specific browser pixel evidence against CoreAnimation-owned GPU textures; unsupported filter objects are rejected without built-in fallback |
+| Filters | Sibling and nested `CAFilter` chains use per-layer WebGPU resources with browser pixel and cleanup evidence; all 7 executable OpenCoreImage transition pipelines also have filter-specific browser pixel evidence, while unsupported transition filter objects are rejected without built-in fallback |
 | Remaining boundary | Core Image transition types without executable WGSL remain unavailable; complete QuartzCore parity is not claimed |
 
 ```swift
