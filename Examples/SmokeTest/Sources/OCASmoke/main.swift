@@ -660,6 +660,13 @@ func installHarness() {
                     layer.isHidden = true
                 }
                 root.backgroundColor = CGColor(red: 0.1, green: 0.1, blue: 0.15, alpha: 0.5)
+                let opacityBackdrop = CALayer()
+                opacityBackdrop.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                opacityBackdrop.position = CGPoint(x: 120, y: 80)
+                opacityBackdrop.zPosition = 199
+                opacityBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(opacityBackdrop)
+
                 let backdrop = CALayer()
                 backdrop.bounds = CGRect(x: 0, y: 0, width: 360, height: 60)
                 backdrop.position = CGPoint(x: 200, y: 140)
@@ -713,6 +720,15 @@ func installHarness() {
                 transparentSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 0.5)
                 transparentSource.compositingFilter = sourceOver
                 root.addSublayer(transparentSource)
+
+                let opacitySource = CALayer()
+                opacitySource.bounds = source.bounds
+                opacitySource.position = CGPoint(x: 120, y: 80)
+                opacitySource.zPosition = 207
+                opacitySource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                opacitySource.opacity = 0.5
+                opacitySource.compositingFilter = multiply
+                root.addSublayer(opacitySource)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -725,6 +741,7 @@ func installHarness() {
                         CGPoint(x: 80, y: 140),
                         CGPoint(x: 52, y: 188),
                         CGPoint(x: 50, y: 60),
+                        CGPoint(x: 120, y: 220),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -733,6 +750,8 @@ func installHarness() {
                         && pixels[4] == [0, 255, 255, 255]
                         && pixels[5] == [255, 0, 0, 255]
                         && pixels[6] == [7, 135, 10, 192]
+                        && pixels[7] == [127, 0, 0, 255]
+                    opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
                     screenedSource.removeFromSuperlayer()
@@ -740,6 +759,7 @@ func installHarness() {
                     laterSource.removeFromSuperlayer()
                     backdropFiltered.removeFromSuperlayer()
                     transparentSource.removeFromSuperlayer()
+                    opacitySource.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden

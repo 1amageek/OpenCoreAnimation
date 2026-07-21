@@ -154,6 +154,11 @@ private struct LayerPrepassTarget {
     let timeOffset: CFTimeInterval
 }
 
+private struct BackdropCompositionTarget {
+    let prepass: LayerPrepassTarget
+    let sourceOpacity: Float
+}
+
 private struct TransitionParticipantCapture {
     let texture: GPUTexture
     let compositeLayer: CALayer
@@ -247,6 +252,8 @@ private struct PrerenderedFilter {
 private final class CompositionLayerResources {
     let backdropTexture: GPUTexture
     let backdropView: GPUTextureView
+    let sourcePremultipliedTexture: GPUTexture
+    let sourcePremultipliedView: GPUTextureView
     let sourceStraightTexture: GPUTexture
     let sourceStraightView: GPUTextureView
     let backdropStraightTexture: GPUTexture
@@ -259,6 +266,7 @@ private final class CompositionLayerResources {
     let mixedBackdropStraightView: GPUTextureView
     let backgroundFilterResources: FilterLayerResources
     let sourceUniformBuffer: GPUBuffer
+    let sourceOpacityUniformBuffer: GPUBuffer
     let backdropUniformBuffer: GPUBuffer
     let resultConversionUniformBuffer: GPUBuffer
     let displayUniformBuffer: GPUBuffer
@@ -282,6 +290,8 @@ private final class CompositionLayerResources {
 
         backdropTexture = makeTexture(format)
         backdropView = backdropTexture.createView()
+        sourcePremultipliedTexture = makeTexture(format)
+        sourcePremultipliedView = sourcePremultipliedTexture.createView()
         sourceStraightTexture = makeTexture(format)
         sourceStraightView = sourceStraightTexture.createView()
         backdropStraightTexture = makeTexture(format)
@@ -299,6 +309,7 @@ private final class CompositionLayerResources {
             format: format
         )
         sourceUniformBuffer = makeUniformBuffer()
+        sourceOpacityUniformBuffer = makeUniformBuffer()
         backdropUniformBuffer = makeUniformBuffer()
         resultConversionUniformBuffer = makeUniformBuffer()
         displayUniformBuffer = makeUniformBuffer()
@@ -314,6 +325,7 @@ private final class CompositionLayerResources {
 
     func destroy() {
         backdropTexture.destroy()
+        sourcePremultipliedTexture.destroy()
         sourceStraightTexture.destroy()
         backdropStraightTexture.destroy()
         resultPremultipliedTexture.destroy()
@@ -321,6 +333,7 @@ private final class CompositionLayerResources {
         mixedBackdropStraightTexture.destroy()
         backgroundFilterResources.destroy()
         sourceUniformBuffer.destroy()
+        sourceOpacityUniformBuffer.destroy()
         backdropUniformBuffer.destroy()
         resultConversionUniformBuffer.destroy()
         displayUniformBuffer.destroy()
@@ -7272,13 +7285,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let depthTextureView,
               let processor = layerFilterProcessor else { return }
 
-        var targets: [LayerPrepassTarget] = []
+        var targets: [BackdropCompositionTarget] = []
         var structurallyInvalidKeys: Set<LayerRenderKey> = []
         collectBackdropCompositionTargets(
             rootLayer,
             parentMatrix: projectionMatrix,
             ancestorCompositionKeys: [],
             hasUnsupportedAncestorClip: false,
+            inheritedOpacity: 1,
             targets: &targets,
             structurallyInvalidKeys: &structurallyInvalidKeys
         )
@@ -7295,7 +7309,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             prefixIsValid = false
         }
 
-        for target in targets {
+        for compositionTarget in targets {
+            let target = compositionTarget.prepass
             let key = target.renderKey
             let presentation = target.presentationLayer
             let requestedBackgroundFilters = presentation.backgroundFilters ?? []
@@ -7318,7 +7333,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             guard prefixIsValid,
                   !structurallyInvalidKeys.contains(key),
                   key.replicatorPath.isEmpty,
-                  presentation.opacity == 1,
                   presentation.mask == nil,
                   processor.supports(compositionFilter, inputMode: .foregroundAndBackground),
                   let source = prerenderedFilters[key] else {
@@ -7403,10 +7417,25 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             compositionCaptureDidReachStop = savedDidReachStop
             backdropPass.end()
 
+            var premultipliedSourceTexture = source.outputTexture
+            if compositionTarget.sourceOpacity < 1 {
+                guard applyFilterOperation(
+                    uniforms: FilterCompositeUniforms(opacity: compositionTarget.sourceOpacity),
+                    inputTexture: source.outputTexture,
+                    outputView: resources.sourcePremultipliedView,
+                    uniformBuffer: resources.sourceOpacityUniformBuffer,
+                    encoder: encoder
+                ) else {
+                    recordFailure(key)
+                    continue
+                }
+                premultipliedSourceTexture = resources.sourcePremultipliedTexture
+            }
+
             guard didReachTarget,
                   applyAlphaConversion(
                     from: .premultiplied,
-                    inputTexture: source.outputTexture,
+                    inputTexture: premultipliedSourceTexture,
                     outputView: resources.sourceStraightView,
                     uniformBuffer: resources.sourceUniformBuffer,
                     encoder: encoder
@@ -7493,7 +7522,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         parentMatrix: Matrix4x4,
         ancestorCompositionKeys: [LayerRenderKey],
         hasUnsupportedAncestorClip: Bool,
-        targets: inout [LayerPrepassTarget],
+        inheritedOpacity: Float,
+        targets: inout [BackdropCompositionTarget],
         structurallyInvalidKeys: inout Set<LayerRenderKey>
     ) {
         let presentation = renderPresentation(for: layer)
@@ -7504,18 +7534,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             || presentation.backgroundFilters?.isEmpty == false
         var descendantAncestors = ancestorCompositionKeys
         if hasComposition {
-            targets.append(LayerPrepassTarget(
-                layer: layer,
-                presentationLayer: presentation,
-                parentMatrix: parentMatrix,
-                renderKey: key,
-                timeOffset: currentReplicatorTimeOffset
+            targets.append(BackdropCompositionTarget(
+                prepass: LayerPrepassTarget(
+                    layer: layer,
+                    presentationLayer: presentation,
+                    parentMatrix: parentMatrix,
+                    renderKey: key,
+                    timeOffset: currentReplicatorTimeOffset
+                ),
+                sourceOpacity: presentation.opacity
             ))
             if !ancestorCompositionKeys.isEmpty {
                 structurallyInvalidKeys.insert(key)
                 structurallyInvalidKeys.formUnion(ancestorCompositionKeys)
             }
             if hasUnsupportedAncestorClip {
+                structurallyInvalidKeys.insert(key)
+            }
+            if inheritedOpacity < 1 {
                 structurallyInvalidKeys.insert(key)
             }
             descendantAncestors.append(key)
@@ -7534,6 +7570,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 hasUnsupportedAncestorClip: hasUnsupportedAncestorClip
                     || presentation.mask != nil
                     || presentation.masksToBounds,
+                inheritedOpacity: inheritedOpacity * presentation.opacity,
                 targets: &targets,
                 structurallyInvalidKeys: &structurallyInvalidKeys
             )
