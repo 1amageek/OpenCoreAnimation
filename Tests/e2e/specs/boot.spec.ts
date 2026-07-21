@@ -21,7 +21,9 @@ interface OCA extends Harness {
     isEngineRunning: () => boolean;
     getPixelReadback: () => string;
     getTransitionSourceCaptureCount: () => number;
-    getActiveTransitionSourceTextureCount: () => number;
+    getTransitionTargetCaptureCount: () => number;
+    getActiveTransitionTextureCount: () => number;
+    mutateTransitionTarget: () => void;
     removeTransition: () => void;
     beginPixelReadback: () => void;
 }
@@ -59,7 +61,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getTileState()).toBe("delegate=true,bounds=80.0x80.0");
         await expect.poll(() => h.getTileDrawCount(), { timeout: 2_000 }).toBeGreaterThan(0);
         await expect.poll(() => h.getTransitionSourceCaptureCount()).toBe(1);
-        expect(await h.getActiveTransitionSourceTextureCount()).toBe(1);
+        expect(await h.getTransitionTargetCaptureCount()).toBe(1);
+        expect(await h.getActiveTransitionTextureCount()).toBe(2);
+        await h.mutateTransitionTarget();
+        expect(await h.getTransitionSourceCaptureCount()).toBe(1);
+        expect(await h.getTransitionTargetCaptureCount()).toBe(1);
         await h.beginPixelReadback();
 
         await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
@@ -68,6 +74,6 @@ test.describe("OpenCoreAnimation smoke", () => {
         );
 
         await h.removeTransition();
-        await expect.poll(() => h.getActiveTransitionSourceTextureCount()).toBe(0);
+        await expect.poll(() => h.getActiveTransitionTextureCount()).toBe(0);
     });
 });

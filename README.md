@@ -11,8 +11,8 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 | Evidence | Result |
 |---|---|
 | Native package | 337 tests passed |
-| Browser | 3 checks passed, including rasterized/tiled pixels and a premultiplied transition source texture read back from WebGPU |
-| Remaining boundary | CIFilter-driven transitions and dual-texture target capture remain open; complete QuartzCore parity is not claimed |
+| Browser | 3 checks passed, including rasterized/tiled pixels and a frozen premultiplied source/target transition pair read back from WebGPU |
+| Remaining boundary | CIFilter-driven transitions remain open; complete QuartzCore parity is not claimed |
 
 ```swift
 #if canImport(QuartzCore)

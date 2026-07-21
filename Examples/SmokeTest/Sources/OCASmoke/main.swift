@@ -208,12 +208,28 @@ func installHarness() {
             }
             return .number(Double(count))
         })
-        h.expose("getActiveTransitionSourceTextureCount", returning: {
+        h.expose("getTransitionTargetCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
-                    .activeTransitionSourceTextureCount ?? -1
+                    .transitionTargetCaptureCount ?? -1
             }
             return .number(Double(count))
+        })
+        h.expose("getActiveTransitionTextureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .activeTransitionTextureCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("mutateTransitionTarget", action: {
+            MainActor.assumeIsolated {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                transitioningLayerRef?.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 0.5)
+                CATransaction.commit()
+                CAAnimationEngine.shared.renderFrame()
+            }
         })
         h.expose("removeTransition", action: {
             MainActor.assumeIsolated {

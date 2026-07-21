@@ -71,7 +71,8 @@ import SwiftWebGPU
 fileprivate enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier)
     case layer(ObjectIdentifier)
-    case transition(ObjectIdentifier)
+    case transitionSource(ObjectIdentifier)
+    case transitionTarget(ObjectIdentifier)
 }
 
 private struct PendingTileDraw {
@@ -84,8 +85,14 @@ private struct PendingTileDraw {
     let pixelHeight: Int
 }
 
-private struct TransitionSourceCapture {
+private struct TransitionParticipantCapture {
     let texture: GPUTexture
+    let compositeLayer: CALayer
+}
+
+private struct TransitionCapturePair {
+    let source: TransitionParticipantCapture
+    let target: TransitionParticipantCapture
 }
 
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
@@ -163,10 +170,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var transitionSourceCaptureCount: Int = 0
 
-    /// Number of frozen transition source textures currently retained by the renderer.
+    /// Number of transition target textures captured during this renderer's lifetime.
     @_spi(RendererDiagnostics)
-    public var activeTransitionSourceTextureCount: Int {
-        transitionSourceCaptures.count
+    public private(set) var transitionTargetCaptureCount: Int = 0
+
+    /// Number of frozen source and target textures currently retained by the renderer.
+    @_spi(RendererDiagnostics)
+    public var activeTransitionTextureCount: Int {
+        transitionCaptures.count * 2
     }
 
     /// The preferred texture format.
@@ -529,8 +540,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// budget can be sized to `viewport × 4 × 2.5` per WWDC 2014 #419.
     private var rasterizationCache: RasterizationCache<GPUTexture>?
 
-    /// Frozen source textures keyed by the immutable transition source snapshot.
-    private var transitionSourceCaptures: [ObjectIdentifier: TransitionSourceCapture] = [:]
+    /// Frozen source/target pairs keyed by the immutable transition source snapshot.
+    private var transitionCaptures: [ObjectIdentifier: TransitionCapturePair] = [:]
 
     /// Source snapshots referenced by an active transition during the current frame.
     private var activeTransitionSourceIDs: Set<ObjectIdentifier> = []
@@ -2078,7 +2089,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             far: 1000
         )
 
-        prerenderTransitionSources(rootLayer, encoder: encoder)
+        prerenderTransitions(rootLayer, encoder: encoder)
 
         // Pre-render shadows with 2-pass Gaussian blur
         prerenderShadows(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
@@ -2349,16 +2360,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Rasterization cache (R3.2 / R3.4)
         rasterizationCache?.removeAll()
         rasterizationCache = nil
-        for capture in transitionSourceCaptures.values {
-            capture.texture.destroy()
+        for capture in transitionCaptures.values {
+            capture.source.texture.destroy()
+            capture.target.texture.destroy()
         }
-        transitionSourceCaptures.removeAll(keepingCapacity: false)
+        transitionCaptures.removeAll(keepingCapacity: false)
         activeTransitionSourceIDs.removeAll(keepingCapacity: false)
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
         transientCaptureDepthTextures.removeAll(keepingCapacity: false)
         transitionSourceCaptureCount = 0
+        transitionTargetCaptureCount = 0
         prerasterizedTextures.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
         for request in pendingTileDraws {
@@ -2475,8 +2488,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         if transitionSuppressedLayer !== layer,
            let transitionState = presentationLayer._transitionRenderState {
             renderTransition(
-                layer,
-                presentationLayer: presentationLayer,
                 state: transitionState,
                 renderPass: renderPass,
                 parentMatrix: parentMatrix
@@ -2731,56 +2742,79 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
     }
 
-    private func prerenderTransitionSources(
+    private func prerenderTransitions(
         _ rootLayer: CALayer,
         encoder: GPUCommandEncoder
     ) {
         guard let device, let pipeline else { return }
 
         func collect(_ layer: CALayer) {
+            // Capture descendants first so a nested active transition is available
+            // when its parent subtree is frozen into the target texture.
+            for sublayer in layer.sublayers ?? [] {
+                collect(sublayer)
+            }
+
             let presentation = layer._renderTimePresentation()
             if let state = presentation._transitionRenderState {
                 let sourceID = ObjectIdentifier(state.sourceLayer)
                 activeTransitionSourceIDs.insert(sourceID)
-                let sourceIsDirty = state.sourceLayer._subtreeDirtyCount > 0
-                    || !state.sourceLayer._dirtyMask.isEmpty
-                if transitionSourceCaptures[sourceID] == nil || sourceIsDirty {
-                    texturedTextureViewCache.removeValue(forKey: .transition(sourceID))
-                    perFrameTexturedBindGroupCache.removeValue(forKey: .transition(sourceID))
-                    transitionSourceCaptures.removeValue(forKey: sourceID)?.texture.destroy()
-                    transitionSourceCaptures[sourceID] = captureTransitionSource(
+                if transitionCaptures[sourceID] == nil {
+                    guard let source = captureTransitionParticipant(
                         state.sourceLayer,
                         device: device,
                         pipeline: pipeline,
                         encoder: encoder
+                    ) else {
+                        return
+                    }
+                    guard let target = captureTransitionParticipant(
+                        layer,
+                        device: device,
+                        pipeline: pipeline,
+                        encoder: encoder
+                    ) else {
+                        source.texture.destroy()
+                        return
+                    }
+                    transitionCaptures[sourceID] = TransitionCapturePair(
+                        source: source,
+                        target: target
                     )
+                    transitionSourceCaptureCount += 1
+                    transitionTargetCaptureCount += 1
                 }
-            }
-
-            for sublayer in layer.sublayers ?? [] {
-                collect(sublayer)
             }
         }
 
         collect(rootLayer)
 
-        let staleSourceIDs = transitionSourceCaptures.keys.filter {
+        let staleSourceIDs = transitionCaptures.keys.filter {
             !activeTransitionSourceIDs.contains($0)
         }
         for sourceID in staleSourceIDs {
-            transitionSourceCaptures.removeValue(forKey: sourceID)?.texture.destroy()
-            texturedTextureViewCache.removeValue(forKey: .transition(sourceID))
-            perFrameTexturedBindGroupCache.removeValue(forKey: .transition(sourceID))
+            destroyTransitionCapture(for: sourceID)
         }
     }
 
-    private func captureTransitionSource(
-        _ sourceLayer: CALayer,
+    private func destroyTransitionCapture(for sourceID: ObjectIdentifier) {
+        if let capture = transitionCaptures.removeValue(forKey: sourceID) {
+            capture.source.texture.destroy()
+            capture.target.texture.destroy()
+        }
+        texturedTextureViewCache.removeValue(forKey: .transitionSource(sourceID))
+        texturedTextureViewCache.removeValue(forKey: .transitionTarget(sourceID))
+        perFrameTexturedBindGroupCache.removeValue(forKey: .transitionSource(sourceID))
+        perFrameTexturedBindGroupCache.removeValue(forKey: .transitionTarget(sourceID))
+    }
+
+    private func captureTransitionParticipant(
+        _ layer: CALayer,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         encoder: GPUCommandEncoder
-    ) -> TransitionSourceCapture? {
-        let presentation = sourceLayer._renderTimePresentation()
+    ) -> TransitionParticipantCapture? {
+        let presentation = layer._renderTimePresentation()
         let bounds = presentation.bounds
         guard bounds.width.isFinite,
               bounds.height.isFinite,
@@ -2873,15 +2907,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let previousMaskNestingDepth = maskNestingDepth
         let previousStencilValue = currentStencilValue
 
-        rasterizePrerenderRootLayer = sourceLayer
-        transitionSuppressedLayer = sourceLayer
+        rasterizePrerenderRootLayer = layer
+        transitionSuppressedLayer = layer
         renderTargetSizeOverride = pixelSize
         clipRectStack.removeAll(keepingCapacity: true)
         opacityStack.removeAll(keepingCapacity: true)
         maskNestingDepth = 0
         currentStencilValue = 0
 
-        renderLayer(sourceLayer, renderPass: capturePass, parentMatrix: captureProjection)
+        renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
 
         rasterizePrerenderRootLayer = previousCaptureRoot
         transitionSuppressedLayer = previousSuppression
@@ -2892,28 +2926,27 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentStencilValue = previousStencilValue
         capturePass.end()
 
-        sourceLayer.recursivelyClearDirtyAfterCommit()
-        transitionSourceCaptureCount += 1
-        return TransitionSourceCapture(texture: texture)
+        let compositeLayer = type(of: presentation).init(layer: presentation)
+        compositeLayer.recursivelyClearDirtyAfterCommit()
+        return TransitionParticipantCapture(texture: texture, compositeLayer: compositeLayer)
     }
 
-    /// Composites the captured and current layer trees for a built-in transition.
+    /// Composites frozen source and target layer trees for a built-in transition.
     private func renderTransition(
-        _ layer: CALayer,
-        presentationLayer: CALayer,
         state: CATransitionRenderState,
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
     ) {
         let sourceID = ObjectIdentifier(state.sourceLayer)
-        guard let sourceCapture = transitionSourceCaptures[sourceID] else { return }
+        guard let capture = transitionCaptures[sourceID] else { return }
+        let targetLayer = capture.target.compositeLayer
         let progress = CGFloat(max(0, min(1, state.progress)))
         let direction = transitionDirection(
             subtype: state.subtype,
-            bounds: presentationLayer.bounds
+            bounds: targetLayer.bounds
         )
-        let baseModelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
-        let transitionClip = calculateClipRect(layer: presentationLayer, modelMatrix: baseModelMatrix)
+        let baseModelMatrix = targetLayer.modelMatrix(parentMatrix: parentMatrix)
+        let transitionClip = calculateClipRect(layer: targetLayer, modelMatrix: baseModelMatrix)
         clipRectStack.append(currentClipRect.intersection(with: transitionClip))
         applyScissorRect(renderPass)
         defer {
@@ -2922,33 +2955,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         func renderParticipant(
-            _ participant: CALayer,
+            _ participant: TransitionParticipantCapture,
+            cacheKey: TexturedCacheKey,
             offset: CGPoint,
-            opacityMultiplier: Float,
-            suppressing liveLayer: CALayer? = nil
+            opacityMultiplier: Float
         ) {
-            guard opacityMultiplier > 0 else { return }
-            let participantPresentation = participant._renderTimePresentation()
-            let originalPosition = participantPresentation.position
-            let originalOpacity = participantPresentation.opacity
-            participantPresentation.position = CGPoint(
-                x: originalPosition.x + offset.x,
-                y: originalPosition.y + offset.y
-            )
-            participantPresentation.opacity = originalOpacity * opacityMultiplier
-            let previousSuppression = transitionSuppressedLayer
-            transitionSuppressedLayer = liveLayer
-            renderLayer(participant, renderPass: renderPass, parentMatrix: parentMatrix)
-            transitionSuppressedLayer = previousSuppression
-            participantPresentation.position = originalPosition
-            participantPresentation.opacity = originalOpacity
-        }
-
-        func renderSource(offset: CGPoint, opacityMultiplier: Float) {
-            renderTransitionSourceCapture(
-                sourceCapture,
-                sourceID: sourceID,
-                sourceLayer: state.sourceLayer,
+            renderTransitionCapture(
+                participant,
+                cacheKey: cacheKey,
                 offset: offset,
                 opacityMultiplier: opacityMultiplier,
                 renderPass: renderPass,
@@ -2958,46 +2972,49 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         switch state.type {
         case .fade:
-            renderSource(offset: .zero, opacityMultiplier: 1)
-            renderParticipant(layer, offset: .zero, opacityMultiplier: Float(progress), suppressing: layer)
+            renderParticipant(capture.source, cacheKey: .transitionSource(sourceID), offset: .zero, opacityMultiplier: 1)
+            renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: Float(progress))
 
         case .moveIn:
-            renderSource(offset: .zero, opacityMultiplier: 1)
+            renderParticipant(capture.source, cacheKey: .transitionSource(sourceID), offset: .zero, opacityMultiplier: 1)
             renderParticipant(
-                layer,
+                capture.target,
+                cacheKey: .transitionTarget(sourceID),
                 offset: CGPoint(x: direction.x * (1 - progress), y: direction.y * (1 - progress)),
-                opacityMultiplier: 1,
-                suppressing: layer
+                opacityMultiplier: 1
             )
 
         case .push:
-            renderSource(
+            renderParticipant(
+                capture.source,
+                cacheKey: .transitionSource(sourceID),
                 offset: CGPoint(x: -direction.x * progress, y: -direction.y * progress),
                 opacityMultiplier: 1
             )
             renderParticipant(
-                layer,
+                capture.target,
+                cacheKey: .transitionTarget(sourceID),
                 offset: CGPoint(x: direction.x * (1 - progress), y: direction.y * (1 - progress)),
-                opacityMultiplier: 1,
-                suppressing: layer
+                opacityMultiplier: 1
             )
 
         case .reveal:
-            renderParticipant(layer, offset: .zero, opacityMultiplier: 1, suppressing: layer)
-            renderSource(
+            renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: 1)
+            renderParticipant(
+                capture.source,
+                cacheKey: .transitionSource(sourceID),
                 offset: CGPoint(x: -direction.x * progress, y: -direction.y * progress),
                 opacityMultiplier: 1
             )
 
         default:
-            renderParticipant(layer, offset: .zero, opacityMultiplier: 1, suppressing: layer)
+            renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: 1)
         }
     }
 
-    private func renderTransitionSourceCapture(
-        _ capture: TransitionSourceCapture,
-        sourceID: ObjectIdentifier,
-        sourceLayer: CALayer,
+    private func renderTransitionCapture(
+        _ capture: TransitionParticipantCapture,
+        cacheKey: TexturedCacheKey,
         offset: CGPoint,
         opacityMultiplier: Float,
         renderPass: GPURenderPassEncoder,
@@ -3012,7 +3029,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        let presentation = sourceLayer._renderTimePresentation()
+        let presentation = capture.compositeLayer
         let bounds = presentation.bounds
         guard bounds.width > 0, bounds.height > 0 else { return }
 
@@ -3063,7 +3080,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         let bindGroup = cachedTexturedBindGroup(
-            cacheKey: .transition(sourceID),
+            cacheKey: cacheKey,
             gpuTexture: capture.texture,
             device: device,
             layout: texturedBindGroupLayout,
