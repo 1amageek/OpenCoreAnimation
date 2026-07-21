@@ -20,6 +20,7 @@ interface OCA extends Harness {
     getTileState: () => string;
     isEngineRunning: () => boolean;
     getPixelReadback: () => string;
+    getTransitionFilterProbeResult: () => string;
     getTransitionSourceCaptureCount: () => number;
     getTransitionTargetCaptureCount: () => number;
     getActiveTransitionTextureCount: () => number;
@@ -27,6 +28,7 @@ interface OCA extends Harness {
     getTransitionFilterFailureCount: () => number;
     mutateTransitionTarget: () => void;
     exerciseUnsupportedTransitionFilter: () => void;
+    beginTransitionFilterProbes: () => void;
     removeTransition: () => void;
     beginPixelReadback: () => void;
 }
@@ -78,9 +80,19 @@ test.describe("OpenCoreAnimation smoke", () => {
             "255,0,0,255;0,255,0,255;0,0,255,255;26,26,38,255;255,0,255,255;106,10,78,255;191,255,64,255"
         );
 
+        await h.beginTransitionFilterProbes();
+        await expect.poll(() => h.getTransitionFilterProbeResult(), { timeout: 10_000 }).toContain("ripple=");
+        expect(await h.getTransitionFilterProbeResult()).toBe(
+            "dissolve=191,0,64,255;swipe=0,255,0,255;bars=0,0,255,255;mod=255,0,0,255;flash=0,128,128,255;copy=0,255,0,255;ripple=0,0,255,255"
+        );
+        expect(await h.getTransitionSourceCaptureCount()).toBe(9);
+        expect(await h.getTransitionTargetCaptureCount()).toBe(9);
+        expect(await h.getActiveTransitionTextureCount()).toBe(2);
+        expect(await h.getTransitionFilterFailureCount()).toBe(0);
+
         await h.exerciseUnsupportedTransitionFilter();
         await expect.poll(() => h.getTransitionFilterFailureCount()).toBe(1);
-        expect(await h.getActiveTransitionTextureCount()).toBe(5);
+        expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.removeTransition();
         await expect.poll(() => h.getActiveTransitionTextureCount()).toBe(0);

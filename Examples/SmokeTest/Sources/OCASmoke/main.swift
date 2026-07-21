@@ -33,6 +33,7 @@ nonisolated(unsafe) var unsupportedTransitioningLayerRef: CALayer?
 nonisolated(unsafe) var tileDelegateRef: SmokeTileDelegate?
 nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
+nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -63,6 +64,7 @@ public func setup() {
             tileDelegateRef = nil
             tileDrawCount = 0
             pixelReadbackResult = "pending"
+            transitionFilterProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -225,6 +227,9 @@ func installHarness() {
         h.expose("getPixelReadback", returning: {
             .string(pixelReadbackResult)
         })
+        h.expose("getTransitionFilterProbeResult", returning: {
+            .string(transitionFilterProbeResult)
+        })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
@@ -286,6 +291,99 @@ func installHarness() {
                 layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                 unsupportedTransitioningLayerRef = layer
                 CAAnimationEngine.shared.renderFrame()
+            }
+        })
+        h.expose("beginTransitionFilterProbes", action: {
+            Task { @MainActor in
+                transitionFilterProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let layer = filteredTransitioningLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    transitionFilterProbeResult = "error: probe layer or renderer unavailable"
+                    return
+                }
+
+                typealias Probe = (
+                    label: String,
+                    filterName: String,
+                    progress: CFTimeInterval,
+                    configure: (CIFilter) -> Void
+                )
+                let probes: [Probe] = [
+                    ("dissolve", "CIDissolveTransition", 0.25, { _ in }),
+                    ("swipe", "CISwipeTransition", 0.36324, { filter in
+                        filter.setValue(Float(0), forKey: kCIInputAngleKey)
+                        filter.setValue(Float(8), forKey: "inputWidth")
+                        filter.setValue(Float(1), forKey: "inputOpacity")
+                        filter.setValue(CIColor(red: 0, green: 1, blue: 0), forKey: kCIInputColorKey)
+                    }),
+                    ("bars", "CIBarsSwipeTransition", 0.5, { filter in
+                        filter.setValue(Float(0), forKey: kCIInputAngleKey)
+                        filter.setValue(Float(20), forKey: "inputWidth")
+                        filter.setValue(Float(0), forKey: "inputBarOffset")
+                    }),
+                    ("mod", "CIModTransition", 0.5, { filter in
+                        filter.setValue([Float(40), Float(40)], forKey: kCIInputCenterKey)
+                        filter.setValue(Float(0), forKey: kCIInputAngleKey)
+                        filter.setValue(Float(10), forKey: kCIInputRadiusKey)
+                        filter.setValue(Float(1), forKey: "inputCompression")
+                    }),
+                    ("flash", "CIFlashTransition", 0.75, { filter in
+                        filter.setValue([Float(40), Float(40)], forKey: kCIInputCenterKey)
+                        filter.setValue(Float(1), forKey: "inputFadeThreshold")
+                        filter.setValue(CIColor(red: 0, green: 1, blue: 0), forKey: kCIInputColorKey)
+                    }),
+                    ("copy", "CICopyMachineTransition", 0.5, { filter in
+                        filter.setValue(Float(0), forKey: kCIInputAngleKey)
+                        filter.setValue(Float(20), forKey: "inputWidth")
+                        filter.setValue(Float(1), forKey: "inputOpacity")
+                        filter.setValue(CIColor(red: 0, green: 1, blue: 0), forKey: kCIInputColorKey)
+                    }),
+                    ("ripple", "CIRippleTransition", 0.5, { filter in
+                        filter.setValue([Float(40), Float(40)], forKey: kCIInputCenterKey)
+                        filter.setValue(Float(10), forKey: "inputWidth")
+                        filter.setValue(Float(0), forKey: kCIInputScaleKey)
+                    }),
+                ]
+
+                layer.removeAnimation(forKey: "browserFilteredTransition")
+                var results: [String] = []
+                do {
+                    for probe in probes {
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                        CATransaction.commit()
+                        engine.renderFrame()
+
+                        guard let filter = CIFilter(name: probe.filterName) else {
+                            transitionFilterProbeResult = "error: \(probe.filterName) unavailable"
+                            return
+                        }
+                        probe.configure(filter)
+                        let transition = CATransition()
+                        transition.filter = filter
+                        transition.duration = 1
+                        transition.speed = 0
+                        transition.timeOffset = probe.progress
+                        layer.add(transition, forKey: "activeFilterProbe")
+
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                        CATransaction.commit()
+                        engine.renderFrame()
+
+                        let pixel = try await renderer.readbackPixel(x: 80, y: 80)
+                        results.append("\(probe.label)=\(pixel.map(String.init).joined(separator: ","))")
+                        layer.removeAnimation(forKey: "activeFilterProbe")
+                        engine.renderFrame()
+                    }
+                    transitionFilterProbeResult = results.joined(separator: ";")
+                } catch {
+                    transitionFilterProbeResult = "error: \(error)"
+                }
             }
         })
         h.expose("removeTransition", action: {
