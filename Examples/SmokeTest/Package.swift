@@ -18,6 +18,7 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../.."),
+        .package(path: "../../../OpenCoreImage"),
         .package(url: "https://github.com/1amageek/swift-wasm-testing", branch: "main"),
     ],
     targets: [
@@ -25,6 +26,7 @@ let package = Package(
             name: "OCASmoke",
             dependencies: [
                 .product(name: "OpenCoreAnimation", package: "OpenCoreAnimation"),
+                .product(name: "OpenCoreImage", package: "OpenCoreImage"),
                 .product(name: "WasmTesting", package: "swift-wasm-testing"),
             ],
             linkerSettings: [

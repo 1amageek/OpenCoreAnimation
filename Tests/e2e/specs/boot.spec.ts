@@ -23,7 +23,10 @@ interface OCA extends Harness {
     getTransitionSourceCaptureCount: () => number;
     getTransitionTargetCaptureCount: () => number;
     getActiveTransitionTextureCount: () => number;
+    getTransitionFilterDispatchCount: () => number;
+    getTransitionFilterFailureCount: () => number;
     mutateTransitionTarget: () => void;
+    exerciseUnsupportedTransitionFilter: () => void;
     removeTransition: () => void;
     beginPixelReadback: () => void;
 }
@@ -39,7 +42,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         expect(await h.getCanvasWidth(), "canvas width").toBe(400);
         expect(await h.getCanvasHeight(), "canvas height").toBe(300);
-        expect(await h.getSublayerCount(), "root sublayer count").toBe(5);
+        expect(await h.getSublayerCount(), "root sublayer count").toBe(6);
     });
 
     test("engine: display link is running", async ({ harness }) => {
@@ -60,18 +63,24 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getStatus()).toBe("ready");
         expect(await h.getTileState()).toBe("delegate=true,bounds=80.0x80.0");
         await expect.poll(() => h.getTileDrawCount(), { timeout: 2_000 }).toBeGreaterThan(0);
-        await expect.poll(() => h.getTransitionSourceCaptureCount()).toBe(1);
-        expect(await h.getTransitionTargetCaptureCount()).toBe(1);
-        expect(await h.getActiveTransitionTextureCount()).toBe(2);
+        await expect.poll(() => h.getTransitionSourceCaptureCount()).toBe(2);
+        expect(await h.getTransitionTargetCaptureCount()).toBe(2);
+        expect(await h.getActiveTransitionTextureCount()).toBe(5);
+        await expect.poll(() => h.getTransitionFilterDispatchCount()).toBeGreaterThan(0);
+        expect(await h.getTransitionFilterFailureCount()).toBe(0);
         await h.mutateTransitionTarget();
-        expect(await h.getTransitionSourceCaptureCount()).toBe(1);
-        expect(await h.getTransitionTargetCaptureCount()).toBe(1);
+        expect(await h.getTransitionSourceCaptureCount()).toBe(2);
+        expect(await h.getTransitionTargetCaptureCount()).toBe(2);
         await h.beginPixelReadback();
 
         await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
         expect(await h.getPixelReadback()).toBe(
-            "255,0,0,255;0,255,0,255;0,0,255,255;26,26,38,255;255,0,255,255;106,10,78,255"
+            "255,0,0,255;0,255,0,255;0,0,255,255;26,26,38,255;255,0,255,255;106,10,78,255;191,255,64,255"
         );
+
+        await h.exerciseUnsupportedTransitionFilter();
+        await expect.poll(() => h.getTransitionFilterFailureCount()).toBe(1);
+        expect(await h.getActiveTransitionTextureCount()).toBe(5);
 
         await h.removeTransition();
         await expect.poll(() => h.getActiveTransitionTextureCount()).toBe(0);

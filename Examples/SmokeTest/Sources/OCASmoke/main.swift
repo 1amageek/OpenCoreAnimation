@@ -13,6 +13,7 @@
 import Foundation
 import WasmTesting
 @_spi(RendererDiagnostics) import OpenCoreAnimation
+import OpenCoreImage
 #if canImport(Testing)
 import Testing
 #endif
@@ -27,6 +28,8 @@ nonisolated(unsafe) var rootLayerRef: CALayer?
 nonisolated(unsafe) var rasterizedGroupRef: CALayer?
 nonisolated(unsafe) var tiledLayerRef: CATiledLayer?
 nonisolated(unsafe) var transitioningLayerRef: CALayer?
+nonisolated(unsafe) var filteredTransitioningLayerRef: CALayer?
+nonisolated(unsafe) var unsupportedTransitioningLayerRef: CALayer?
 nonisolated(unsafe) var tileDelegateRef: SmokeTileDelegate?
 nonisolated(unsafe) var tileDrawCount: Int = 0
 nonisolated(unsafe) var pixelReadbackResult: String = "pending"
@@ -55,6 +58,8 @@ public func setup() {
             rootLayerRef = nil
             tiledLayerRef = nil
             transitioningLayerRef = nil
+            filteredTransitioningLayerRef = nil
+            unsupportedTransitioningLayerRef = nil
             tileDelegateRef = nil
             tileDrawCount = 0
             pixelReadbackResult = "pending"
@@ -158,6 +163,25 @@ func performSetup() async {
     transitioning.add(transition, forKey: "browserCrossfade")
     transitioning.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 0.5)
 
+    let filteredTransitioning = CALayer()
+    filteredTransitioning.bounds = CGRect(x: 0, y: 0, width: 80, height: 80)
+    filteredTransitioning.position = CGPoint(x: 80, y: 220)
+    filteredTransitioning.backgroundColor = CGColor(red: 1, green: 1, blue: 0, alpha: 1)
+    root.addSublayer(filteredTransitioning)
+    filteredTransitioningLayerRef = filteredTransitioning
+
+    guard let dissolve = CIFilter(name: "CIDissolveTransition") else {
+        statusText = "error: CIDissolveTransition unavailable"
+        return
+    }
+    let filteredTransition = CATransition()
+    filteredTransition.filter = dissolve
+    filteredTransition.duration = 1
+    filteredTransition.speed = 0
+    filteredTransition.timeOffset = 0.25
+    filteredTransitioning.add(filteredTransition, forKey: "browserFilteredTransition")
+    filteredTransitioning.backgroundColor = CGColor(red: 0, green: 1, blue: 1, alpha: 1)
+
     rootLayerRef = root
     sublayerCount = root.sublayers?.count ?? 0
 
@@ -222,6 +246,20 @@ func installHarness() {
             }
             return .number(Double(count))
         })
+        h.expose("getTransitionFilterDispatchCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .transitionFilterDispatchCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getTransitionFilterFailureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                    .transitionFilterFailureCount ?? -1
+            }
+            return .number(Double(count))
+        })
         h.expose("mutateTransitionTarget", action: {
             MainActor.assumeIsolated {
                 CATransaction.begin()
@@ -231,9 +269,30 @@ func installHarness() {
                 CAAnimationEngine.shared.renderFrame()
             }
         })
+        h.expose("exerciseUnsupportedTransitionFilter", action: {
+            MainActor.assumeIsolated {
+                let layer = CALayer()
+                layer.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+                layer.position = CGPoint(x: 4, y: 4)
+                layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                rootLayerRef?.addSublayer(layer)
+
+                let transition = CATransition()
+                transition.filter = "unsupported-filter"
+                transition.duration = 1
+                transition.speed = 0
+                transition.timeOffset = 0.5
+                layer.add(transition, forKey: "unsupportedFilteredTransition")
+                layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                unsupportedTransitioningLayerRef = layer
+                CAAnimationEngine.shared.renderFrame()
+            }
+        })
         h.expose("removeTransition", action: {
             MainActor.assumeIsolated {
                 transitioningLayerRef?.removeAnimation(forKey: "browserCrossfade")
+                filteredTransitioningLayerRef?.removeAnimation(forKey: "browserFilteredTransition")
+                unsupportedTransitioningLayerRef?.removeFromSuperlayer()
                 CAAnimationEngine.shared.renderFrame()
             }
         })
@@ -263,6 +322,7 @@ func installHarness() {
                         CGPoint(x: 10, y: 10),
                         CGPoint(x: 200, y: 80),
                         CGPoint(x: 320, y: 80),
+                        CGPoint(x: 80, y: 80),
                     ])
                     pixelReadbackResult = pixels
                         .map { $0.map(String.init).joined(separator: ",") }

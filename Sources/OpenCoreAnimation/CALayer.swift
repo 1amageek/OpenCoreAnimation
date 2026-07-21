@@ -506,17 +506,12 @@ open class CALayer: CAMediaTiming, Hashable {
         let endProgress = CFTimeInterval(transition.endProgress)
         let rangedProgress = startProgress + adjustedProgress * (endProgress - startProgress)
 
-        // Filter-driven transitions are not complete: `CATransition.filter` exposes `Any`
-        // and the current renderer has no typed source/target-image contract for executing it.
-        // The active path therefore creates render state only for built-in transition types.
-        // A non-nil filter must not be considered rendered until an offscreen filter bridge can
-        // provide and validate the filtered output texture.
-        guard transition.filter == nil,
-              let sourceLayer = transition.sourceLayerSnapshot else { return }
+        guard let sourceLayer = transition.sourceLayerSnapshot else { return }
         layer._transitionRenderState = CATransitionRenderState(
             sourceLayer: sourceLayer,
             type: transition.type,
             subtype: transition.subtype,
+            filter: transition.filter,
             progress: max(0, min(1, rangedProgress))
         )
     }

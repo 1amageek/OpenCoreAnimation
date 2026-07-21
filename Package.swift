@@ -17,6 +17,7 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../OpenCoreGraphics"),
+        .package(path: "../OpenCoreImage"),
         .package(path: "../swift-webgpu"),
     ],
     targets: [
@@ -24,6 +25,7 @@ let package = Package(
             name: "OpenCoreAnimation",
             dependencies: [
                 .product(name: "OpenCoreGraphics", package: "OpenCoreGraphics"),
+                .product(name: "OpenCoreImage", package: "OpenCoreImage", condition: .when(platforms: [.wasi])),
                 .product(name: "SwiftWebGPU", package: "swift-webgpu", condition: .when(platforms: [.wasi])),
             ],
             swiftSettings: [

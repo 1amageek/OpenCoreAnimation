@@ -5,5 +5,6 @@ internal struct CATransitionRenderState {
     internal let sourceLayer: CALayer
     internal let type: CATransitionType
     internal let subtype: CATransitionSubtype?
+    internal let filter: Any?
     internal let progress: CFTimeInterval
 }

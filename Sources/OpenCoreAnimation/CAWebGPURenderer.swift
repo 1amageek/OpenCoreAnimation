@@ -1,5 +1,6 @@
 #if arch(wasm32)
 @_spi(SoftwareBitmapContext) import OpenCoreGraphics
+@_spi(WebGPUInterop) import OpenCoreImage
 import Foundation
 import JavaScriptKit
 import SwiftWebGPU
@@ -73,6 +74,7 @@ fileprivate enum TexturedCacheKey: Hashable {
     case layer(ObjectIdentifier)
     case transitionSource(ObjectIdentifier)
     case transitionTarget(ObjectIdentifier)
+    case transitionFilter(ObjectIdentifier)
 }
 
 private struct PendingTileDraw {
@@ -88,11 +90,14 @@ private struct PendingTileDraw {
 private struct TransitionParticipantCapture {
     let texture: GPUTexture
     let compositeLayer: CALayer
+    let pixelWidth: Int
+    let pixelHeight: Int
 }
 
 private struct TransitionCapturePair {
     let source: TransitionParticipantCapture
     let target: TransitionParticipantCapture
+    let filterExecution: CIWebGPUTransitionExecution?
 }
 
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
@@ -174,10 +179,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var transitionTargetCaptureCount: Int = 0
 
+    /// Number of Core Image transition dispatches encoded by this renderer.
+    @_spi(RendererDiagnostics)
+    public private(set) var transitionFilterDispatchCount: Int = 0
+
+    /// Number of filter transitions rejected before GPU dispatch.
+    @_spi(RendererDiagnostics)
+    public private(set) var transitionFilterFailureCount: Int = 0
+
     /// Number of frozen source and target textures currently retained by the renderer.
     @_spi(RendererDiagnostics)
     public var activeTransitionTextureCount: Int {
-        transitionCaptures.count * 2
+        transitionCaptures.values.reduce(into: 0) { count, capture in
+            count += capture.filterExecution == nil ? 2 : 3
+        }
     }
 
     /// The preferred texture format.
@@ -543,8 +558,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Frozen source/target pairs keyed by the immutable transition source snapshot.
     private var transitionCaptures: [ObjectIdentifier: TransitionCapturePair] = [:]
 
+    /// Executes Core Image transition shaders on this renderer's GPU device.
+    private var transitionFilterProcessor: CIWebGPUTransitionProcessor?
+
     /// Source snapshots referenced by an active transition during the current frame.
     private var activeTransitionSourceIDs: Set<ObjectIdentifier> = []
+
+    /// Active transitions rejected because their filter cannot execute.
+    private var failedTransitionSourceIDs: Set<ObjectIdentifier> = []
 
     /// Capture-only depth textures retained until their command buffer has been submitted.
     private var transientCaptureDepthTextures: [GPUTexture] = []
@@ -694,6 +715,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Request device
         let device = try await adapter.requestDevice()
         self.device = device
+        transitionFilterProcessor = CIWebGPUTransitionProcessor(device: device)
 
         // Get preferred format
         preferredFormat = gpu.preferredCanvasFormat
@@ -2361,17 +2383,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         rasterizationCache?.removeAll()
         rasterizationCache = nil
         for capture in transitionCaptures.values {
+            capture.filterExecution?.invalidate()
             capture.source.texture.destroy()
             capture.target.texture.destroy()
         }
         transitionCaptures.removeAll(keepingCapacity: false)
         activeTransitionSourceIDs.removeAll(keepingCapacity: false)
+        failedTransitionSourceIDs.removeAll(keepingCapacity: false)
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
         transientCaptureDepthTextures.removeAll(keepingCapacity: false)
         transitionSourceCaptureCount = 0
         transitionTargetCaptureCount = 0
+        transitionFilterDispatchCount = 0
+        transitionFilterFailureCount = 0
+        transitionFilterProcessor?.invalidate()
+        transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
         for request in pendingTileDraws {
@@ -2759,30 +2787,59 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             if let state = presentation._transitionRenderState {
                 let sourceID = ObjectIdentifier(state.sourceLayer)
                 activeTransitionSourceIDs.insert(sourceID)
-                if transitionCaptures[sourceID] == nil {
-                    guard let source = captureTransitionParticipant(
-                        state.sourceLayer,
-                        device: device,
-                        pipeline: pipeline,
-                        encoder: encoder
-                    ) else {
+                if transitionCaptures[sourceID] == nil,
+                   !failedTransitionSourceIDs.contains(sourceID) {
+                    let capture: TransitionCapturePair?
+                    if let filterValue = state.filter {
+                        guard let filter = filterValue as? CIFilter,
+                              let processor = transitionFilterProcessor,
+                              processor.supports(filter) else {
+                            failedTransitionSourceIDs.insert(sourceID)
+                            transitionFilterFailureCount += 1
+                            return
+                        }
+                        capture = createFilteredTransitionCapture(
+                            sourceLayer: state.sourceLayer,
+                            targetLayer: layer,
+                            filter: filter,
+                            processor: processor,
+                            device: device,
+                            pipeline: pipeline,
+                            encoder: encoder
+                        )
+                    } else {
+                        capture = createBuiltInTransitionCapture(
+                            sourceLayer: state.sourceLayer,
+                            targetLayer: layer,
+                            device: device,
+                            pipeline: pipeline,
+                            encoder: encoder
+                        )
+                    }
+                    guard let capture else {
+                        failedTransitionSourceIDs.insert(sourceID)
+                        if state.filter != nil {
+                            transitionFilterFailureCount += 1
+                        }
                         return
                     }
-                    guard let target = captureTransitionParticipant(
-                        layer,
-                        device: device,
-                        pipeline: pipeline,
-                        encoder: encoder
-                    ) else {
-                        source.texture.destroy()
-                        return
-                    }
-                    transitionCaptures[sourceID] = TransitionCapturePair(
-                        source: source,
-                        target: target
-                    )
+                    transitionCaptures[sourceID] = capture
                     transitionSourceCaptureCount += 1
                     transitionTargetCaptureCount += 1
+                }
+
+                if let execution = transitionCaptures[sourceID]?.filterExecution {
+                    do {
+                        try execution.encode(
+                            progress: Float(state.progress),
+                            commandEncoder: encoder
+                        )
+                        transitionFilterDispatchCount += 1
+                    } catch {
+                        destroyTransitionCapture(for: sourceID)
+                        failedTransitionSourceIDs.insert(sourceID)
+                        transitionFilterFailureCount += 1
+                    }
                 }
             }
         }
@@ -2795,21 +2852,102 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         for sourceID in staleSourceIDs {
             destroyTransitionCapture(for: sourceID)
         }
+        failedTransitionSourceIDs = failedTransitionSourceIDs.intersection(activeTransitionSourceIDs)
+    }
+
+    private func createBuiltInTransitionCapture(
+        sourceLayer: CALayer,
+        targetLayer: CALayer,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        encoder: GPUCommandEncoder
+    ) -> TransitionCapturePair? {
+        guard let source = captureTransitionParticipant(
+            sourceLayer,
+            device: device,
+            pipeline: pipeline,
+            encoder: encoder
+        ) else {
+            return nil
+        }
+        guard let target = captureTransitionParticipant(
+            targetLayer,
+            device: device,
+            pipeline: pipeline,
+            encoder: encoder
+        ) else {
+            source.texture.destroy()
+            return nil
+        }
+        return TransitionCapturePair(source: source, target: target, filterExecution: nil)
+    }
+
+    private func createFilteredTransitionCapture(
+        sourceLayer: CALayer,
+        targetLayer: CALayer,
+        filter: CIFilter,
+        processor: CIWebGPUTransitionProcessor,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        encoder: GPUCommandEncoder
+    ) -> TransitionCapturePair? {
+        guard let target = captureTransitionParticipant(
+            targetLayer,
+            device: device,
+            pipeline: pipeline,
+            encoder: encoder
+        ) else {
+            return nil
+        }
+        let sharedPixelSize = CGSize(width: target.pixelWidth, height: target.pixelHeight)
+        guard let source = captureTransitionParticipant(
+            sourceLayer,
+            pixelSizeOverride: sharedPixelSize,
+            device: device,
+            pipeline: pipeline,
+            encoder: encoder
+        ) else {
+            target.texture.destroy()
+            return nil
+        }
+
+        do {
+            let execution = try processor.makeExecution(
+                filter: filter,
+                sourceTexture: source.texture,
+                targetTexture: target.texture,
+                width: UInt32(target.pixelWidth),
+                height: UInt32(target.pixelHeight)
+            )
+            return TransitionCapturePair(
+                source: source,
+                target: target,
+                filterExecution: execution
+            )
+        } catch {
+            source.texture.destroy()
+            target.texture.destroy()
+            return nil
+        }
     }
 
     private func destroyTransitionCapture(for sourceID: ObjectIdentifier) {
         if let capture = transitionCaptures.removeValue(forKey: sourceID) {
+            capture.filterExecution?.invalidate()
             capture.source.texture.destroy()
             capture.target.texture.destroy()
         }
         texturedTextureViewCache.removeValue(forKey: .transitionSource(sourceID))
         texturedTextureViewCache.removeValue(forKey: .transitionTarget(sourceID))
+        texturedTextureViewCache.removeValue(forKey: .transitionFilter(sourceID))
         perFrameTexturedBindGroupCache.removeValue(forKey: .transitionSource(sourceID))
         perFrameTexturedBindGroupCache.removeValue(forKey: .transitionTarget(sourceID))
+        perFrameTexturedBindGroupCache.removeValue(forKey: .transitionFilter(sourceID))
     }
 
     private func captureTransitionParticipant(
         _ layer: CALayer,
+        pixelSizeOverride: CGSize? = nil,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         encoder: GPUCommandEncoder
@@ -2823,24 +2961,37 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return nil
         }
 
-        let requestedScale = presentation.contentsScale.isFinite
-            ? max(presentation.contentsScale, 1)
-            : 1
-        let maximumDimension = CGFloat(max(1, Int(device.limits.maxTextureDimension2D)))
-        let requestedWidth = bounds.width * requestedScale
-        let requestedHeight = bounds.height * requestedScale
-        guard requestedWidth.isFinite,
-              requestedHeight.isFinite,
-              requestedWidth > 0,
-              requestedHeight > 0 else {
-            return nil
+        let pixelWidth: Int
+        let pixelHeight: Int
+        if let pixelSizeOverride {
+            guard pixelSizeOverride.width.isFinite,
+                  pixelSizeOverride.height.isFinite,
+                  pixelSizeOverride.width > 0,
+                  pixelSizeOverride.height > 0 else {
+                return nil
+            }
+            pixelWidth = Int(pixelSizeOverride.width)
+            pixelHeight = Int(pixelSizeOverride.height)
+        } else {
+            let requestedScale = presentation.contentsScale.isFinite
+                ? max(presentation.contentsScale, 1)
+                : 1
+            let maximumDimension = CGFloat(max(1, Int(device.limits.maxTextureDimension2D)))
+            let requestedWidth = bounds.width * requestedScale
+            let requestedHeight = bounds.height * requestedScale
+            guard requestedWidth.isFinite,
+                  requestedHeight.isFinite,
+                  requestedWidth > 0,
+                  requestedHeight > 0 else {
+                return nil
+            }
+            let fittingScale = min(
+                1,
+                maximumDimension / max(requestedWidth, requestedHeight)
+            )
+            pixelWidth = max(1, Int(ceil(requestedWidth * fittingScale)))
+            pixelHeight = max(1, Int(ceil(requestedHeight * fittingScale)))
         }
-        let fittingScale = min(
-            1,
-            maximumDimension / max(requestedWidth, requestedHeight)
-        )
-        let pixelWidth = max(1, Int(ceil(requestedWidth * fittingScale)))
-        let pixelHeight = max(1, Int(ceil(requestedHeight * fittingScale)))
         let pixelSize = CGSize(width: pixelWidth, height: pixelHeight)
 
         let texture = device.createTexture(descriptor: GPUTextureDescriptor(
@@ -2928,10 +3079,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let compositeLayer = type(of: presentation).init(layer: presentation)
         compositeLayer.recursivelyClearDirtyAfterCommit()
-        return TransitionParticipantCapture(texture: texture, compositeLayer: compositeLayer)
+        return TransitionParticipantCapture(
+            texture: texture,
+            compositeLayer: compositeLayer,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        )
     }
 
-    /// Composites frozen source and target layer trees for a built-in transition.
+    /// Composites frozen source and target layer trees for a built-in or filtered transition.
     private func renderTransition(
         state: CATransitionRenderState,
         renderPass: GPURenderPassEncoder,
@@ -2968,6 +3124,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 renderPass: renderPass,
                 parentMatrix: parentMatrix
             )
+        }
+
+        if let filterExecution = capture.filterExecution {
+            renderParticipant(
+                TransitionParticipantCapture(
+                    texture: filterExecution.outputTexture,
+                    compositeLayer: capture.target.compositeLayer,
+                    pixelWidth: capture.target.pixelWidth,
+                    pixelHeight: capture.target.pixelHeight
+                ),
+                cacheKey: .transitionFilter(sourceID),
+                offset: .zero,
+                opacityMultiplier: 1
+            )
+            return
         }
 
         switch state.type {

@@ -188,8 +188,8 @@ struct CATransitionTests {
         #expect(layer.sublayers?.map(\.name) == ["current"])
     }
 
-    @Test("Filter transition is not reported as a completed built-in composition")
-    func filterTransitionDoesNotUseBuiltInCompositor() throws {
+    @Test("Filter transition is preserved for renderer validation")
+    func filterTransitionIsPreservedForRendererValidation() throws {
         let layer = CALayer()
         let transition = CATransition()
         transition.filter = "typed-filter-bridge-required"
@@ -202,6 +202,7 @@ struct CATransitionTests {
         )
 
         let presentation = try #require(layer.presentation())
-        #expect(presentation._transitionRenderState == nil)
+        let state = try #require(presentation._transitionRenderState)
+        #expect(state.filter as? String == "typed-filter-bridge-required")
     }
 }
