@@ -40,6 +40,7 @@ nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var textProbeResult: String = "pending"
 nonisolated(unsafe) var edgeAntialiasingProbeResult: String = "pending"
 nonisolated(unsafe) var booleanAnimationProbeResult: String = "pending"
+nonisolated(unsafe) var contentsAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -155,6 +156,7 @@ public func setup() {
             textProbeResult = "pending"
             edgeAntialiasingProbeResult = "pending"
             booleanAnimationProbeResult = "pending"
+            contentsAnimationProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -338,6 +340,9 @@ func installHarness() {
         })
         h.expose("getBooleanAnimationProbeResult", returning: {
             .string(booleanAnimationProbeResult)
+        })
+        h.expose("getContentsAnimationProbeResult", returning: {
+            .string(contentsAnimationProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1144,6 +1149,132 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     booleanAnimationProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginContentsAnimationProbe", action: {
+            Task { @MainActor in
+                contentsAnimationProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    contentsAnimationProbeResult = "error: contents animation dependencies unavailable"
+                    return
+                }
+
+                func makeImage(_ bytes: [UInt8]) -> CGImage? {
+                    CGImage(
+                        width: 1,
+                        height: 1,
+                        bitsPerComponent: 8,
+                        bitsPerPixel: 32,
+                        bytesPerRow: 4,
+                        space: .deviceRGB,
+                        bitmapInfo: CGBitmapInfo(
+                            rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                        ),
+                        provider: CGDataProvider(data: Data(bytes)),
+                        decode: nil,
+                        shouldInterpolate: false,
+                        intent: .defaultIntent
+                    )
+                }
+
+                guard let redImage = makeImage([255, 0, 0, 255]),
+                      let greenImage = makeImage([0, 255, 0, 255]),
+                      let blueImage = makeImage([0, 0, 255, 255]) else {
+                    contentsAnimationProbeResult = "error: contents animation images unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func makeLayer(x: CGFloat) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = CGPoint(x: x, y: 160)
+                    layer.zPosition = 100
+                    layer.contents = blueImage
+                    layer.contentsGravity = .resize
+                    layer.magnificationFilter = .nearest
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                func configure(_ animation: CAAnimation, offset: CFTimeInterval) {
+                    animation.duration = 1
+                    animation.speed = 0
+                    animation.timeOffset = offset
+                    animation.fillMode = .both
+                    animation.isRemovedOnCompletion = false
+                }
+
+                let basicBeforeLayer = makeLayer(x: 50)
+                let basicBefore = CABasicAnimation(keyPath: "contents")
+                basicBefore.fromValue = redImage
+                basicBefore.toValue = blueImage
+                configure(basicBefore, offset: 0.49)
+                basicBeforeLayer.add(basicBefore, forKey: "basicBefore")
+
+                let basicMidpointLayer = makeLayer(x: 130)
+                let basicMidpoint = CABasicAnimation(keyPath: "contents")
+                basicMidpoint.fromValue = redImage
+                basicMidpoint.toValue = blueImage
+                configure(basicMidpoint, offset: 0.5)
+                basicMidpointLayer.add(basicMidpoint, forKey: "basicMidpoint")
+
+                let linearLayer = makeLayer(x: 210)
+                let linear = CAKeyframeAnimation(keyPath: "contents")
+                linear.values = [redImage, greenImage, blueImage]
+                linear.keyTimes = [0, 0.5, 1]
+                configure(linear, offset: 0.25)
+                linearLayer.add(linear, forKey: "linear")
+
+                let discreteLayer = makeLayer(x: 290)
+                let discrete = CAKeyframeAnimation(keyPath: "contents")
+                discrete.values = [redImage, greenImage, blueImage]
+                discrete.keyTimes = [0, 0.5, 1]
+                discrete.calculationMode = .discrete
+                configure(discrete, offset: 0.75)
+                discreteLayer.add(discrete, forKey: "discrete")
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    basicBeforeLayer.removeFromSuperlayer()
+                    basicMidpointLayer.removeFromSuperlayer()
+                    linearLayer.removeFromSuperlayer()
+                    discreteLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 50, y: 140),
+                        CGPoint(x: 130, y: 140),
+                        CGPoint(x: 210, y: 140),
+                        CGPoint(x: 290, y: 140),
+                    ])
+                    restoreScene()
+                    contentsAnimationProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                } catch {
+                    restoreScene()
+                    contentsAnimationProbeResult = "error: \(error)"
                 }
             }
         })

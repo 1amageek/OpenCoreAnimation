@@ -54,7 +54,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
             // Copy content properties — use backing storage to bypass
             // markDirty during init (we reset dirty state below).
-            self.contents = otherLayer.contents
+            self._contents = otherLayer._contents
             self._contentsRect = otherLayer._contentsRect
             self.contentsCenter = otherLayer.contentsCenter
             self.contentsGravity = otherLayer.contentsGravity
@@ -292,7 +292,7 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._shadowPath = _shadowPath
 
         // Copy contents-related properties (critical for texture animation)
-        presentation.contents = contents
+        presentation._contents = _contents
         presentation._contentsRect = _contentsRect
         presentation.contentsCenter = contentsCenter
         presentation.contentsGravity = contentsGravity
@@ -671,6 +671,9 @@ open class CALayer: CAMediaTiming, Hashable {
         case "path", "shadowPath":
             applyPathAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
+        case "contents":
+            applyContentsAnimation(animation, to: layer, progress: progress)
+
         case "hidden", "isHidden", "masksToBounds", "doubleSided", "isDoubleSided", "shouldRasterize":
             applyBooleanAnimation(animation, to: layer, keyPath: keyPath, progress: progress)
 
@@ -700,6 +703,18 @@ open class CALayer: CAMediaTiming, Hashable {
             to: layer,
             keyPath: keyPath
         )
+    }
+
+    /// Non-interpolatable contents objects switch at the temporal midpoint,
+    /// matching QuartzCore's presentation-layer selection semantics.
+    private func applyContentsAnimation(
+        _ animation: CABasicAnimation,
+        to layer: CALayer,
+        progress: CFTimeInterval
+    ) {
+        let fromValue = animation.fromValue ?? _contents
+        let toValue = animation.toValue ?? _contents
+        layer._contents = progress < 0.5 ? fromValue : toValue
     }
 
     private func booleanAnimationValue(for keyPath: String) -> Bool? {
@@ -978,6 +993,7 @@ open class CALayer: CAMediaTiming, Hashable {
     private func currentAnimationValue(for keyPath: String) -> Any? {
         switch keyPath {
         case "opacity": return _opacity
+        case "contents": return _contents
         case "hidden", "isHidden": return _isHidden
         case "masksToBounds": return _masksToBounds
         case "doubleSided", "isDoubleSided": return _isDoubleSided
@@ -2396,6 +2412,8 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Applies a single keyframe value without interpolation.
     private func applyKeyframeValue(_ value: Any, layer: CALayer, keyPath: String) {
         switch keyPath {
+        case "contents":
+            layer._contents = value
         case "opacity":
             if let v = value as? Float { layer._opacity = v }
         case "position":
@@ -2543,6 +2561,8 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Interpolates between two keyframe values.
     private func interpolateKeyframeValue(from fromValue: Any, to toValue: Any, progress: CFTimeInterval, layer: CALayer, keyPath: String) {
         switch keyPath {
+        case "contents":
+            layer._contents = progress < 0.5 ? fromValue : toValue
         case "opacity":
             if let f = fromValue as? Float, let t = toValue as? Float {
                 layer._opacity = f + Float(progress) * (t - f)
@@ -2871,6 +2891,10 @@ open class CALayer: CAMediaTiming, Hashable {
         layer: CALayer,
         keyPath: String
     ) {
+        if keyPath == "contents" {
+            layer._contents = t < 0.5 ? p1 : p2
+            return
+        }
         guard let value = cubicValue(
             p0: p0,
             p1: p1,
@@ -3183,11 +3207,15 @@ open class CALayer: CAMediaTiming, Hashable {
     // MARK: - Providing the Layer's Content
 
     /// An object that provides the contents of the layer. Animatable.
+    private var _contents: Any?
     open var contents: Any? {
-        didSet {
+        get { _contents }
+        set {
+            let oldValue = _contents
+            _contents = newValue
             markDirty(.contents)
             if Self.needsDisplay(forKey: "contents") { setNeedsDisplay() }
-            CATransaction.registerChange(layer: self, keyPath: "contents", oldValue: oldValue, newValue: contents)
+            CATransaction.registerChange(layer: self, keyPath: "contents", oldValue: oldValue, newValue: newValue)
         }
     }
 
