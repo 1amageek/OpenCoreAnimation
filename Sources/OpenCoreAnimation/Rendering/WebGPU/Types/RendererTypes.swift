@@ -30,7 +30,8 @@ public struct CARendererUniforms {
     public var gradientStartPoint: SIMD2<Float>
     public var gradientEndPoint: SIMD2<Float>
     public var gradientColorCount: Float
-    public var padding3: SIMD3<Float>
+    /// Raw `CAEdgeAntialiasingMask` bits in x; y/z preserve uniform alignment.
+    public var edgeAntialiasingParameters: SIMD3<Float>
     /// Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
     /// Corresponds to CACornerMask corners for selective corner rounding.
     public var cornerRadii: SIMD4<Float>
@@ -51,6 +52,7 @@ public struct CARendererUniforms {
         gradientStartPoint: SIMD2<Float> = .zero,
         gradientEndPoint: SIMD2<Float> = SIMD2(0, 1),
         gradientColorCount: Float = 0,
+        edgeAntialiasingMask: Float = 0,
         cornerRadii: SIMD4<Float> = .zero
     ) {
         self.mvpMatrix = mvpMatrix
@@ -62,7 +64,7 @@ public struct CARendererUniforms {
         self.gradientStartPoint = gradientStartPoint
         self.gradientEndPoint = gradientEndPoint
         self.gradientColorCount = gradientColorCount
-        self.padding3 = .zero
+        self.edgeAntialiasingParameters = SIMD3(edgeAntialiasingMask, 0, 0)
         self.cornerRadii = cornerRadii
         self.gradientColors = (.zero, .zero, .zero, .zero, .zero, .zero, .zero, .zero)
         self.gradientLocations = .zero
@@ -79,7 +81,8 @@ public struct TexturedUniforms {
     /// Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
     public var cornerRadii: SIMD4<Float>
     public var samplingBias: Float
-    public var padding0: Float = 0
+    /// Raw `CAEdgeAntialiasingMask` bits.
+    public var edgeAntialiasingMask: Float
     public var padding1: Float = 0
     public var padding2: Float = 0
 
@@ -89,7 +92,8 @@ public struct TexturedUniforms {
         cornerRadius: Float = 0.0,
         layerSize: SIMD2<Float> = .zero,
         cornerRadii: SIMD4<Float> = .zero,
-        samplingBias: Float = 0
+        samplingBias: Float = 0,
+        edgeAntialiasingMask: Float = 0
     ) {
         self.mvpMatrix = mvpMatrix
         self.opacity = opacity
@@ -97,6 +101,7 @@ public struct TexturedUniforms {
         self.layerSize = layerSize
         self.cornerRadii = cornerRadii
         self.samplingBias = samplingBias
+        self.edgeAntialiasingMask = edgeAntialiasingMask
     }
 }
 

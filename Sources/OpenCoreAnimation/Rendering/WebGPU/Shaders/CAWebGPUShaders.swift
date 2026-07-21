@@ -84,7 +84,7 @@ public enum CAWebGPUShaders {
         gradientStartPoint: vec2<f32>,
         gradientEndPoint: vec2<f32>,
         gradientColorCount: f32,
-        padding3: vec3<f32>,
+        edgeAntialiasingParameters: vec3<f32>,
         // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
         // Corresponds to: (bottom-left, bottom-right, top-left, top-right)
         cornerRadii: vec4<f32>,
@@ -180,6 +180,31 @@ public enum CAWebGPUShaders {
         return uniforms.cornerRadii;
     }
 
+    // Calculates coverage for independently selectable layer edges. Coordinates
+    // are layer-local (left/bottom = 0, right/top = 1), so derivatives preserve
+    // a one-pixel transition under affine and perspective transforms.
+    fn edgeCoverage(layerCoord: vec2<f32>) -> f32 {
+        let mask = u32(max(uniforms.edgeAntialiasingParameters.x, 0.0));
+        if (mask == 0u) {
+            return 1.0;
+        }
+        let footprint = max(fwidth(layerCoord), vec2<f32>(0.000001));
+        var coverage = 1.0;
+        if ((mask & 1u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.x, layerCoord.x);
+        }
+        if ((mask & 2u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.x, 1.0 - layerCoord.x);
+        }
+        if ((mask & 4u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.y, layerCoord.y);
+        }
+        if ((mask & 8u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.y, 1.0 - layerCoord.y);
+        }
+        return coverage;
+    }
+
     // Get gradient color at index
     fn getGradientColor(index: i32) -> vec4<f32> {
         switch (index) {
@@ -240,12 +265,13 @@ public enum CAWebGPUShaders {
 
     @fragment
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+        let layerEdgeCoverage = edgeCoverage(input.texCoord);
         // Handle case where layer size is zero
         if (uniforms.layerSize.x <= 0.0 || uniforms.layerSize.y <= 0.0) {
             if (input.color.a <= 0.0) {
                 discard;
             }
-            return input.color;
+            return vec4<f32>(input.color.rgb, input.color.a * layerEdgeCoverage);
         }
 
         // Convert texCoord (0-1) to pixel coordinates centered at origin
@@ -272,7 +298,7 @@ public enum CAWebGPUShaders {
 
             // Sample gradient
             var gradientColor = sampleGradient(t);
-            gradientColor.a *= uniforms.opacity;
+            gradientColor.a *= uniforms.opacity * layerEdgeCoverage;
 
             // Apply corner radius if set (using per-corner radii)
             if (hasAnyCornerRadius) {
@@ -307,7 +333,7 @@ public enum CAWebGPUShaders {
             let innerAlpha = 1.0 - smoothstep(-1.0, 1.0, innerDist);
             let borderAlpha = outerAlpha - innerAlpha;
 
-            let borderColor = vec4<f32>(input.color.rgb, input.color.a * borderAlpha);
+            let borderColor = vec4<f32>(input.color.rgb, input.color.a * borderAlpha * layerEdgeCoverage);
             if (borderColor.a <= 0.0) {
                 discard;
             }
@@ -319,7 +345,7 @@ public enum CAWebGPUShaders {
             if (input.color.a <= 0.0) {
                 discard;
             }
-            return input.color;
+            return vec4<f32>(input.color.rgb, input.color.a * layerEdgeCoverage);
         }
 
         // Calculate signed distance for fill using per-corner radii
@@ -328,7 +354,7 @@ public enum CAWebGPUShaders {
         // Anti-aliased edge (smooth over 1 pixel)
         let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);
 
-        let fillColor = vec4<f32>(input.color.rgb, input.color.a * alpha);
+        let fillColor = vec4<f32>(input.color.rgb, input.color.a * alpha * layerEdgeCoverage);
         if (fillColor.a <= 0.0) {
             discard;
         }
@@ -366,7 +392,7 @@ public enum CAWebGPUShaders {
         // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
         cornerRadii: vec4<f32>,
         samplingBias: f32,
-        padding0: f32,
+        edgeAntialiasingMask: f32,
         padding1: f32,
         padding2: f32,
     }
@@ -385,6 +411,7 @@ public enum CAWebGPUShaders {
         @builtin(position) position: vec4<f32>,
         @location(0) texCoord: vec2<f32>,
         @location(1) color: vec4<f32>,
+        @location(2) layerCoord: vec2<f32>,
     }
 
     @vertex
@@ -393,7 +420,30 @@ public enum CAWebGPUShaders {
         output.position = uniforms.mvpMatrix * vec4<f32>(input.position, 0.0, 1.0);
         output.texCoord = input.texCoord;
         output.color = input.color;
+        output.layerCoord = input.position;
         return output;
+    }
+
+    fn edgeCoverage(layerCoord: vec2<f32>) -> f32 {
+        let mask = u32(max(uniforms.edgeAntialiasingMask, 0.0));
+        if (mask == 0u) {
+            return 1.0;
+        }
+        let footprint = max(fwidth(layerCoord), vec2<f32>(0.000001));
+        var coverage = 1.0;
+        if ((mask & 1u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.x, layerCoord.x);
+        }
+        if ((mask & 2u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.x, 1.0 - layerCoord.x);
+        }
+        if ((mask & 4u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.y, layerCoord.y);
+        }
+        if ((mask & 8u) != 0u) {
+            coverage *= smoothstep(0.0, footprint.y, 1.0 - layerCoord.y);
+        }
+        return coverage;
     }
 
     // Signed distance function for a rounded rectangle with per-corner radii
@@ -438,7 +488,7 @@ public enum CAWebGPUShaders {
         ) * input.color;
 
         // Apply opacity
-        texColor.a *= uniforms.opacity;
+        texColor.a *= uniforms.opacity * edgeCoverage(input.layerCoord);
 
         // Get effective corner radii
         let radii = getEffectiveRadii();
@@ -446,10 +496,7 @@ public enum CAWebGPUShaders {
 
         // Apply corner radius if set
         if (hasAnyCornerRadius && uniforms.layerSize.x > 0.0 && uniforms.layerSize.y > 0.0) {
-            // Compensate for V-flip: texCoord.y is flipped for texture sampling,
-            // but SDF needs unflipped coordinates for correct corner placement.
-            let sdfCoord = vec2<f32>(input.texCoord.x, 1.0 - input.texCoord.y);
-            let pixelCoord = (sdfCoord - 0.5) * uniforms.layerSize;
+            let pixelCoord = (input.layerCoord - 0.5) * uniforms.layerSize;
             let halfSize = uniforms.layerSize * 0.5;
             let dist = sdRoundedBoxVariable(pixelCoord, halfSize, radii);
             let alpha = 1.0 - smoothstep(-1.0, 1.0, dist);

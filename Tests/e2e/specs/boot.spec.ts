@@ -137,6 +137,11 @@ test.describe("OpenCoreAnimation smoke", () => {
             "initial=255,0,0,255;0,255,0,255,updated=0,0,255,255;255,255,0,255,normalVertical=255,0,0,255;255,255,255,255,flippedVertical=255,255,255,255;0,0,255,255,callbacks=true,display=true,retained=true,replaced=true,released=true,rejected=true,failures=1"
         );
 
+        await h.beginEdgeAntialiasingProbe();
+        await expect.poll(() => h.getEdgeAntialiasingProbeResult(), { timeout: 10_000 }).toBe(
+            "initial=255,255,255,255;40,40,40,255;255,255,255,255;255,255,255,255;215,215,215,255;40,40,40,255,mutated=255,255,255,255;215,215,215,255,bottom=40,40,40,255;255,255,255,255,top=255,255,255,255;215,215,215,255"
+        );
+
         await h.beginTransformDepthProbe();
         await expect.poll(() => h.getTransformDepthProbeResult(), { timeout: 10_000 }).toBe(
             "crossing=true,transparent=true,isolated=true,flattened=true,nested=true,captures=10,composites=10,groupOpacity=true,filter=true,mask=true,directMask=true,rasterMask=true,maskUpdated=true,nestedFilter=true,shadow=true,shadowPath=true,compositionDepth=true,nestedComposition=true,overflow=true,updated=true,reused=true"

@@ -1859,6 +1859,21 @@ struct CAEdgeAntialiasingMaskTests {
         #expect(!layer.edgeAntialiasingMask.contains(.layerTopEdge))
         #expect(!layer.edgeAntialiasingMask.contains(.layerBottomEdge))
     }
+
+    @Test("Presentation state carries edge antialiasing configuration")
+    func presentationCarriesEdgeAntialiasingConfiguration() throws {
+        let layer = CALayer()
+        layer.allowsEdgeAntialiasing = true
+        layer.edgeAntialiasingMask = [.layerLeftEdge, .layerTopEdge]
+
+        let presentation = try #require(layer.presentation())
+        #expect(presentation.allowsEdgeAntialiasing)
+        #expect(presentation.edgeAntialiasingMask == [.layerLeftEdge, .layerTopEdge])
+
+        layer.edgeAntialiasingMask = [.layerRightEdge]
+        let updatedPresentation = try #require(layer.presentation())
+        #expect(updatedPresentation.edgeAntialiasingMask == [.layerRightEdge])
+    }
 }
 
 // MARK: - Autoresizing Mask Tests

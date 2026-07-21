@@ -38,6 +38,7 @@ nonisolated(unsafe) var pixelReadbackResult: String = "pending"
 nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var textProbeResult: String = "pending"
+nonisolated(unsafe) var edgeAntialiasingProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -151,6 +152,7 @@ public func setup() {
             transitionFilterProbeResult = "pending"
             layerFilterProbeResult = "pending"
             textProbeResult = "pending"
+            edgeAntialiasingProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -328,6 +330,9 @@ func installHarness() {
         })
         h.expose("getTextProbeResult", returning: {
             .string(textProbeResult)
+        })
+        h.expose("getEdgeAntialiasingProbeResult", returning: {
+            .string(edgeAntialiasingProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -902,6 +907,129 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     textProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginEdgeAntialiasingProbe", action: {
+            Task { @MainActor in
+                edgeAntialiasingProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    edgeAntialiasingProbeResult = "error: edge antialiasing dependencies unavailable"
+                    return
+                }
+
+                let whitePixel = Data([255, 255, 255, 255])
+                guard let whiteImage = CGImage(
+                    width: 1,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 4,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                    provider: CGDataProvider(data: whitePixel),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    edgeAntialiasingProbeResult = "error: edge antialiasing image unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func makeLayer(x: CGFloat, edgeMask: CAEdgeAntialiasingMask?) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = CGPoint(x: x, y: 80.25)
+                    layer.zPosition = 100
+                    layer.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                    if let edgeMask {
+                        layer.allowsEdgeAntialiasing = true
+                        layer.edgeAntialiasingMask = edgeMask
+                    }
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                let disabledLayer = makeLayer(x: 50.25, edgeMask: nil)
+                let mutableLayer = makeLayer(x: 120.25, edgeMask: [.layerLeftEdge])
+                let rightLayer = makeLayer(x: 190.25, edgeMask: [.layerRightEdge])
+                let texturedLayer = CALayer()
+                texturedLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                texturedLayer.position = CGPoint(x: 260.25, y: 80.25)
+                texturedLayer.zPosition = 100
+                texturedLayer.contents = whiteImage
+                texturedLayer.contentsGravity = .resize
+                texturedLayer.allowsEdgeAntialiasing = true
+                texturedLayer.edgeAntialiasingMask = [.layerLeftEdge]
+                root.addSublayer(texturedLayer)
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    disabledLayer.removeFromSuperlayer()
+                    mutableLayer.removeFromSuperlayer()
+                    rightLayer.removeFromSuperlayer()
+                    texturedLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                let samplePoints = [
+                    CGPoint(x: 30, y: 220),
+                    CGPoint(x: 100, y: 220),
+                    CGPoint(x: 139, y: 220),
+                    CGPoint(x: 170, y: 220),
+                    CGPoint(x: 209, y: 220),
+                    CGPoint(x: 240, y: 220),
+                ]
+                engine.renderFrame()
+                do {
+                    let initialPixels = try await renderer.readbackPixels(at: samplePoints)
+                    mutableLayer.edgeAntialiasingMask = [.layerRightEdge]
+                    engine.renderFrame()
+                    let mutatedPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 100, y: 220),
+                        CGPoint(x: 139, y: 220),
+                    ])
+                    mutableLayer.edgeAntialiasingMask = [.layerBottomEdge]
+                    engine.renderFrame()
+                    let bottomPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 120, y: 239),
+                        CGPoint(x: 120, y: 200),
+                    ])
+                    mutableLayer.edgeAntialiasingMask = [.layerTopEdge]
+                    engine.renderFrame()
+                    let topPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 120, y: 239),
+                        CGPoint(x: 120, y: 200),
+                    ])
+                    restoreScene()
+                    edgeAntialiasingProbeResult = "initial="
+                        + initialPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",mutated="
+                        + mutatedPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",bottom="
+                        + bottomPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",top="
+                        + topPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                } catch {
+                    restoreScene()
+                    edgeAntialiasingProbeResult = "error: \(error)"
                 }
             }
         })

@@ -5197,6 +5197,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             opacity: currentEffectiveOpacity,
             cornerRadius: Float(presentationLayer.cornerRadius),
             layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+            edgeAntialiasingMask: presentationLayer.edgeAntialiasingMaskValue,
             cornerRadii: presentationLayer.cornerRadiiComponents
         )
 
@@ -5265,6 +5266,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
             borderWidth: Float(presentationLayer.borderWidth),
             renderMode: 1.0,  // Border mode
+            edgeAntialiasingMask: presentationLayer.edgeAntialiasingMaskValue,
             cornerRadii: presentationLayer.cornerRadiiComponents
         )
 
@@ -5818,7 +5820,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             opacity: currentEffectiveOpacity,
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
-            cornerRadii: effectiveCornerRadii
+            cornerRadii: effectiveCornerRadii,
+            edgeAntialiasingMask: layer.edgeAntialiasingMaskValue
         )
 
         let white = currentReplicatorColor
@@ -6037,7 +6040,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             opacity: currentEffectiveOpacity,
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
-            cornerRadii: effectiveCornerRadii
+            cornerRadii: effectiveCornerRadii,
+            edgeAntialiasingMask: layer.edgeAntialiasingMaskValue
         )
 
         // Write uniforms
@@ -6624,7 +6628,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             descriptor: GPUBindGroupDescriptor(
                 layout: texturedBindGroupLayout,
                 entries: [
-                    GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<CARendererUniforms>.stride))),
+                    GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<TexturedUniforms>.stride))),
                     GPUBindGroupEntry(binding: 1, resource: .sampler(textureSampler)),
                     GPUBindGroupEntry(binding: 2, resource: .textureView(textureView))
                 ]
@@ -6682,12 +6686,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let effectiveCornerRadii: SIMD4<Float> = textLayer.masksToBounds ? textLayer.cornerRadiiComponents : .zero
 
         // Update uniforms
-        var uniforms = CARendererUniforms(
+        var uniforms = TexturedUniforms(
             mvpMatrix: finalMatrix,
             opacity: currentEffectiveOpacity,
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(width), Float(height)),
-            cornerRadii: effectiveCornerRadii
+            cornerRadii: effectiveCornerRadii,
+            edgeAntialiasingMask: textLayer.edgeAntialiasingMaskValue
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -7368,12 +7373,20 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 // Create vertices from triangulation
                 var vertices: [CARendererVertex] = []
                 let colorComponents = cgColorToSIMD4(fillColor)
+                let bounds = shapeLayer.bounds
+                let hasValidBounds = bounds.width > 0 && bounds.height > 0
 
                 for idx in indices {
                     let point = polyline[idx]
+                    let layerCoordinate = hasValidBounds
+                        ? SIMD2(
+                            Float((point.x - bounds.minX) / bounds.width),
+                            Float((point.y - bounds.minY) / bounds.height)
+                        )
+                        : .zero
                     vertices.append(CARendererVertex(
                         position: SIMD2(Float(point.x), Float(point.y)),
-                        texCoord: SIMD2(0, 0),  // Not used for solid color
+                        texCoord: layerCoordinate,
                         color: colorComponents
                     ))
                 }
@@ -7390,7 +7403,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     mvpMatrix: modelMatrix,
                     opacity: currentEffectiveOpacity,
                     cornerRadius: 0,
-                    layerSize: .zero  // No SDF-based corner radius for shapes
+                    layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
+                    edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
                 )
 
                 let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
@@ -7433,11 +7447,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 // Create vertices
                 var vertices: [CARendererVertex] = []
                 let colorComponents = cgColorToSIMD4(strokeColor)
+                let bounds = shapeLayer.bounds
+                let hasValidBounds = bounds.width > 0 && bounds.height > 0
 
                 for point in strokeVertices {
+                    let layerCoordinate = hasValidBounds
+                        ? SIMD2(
+                            Float((point.x - bounds.minX) / bounds.width),
+                            Float((point.y - bounds.minY) / bounds.height)
+                        )
+                        : .zero
                     vertices.append(CARendererVertex(
                         position: SIMD2(Float(point.x), Float(point.y)),
-                        texCoord: SIMD2(0, 0),
+                        texCoord: layerCoordinate,
                         color: colorComponents
                     ))
                 }
@@ -7452,7 +7474,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     mvpMatrix: modelMatrix,
                     opacity: currentEffectiveOpacity,
                     cornerRadius: 0,
-                    layerSize: .zero
+                    layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
+                    edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
                 )
 
                 let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
@@ -7519,6 +7542,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             gradientStartPoint: SIMD2<Float>(Float(gradientLayer.startPoint.x), Float(gradientLayer.startPoint.y)),
             gradientEndPoint: SIMD2<Float>(Float(gradientLayer.endPoint.x), Float(gradientLayer.endPoint.y)),
             gradientColorCount: Float(min(colors.count, kMaxGradientStops)),
+            edgeAntialiasingMask: gradientLayer.edgeAntialiasingMaskValue,
             cornerRadii: gradientLayer.cornerRadiiComponents
         )
 
@@ -11960,6 +11984,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     if fadeOpacity < 1 {
                         tiledLayer.markDirty(.contents)
                     }
+                    var outerEdges: CAEdgeAntialiasingMask = []
+                    if tx == 0 { outerEdges.insert(.layerLeftEdge) }
+                    if tx == tilesX - 1 { outerEdges.insert(.layerRightEdge) }
+                    if ty == 0 { outerEdges.insert(.layerBottomEdge) }
+                    if ty == tilesY - 1 { outerEdges.insert(.layerTopEdge) }
+                    let tileEdgeAntialiasingMask = presentation.allowsEdgeAntialiasing
+                        ? Float(presentation.edgeAntialiasingMask.intersection(outerEdges).rawValue)
+                        : 0
                     // Render cached tile as texture
                     renderTileWithImage(
                         cachedImage,
@@ -11968,7 +12000,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         renderPass: renderPass,
                         tileMatrix: tileMatrix,
                         tileSize: CGSize(width: tileW, height: tileH),
-                        opacity: currentEffectiveOpacity * fadeOpacity
+                        opacity: currentEffectiveOpacity * fadeOpacity,
+                        edgeAntialiasingMask: tileEdgeAntialiasingMask
                     )
                 } else {
                     // Request tile from delegate if not already loading
@@ -12000,10 +12033,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         tileMatrix: Matrix4x4,
         tileSize: CGSize,
-        opacity: Float
+        opacity: Float,
+        edgeAntialiasingMask: Float
     ) {
-        guard let texturedPipeline = texturedPipeline,
-              let vertexBuffer = vertexBuffer,
+        guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let textureSampler = textureSampler else { return }
 
@@ -12039,11 +12072,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let (vertexOffset, layerIndex) = allocation
 
         // Create uniforms
-        var uniforms = CARendererUniforms(
+        var uniforms = TexturedUniforms(
             mvpMatrix: tileMatrix,
             opacity: opacity,
             cornerRadius: 0,
-            layerSize: SIMD2<Float>(Float(tileSize.width), Float(tileSize.height))
+            layerSize: SIMD2<Float>(Float(tileSize.width), Float(tileSize.height)),
+            edgeAntialiasingMask: edgeAntialiasingMask
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -12061,7 +12095,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     binding: 0,
                     resource: .bufferBinding(GPUBufferBinding(
                         buffer: uniformBuffer,
-                        size: UInt64(MemoryLayout<CARendererUniforms>.stride)
+                        size: UInt64(MemoryLayout<TexturedUniforms>.stride)
                     ))
                 ),
                 GPUBindGroupEntry(binding: 1, resource: .sampler(textureSampler)),

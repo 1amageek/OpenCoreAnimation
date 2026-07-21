@@ -4,6 +4,12 @@ import Foundation
 // MARK: - WASM Helper Extensions
 
 extension CALayer {
+    /// Raw edge-antialiasing bits consumed by the WebGPU fragment shaders.
+    internal var edgeAntialiasingMaskValue: Float {
+        guard allowsEdgeAntialiasing else { return 0 }
+        return Float(edgeAntialiasingMask.rawValue & 0xF)
+    }
+
     /// Converts the layer's background color to SIMD4<Float>.
     internal var backgroundColorComponents: SIMD4<Float> {
         guard let color = backgroundColor,
