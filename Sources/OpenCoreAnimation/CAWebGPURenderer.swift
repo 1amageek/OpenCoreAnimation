@@ -7304,8 +7304,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         collectBackdropCompositionTargets(
             rootLayer,
             parentMatrix: projectionMatrix,
-            ancestorCompositionTargets: [],
+            ancestorBackdropScopes: [],
             hasUnsupportedAncestorClip: false,
+            hasUnsupportedAncestorRasterization: false,
             inheritedOpacity: 1,
             targets: &targets,
             structurallyInvalidKeys: &structurallyInvalidKeys
@@ -7558,6 +7559,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
         }
 
+        if let finalDepth = previousDepth, finalDepth > 0 {
+            prerenderFilteredLayers(
+                rootLayer,
+                encoder: encoder,
+                projectionMatrix: projectionMatrix
+            )
+        }
+
         failedCompositionKeys.formIntersection(failedKeys)
         let staleKeys = compositionLayerResources.keys.filter { !activeKeys.contains($0) }
         for key in staleKeys {
@@ -7569,8 +7578,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func collectBackdropCompositionTargets(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
-        ancestorCompositionTargets: [LayerPrepassTarget],
+        ancestorBackdropScopes: [LayerPrepassTarget],
         hasUnsupportedAncestorClip: Bool,
+        hasUnsupportedAncestorRasterization: Bool,
         inheritedOpacity: Float,
         targets: inout [BackdropCompositionTarget],
         structurallyInvalidKeys: inout Set<LayerRenderKey>
@@ -7581,29 +7591,36 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let key = renderKey(for: layer)
         let hasComposition = presentation.compositingFilter != nil
             || presentation.backgroundFilters?.isEmpty == false
-        var descendantAncestors = ancestorCompositionTargets
+        let createsBackdropScope = hasComposition
+            || requiresGroupOpacity(presentation)
+            || presentation.filters?.isEmpty == false
+        let prepass = LayerPrepassTarget(
+            layer: layer,
+            presentationLayer: presentation,
+            parentMatrix: parentMatrix,
+            renderKey: key,
+            timeOffset: currentReplicatorTimeOffset
+        )
+        var descendantScopes = ancestorBackdropScopes
         if hasComposition {
-            let prepass = LayerPrepassTarget(
-                layer: layer,
-                presentationLayer: presentation,
-                parentMatrix: parentMatrix,
-                renderKey: key,
-                timeOffset: currentReplicatorTimeOffset
-            )
             targets.append(BackdropCompositionTarget(
                 prepass: prepass,
-                scope: ancestorCompositionTargets.last,
-                depth: ancestorCompositionTargets.count,
-                sourceOpacity: presentation.opacity,
-                sourceColor: currentReplicatorColor
+                scope: ancestorBackdropScopes.last,
+                depth: ancestorBackdropScopes.count,
+                sourceOpacity: inheritedOpacity * presentation.opacity,
+                sourceColor: ancestorBackdropScopes.isEmpty
+                    ? currentReplicatorColor
+                    : SIMD4<Float>(repeating: 1)
             ))
             if hasUnsupportedAncestorClip {
                 structurallyInvalidKeys.insert(key)
             }
-            if inheritedOpacity < 1 {
+            if hasUnsupportedAncestorRasterization {
                 structurallyInvalidKeys.insert(key)
             }
-            descendantAncestors.append(prepass)
+        }
+        if createsBackdropScope {
+            descendantScopes.append(prepass)
         }
 
         let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
@@ -7615,11 +7632,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             collectBackdropCompositionTargets(
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
-                ancestorCompositionTargets: descendantAncestors,
+                ancestorBackdropScopes: descendantScopes,
                 hasUnsupportedAncestorClip: hasUnsupportedAncestorClip
                     || presentation.mask != nil
                     || presentation.masksToBounds,
-                inheritedOpacity: inheritedOpacity * presentation.opacity,
+                hasUnsupportedAncestorRasterization: hasUnsupportedAncestorRasterization
+                    || presentation.shouldRasterize,
+                inheritedOpacity: createsBackdropScope
+                    ? 1
+                    : inheritedOpacity * presentation.opacity,
                 targets: &targets,
                 structurallyInvalidKeys: &structurallyInvalidKeys
             )

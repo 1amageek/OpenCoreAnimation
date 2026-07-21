@@ -766,6 +766,7 @@ func installHarness() {
                 outerComposition.position = nestedBackdrop.position
                 outerComposition.zPosition = 209
                 outerComposition.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                outerComposition.opacity = 0.5
                 outerComposition.compositingFilter = screen
                 let innerComposition = CALayer()
                 innerComposition.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
@@ -774,6 +775,67 @@ func installHarness() {
                 innerComposition.compositingFilter = multiply
                 outerComposition.addSublayer(innerComposition)
                 root.addSublayer(outerComposition)
+
+                let inheritedOpacityBackdrop = CALayer()
+                inheritedOpacityBackdrop.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+                inheritedOpacityBackdrop.position = CGPoint(x: 50, y: 40)
+                inheritedOpacityBackdrop.zPosition = 196
+                inheritedOpacityBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(inheritedOpacityBackdrop)
+
+                let opacityParent = CALayer()
+                opacityParent.bounds = inheritedOpacityBackdrop.bounds
+                opacityParent.position = inheritedOpacityBackdrop.position
+                opacityParent.zPosition = 210
+                opacityParent.opacity = 0.5
+                opacityParent.allowsGroupOpacity = false
+                let inheritedOpacitySource = CALayer()
+                inheritedOpacitySource.bounds = inheritedOpacityBackdrop.bounds
+                inheritedOpacitySource.position = CGPoint(x: 15, y: 15)
+                inheritedOpacitySource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                inheritedOpacitySource.compositingFilter = multiply
+                opacityParent.addSublayer(inheritedOpacitySource)
+                root.addSublayer(opacityParent)
+
+                let groupOpacityBackdrop = CALayer()
+                groupOpacityBackdrop.bounds = inheritedOpacityBackdrop.bounds
+                groupOpacityBackdrop.position = CGPoint(x: 85, y: 40)
+                groupOpacityBackdrop.zPosition = 195
+                groupOpacityBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(groupOpacityBackdrop)
+
+                let groupOpacityParent = CALayer()
+                groupOpacityParent.bounds = groupOpacityBackdrop.bounds
+                groupOpacityParent.position = groupOpacityBackdrop.position
+                groupOpacityParent.zPosition = 211
+                groupOpacityParent.opacity = 0.5
+                let groupOpacitySource = CALayer()
+                groupOpacitySource.bounds = groupOpacityBackdrop.bounds
+                groupOpacitySource.position = CGPoint(x: 15, y: 15)
+                groupOpacitySource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                groupOpacitySource.compositingFilter = multiply
+                groupOpacityParent.addSublayer(groupOpacitySource)
+                root.addSublayer(groupOpacityParent)
+
+                let filteredScopeBackdrop = CALayer()
+                filteredScopeBackdrop.bounds = inheritedOpacityBackdrop.bounds
+                filteredScopeBackdrop.position = CGPoint(x: 160, y: 40)
+                filteredScopeBackdrop.zPosition = 194
+                filteredScopeBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(filteredScopeBackdrop)
+
+                let filteredScopeParent = CALayer()
+                filteredScopeParent.bounds = filteredScopeBackdrop.bounds
+                filteredScopeParent.position = filteredScopeBackdrop.position
+                filteredScopeParent.zPosition = 212
+                filteredScopeParent.filters = [CAFilter.colorInvert()]
+                let filteredScopeSource = CALayer()
+                filteredScopeSource.bounds = filteredScopeBackdrop.bounds
+                filteredScopeSource.position = CGPoint(x: 15, y: 15)
+                filteredScopeSource.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                filteredScopeSource.compositingFilter = multiply
+                filteredScopeParent.addSublayer(filteredScopeSource)
+                root.addSublayer(filteredScopeParent)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -791,6 +853,9 @@ func installHarness() {
                         CGPoint(x: 260, y: 260),
                         CGPoint(x: 315, y: 260),
                         CGPoint(x: 345, y: 260),
+                        CGPoint(x: 50, y: 260),
+                        CGPoint(x: 85, y: 260),
+                        CGPoint(x: 160, y: 260),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -803,7 +868,10 @@ func installHarness() {
                         && pixels[8] == [255, 255, 0, 255]
                         && pixels[9] == [255, 0, 0, 255]
                         && pixels[10] == [255, 0, 0, 255]
-                        && pixels[11] == [255, 255, 0, 255]
+                        && pixels[11] == [255, 128, 0, 255]
+                        && pixels[12] == [127, 0, 0, 255]
+                        && pixels[13] == [128, 128, 0, 255]
+                        && pixels[14] == [255, 0, 255, 255]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -817,12 +885,18 @@ func installHarness() {
                     compositionReplicator.removeFromSuperlayer()
                     nestedBackdrop.removeFromSuperlayer()
                     outerComposition.removeFromSuperlayer()
+                    inheritedOpacityBackdrop.removeFromSuperlayer()
+                    opacityParent.removeFromSuperlayer()
+                    groupOpacityBackdrop.removeFromSuperlayer()
+                    groupOpacityParent.removeFromSuperlayer()
+                    filteredScopeBackdrop.removeFromSuperlayer()
+                    filteredScopeParent.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
                     engine.renderFrame()
-                    compositionProbeResult = "ordered=\(composited),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),after=\(renderer.activeCompositionResourceCount)"
+                    compositionProbeResult = "ordered=\(composited),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
                 } catch {
                     compositionProbeResult = "error: \(error)"
                 }
