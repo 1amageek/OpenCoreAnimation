@@ -2048,7 +2048,11 @@ open class CALayer: CAMediaTiming, Hashable {
         switch animation.calculationMode {
         case .paced, .cubicPaced:
             // Calculate arc-length parameterized progress
-            let (remappedProgress, pacedKeyTimes) = calculatePacedProgress(progress: CGFloat(progress), values: values, cubic: animation.calculationMode == .cubicPaced)
+            let (remappedProgress, pacedKeyTimes) = calculatePacedProgress(
+                progress: CGFloat(progress),
+                values: values,
+                animation: animation
+            )
             effectiveProgress = CFTimeInterval(remappedProgress)
             effectiveKeyTimes = pacedKeyTimes
         default:
@@ -2103,7 +2107,17 @@ open class CALayer: CAMediaTiming, Hashable {
             let p2 = values[endIndex]
             let p3 = values[p3Index]
 
-            interpolateCubicKeyframeValue(p0: p0, p1: p1, p2: p2, p3: p3, t: CGFloat(adjustedProgress), layer: layer, keyPath: keyPath)
+            interpolateCubicKeyframeValue(
+                p0: p0,
+                p1: p1,
+                p2: p2,
+                p3: p3,
+                t: CGFloat(adjustedProgress),
+                startParameters: cubicParameters(for: animation, at: startIndex),
+                endParameters: cubicParameters(for: animation, at: endIndex),
+                layer: layer,
+                keyPath: keyPath
+            )
         default:
             interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
         }
@@ -2112,22 +2126,28 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Calculates arc-length parameterized progress for paced animation modes.
     ///
     /// Returns the remapped progress and the paced key times array.
-    private func calculatePacedProgress(progress: CGFloat, values: [Any], cubic: Bool) -> (CGFloat, [CGFloat]) {
+    private func calculatePacedProgress(
+        progress: CGFloat,
+        values: [Any],
+        animation: CAKeyframeAnimation
+    ) -> (CGFloat, [CGFloat]) {
         guard values.count > 1 else { return (progress, [0]) }
 
         // Calculate distances between consecutive keyframes
         var distances: [CGFloat] = []
         for i in 0..<(values.count - 1) {
             let distance: CGFloat
-            if cubic {
-                // For cubic paced, estimate arc length of Catmull-Rom spline segment
+            if animation.calculationMode == .cubicPaced {
+                // For cubic paced, estimate the Kochanek-Bartels segment length.
                 let p0Index = max(0, i - 1)
                 let p3Index = min(values.count - 1, i + 2)
                 distance = estimateCubicArcLength(
                     p0: values[p0Index],
                     p1: values[i],
                     p2: values[i + 1],
-                    p3: values[p3Index]
+                    p3: values[p3Index],
+                    startParameters: cubicParameters(for: animation, at: i),
+                    endParameters: cubicParameters(for: animation, at: i + 1)
                 )
             } else {
                 distance = calculateDistance(from: values[i], to: values[i + 1])
@@ -2194,14 +2214,28 @@ open class CALayer: CAMediaTiming, Hashable {
         return 1.0
     }
 
-    /// Estimates the arc length of a Catmull-Rom spline segment using numerical integration.
-    private func estimateCubicArcLength(p0: Any, p1: Any, p2: Any, p3: Any) -> CGFloat {
-        // Use numerical integration with Simpson's rule
-        // Sample the curve at multiple points and sum segment lengths
+    /// Estimates the arc length of a Kochanek-Bartels spline segment using numerical integration.
+    private func estimateCubicArcLength(
+        p0: Any,
+        p1: Any,
+        p2: Any,
+        p3: Any,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters
+    ) -> CGFloat {
+        // Sample the curve at multiple points and sum the chord lengths.
         let numSamples = 10
         var arcLength: CGFloat = 0
 
-        guard let prev = interpolateForDistance(p0: p0, p1: p1, p2: p2, p3: p3, t: 0) else {
+        guard let prev = interpolateForDistance(
+            p0: p0,
+            p1: p1,
+            p2: p2,
+            p3: p3,
+            t: 0,
+            startParameters: startParameters,
+            endParameters: endParameters
+        ) else {
             // Fallback to linear distance
             return calculateDistance(from: p1, to: p2)
         }
@@ -2210,7 +2244,15 @@ open class CALayer: CAMediaTiming, Hashable {
 
         for i in 1...numSamples {
             let t = CGFloat(i) / CGFloat(numSamples)
-            guard let currentPoint = interpolateForDistance(p0: p0, p1: p1, p2: p2, p3: p3, t: t) else {
+            guard let currentPoint = interpolateForDistance(
+                p0: p0,
+                p1: p1,
+                p2: p2,
+                p3: p3,
+                t: t,
+                startParameters: startParameters,
+                endParameters: endParameters
+            ) else {
                 return calculateDistance(from: p1, to: p2)
             }
             arcLength += calculatePointDistance(from: previousPoint, to: currentPoint)
@@ -2220,12 +2262,27 @@ open class CALayer: CAMediaTiming, Hashable {
         return arcLength
     }
 
-    /// Interpolates a point on the Catmull-Rom spline for distance calculation.
-    private func interpolateForDistance(p0: Any, p1: Any, p2: Any, p3: Any, t: CGFloat) -> (x: CGFloat, y: CGFloat)? {
-        // Only support CGPoint for now
+    /// Interpolates a point on the Kochanek-Bartels spline for distance calculation.
+    private func interpolateForDistance(
+        p0: Any,
+        p1: Any,
+        p2: Any,
+        p3: Any,
+        t: CGFloat,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters
+    ) -> (x: CGFloat, y: CGFloat)? {
         if let v0 = p0 as? CGPoint, let v1 = p1 as? CGPoint, let v2 = p2 as? CGPoint, let v3 = p3 as? CGPoint {
-            let x = catmullRom(v0.x, v1.x, v2.x, v3.x, t)
-            let y = catmullRom(v0.y, v1.y, v2.y, v3.y, t)
+            let x = cubicInterpolate(
+                v0.x, v1.x, v2.x, v3.x, t,
+                startParameters: startParameters,
+                endParameters: endParameters
+            )
+            let y = cubicInterpolate(
+                v0.y, v1.y, v2.y, v3.y, t,
+                startParameters: startParameters,
+                endParameters: endParameters
+            )
             return (x, y)
         }
         return nil
@@ -2674,104 +2731,321 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    /// Catmull-Rom spline interpolation between 4 control points.
-    ///
-    /// The Catmull-Rom spline passes through P1 and P2, using P0 and P3 to determine
-    /// the tangent at those points. The parameter `t` goes from 0 (at P1) to 1 (at P2).
-    ///
-    /// Formula:
-    /// ```
-    /// p(t) = 0.5 * ((2*P1) + (-P0 + P2)*t + (2*P0 - 5*P1 + 4*P2 - P3)*t² + (-P0 + 3*P1 - 3*P2 + P3)*t³)
-    /// ```
-    private func interpolateCubicKeyframeValue(p0: Any, p1: Any, p2: Any, p3: Any, t: CGFloat, layer: CALayer, keyPath: String) {
-        switch keyPath {
-        case "opacity":
-            if let v0 = p0 as? Float, let v1 = p1 as? Float, let v2 = p2 as? Float, let v3 = p3 as? Float {
-                layer._opacity = catmullRom(v0, v1, v2, v3, Float(t))
-            }
-        case "position":
-            if let v0 = p0 as? CGPoint, let v1 = p1 as? CGPoint, let v2 = p2 as? CGPoint, let v3 = p3 as? CGPoint {
-                layer._position = CGPoint(
-                    x: catmullRom(v0.x, v1.x, v2.x, v3.x, t),
-                    y: catmullRom(v0.y, v1.y, v2.y, v3.y, t)
-                )
-            }
-        case "bounds":
-            if let v0 = p0 as? CGRect, let v1 = p1 as? CGRect, let v2 = p2 as? CGRect, let v3 = p3 as? CGRect {
-                layer._bounds = CGRect(
-                    x: catmullRom(v0.origin.x, v1.origin.x, v2.origin.x, v3.origin.x, t),
-                    y: catmullRom(v0.origin.y, v1.origin.y, v2.origin.y, v3.origin.y, t),
-                    width: catmullRom(v0.size.width, v1.size.width, v2.size.width, v3.size.width, t),
-                    height: catmullRom(v0.size.height, v1.size.height, v2.size.height, v3.size.height, t)
-                )
-            }
-        case "cornerRadius", "borderWidth", "shadowRadius", "zPosition":
-            if let v0 = p0 as? CGFloat, let v1 = p1 as? CGFloat, let v2 = p2 as? CGFloat, let v3 = p3 as? CGFloat {
-                let value = catmullRom(v0, v1, v2, v3, t)
-                switch keyPath {
-                case "cornerRadius": layer._cornerRadius = value
-                case "borderWidth": layer._borderWidth = value
-                case "shadowRadius": layer._shadowRadius = value
-                case "zPosition": layer._zPosition = value
-                default: break
-                }
-            }
-        case "transform":
-            if let v0 = p0 as? CATransform3D, let v1 = p1 as? CATransform3D, let v2 = p2 as? CATransform3D, let v3 = p3 as? CATransform3D {
-                layer._transform = catmullRomTransform(v0, v1, v2, v3, t)
-            }
-        default:
-            // Fallback to linear interpolation for unsupported types
-            interpolateKeyframeValue(from: p1, to: p2, progress: CFTimeInterval(t), layer: layer, keyPath: keyPath)
+    private struct CubicParameters {
+        let tension: CGFloat
+        let continuity: CGFloat
+        let bias: CGFloat
+    }
+
+    private func cubicParameters(
+        for animation: CAKeyframeAnimation,
+        at index: Int
+    ) -> CubicParameters {
+        func value(_ values: [CGFloat]?) -> CGFloat {
+            guard let values, values.indices.contains(index) else { return 0 }
+            return values[index]
         }
-    }
-
-    /// Catmull-Rom spline interpolation for a single CGFloat value.
-    private func catmullRom(_ p0: CGFloat, _ p1: CGFloat, _ p2: CGFloat, _ p3: CGFloat, _ t: CGFloat) -> CGFloat {
-        let t2 = t * t
-        let t3 = t2 * t
-
-        return 0.5 * (
-            (2 * p1) +
-            (-p0 + p2) * t +
-            (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-            (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+        return CubicParameters(
+            tension: value(animation.tensionValues),
+            continuity: value(animation.continuityValues),
+            bias: value(animation.biasValues)
         )
     }
 
-    /// Catmull-Rom spline interpolation for a single Float value.
-    private func catmullRom(_ p0: Float, _ p1: Float, _ p2: Float, _ p3: Float, _ t: Float) -> Float {
-        let t2 = t * t
-        let t3 = t2 * t
-
-        return 0.5 * (
-            (2 * p1) +
-            (-p0 + p2) * t +
-            (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
-            (-p0 + 3 * p1 - 3 * p2 + p3) * t3
-        )
+    /// Applies Kochanek-Bartels cubic interpolation without falling back to linear
+    /// interpolation when a value family is not cubic-interpolable.
+    private func interpolateCubicKeyframeValue(
+        p0: Any,
+        p1: Any,
+        p2: Any,
+        p3: Any,
+        t: CGFloat,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters,
+        layer: CALayer,
+        keyPath: String
+    ) {
+        guard let value = cubicValue(
+            p0: p0,
+            p1: p1,
+            p2: p2,
+            p3: p3,
+            t: t,
+            startParameters: startParameters,
+            endParameters: endParameters
+        ) else {
+            return
+        }
+        applyKeyframeValue(value, layer: layer, keyPath: keyPath)
     }
 
-    /// Catmull-Rom spline interpolation for CATransform3D.
-    private func catmullRomTransform(_ p0: CATransform3D, _ p1: CATransform3D, _ p2: CATransform3D, _ p3: CATransform3D, _ t: CGFloat) -> CATransform3D {
+    private func cubicValue(
+        p0: Any,
+        p1: Any,
+        p2: Any,
+        p3: Any,
+        t: CGFloat,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters
+    ) -> Any? {
+        func scalar(_ v0: CGFloat, _ v1: CGFloat, _ v2: CGFloat, _ v3: CGFloat) -> CGFloat {
+            cubicInterpolate(
+                v0, v1, v2, v3, t,
+                startParameters: startParameters,
+                endParameters: endParameters
+            )
+        }
+
+        if let v0 = p0 as? CGFloat,
+           let v1 = p1 as? CGFloat,
+           let v2 = p2 as? CGFloat,
+           let v3 = p3 as? CGFloat {
+            return scalar(v0, v1, v2, v3)
+        }
+        if let v0 = p0 as? Float,
+           let v1 = p1 as? Float,
+           let v2 = p2 as? Float,
+           let v3 = p3 as? Float {
+            return Float(scalar(CGFloat(v0), CGFloat(v1), CGFloat(v2), CGFloat(v3)))
+        }
+        if let v0 = p0 as? CGPoint,
+           let v1 = p1 as? CGPoint,
+           let v2 = p2 as? CGPoint,
+           let v3 = p3 as? CGPoint {
+            return CGPoint(
+                x: scalar(v0.x, v1.x, v2.x, v3.x),
+                y: scalar(v0.y, v1.y, v2.y, v3.y)
+            )
+        }
+        if let v0 = p0 as? CGSize,
+           let v1 = p1 as? CGSize,
+           let v2 = p2 as? CGSize,
+           let v3 = p3 as? CGSize {
+            return CGSize(
+                width: scalar(v0.width, v1.width, v2.width, v3.width),
+                height: scalar(v0.height, v1.height, v2.height, v3.height)
+            )
+        }
+        if let v0 = p0 as? CGRect,
+           let v1 = p1 as? CGRect,
+           let v2 = p2 as? CGRect,
+           let v3 = p3 as? CGRect {
+            return CGRect(
+                x: scalar(v0.origin.x, v1.origin.x, v2.origin.x, v3.origin.x),
+                y: scalar(v0.origin.y, v1.origin.y, v2.origin.y, v3.origin.y),
+                width: scalar(v0.size.width, v1.size.width, v2.size.width, v3.size.width),
+                height: scalar(v0.size.height, v1.size.height, v2.size.height, v3.size.height)
+            )
+        }
+        if let v0 = p0 as? CATransform3D,
+           let v1 = p1 as? CATransform3D,
+           let v2 = p2 as? CATransform3D,
+           let v3 = p3 as? CATransform3D {
+            return cubicTransform(
+                v0, v1, v2, v3, t,
+                startParameters: startParameters,
+                endParameters: endParameters
+            )
+        }
+        if let v0 = extractColor(p0),
+           let v1 = extractColor(p1),
+           let v2 = extractColor(p2),
+           let v3 = extractColor(p3) {
+            let c0 = extractRGBA(from: v0)
+            let c1 = extractRGBA(from: v1)
+            let c2 = extractRGBA(from: v2)
+            let c3 = extractRGBA(from: v3)
+            return CGColor(
+                red: scalar(c0.r, c1.r, c2.r, c3.r),
+                green: scalar(c0.g, c1.g, c2.g, c3.g),
+                blue: scalar(c0.b, c1.b, c2.b, c3.b),
+                alpha: scalar(c0.a, c1.a, c2.a, c3.a)
+            )
+        }
+        if let v0 = p0 as? [CGFloat],
+           let v1 = p1 as? [CGFloat],
+           let v2 = p2 as? [CGFloat],
+           let v3 = p3 as? [CGFloat],
+           v0.count == v1.count,
+           v1.count == v2.count,
+           v2.count == v3.count {
+            return v0.indices.map { index in
+                scalar(v0[index], v1[index], v2[index], v3[index])
+            }
+        }
+        if let v0 = p0 as? [Any],
+           let v1 = p1 as? [Any],
+           let v2 = p2 as? [Any],
+           let v3 = p3 as? [Any],
+           v0.count == v1.count,
+           v1.count == v2.count,
+           v2.count == v3.count {
+            var colors: [Any] = []
+            colors.reserveCapacity(v0.count)
+            for index in v0.indices {
+                guard let color = cubicValue(
+                    p0: v0[index],
+                    p1: v1[index],
+                    p2: v2[index],
+                    p3: v3[index],
+                    t: t,
+                    startParameters: startParameters,
+                    endParameters: endParameters
+                ) as? CGColor else {
+                    return nil
+                }
+                colors.append(color)
+            }
+            return colors
+        }
+        if let v0 = extractPath(p0),
+           let v1 = extractPath(p1),
+           let v2 = extractPath(p2),
+           let v3 = extractPath(p3) {
+            return cubicPath(
+                v0, v1, v2, v3, t,
+                startParameters: startParameters,
+                endParameters: endParameters
+            )
+        }
+        return nil
+    }
+
+    private func cubicInterpolate(
+        _ p0: CGFloat,
+        _ p1: CGFloat,
+        _ p2: CGFloat,
+        _ p3: CGFloat,
+        _ t: CGFloat,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters
+    ) -> CGFloat {
+        let startScale = 0.5 * (1 - startParameters.tension)
+        let outgoing = startScale * (
+            (1 + startParameters.continuity) * (1 + startParameters.bias) * (p1 - p0)
+                + (1 - startParameters.continuity) * (1 - startParameters.bias) * (p2 - p1)
+        )
+        let endScale = 0.5 * (1 - endParameters.tension)
+        let incoming = endScale * (
+            (1 - endParameters.continuity) * (1 + endParameters.bias) * (p2 - p1)
+                + (1 + endParameters.continuity) * (1 - endParameters.bias) * (p3 - p2)
+        )
+        let t2 = t * t
+        let t3 = t2 * t
+        let h00 = 2 * t3 - 3 * t2 + 1
+        let h10 = t3 - 2 * t2 + t
+        let h01 = -2 * t3 + 3 * t2
+        let h11 = t3 - t2
+        return h00 * p1 + h10 * outgoing + h01 * p2 + h11 * incoming
+    }
+
+    private func cubicTransform(
+        _ p0: CATransform3D,
+        _ p1: CATransform3D,
+        _ p2: CATransform3D,
+        _ p3: CATransform3D,
+        _ t: CGFloat,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters
+    ) -> CATransform3D {
+        func scalar(_ v0: CGFloat, _ v1: CGFloat, _ v2: CGFloat, _ v3: CGFloat) -> CGFloat {
+            cubicInterpolate(
+                v0, v1, v2, v3, t,
+                startParameters: startParameters,
+                endParameters: endParameters
+            )
+        }
         return CATransform3D(
-            m11: catmullRom(p0.m11, p1.m11, p2.m11, p3.m11, t),
-            m12: catmullRom(p0.m12, p1.m12, p2.m12, p3.m12, t),
-            m13: catmullRom(p0.m13, p1.m13, p2.m13, p3.m13, t),
-            m14: catmullRom(p0.m14, p1.m14, p2.m14, p3.m14, t),
-            m21: catmullRom(p0.m21, p1.m21, p2.m21, p3.m21, t),
-            m22: catmullRom(p0.m22, p1.m22, p2.m22, p3.m22, t),
-            m23: catmullRom(p0.m23, p1.m23, p2.m23, p3.m23, t),
-            m24: catmullRom(p0.m24, p1.m24, p2.m24, p3.m24, t),
-            m31: catmullRom(p0.m31, p1.m31, p2.m31, p3.m31, t),
-            m32: catmullRom(p0.m32, p1.m32, p2.m32, p3.m32, t),
-            m33: catmullRom(p0.m33, p1.m33, p2.m33, p3.m33, t),
-            m34: catmullRom(p0.m34, p1.m34, p2.m34, p3.m34, t),
-            m41: catmullRom(p0.m41, p1.m41, p2.m41, p3.m41, t),
-            m42: catmullRom(p0.m42, p1.m42, p2.m42, p3.m42, t),
-            m43: catmullRom(p0.m43, p1.m43, p2.m43, p3.m43, t),
-            m44: catmullRom(p0.m44, p1.m44, p2.m44, p3.m44, t)
+            m11: scalar(p0.m11, p1.m11, p2.m11, p3.m11),
+            m12: scalar(p0.m12, p1.m12, p2.m12, p3.m12),
+            m13: scalar(p0.m13, p1.m13, p2.m13, p3.m13),
+            m14: scalar(p0.m14, p1.m14, p2.m14, p3.m14),
+            m21: scalar(p0.m21, p1.m21, p2.m21, p3.m21),
+            m22: scalar(p0.m22, p1.m22, p2.m22, p3.m22),
+            m23: scalar(p0.m23, p1.m23, p2.m23, p3.m23),
+            m24: scalar(p0.m24, p1.m24, p2.m24, p3.m24),
+            m31: scalar(p0.m31, p1.m31, p2.m31, p3.m31),
+            m32: scalar(p0.m32, p1.m32, p2.m32, p3.m32),
+            m33: scalar(p0.m33, p1.m33, p2.m33, p3.m33),
+            m34: scalar(p0.m34, p1.m34, p2.m34, p3.m34),
+            m41: scalar(p0.m41, p1.m41, p2.m41, p3.m41),
+            m42: scalar(p0.m42, p1.m42, p2.m42, p3.m42),
+            m43: scalar(p0.m43, p1.m43, p2.m43, p3.m43),
+            m44: scalar(p0.m44, p1.m44, p2.m44, p3.m44)
         )
+    }
+
+    private func cubicPath(
+        _ p0: CGPath,
+        _ p1: CGPath,
+        _ p2: CGPath,
+        _ p3: CGPath,
+        _ t: CGFloat,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters
+    ) -> CGPath? {
+        let elements0 = pathElements(p0)
+        let elements1 = pathElements(p1)
+        let elements2 = pathElements(p2)
+        let elements3 = pathElements(p3)
+        guard elements0.count == elements1.count,
+              elements1.count == elements2.count,
+              elements2.count == elements3.count else {
+            return nil
+        }
+
+        let output = CGMutablePath()
+        for index in elements0.indices {
+            let e0 = elements0[index]
+            let e1 = elements1[index]
+            let e2 = elements2[index]
+            let e3 = elements3[index]
+            guard e0.type == e1.type,
+                  e1.type == e2.type,
+                  e2.type == e3.type,
+                  e0.points.count == e1.points.count,
+                  e1.points.count == e2.points.count,
+                  e2.points.count == e3.points.count else {
+                return nil
+            }
+            let points = e0.points.indices.map { pointIndex in
+                CGPoint(
+                    x: cubicInterpolate(
+                        e0.points[pointIndex].x,
+                        e1.points[pointIndex].x,
+                        e2.points[pointIndex].x,
+                        e3.points[pointIndex].x,
+                        t,
+                        startParameters: startParameters,
+                        endParameters: endParameters
+                    ),
+                    y: cubicInterpolate(
+                        e0.points[pointIndex].y,
+                        e1.points[pointIndex].y,
+                        e2.points[pointIndex].y,
+                        e3.points[pointIndex].y,
+                        t,
+                        startParameters: startParameters,
+                        endParameters: endParameters
+                    )
+                )
+            }
+            switch e1.type {
+            case .moveToPoint:
+                output.move(to: points[0])
+            case .addLineToPoint:
+                output.addLine(to: points[0])
+            case .addQuadCurveToPoint:
+                output.addQuadCurve(to: points[1], control: points[0])
+            case .addCurveToPoint:
+                output.addCurve(to: points[2], control1: points[0], control2: points[1])
+            case .closeSubpath:
+                output.closeSubpath()
+            @unknown default:
+                return nil
+            }
+        }
+        return output
     }
 
     /// Returns the model layer object associated with the receiver, if any.

@@ -1204,6 +1204,20 @@ struct CASpringAnimationTests {
 @Suite("CAKeyframeAnimation Tests")
 struct CAKeyframeAnimationTests {
 
+    private func frozenCubicAnimation(
+        keyPath: String,
+        values: [Any]
+    ) -> CAKeyframeAnimation {
+        let animation = CAKeyframeAnimation(keyPath: keyPath)
+        animation.values = values
+        animation.keyTimes = [0, 0.25, 0.75, 1]
+        animation.calculationMode = .cubic
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        return animation
+    }
+
     @Test("Default keyframe properties")
     func defaultKeyframeProperties() {
         let keyframe = CAKeyframeAnimation()
@@ -1250,34 +1264,178 @@ struct CAKeyframeAnimationTests {
         #expect(keyframe.calculationMode == .cubicPaced)
     }
 
-    @Test("Cubic interpolation produces smooth curve")
-    func cubicInterpolationProducesSmoothCurve() {
-        // Create a keyframe animation with cubic calculation mode
-        let keyframe = CAKeyframeAnimation(keyPath: "position")
-        keyframe.values = [
-            CGPoint(x: 0, y: 0),
-            CGPoint(x: 100, y: 50),
-            CGPoint(x: 200, y: 0),
-            CGPoint(x: 300, y: 50)
-        ]
-        keyframe.calculationMode = .cubic
-        keyframe.duration = 1.0
+    @Test("Cubic interpolation evaluates Kochanek-Bartels parameters")
+    func cubicInterpolationEvaluatesParameters() {
+        func sampledZ(
+            tension: [CGFloat]? = nil,
+            continuity: [CGFloat]? = nil,
+            bias: [CGFloat]? = nil
+        ) -> CGFloat {
+            let layer = CALayer()
+            let animation = frozenCubicAnimation(
+                keyPath: "zPosition",
+                values: [CGFloat(0), CGFloat(1), CGFloat(4), CGFloat(9)]
+            )
+            animation.tensionValues = tension
+            animation.continuityValues = continuity
+            animation.biasValues = bias
+            layer.add(animation, forKey: "cubicZ")
+            return layer.presentation()?.zPosition ?? -.infinity
+        }
 
-        // The animation should use Catmull-Rom spline interpolation
-        #expect(keyframe.calculationMode == .cubic)
-        #expect(keyframe.values?.count == 4)
+        #expect(abs(sampledZ() - 2.25) < 0.001)
+        #expect(abs(sampledZ(tension: [0, 1, 1, 0]) - 2.5) < 0.001)
+        #expect(abs(sampledZ(continuity: [0, 1, 0, 0]) - 2.125) < 0.001)
+        #expect(abs(sampledZ(bias: [0, 0, 1, 0]) - 2.375) < 0.001)
+        #expect(abs(sampledZ(tension: [1]) - 2.25) < 0.001)
     }
 
     @Test("Cubic interpolation with two values")
     func cubicInterpolationWithTwoValues() {
-        // Edge case: only 2 values
-        let keyframe = CAKeyframeAnimation(keyPath: "opacity")
-        keyframe.values = [Float(0.0), Float(1.0)]
-        keyframe.calculationMode = .cubic
-        keyframe.duration = 1.0
+        let layer = CALayer()
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        animation.values = [Float(0), Float(1)]
+        animation.calculationMode = .cubic
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        layer.add(animation, forKey: "twoValueCubic")
 
-        // Should still work (P0 and P3 will duplicate P1 and P2)
-        #expect(keyframe.values?.count == 2)
+        #expect(abs((layer.presentation()?.opacity ?? -.infinity) - 0.5) < 0.001)
+    }
+
+    @Test("Cubic interpolation applies to colors and rectangles")
+    func cubicInterpolationAppliesToValueFamilies() {
+        let layer = CALayer()
+        let colorValues: [Any] = [CGFloat(0), CGFloat(0.1), CGFloat(0.4), CGFloat(0.9)].map {
+            CGColor(red: $0, green: 0, blue: 0, alpha: 1)
+        }
+        layer.add(
+            frozenCubicAnimation(keyPath: "backgroundColor", values: colorValues),
+            forKey: "cubicColor"
+        )
+        layer.add(
+            frozenCubicAnimation(
+                keyPath: "bounds",
+                values: [CGFloat(0), CGFloat(0.1), CGFloat(0.4), CGFloat(0.9)].map {
+                    CGRect(x: $0, y: 0, width: 10 + $0, height: 20)
+                }
+            ),
+            forKey: "cubicBounds"
+        )
+
+        guard let presentation = layer.presentation(),
+              let red = presentation.backgroundColor?.components?.first else {
+            Issue.record("Expected cubic color and rectangle presentation values")
+            return
+        }
+        #expect(abs(red - 0.225) < 0.001)
+        #expect(abs(presentation.bounds.origin.x - 0.225) < 0.001)
+        #expect(abs(presentation.bounds.width - 10.225) < 0.001)
+    }
+
+    @Test("Cubic interpolation morphs compatible paths")
+    func cubicInterpolationMorphsPaths() {
+        let paths: [Any] = [CGFloat(0), CGFloat(10), CGFloat(40), CGFloat(90)].map { x in
+            let path = CGMutablePath()
+            path.addRect(CGRect(x: x, y: 0, width: 10, height: 10))
+            return path
+        }
+        let layer = CAShapeLayer()
+        layer.add(
+            frozenCubicAnimation(keyPath: "path", values: paths),
+            forKey: "cubicPath"
+        )
+
+        guard let bounds = layer.presentation()?.path?.boundingBox else {
+            Issue.record("Expected a cubic path presentation value")
+            return
+        }
+        #expect(abs(bounds.minX - 22.5) < 0.001)
+        #expect(abs(bounds.width - 10) < 0.001)
+    }
+
+    @Test("Cubic interpolation applies to transforms, floats, and gradient arrays")
+    func cubicInterpolationAppliesToRemainingValueFamilies() {
+        let transformLayer = CALayer()
+        transformLayer.add(
+            frozenCubicAnimation(
+                keyPath: "transform",
+                values: [CGFloat(0), CGFloat(10), CGFloat(40), CGFloat(90)].map {
+                    CATransform3DMakeTranslation($0, 0, 0)
+                }
+            ),
+            forKey: "cubicTransform"
+        )
+
+        let floatLayer = CALayer()
+        floatLayer.add(
+            frozenCubicAnimation(
+                keyPath: "opacity",
+                values: [Float(0), Float(0.1), Float(0.4), Float(0.9)]
+            ),
+            forKey: "cubicFloat"
+        )
+
+        let gradientLayer = CAGradientLayer()
+        gradientLayer.add(
+            frozenCubicAnimation(
+                keyPath: "locations",
+                values: [CGFloat(0), CGFloat(0.1), CGFloat(0.4), CGFloat(0.9)].map {
+                    [$0, 1 + $0]
+                }
+            ),
+            forKey: "cubicLocations"
+        )
+        gradientLayer.add(
+            frozenCubicAnimation(
+                keyPath: "colors",
+                values: [CGFloat(0), CGFloat(0.1), CGFloat(0.4), CGFloat(0.9)].map { red in
+                    [CGColor(red: red, green: 0, blue: 0, alpha: 1)] as [Any]
+                }
+            ),
+            forKey: "cubicColors"
+        )
+
+        guard let transformPresentation = transformLayer.presentation(),
+              let floatPresentation = floatLayer.presentation(),
+              let gradientPresentation = gradientLayer.presentation(),
+              let locations = gradientPresentation.locations,
+              let color = gradientPresentation.colors?.first as? CGColor,
+              let red = color.components?.first else {
+            Issue.record("Expected cubic presentation values for every supported family")
+            return
+        }
+        #expect(abs(transformPresentation.transform.m41 - 22.5) < 0.001)
+        #expect(abs(floatPresentation.opacity - 0.225) < 0.001)
+        #expect(abs(locations[0] - 0.225) < 0.001)
+        #expect(abs(locations[1] - 1.225) < 0.001)
+        #expect(abs(red - 0.225) < 0.001)
+    }
+
+    @Test("Cubic-paced arc length responds to cubic parameters")
+    func cubicPacedArcLengthUsesParameters() {
+        func sampledPosition(tension: [CGFloat]?) -> CGPoint {
+            let layer = CALayer()
+            let animation = CAKeyframeAnimation(keyPath: "position")
+            animation.values = [
+                CGPoint(x: 0, y: 0),
+                CGPoint(x: 20, y: 80),
+                CGPoint(x: 100, y: 20),
+                CGPoint(x: 120, y: 100),
+            ]
+            animation.calculationMode = .cubicPaced
+            animation.tensionValues = tension
+            animation.duration = 1
+            animation.speed = 0
+            animation.timeOffset = 0.35
+            layer.add(animation, forKey: "cubicPacedPosition")
+            return layer.presentation()?.position ?? CGPoint(x: -.infinity, y: -.infinity)
+        }
+
+        let rounded = sampledPosition(tension: nil)
+        let tight = sampledPosition(tension: [1, 1, 1, 1])
+        #expect(abs(rounded.x - tight.x) > 0.01 || abs(rounded.y - tight.y) > 0.01)
     }
 }
 
