@@ -4885,13 +4885,11 @@ open class CALayer: CAMediaTiming, Hashable {
         let localPoint = convertPointFromSuperlayer(p)
         guard contains(localPoint) else { return nil }
 
-        // Check sublayers in reverse order (front to back)
-        // localPoint is in self's coordinate system, which is the sublayer's superlayer coordinate system
-        if let sublayers = sublayers?.reversed() {
-            for sublayer in sublayers {
-                if let hit = sublayer.hitTest(localPoint) {
-                    return hit
-                }
+        // Renderer order is zPosition first and insertion order second. Walk the
+        // exact reverse order so input reaches the visually frontmost subtree.
+        for sublayer in sortedSublayers().reversed() {
+            if let hit = sublayer.hitTest(localPoint) {
+                return hit
             }
         }
 

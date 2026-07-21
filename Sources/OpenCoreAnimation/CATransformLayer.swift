@@ -34,14 +34,13 @@ open class CATransformLayer: CALayer {
     open override func hitTest(_ p: CGPoint) -> CALayer? {
         guard !isHidden, opacity > 0 else { return nil }
 
-        // Check sublayers in reverse order (front-to-back)
-        if let sublayers = sublayers {
-            for sublayer in sublayers.reversed() {
-                // Convert point to sublayer's coordinate space
-                let convertedPoint = sublayer.convert(p, from: self)
-                if let hit = sublayer.hitTest(convertedPoint) {
-                    return hit
-                }
+        // `p` is expressed in this layer's superlayer space. Convert it once to
+        // this transform layer's local space; each child then performs its own
+        // single superlayer-to-local conversion.
+        let localPoint = convert(p, from: superlayer)
+        for sublayer in sortedSublayers().reversed() {
+            if let hit = sublayer.hitTest(localPoint) {
+                return hit
             }
         }
 
