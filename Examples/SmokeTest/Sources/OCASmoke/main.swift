@@ -647,7 +647,8 @@ func installHarness() {
                       let multiply = CIFilter(name: "CIMultiplyCompositing"),
                       let screen = CIFilter(name: "CIScreenCompositing"),
                       let sourceOver = CIFilter(name: "CISourceOverCompositing"),
-                      let invert = CIFilter(name: "CIColorInvert") else {
+                      let invert = CIFilter(name: "CIColorInvert"),
+                      let halfAlphaMask = CIFilter(name: "CIColorMatrix") else {
                     compositionProbeResult = "error: composition dependencies unavailable"
                     return
                 }
@@ -903,7 +904,13 @@ func installHarness() {
                 contentMaskParent.bounds = contentMaskBackdrop.bounds
                 contentMaskParent.position = contentMaskBackdrop.position
                 contentMaskParent.zPosition = 215
-                contentMaskParent.mask = makeHalfMask()
+                halfAlphaMask.setValue(
+                    CIVector(x: 0, y: 0, z: 0, w: 0.5),
+                    forKey: "inputAVector"
+                )
+                let filteredHalfMask = makeHalfMask()
+                filteredHalfMask.filters = [CAFilter.brightness(0), halfAlphaMask]
+                contentMaskParent.mask = filteredHalfMask
                 let contentMaskedSource = CALayer()
                 contentMaskedSource.bounds = contentMaskBackdrop.bounds
                 contentMaskedSource.position = CGPoint(x: 30, y: 30)
@@ -980,7 +987,7 @@ func installHarness() {
                         && pixels[19] == [0, 255, 255, 255]
                         && pixels[20] == [255, 0, 0, 255]
                         && pixels[21] == [255, 0, 0, 255]
-                        && pixels[22] == [255, 255, 0, 255]
+                        && pixels[22] == [255, 128, 0, 255]
                         && pixels[23] == [255, 0, 0, 255]
                         && pixels[24] == [0, 255, 255, 255]
                         && pixels[25] == [255, 0, 0, 255]

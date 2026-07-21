@@ -294,6 +294,7 @@ private final class CompositionLayerResources {
     let backdropMaskUniformBuffer: GPUBuffer
     let backdropMaskVertexBuffer: GPUBuffer
     private(set) var clipUniformBuffers: [GPUBuffer] = []
+    private(set) var contentMaskFilterResources: [FilterLayerResources] = []
 
     init(device: GPUDevice, width: Int, height: Int, format: GPUTextureFormat) {
         func makeTexture(_ format: GPUTextureFormat) -> GPUTexture {
@@ -365,6 +366,24 @@ private final class CompositionLayerResources {
         return clipUniformBuffers[index]
     }
 
+    func contentMaskResources(
+        at index: Int,
+        device: GPUDevice,
+        width: Int,
+        height: Int,
+        format: GPUTextureFormat
+    ) -> FilterLayerResources {
+        while contentMaskFilterResources.count <= index {
+            contentMaskFilterResources.append(FilterLayerResources(
+                device: device,
+                width: width,
+                height: height,
+                format: format
+            ))
+        }
+        return contentMaskFilterResources[index]
+    }
+
     func destroy() {
         backdropTexture.destroy()
         sourcePremultipliedTexture.destroy()
@@ -390,6 +409,10 @@ private final class CompositionLayerResources {
             buffer.destroy()
         }
         clipUniformBuffers.removeAll(keepingCapacity: false)
+        for resources in contentMaskFilterResources {
+            resources.destroy()
+        }
+        contentMaskFilterResources.removeAll(keepingCapacity: false)
     }
 }
 
@@ -7176,6 +7199,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         _ stages: [LayerFilterStage],
         inputTexture: GPUTexture,
         inputView: GPUTextureView,
+        inputAlphaMode: FilterTextureAlphaMode = .straight,
         resources: FilterLayerResources,
         encoder: GPUCommandEncoder
     ) -> (texture: GPUTexture, view: GPUTextureView)? {
@@ -7183,7 +7207,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         var currentTexture = inputTexture
         var currentView = inputView
-        var currentAlphaMode = FilterTextureAlphaMode.straight
+        var currentAlphaMode = inputAlphaMode
         var conversionIndex = 0
 
         func convert(to targetMode: FilterTextureAlphaMode) -> Bool {
@@ -7401,23 +7425,31 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return true
     }
 
-    private func compositionContentMaskTreeIsDirectlyRenderable(_ layer: CALayer) -> Bool {
+    private func compositionContentMaskTreeIsDirectlyRenderable(
+        _ layer: CALayer,
+        isRoot: Bool = true
+    ) -> Bool {
         let presentation = renderPresentation(for: layer)
-        if presentation.filters?.isEmpty == false
+        if (!isRoot && presentation.filters?.isEmpty == false)
             || presentation.compositingFilter != nil
             || presentation.backgroundFilters?.isEmpty == false
             || presentation.shouldRasterize
             || presentation._transitionRenderState != nil {
             return false
         }
+        if let nestedMask = presentation.mask,
+           !compositionContentMaskTreeIsDirectlyRenderable(nestedMask, isRoot: false) {
+            return false
+        }
         return (layer.sublayers ?? []).allSatisfy {
-            compositionContentMaskTreeIsDirectlyRenderable($0)
+            compositionContentMaskTreeIsDirectlyRenderable($0, isRoot: false)
         }
     }
 
-    private func renderCompositionContentMask(
+    private func renderRawCompositionContentMask(
         _ target: LayerPrepassTarget,
         outputView: GPUTextureView,
+        suppressRootFilters: Bool,
         encoder: GPUCommandEncoder
     ) -> Bool {
         guard let pipeline,
@@ -7462,6 +7494,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let savedStencilValue = currentStencilValue
         let savedStopKey = compositionCaptureStopKey
         let savedDidReachStop = compositionCaptureDidReachStop
+        let savedFilterPrerenderRoot = filterPrerenderRootLayer
 
         opacityStack.removeAll(keepingCapacity: true)
         replicatorColorStack.removeAll(keepingCapacity: true)
@@ -7472,6 +7505,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentStencilValue = 0
         compositionCaptureStopKey = nil
         compositionCaptureDidReachStop = false
+        if suppressRootFilters {
+            filterPrerenderRootLayer = target.layer
+        }
 
         withPrepassContext(target) {
             renderLayer(
@@ -7490,8 +7526,82 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentStencilValue = savedStencilValue
         compositionCaptureStopKey = savedStopKey
         compositionCaptureDidReachStop = savedDidReachStop
+        filterPrerenderRootLayer = savedFilterPrerenderRoot
         renderPass.end()
         return true
+    }
+
+    private func renderCompositionContentMask(
+        _ target: LayerPrepassTarget,
+        outputView: GPUTextureView,
+        resources: CompositionLayerResources,
+        contentMaskIndex: Int,
+        encoder: GPUCommandEncoder
+    ) -> Bool {
+        guard let device,
+              let stages = layerFilterStages(from: target.presentationLayer.filters ?? []) else {
+            return false
+        }
+        guard !stages.isEmpty else {
+            return renderRawCompositionContentMask(
+                target,
+                outputView: outputView,
+                suppressRootFilters: false,
+                encoder: encoder
+            )
+        }
+
+        let filterResources = resources.contentMaskResources(
+            at: contentMaskIndex,
+            device: device,
+            width: Int(size.width),
+            height: Int(size.height),
+            format: preferredFormat
+        )
+        guard renderRawCompositionContentMask(
+            target,
+            outputView: filterResources.sourceView,
+            suppressRootFilters: true,
+            encoder: encoder
+        ) else { return false }
+
+        var inputTexture = filterResources.sourceTexture
+        var inputView = filterResources.sourceView
+        if target.presentationLayer.opacity < 1 {
+            let opacityUniformBuffer = filterResources.uniformBuffer(
+                forOperationAt: stages.count + 16,
+                device: device
+            )
+            guard applyFilterOperation(
+                uniforms: FilterCompositeUniforms(opacity: target.presentationLayer.opacity),
+                inputTexture: inputTexture,
+                outputView: filterResources.resultView,
+                uniformBuffer: opacityUniformBuffer,
+                encoder: encoder
+            ) else { return false }
+            inputTexture = filterResources.resultTexture
+            inputView = filterResources.resultView
+        }
+
+        guard let filteredMask = executeBackdropFilterStages(
+            stages,
+            inputTexture: inputTexture,
+            inputView: inputView,
+            inputAlphaMode: .premultiplied,
+            resources: filterResources,
+            encoder: encoder
+        ) else { return false }
+        let outputUniformBuffer = filterResources.uniformBuffer(
+            forOperationAt: stages.count + 17,
+            device: device
+        )
+        return applyAlphaConversion(
+            from: .straight,
+            inputTexture: filteredMask.texture,
+            outputView: outputView,
+            uniformBuffer: outputUniformBuffer,
+            encoder: encoder
+        )
     }
 
     private func buildCompositionClipMask(
@@ -7525,6 +7635,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 didRender = renderCompositionContentMask(
                     contentTarget,
                     outputView: outputView,
+                    resources: resources,
+                    contentMaskIndex: index,
                     encoder: encoder
                 )
             }
