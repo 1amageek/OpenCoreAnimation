@@ -694,7 +694,7 @@ frames of the same image cause 1 upload, not 2.
 ```swift
 internal struct RasterizedLayer: Sendable {
     let texture: GPUTexture
-    let pixelSize: CGSize          // bounds.size × rasterizationScale
+    let pixelSize: CGSize          // visible local subtree extent × rasterizationScale
     let contentBoundsHash: Int     // hash of bounds + transform (for fast invalidation)
     var lastUsedFrame: UInt64
 }
@@ -723,7 +723,13 @@ For a layer with `shouldRasterize == true`:
       the cache).
     - Update `lastUsedFrame = _currentFrameToken`.
 2. Else:
-    - Allocate offscreen `GPUTexture` of `pixelSize`.
+    - Compute the local visible-subtree extent recursively. Unclipped descendant
+      bounds are projected into the capture root's coordinate space; a
+      `masksToBounds` layer terminates expansion at its own bounds. Shadows expand
+      the resulting extent.
+    - Allocate an offscreen `GPUTexture` for that extent. If the requested pixel
+      dimensions exceed WebGPU limits, retain the logical extent and reduce only
+      the capture resolution.
     - Recursively render `layer` and its subtree into the texture (calling
       the existing `renderLayer` with a redirected render-pass target).
     - Replace cache entry.

@@ -782,6 +782,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var shadowRenderFailureCount: Int = 0
 
+    /// Number of rasterization captures rejected because their extent or scale was invalid.
+    @_spi(RendererDiagnostics)
+    public private(set) var rasterizationFailureCount: Int = 0
+
     /// The preferred texture format.
     private var preferredFormat: GPUTextureFormat = .bgra8unorm
 
@@ -3607,6 +3611,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         shadowLayerResources.removeAll(keepingCapacity: false)
         prerenderedShadows.removeAll(keepingCapacity: false)
         shadowRenderFailureCount = 0
+        rasterizationFailureCount = 0
         depthTextureView = nil
         lastRenderedTexture = nil
         shadowBlurHorizontalPipeline = nil
@@ -8915,10 +8920,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ///
     /// Per PERFORMANCE_DESIGN.md §5.2 the offscreen texture is sized to
     /// the layer's local capture extent × `rasterizationScale`, not the canvas.
-    /// The extent is normally the layer bounds and expands only for a visible
-    /// shadow, so the composite path preserves blur/offset pixels without
-    /// burning canvas-sized memory per cached entry. The capture pass uses a local
-    /// orthographic projection so the layer's own `position`, `transform`
+    /// The extent unions visible unmasked descendants through their projective
+    /// transforms and expands for shadows, so the composite path preserves
+    /// out-of-bounds pixels without burning canvas-sized memory per entry. The
+    /// capture pass uses a local orthographic projection so the layer's own
+    /// `position`, `transform`
     /// and `anchorPoint` are *excluded* from the bake — those land at
     /// composite time. `renderLayer` recognises the capture root via
     /// `rasterizePrerenderRootLayer` and skips its `modelMatrix`
@@ -8935,8 +8941,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let layerRenderKey = renderKey(for: layer)
         let key = RasterizationCacheKey(layerRenderKey, purpose: purpose)
         let presentationLayer = renderPresentation(for: layer)
-        let captureBounds = rasterizationCaptureBounds(for: presentationLayer)
-        let contentBoundsHash = rasterizationContentBoundsHash(for: layer)
+        guard let captureBounds = rasterizationCaptureBounds(for: layer) else {
+            rasterizationFailureCount += 1
+            return
+        }
+        let contentBoundsHash = rasterizationContentBoundsHash(
+            for: layer,
+            captureBounds: captureBounds
+        )
 
         // Backdrop-dependent captures cannot reuse ordinary layer dirty state:
         // pixels outside the captured subtree can change their result. Other
@@ -8957,12 +8969,26 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        // Miss — allocate a layer-sized texture (`bounds × scale`) and
-        // render the subtree into it under a bounds-local projection.
-        let scale = max(1.0, CGFloat(presentationLayer.rasterizationScale))
-        let pixelWidth = max(1, Int((captureBounds.width * scale).rounded(.up)))
-        let pixelHeight = max(1, Int((captureBounds.height * scale).rounded(.up)))
-        guard captureBounds.width > 0, captureBounds.height > 0 else { return }
+        // Miss — allocate a visible-subtree texture (`captureBounds × scale`)
+        // and render the subtree into it under a bounds-local projection.
+        let requestedScale = CGFloat(presentationLayer.rasterizationScale)
+        guard requestedScale.isFinite, requestedScale > 0 else {
+            rasterizationFailureCount += 1
+            return
+        }
+        let scaledWidth = captureBounds.width * requestedScale
+        let scaledHeight = captureBounds.height * requestedScale
+        guard scaledWidth.isFinite,
+              scaledHeight.isFinite,
+              scaledWidth > 0,
+              scaledHeight > 0 else {
+            rasterizationFailureCount += 1
+            return
+        }
+        let maximumDimension = CGFloat(max(1, Int(device.limits.maxTextureDimension2D)))
+        let fittingScale = min(1, maximumDimension / max(scaledWidth, scaledHeight))
+        let pixelWidth = max(1, Int((scaledWidth * fittingScale).rounded(.up)))
+        let pixelHeight = max(1, Int((scaledHeight * fittingScale).rounded(.up)))
 
         let requestedFilters = presentationLayer.filters ?? []
         let filterStages: [LayerFilterStage]
@@ -9149,16 +9175,106 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return entry.contentBoundsHash == contentBoundsHash
     }
 
-    private func rasterizationCaptureBounds(for layer: CALayer) -> CGRect {
-        let contentBounds = CGRect(origin: .zero, size: layer.bounds.size)
-        guard hasVisibleShadow(layer) else { return contentBounds }
+    private func rasterizationCaptureBounds(for layer: CALayer) -> CGRect? {
+        let bounds = rasterizationSubtreeBounds(for: layer)
+        guard !bounds.isNull,
+              !bounds.isInfinite,
+              bounds.minX.isFinite,
+              bounds.minY.isFinite,
+              bounds.width.isFinite,
+              bounds.height.isFinite,
+              bounds.width > 0,
+              bounds.height > 0 else {
+            return nil
+        }
+        return bounds
+    }
 
-        let shadowSourceBounds = layer.shadowPath?.boundingBox ?? contentBounds
-        let blurPadding = max(0, layer.shadowRadius * 2)
+    private func rasterizationSubtreeBounds(for layer: CALayer) -> CGRect {
+        let presentation = renderPresentation(for: layer)
+        guard !presentation.isHidden, presentation.opacity > 0 else {
+            return .null
+        }
+
+        let contentBounds = CGRect(origin: .zero, size: presentation.bounds.size)
+        var subtreeBounds = contentBounds
+        if !presentation.masksToBounds {
+            forEachPrepassSublayer(
+                of: layer,
+                presentationLayer: presentation,
+                modelMatrix: .identity
+            ) { sublayer, sublayerParentMatrix in
+                let sublayerPresentation = renderPresentation(for: sublayer)
+                let sublayerBounds = rasterizationSubtreeBounds(for: sublayer)
+                if sublayerBounds.isNull { return }
+                guard let projectedBounds = projectedRasterizationBounds(
+                    sublayerBounds,
+                    matrix: sublayerPresentation.modelMatrix(
+                        parentMatrix: sublayerParentMatrix
+                    )
+                ) else {
+                    subtreeBounds = .infinite
+                    return
+                }
+                subtreeBounds = subtreeBounds.union(projectedBounds)
+            }
+        }
+
+        guard hasVisibleShadow(presentation) else { return subtreeBounds }
+        let shadowSourceBounds = presentation.shadowPath?.boundingBox ?? subtreeBounds
+        let blurPadding = max(0, presentation.shadowRadius * 2)
         let shadowBounds = shadowSourceBounds
-            .offsetBy(dx: layer.shadowOffset.width, dy: layer.shadowOffset.height)
+            .offsetBy(dx: presentation.shadowOffset.width, dy: presentation.shadowOffset.height)
             .insetBy(dx: -blurPadding, dy: -blurPadding)
-        return contentBounds.union(shadowBounds)
+        return subtreeBounds.union(shadowBounds)
+    }
+
+    private func projectedRasterizationBounds(
+        _ bounds: CGRect,
+        matrix: Matrix4x4
+    ) -> CGRect? {
+        let corners = [
+            SIMD4<Float>(Float(bounds.minX), Float(bounds.minY), 0, 1),
+            SIMD4<Float>(Float(bounds.maxX), Float(bounds.minY), 0, 1),
+            SIMD4<Float>(Float(bounds.minX), Float(bounds.maxY), 0, 1),
+            SIMD4<Float>(Float(bounds.maxX), Float(bounds.maxY), 0, 1),
+        ]
+        var minimum = SIMD2<Float>(repeating: .infinity)
+        var maximum = SIMD2<Float>(repeating: -.infinity)
+        var positiveW: Bool?
+
+        for corner in corners {
+            let projected = matrix * corner
+            guard projected.x.isFinite,
+                  projected.y.isFinite,
+                  projected.w.isFinite,
+                  abs(projected.w) > 0.000001 else {
+                return nil
+            }
+            let isPositive = projected.w > 0
+            if let positiveW, positiveW != isPositive {
+                return nil
+            }
+            positiveW = isPositive
+            let point = SIMD2<Float>(projected.x / projected.w, projected.y / projected.w)
+            minimum = SIMD2<Float>(Swift.min(minimum.x, point.x), Swift.min(minimum.y, point.y))
+            maximum = SIMD2<Float>(Swift.max(maximum.x, point.x), Swift.max(maximum.y, point.y))
+        }
+
+        let result = CGRect(
+            x: CGFloat(minimum.x),
+            y: CGFloat(minimum.y),
+            width: CGFloat(maximum.x - minimum.x),
+            height: CGFloat(maximum.y - minimum.y)
+        )
+        guard !result.isInfinite,
+              result.minX.isFinite,
+              result.minY.isFinite,
+              result.width.isFinite,
+              result.height.isFinite else {
+            return nil
+        }
+        return result
     }
 
     private func executeRasterizedFilterStages(
@@ -9511,7 +9627,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// of the captured pixels — including it would force a recapture on
     /// every transform-only change (e.g. scrolling), defeating the
     /// cache. Internal layout is captured by `bounds` alone.
-    private func rasterizationContentBoundsHash(for layer: CALayer) -> Int {
+    private func rasterizationContentBoundsHash(
+        for layer: CALayer,
+        captureBounds: CGRect
+    ) -> Int {
         let presentationLayer = renderPresentation(for: layer)
         var hasher = Hasher()
         hasher.combine(presentationLayer.bounds.origin.x)
@@ -9519,6 +9638,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         hasher.combine(presentationLayer.bounds.size.width)
         hasher.combine(presentationLayer.bounds.size.height)
         hasher.combine(presentationLayer.rasterizationScale)
+        hasher.combine(captureBounds.minX)
+        hasher.combine(captureBounds.minY)
+        hasher.combine(captureBounds.width)
+        hasher.combine(captureBounds.height)
         if hasVisibleShadow(presentationLayer) {
             hasher.combine(presentationLayer.shadowOpacity)
             hasher.combine(presentationLayer.shadowOffset.width)

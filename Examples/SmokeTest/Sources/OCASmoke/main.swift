@@ -895,6 +895,29 @@ func installHarness() {
                 explicitCompositionGroup.addSublayer(nestedCompositionChild)
                 nestedCompositionGroup.addSublayer(explicitCompositionGroup)
                 crossingGroup.addSublayer(nestedCompositionGroup)
+
+                let overflowGroup = CALayer()
+                overflowGroup.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                overflowGroup.position = CGPoint(x: 100, y: 40)
+                let overflowChild = CALayer()
+                overflowChild.bounds = overflowGroup.bounds
+                overflowChild.position = CGPoint(x: 30, y: 10)
+                overflowChild.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                overflowChild.transform = CATransform3DMakeRotation(.pi / 4, 0, 0, 1)
+                overflowGroup.addSublayer(overflowChild)
+                crossingGroup.addSublayer(overflowGroup)
+
+                let clippedOverflowGroup = CALayer()
+                clippedOverflowGroup.bounds = overflowGroup.bounds
+                clippedOverflowGroup.position = CGPoint(x: 160, y: 40)
+                clippedOverflowGroup.masksToBounds = true
+                let clippedOverflowChild = CALayer()
+                clippedOverflowChild.bounds = clippedOverflowGroup.bounds
+                clippedOverflowChild.position = CGPoint(x: 30, y: 10)
+                clippedOverflowChild.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                clippedOverflowChild.transform = CATransform3DMakeRotation(.pi / 4, 0, 0, 1)
+                clippedOverflowGroup.addSublayer(clippedOverflowChild)
+                crossingGroup.addSublayer(clippedOverflowGroup)
                 root.addSublayer(crossingGroup)
 
                 let transparencyGroup = CATransformLayer()
@@ -995,6 +1018,8 @@ func installHarness() {
                         CGPoint(x: 315, y: 260),
                         CGPoint(x: 140, y: 50),
                         CGPoint(x: 160, y: 50),
+                        CGPoint(x: 120, y: 260),
+                        CGPoint(x: 180, y: 260),
                     ])
                     let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
@@ -1053,15 +1078,18 @@ func installHarness() {
                         && pixels[18] == [255, 255, 0, 255]
                     let nestedCompositionSurvivesFlattening = pixels[19] == [255, 255, 0, 255]
                         && pixels[20] == [255, 0, 0, 255]
+                    let overflowRespectsClipping = pixels[21] == [0, 255, 0, 255]
+                        && pixels[22] == [0, 0, 0, 255]
+                        && renderer.rasterizationFailureCount == 0
                     // The composition-dependent flattened group is recaptured every frame
                     // because its pixels depend on an external backdrop, while unrelated
                     // flattened groups remain reusable.
                     let changedSubtreeWasRecaptured = updatedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningRecaptureCount == 2
-                        && flatteningUpdatedCompositeCount == 8
+                        && flatteningUpdatedCompositeCount == 10
                     let unchangedSubtreeWasReused = reusedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningReuseCaptureCount == 1
-                        && flatteningReuseCompositeCount == 8
+                        && flatteningReuseCompositeCount == 10
                     transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
                         + ",transparent=\(transparentPixelsAreCorrect)"
                         + ",isolated=\(independentGroupsAreIsolated)"
@@ -1077,6 +1105,7 @@ func installHarness() {
                         + ",shadowPath=\(customShadowPathIsRespected)"
                         + ",compositionDepth=\(compositionPlaneWritesDepth)"
                         + ",nestedComposition=\(nestedCompositionSurvivesFlattening)"
+                        + ",overflow=\(overflowRespectsClipping)"
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
                 } catch {
