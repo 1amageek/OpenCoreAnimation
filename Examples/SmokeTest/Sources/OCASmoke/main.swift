@@ -753,6 +753,27 @@ func installHarness() {
                 replicatedSource.compositingFilter = screen
                 compositionReplicator.addSublayer(replicatedSource)
                 root.addSublayer(compositionReplicator)
+
+                let nestedBackdrop = CALayer()
+                nestedBackdrop.bounds = CGRect(x: 0, y: 0, width: 60, height: 30)
+                nestedBackdrop.position = CGPoint(x: 330, y: 40)
+                nestedBackdrop.zPosition = 197
+                nestedBackdrop.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                root.addSublayer(nestedBackdrop)
+
+                let outerComposition = CALayer()
+                outerComposition.bounds = nestedBackdrop.bounds
+                outerComposition.position = nestedBackdrop.position
+                outerComposition.zPosition = 209
+                outerComposition.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                outerComposition.compositingFilter = screen
+                let innerComposition = CALayer()
+                innerComposition.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+                innerComposition.position = CGPoint(x: 15, y: 15)
+                innerComposition.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                innerComposition.compositingFilter = multiply
+                outerComposition.addSublayer(innerComposition)
+                root.addSublayer(outerComposition)
                 CATransaction.commit()
 
                 engine.renderFrame()
@@ -768,6 +789,8 @@ func installHarness() {
                         CGPoint(x: 120, y: 220),
                         CGPoint(x: 220, y: 260),
                         CGPoint(x: 260, y: 260),
+                        CGPoint(x: 315, y: 260),
+                        CGPoint(x: 345, y: 260),
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
@@ -779,6 +802,8 @@ func installHarness() {
                         && pixels[7] == [127, 0, 0, 255]
                         && pixels[8] == [255, 255, 0, 255]
                         && pixels[9] == [255, 0, 0, 255]
+                        && pixels[10] == [255, 0, 0, 255]
+                        && pixels[11] == [255, 255, 0, 255]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -790,6 +815,8 @@ func installHarness() {
                     opacitySource.removeFromSuperlayer()
                     replicatorBackdrop.removeFromSuperlayer()
                     compositionReplicator.removeFromSuperlayer()
+                    nestedBackdrop.removeFromSuperlayer()
+                    outerComposition.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden

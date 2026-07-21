@@ -156,6 +156,8 @@ private struct LayerPrepassTarget {
 
 private struct BackdropCompositionTarget {
     let prepass: LayerPrepassTarget
+    let scope: LayerPrepassTarget?
+    let depth: Int
     let sourceOpacity: Float
     let sourceColor: SIMD4<Float>
 }
@@ -7302,7 +7304,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         collectBackdropCompositionTargets(
             rootLayer,
             parentMatrix: projectionMatrix,
-            ancestorCompositionKeys: [],
+            ancestorCompositionTargets: [],
             hasUnsupportedAncestorClip: false,
             inheritedOpacity: 1,
             targets: &targets,
@@ -7321,7 +7323,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             prefixIsValid = false
         }
 
-        for compositionTarget in targets {
+        let processingTargets = targets.enumerated().sorted { lhs, rhs in
+            if lhs.element.depth != rhs.element.depth {
+                return lhs.element.depth > rhs.element.depth
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+        var previousDepth = processingTargets.first?.depth
+
+        for compositionTarget in processingTargets {
+            if let previousDepth, compositionTarget.depth < previousDepth {
+                prerenderFilteredLayers(
+                    rootLayer,
+                    encoder: encoder,
+                    projectionMatrix: projectionMatrix
+                )
+            }
+            previousDepth = compositionTarget.depth
             let target = compositionTarget.prepass
             let key = target.renderKey
             let presentation = target.presentationLayer
@@ -7365,11 +7383,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             }
             activeKeys.insert(key)
 
+            let backdropClearColor = compositionTarget.scope == nil
+                ? clearColor
+                : GPUColor(r: 0, g: 0, b: 0, a: 0)
             let backdropPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
                 colorAttachments: [
                     GPURenderPassColorAttachment(
                         view: resources.backdropView,
-                        clearValue: clearColor,
+                        clearValue: backdropClearColor,
                         loadOp: .clear,
                         storeOp: .store
                     )
@@ -7403,6 +7424,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let savedStencilValue = currentStencilValue
             let savedStopKey = compositionCaptureStopKey
             let savedDidReachStop = compositionCaptureDidReachStop
+            let savedFilterPrerenderRoot = filterPrerenderRootLayer
 
             opacityStack.removeAll(keepingCapacity: true)
             replicatorColorStack.removeAll(keepingCapacity: true)
@@ -7414,7 +7436,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             compositionCaptureStopKey = key
             compositionCaptureDidReachStop = false
 
-            renderLayer(rootLayer, renderPass: backdropPass, parentMatrix: projectionMatrix)
+            if let scope = compositionTarget.scope {
+                filterPrerenderRootLayer = scope.layer
+                withPrepassContext(scope) {
+                    renderLayer(
+                        scope.layer,
+                        renderPass: backdropPass,
+                        parentMatrix: scope.parentMatrix
+                    )
+                }
+            } else {
+                renderLayer(rootLayer, renderPass: backdropPass, parentMatrix: projectionMatrix)
+            }
             let didReachTarget = compositionCaptureDidReachStop
 
             opacityStack = savedOpacityStack
@@ -7426,6 +7459,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             currentStencilValue = savedStencilValue
             compositionCaptureStopKey = savedStopKey
             compositionCaptureDidReachStop = savedDidReachStop
+            filterPrerenderRootLayer = savedFilterPrerenderRoot
             backdropPass.end()
 
             var premultipliedSourceTexture = source.outputTexture
@@ -7535,7 +7569,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private func collectBackdropCompositionTargets(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
-        ancestorCompositionKeys: [LayerRenderKey],
+        ancestorCompositionTargets: [LayerPrepassTarget],
         hasUnsupportedAncestorClip: Bool,
         inheritedOpacity: Float,
         targets: inout [BackdropCompositionTarget],
@@ -7547,30 +7581,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let key = renderKey(for: layer)
         let hasComposition = presentation.compositingFilter != nil
             || presentation.backgroundFilters?.isEmpty == false
-        var descendantAncestors = ancestorCompositionKeys
+        var descendantAncestors = ancestorCompositionTargets
         if hasComposition {
+            let prepass = LayerPrepassTarget(
+                layer: layer,
+                presentationLayer: presentation,
+                parentMatrix: parentMatrix,
+                renderKey: key,
+                timeOffset: currentReplicatorTimeOffset
+            )
             targets.append(BackdropCompositionTarget(
-                prepass: LayerPrepassTarget(
-                    layer: layer,
-                    presentationLayer: presentation,
-                    parentMatrix: parentMatrix,
-                    renderKey: key,
-                    timeOffset: currentReplicatorTimeOffset
-                ),
+                prepass: prepass,
+                scope: ancestorCompositionTargets.last,
+                depth: ancestorCompositionTargets.count,
                 sourceOpacity: presentation.opacity,
                 sourceColor: currentReplicatorColor
             ))
-            if !ancestorCompositionKeys.isEmpty {
-                structurallyInvalidKeys.insert(key)
-                structurallyInvalidKeys.formUnion(ancestorCompositionKeys)
-            }
             if hasUnsupportedAncestorClip {
                 structurallyInvalidKeys.insert(key)
             }
             if inheritedOpacity < 1 {
                 structurallyInvalidKeys.insert(key)
             }
-            descendantAncestors.append(key)
+            descendantAncestors.append(prepass)
         }
 
         let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
@@ -7582,7 +7615,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             collectBackdropCompositionTargets(
                 sublayer,
                 parentMatrix: sublayerParentMatrix,
-                ancestorCompositionKeys: descendantAncestors,
+                ancestorCompositionTargets: descendantAncestors,
                 hasUnsupportedAncestorClip: hasUnsupportedAncestorClip
                     || presentation.mask != nil
                     || presentation.masksToBounds,
