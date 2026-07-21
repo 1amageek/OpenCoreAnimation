@@ -41,8 +41,8 @@ struct CALayerHitTestingTests {
         #expect(root.hitTest(CGPoint(x: 50, y: 50)) === second)
     }
 
-    @Test("Transform layer converts the input point exactly once")
-    func transformLayerConvertsPointOnce() {
+    @Test("Transform layers reject two-dimensional hit testing")
+    func transformLayerRejectsHitTesting() {
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 300, height: 300)
         root.anchorPoint = .zero
@@ -57,12 +57,12 @@ struct CALayerHitTestingTests {
         child.frame = transformLayer.bounds
         transformLayer.addSublayer(child)
 
-        #expect(transformLayer.hitTest(CGPoint(x: 150, y: 150)) === child)
+        #expect(transformLayer.hitTest(CGPoint(x: 150, y: 150)) == nil)
         #expect(transformLayer.hitTest(CGPoint(x: 250, y: 250)) == nil)
     }
 
-    @Test("Transform layer hit testing follows child zPosition")
-    func transformLayerHitTestingUsesZPosition() {
+    @Test("Transform layer depth does not synthesize two-dimensional hits")
+    func transformLayerDepthDoesNotEnableHitTesting() {
         let transformLayer = CATransformLayer()
         transformLayer.bounds = CGRect(x: 0, y: 0, width: 100, height: 100)
         transformLayer.anchorPoint = .zero
@@ -78,6 +78,6 @@ struct CALayerHitTestingTests {
         back.zPosition = -5
         transformLayer.addSublayer(back)
 
-        #expect(transformLayer.hitTest(CGPoint(x: 50, y: 50)) === front)
+        #expect(transformLayer.hitTest(CGPoint(x: 50, y: 50)) == nil)
     }
 }

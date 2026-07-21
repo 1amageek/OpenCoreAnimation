@@ -29,22 +29,9 @@ open class CATransformLayer: CALayer {
 
     // MARK: - Hit Testing
 
-    /// Transform layers do not render their own content, but forward hit testing
-    /// to sublayers. A CATransformLayer never returns itself from hitTest.
+    /// A transform layer has no two-dimensional coordinate space into which a
+    /// point can be mapped. Callers must perform scene-specific 3D hit testing.
     open override func hitTest(_ p: CGPoint) -> CALayer? {
-        guard !isHidden, opacity > 0 else { return nil }
-
-        // `p` is expressed in this layer's superlayer space. Convert it once to
-        // this transform layer's local space; each child then performs its own
-        // single superlayer-to-local conversion.
-        let localPoint = convert(p, from: superlayer)
-        for sublayer in sortedSublayers().reversed() {
-            if let hit = sublayer.hitTest(localPoint) {
-                return hit
-            }
-        }
-
-        // Never return self for CATransformLayer
         return nil
     }
 }
