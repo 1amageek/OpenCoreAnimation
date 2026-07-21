@@ -748,6 +748,32 @@ func installHarness() {
                 let endLayer = makeTextLayer(x: 120, mode: .end)
                 let middleLayer = makeTextLayer(x: 190, mode: .middle)
                 let wrappedLayer = makeTextLayer(x: 260, mode: .end, wrapped: true)
+
+                let paragraphLayer = CATextLayer()
+                paragraphLayer.bounds = CGRect(x: 0, y: 0, width: 48, height: 48)
+                paragraphLayer.position = CGPoint(x: 50, y: 240)
+                paragraphLayer.zPosition = 100
+                paragraphLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+                paragraphLayer.foregroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                paragraphLayer.font = "monospace"
+                paragraphLayer.fontSize = 20
+                paragraphLayer.string = "█\n█"
+                paragraphLayer.isHidden = true
+                root.addSublayer(paragraphLayer)
+
+                let justifiedLayer = CATextLayer()
+                justifiedLayer.bounds = CGRect(x: 0, y: 0, width: 48, height: 48)
+                justifiedLayer.position = CGPoint(x: 120, y: 240)
+                justifiedLayer.zPosition = 100
+                justifiedLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+                justifiedLayer.foregroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                justifiedLayer.font = "monospace"
+                justifiedLayer.fontSize = 20
+                justifiedLayer.string = "█ █ █"
+                justifiedLayer.isWrapped = true
+                justifiedLayer.alignmentMode = .justified
+                justifiedLayer.isHidden = true
+                root.addSublayer(justifiedLayer)
                 CATransaction.commit()
 
                 @MainActor
@@ -756,6 +782,8 @@ func installHarness() {
                     endLayer.removeFromSuperlayer()
                     middleLayer.removeFromSuperlayer()
                     wrappedLayer.removeFromSuperlayer()
+                    paragraphLayer.removeFromSuperlayer()
+                    justifiedLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
@@ -779,6 +807,22 @@ func installHarness() {
                     endLayer.truncationMode = .start
                     engine.renderFrame()
                     let mutatedPixels = try await renderer.readbackPixels(at: samplePoints(for: 120))
+                    startLayer.isHidden = true
+                    endLayer.isHidden = true
+                    middleLayer.isHidden = true
+                    wrappedLayer.isHidden = true
+                    paragraphLayer.isHidden = false
+                    justifiedLayer.isHidden = false
+                    engine.renderFrame()
+                    let multilinePixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 32, y: 46),
+                        CGPoint(x: 32, y: 70),
+                        CGPoint(x: 102, y: 46),
+                        CGPoint(x: 126, y: 46),
+                        CGPoint(x: 138, y: 46),
+                        CGPoint(x: 102, y: 70),
+                        CGPoint(x: 138, y: 70),
+                    ])
 
                     restoreScene()
 
@@ -786,6 +830,8 @@ func installHarness() {
                         + initialPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
                         + ",mutated="
                         + mutatedPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",multiline="
+                        + multilinePixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
                 } catch {
                     restoreScene()
                     textProbeResult = "error: \(error)"

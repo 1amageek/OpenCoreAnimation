@@ -6415,9 +6415,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 x = 0
             }
 
-            // Draw measured single-line or wrapped text into the layer texture.
-            if textLayer.isWrapped {
-                drawWrappedText(
+            // Draw measured single-line or multiline text into the layer texture.
+            if textLayer.isWrapped || CATextLayoutEngine.containsParagraphBreak(text) {
+                drawMultilineText(
                     ctx: ctx,
                     text: text,
                     x: x,
@@ -6425,7 +6425,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     maxWidth: Double(width),
                     maxHeight: Double(height),
                     lineHeight: textLayer.fontSize * 1.2,
-                    truncationMode: textLayer.truncationMode
+                    truncationMode: textLayer.truncationMode,
+                    alignmentMode: textLayer.alignmentMode,
+                    wrapsToWidth: textLayer.isWrapped
                 )
             } else {
                 let displayedText = CATextLayoutEngine.truncatedText(
@@ -6606,106 +6608,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         return "\(text)_\(width)x\(height)_\(layer.fontSize)_\(layer.alignmentMode.rawValue)_\(layer.truncationMode.rawValue)_\(fontFingerprint)_\(colorHex)_\(layer.isWrapped ? "w" : "n")"
     }
 
-    /// Returns `true` if the given Unicode scalar is in a CJK script range where
-    /// a line break is permitted between any two adjacent characters.
-    ///
-    /// This is a deliberately narrow approximation of UAX #14 — only the
-    /// ranges that cover the vast majority of the text that OpenSpriteKit /
-    /// megaman will encounter (Japanese, Simplified / Traditional Chinese,
-    /// Korean). It does not attempt prohibited-break rules (line-start
-    /// brackets, line-end punctuation), so the result is "break-friendly".
-    private static func isCJKLineBreakable(_ scalar: Unicode.Scalar) -> Bool {
-        let v = scalar.value
-        // CJK Unified Ideographs
-        if v >= 0x4E00 && v <= 0x9FFF { return true }
-        // CJK Unified Ideographs Extension A
-        if v >= 0x3400 && v <= 0x4DBF { return true }
-        // Hiragana
-        if v >= 0x3040 && v <= 0x309F { return true }
-        // Katakana
-        if v >= 0x30A0 && v <= 0x30FF { return true }
-        // Hangul Syllables
-        if v >= 0xAC00 && v <= 0xD7AF { return true }
-        return false
-    }
-
-    /// Splits a string into "line break tokens" — atomic substrings between
-    /// break opportunities. ASCII whitespace separators are dropped; soft
-    /// hyphens and CJK characters each produce a one-character token.
-    ///
-    /// Example:
-    ///   "hello world"       → ["hello", "world"]
-    ///   "これはテスト"       → ["こ","れ","は","テ","ス","ト"]
-    ///   "hello 世界 text"   → ["hello","世","界","text"]
-    private static func lineBreakTokens(in text: String) -> [String] {
-        var tokens: [String] = []
-        var current = ""
-
-        func flush() {
-            if !current.isEmpty {
-                tokens.append(current)
-                current = ""
-            }
-        }
-
-        for scalar in text.unicodeScalars {
-            // ASCII whitespace → break before next token
-            if scalar == " " || scalar == "\t" || scalar == "\n" || scalar == "\r" {
-                flush()
-                continue
-            }
-            // Soft hyphen → break after
-            if scalar.value == 0x00AD {
-                current.unicodeScalars.append(scalar)
-                flush()
-                continue
-            }
-            // CJK character → break before AND after (each is its own token)
-            if isCJKLineBreakable(scalar) {
-                flush()
-                current.unicodeScalars.append(scalar)
-                flush()
-                continue
-            }
-            // Otherwise accumulate
-            current.unicodeScalars.append(scalar)
-        }
-        flush()
-
-        return tokens
-    }
-
     /// Canvas2D text width for a string.
     private func measureWidth(ctx: JSObject, _ s: String) -> Double {
         let metrics = ctx.measureText!(s)
         return metrics.width.number ?? 0
     }
 
-    /// Breaks an overlong token into per-character chunks that each fit in
-    /// `maxWidth`. Used as a fallback when a single token is wider than the
-    /// wrap limit (e.g. a very long URL).
-    private func breakOversizedToken(
-        ctx: JSObject,
-        token: String,
-        maxWidth: Double
-    ) -> [String] {
-        var out: [String] = []
-        var buffer = ""
-        for char in token {
-            let candidate = buffer + String(char)
-            if !buffer.isEmpty && measureWidth(ctx: ctx, candidate) > maxWidth {
-                out.append(buffer)
-                buffer = String(char)
-            } else {
-                buffer = candidate
-            }
-        }
-        if !buffer.isEmpty { out.append(buffer) }
-        return out
-    }
-
-    /// Draws wrapped text and truncates the final visible line when requested.
-    private func drawWrappedText(
+    /// Draws paragraph and width-driven line breaks, truncating visible lines when requested.
+    private func drawMultilineText(
         ctx: JSObject,
         text: String,
         x: Double,
@@ -6713,68 +6623,92 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         maxWidth: Double,
         maxHeight: Double,
         lineHeight: CGFloat,
-        truncationMode: CATextLayerTruncationMode
+        truncationMode: CATextLayerTruncationMode,
+        alignmentMode: CATextLayerAlignmentMode,
+        wrapsToWidth: Bool
     ) {
         guard lineHeight.isFinite, lineHeight > 0 else { return }
-        var lines: [String] = []
-        var line = ""
-
-        func appendLine() {
-            lines.append(line)
-            line = ""
-        }
-
-        for token in Self.lineBreakTokens(in: text) {
-            let candidate = line.isEmpty ? token : line + " " + token
-            let candidateWidth = measureWidth(ctx: ctx, candidate)
-
-            if candidateWidth > maxWidth && !line.isEmpty {
-                appendLine()
-                if measureWidth(ctx: ctx, token) > maxWidth {
-                    let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: maxWidth)
-                    lines.append(contentsOf: chunks.dropLast())
-                    line = chunks.last ?? ""
-                } else {
-                    line = token
-                }
-            } else if line.isEmpty && candidateWidth > maxWidth {
-                let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: maxWidth)
-                lines.append(contentsOf: chunks.dropLast())
-                line = chunks.last ?? ""
-            } else {
-                line = candidate
-            }
-        }
-        if !line.isEmpty || lines.isEmpty {
-            appendLine()
-        }
+        let lines = CATextLayoutEngine.wrappedLines(
+            text,
+            maximumWidth: CGFloat(maxWidth),
+            wrapsToWidth: wrapsToWidth,
+            measure: { candidate in CGFloat(self.measureWidth(ctx: ctx, candidate)) }
+        )
 
         let visibleLineCount = max(1, Int(floor(maxHeight / Double(lineHeight))))
         var displayedLines = lines
         let shouldTruncate = truncationMode == .start
             || truncationMode == .middle
             || truncationMode == .end
+        if shouldTruncate, !wrapsToWidth {
+            displayedLines = lines.map { line in
+                CATextLayoutLine(
+                    text: CATextLayoutEngine.truncatedText(
+                        line.text,
+                        mode: truncationMode,
+                        maximumWidth: CGFloat(maxWidth),
+                        measure: { candidate in
+                            CGFloat(self.measureWidth(ctx: ctx, candidate))
+                        }
+                    ),
+                    separatorAfter: line.separatorAfter,
+                    isParagraphFinal: line.isParagraphFinal
+                )
+            }
+        }
         if shouldTruncate, lines.count > visibleLineCount {
             displayedLines = Array(lines.prefix(visibleLineCount))
-            let overflowText = lines
-                .dropFirst(visibleLineCount - 1)
-                .joined(separator: " ")
-            displayedLines[visibleLineCount - 1] = CATextLayoutEngine.truncatedText(
-                overflowText,
-                mode: truncationMode,
-                maximumWidth: CGFloat(maxWidth),
-                measure: { candidate in
-                    CGFloat(self.measureWidth(ctx: ctx, candidate))
-                }
+            let overflowText = CATextLayoutEngine.joinedText(
+                lines[(visibleLineCount - 1)...]
+            )
+            displayedLines[visibleLineCount - 1] = CATextLayoutLine(
+                text: CATextLayoutEngine.truncatedText(
+                    overflowText,
+                    mode: truncationMode,
+                    maximumWidth: CGFloat(maxWidth),
+                    measure: { candidate in
+                        CGFloat(self.measureWidth(ctx: ctx, candidate))
+                    }
+                ),
+                separatorAfter: "",
+                isParagraphFinal: true
             )
         }
 
         for (index, displayedLine) in displayedLines.enumerated() {
-            _ = ctx.fillText!(
-                displayedLine,
-                x,
-                y + Double(index) * Double(lineHeight)
-            )
+            let lineY = y + Double(index) * Double(lineHeight)
+            if alignmentMode == .justified, !displayedLine.isParagraphFinal {
+                drawJustifiedText(
+                    ctx: ctx,
+                    text: displayedLine.text,
+                    y: lineY,
+                    maximumWidth: maxWidth
+                )
+            } else {
+                _ = ctx.fillText!(displayedLine.text, x, lineY)
+            }
+        }
+    }
+
+    private func drawJustifiedText(
+        ctx: JSObject,
+        text: String,
+        y: Double,
+        maximumWidth: Double
+    ) {
+        let segments = CATextLayoutEngine.justificationSegments(for: text)
+        guard segments.count > 1 else {
+            _ = ctx.fillText!(text, 0, y)
+            return
+        }
+        let contentWidth = segments.reduce(0) { partialResult, segment in
+            partialResult + measureWidth(ctx: ctx, segment)
+        }
+        let spacing = max(0, maximumWidth - contentWidth) / Double(segments.count - 1)
+        var cursor = 0.0
+        for segment in segments {
+            _ = ctx.fillText!(segment, cursor, y)
+            cursor += measureWidth(ctx: ctx, segment) + spacing
         }
     }
 
@@ -6816,46 +6750,29 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let descent = metrics.actualBoundingBoxDescent.number ?? Double(fontSize) * 0.2
         let lineHeight = ascent + descent
 
-        if isWrapped, let maxWidth = maxWidth, CGFloat(measuredWidth) > maxWidth {
-            // Calculate wrapped text height using the same tokenization + oversized-token
-            // fallback as drawWrappedText. Using identical logic ensures that the
-            // measured size matches the rendered output line-for-line (otherwise the
-            // caller's texture would clip or leave blank rows).
-            let tokens = Self.lineBreakTokens(in: text)
-            var lineCount = 1
-            var line = ""
-
-            for token in tokens {
-                let candidate = line.isEmpty ? token : line + " " + token
-                let candidateWidth = measureWidth(ctx: ctx, candidate)
-
-                if candidateWidth > Double(maxWidth) && !line.isEmpty {
-                    // Commit the current line.
-                    lineCount += 1
-
-                    // Does the token itself fit on an empty line?
-                    if measureWidth(ctx: ctx, token) > Double(maxWidth) {
-                        let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: Double(maxWidth))
-                        // All but the last chunk each become their own line.
-                        lineCount += max(0, chunks.count - 1)
-                        line = chunks.last ?? ""
-                    } else {
-                        line = token
-                    }
-                } else if line.isEmpty && candidateWidth > Double(maxWidth) {
-                    // First token on the line is already too wide — break per-character.
-                    let chunks = breakOversizedToken(ctx: ctx, token: token, maxWidth: Double(maxWidth))
-                    // lineCount already starts at 1 for the first chunk; add the rest.
-                    lineCount += max(0, chunks.count - 1)
-                    line = chunks.last ?? ""
-                } else {
-                    line = candidate
-                }
-            }
-
+        if isWrapped, let maxWidth {
+            let lines = CATextLayoutEngine.wrappedLines(
+                text,
+                maximumWidth: maxWidth,
+                measure: { candidate in CGFloat(self.measureWidth(ctx: ctx, candidate)) }
+            )
             return CGSize(
                 width: maxWidth,
-                height: CGFloat(lineHeight) * CGFloat(lineCount) * 1.2
+                height: fontSize * 1.2 * CGFloat(lines.count)
+            )
+        } else if CATextLayoutEngine.containsParagraphBreak(text) {
+            let lines = CATextLayoutEngine.wrappedLines(
+                text,
+                maximumWidth: maxWidth ?? .greatestFiniteMagnitude,
+                wrapsToWidth: false,
+                measure: { candidate in CGFloat(self.measureWidth(ctx: ctx, candidate)) }
+            )
+            let widestLine = lines.reduce(CGFloat.zero) { width, line in
+                max(width, CGFloat(measureWidth(ctx: ctx, line.text)))
+            }
+            return CGSize(
+                width: maxWidth ?? widestLine + fontSize * 0.1,
+                height: fontSize * 1.2 * CGFloat(lines.count)
             )
         } else if let maxWidth = maxWidth, CGFloat(measuredWidth) > maxWidth {
             // Not wrapped but has maxWidth constraint - text will be clipped
