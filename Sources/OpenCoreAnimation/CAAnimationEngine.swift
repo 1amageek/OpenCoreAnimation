@@ -68,17 +68,18 @@ import JavaScriptKit
     /// The display link driving the animation loop.
     private var displayLink: CADisplayLink?
 
+    /// The range currently submitted to the display scheduler.
+    internal var displayLinkFrameRateRange: CAFrameRateRange? {
+        displayLink?.preferredFrameRateRange
+    }
+
     /// Whether the engine is currently running.
     public private(set) var isRunning: Bool = false
 
     /// The preferred frame rate for animations.
     public var preferredFrameRate: Float = 60 {
         didSet {
-            displayLink?.preferredFrameRateRange = CAFrameRateRange(
-                minimum: preferredFrameRate,
-                maximum: preferredFrameRate,
-                preferred: preferredFrameRate
-            )
+            updateDisplayLinkFrameRate(at: CACurrentMediaTime())
         }
     }
 
@@ -121,11 +122,7 @@ import JavaScriptKit
 
         isRunning = true
         displayLink = CADisplayLink(target: self, selector: Selector("displayLinkDidFire"))
-        displayLink?.preferredFrameRateRange = CAFrameRateRange(
-            minimum: preferredFrameRate,
-            maximum: preferredFrameRate,
-            preferred: preferredFrameRate
-        )
+        updateDisplayLinkFrameRate(at: CACurrentMediaTime())
         displayLink?.add(to: .main, forMode: .common)
     }
 
@@ -163,6 +160,8 @@ import JavaScriptKit
     /// `.forwards` fill mode animations render their final frame
     /// before being removed.
     public func displayLinkDidFire(_ displayLink: CADisplayLink) {
+        updateDisplayLinkFrameRate(at: CACurrentMediaTime())
+
         // Render the layer tree first using internal delegate
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
             layoutRecursively(rootLayer)
@@ -189,6 +188,130 @@ import JavaScriptKit
             for sublayer in sublayers {
                 processAnimationsRecursively(sublayer)
             }
+        }
+    }
+
+    /// Resolves the highest-demand timing hints among animations active in the tree.
+    ///
+    /// The browser ultimately controls its physical refresh rate. This arbitration
+    /// only selects the callback range requested from `CADisplayLink`.
+    internal func resolvedFrameRateRange(at mediaTime: CFTimeInterval) -> CAFrameRateRange {
+        var accumulator = FrameRateRangeAccumulator()
+        collectActiveFrameRateRanges(
+            from: rootLayer,
+            mediaTime: mediaTime,
+            into: &accumulator
+        )
+
+        guard accumulator.hasExplicitRange else {
+            return CAFrameRateRange(
+                minimum: preferredFrameRate,
+                maximum: preferredFrameRate,
+                preferred: preferredFrameRate
+            )
+        }
+
+        return accumulator.resolvedRange
+    }
+
+    /// Incrementally combines animation hints without allocating on each frame.
+    private struct FrameRateRangeAccumulator {
+        private(set) var hasExplicitRange = false
+        private var minimum: Float = 0
+        private var maximum: Float = 0
+        private var preferred: Float?
+
+        mutating func include(_ range: CAFrameRateRange) {
+            hasExplicitRange = true
+            minimum = max(minimum, range.minimum)
+            maximum = max(maximum, range.maximum)
+            if let candidate = range.preferred, candidate > 0 {
+                preferred = max(preferred ?? 0, candidate)
+            }
+        }
+
+        var resolvedRange: CAFrameRateRange {
+            let normalizedMaximum = max(minimum, max(maximum, preferred ?? 0))
+            let normalizedPreferred = preferred.map {
+                min(normalizedMaximum, max(minimum, $0))
+            }
+            return CAFrameRateRange(
+                minimum: minimum,
+                maximum: normalizedMaximum,
+                preferred: normalizedPreferred
+            )
+        }
+    }
+
+    private func collectActiveFrameRateRanges(
+        from layer: CALayer?,
+        mediaTime: CFTimeInterval,
+        into accumulator: inout FrameRateRangeAccumulator
+    ) {
+        guard let layer else { return }
+        let localTime = layer.convertTime(mediaTime, from: nil)
+
+        layer.forEachAttachedAnimation { animation in
+            collectActiveFrameRateRanges(
+                from: animation,
+                parentTime: localTime,
+                inheritedDuration: nil,
+                into: &accumulator
+            )
+        }
+
+        for sublayer in layer.sublayers ?? [] {
+            collectActiveFrameRateRanges(
+                from: sublayer,
+                mediaTime: mediaTime,
+                into: &accumulator
+            )
+        }
+    }
+
+    private func collectActiveFrameRateRanges(
+        from animation: CAAnimation,
+        parentTime: CFTimeInterval,
+        inheritedDuration: CFTimeInterval?,
+        into accumulator: inout FrameRateRangeAccumulator
+    ) {
+        guard !animation.isFinished else { return }
+        let duration = animation.duration > 0
+            ? animation.duration
+            : inheritedDuration ?? animation.effectiveBaseDuration
+        let timing = CAMediaTimingEvaluator.evaluate(
+            animation,
+            parentTime: parentTime,
+            duration: duration
+        )
+        guard timing.phase == .active else { return }
+
+        if animation.preferredFrameRateRange != .default {
+            accumulator.include(animation.preferredFrameRateRange)
+        }
+        if let group = animation as? CAAnimationGroup {
+            let childTime: CFTimeInterval
+            if let timingFunction = group.timingFunction {
+                let easedProgress = timingFunction.evaluate(at: Float(timing.progress))
+                childTime = CFTimeInterval(max(0, min(1, easedProgress))) * duration
+            } else {
+                childTime = timing.basicTime
+            }
+            for child in group.animations ?? [] {
+                collectActiveFrameRateRanges(
+                    from: child,
+                    parentTime: childTime,
+                    inheritedDuration: duration,
+                    into: &accumulator
+                )
+            }
+        }
+    }
+
+    private func updateDisplayLinkFrameRate(at mediaTime: CFTimeInterval) {
+        let range = resolvedFrameRateRange(at: mediaTime)
+        if displayLink?.preferredFrameRateRange != range {
+            displayLink?.preferredFrameRateRange = range
         }
     }
 

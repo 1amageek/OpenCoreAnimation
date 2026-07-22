@@ -5074,6 +5074,13 @@ open class CALayer: CAMediaTiming, Hashable {
         return _animations.isEmpty ? nil : Array(_animations.keys)
     }
 
+    /// Visits attached animations without materializing the public key array.
+    internal func forEachAttachedAnimation(_ body: (CAAnimation) -> Void) {
+        for animation in _animations.values {
+            body(animation)
+        }
+    }
+
     /// Checks for completed animations and removes them if needed.
     ///
     /// This method is called by `CAAnimationEngine` during the display refresh cycle

@@ -26,6 +26,7 @@ open class CAAnimation: CAMediaTiming, CAAction {
         self.autoreverses = animation.autoreverses
         self.fillMode = animation.fillMode
         self.timingFunction = animation.timingFunction
+        self.preferredFrameRateRange = animation.preferredFrameRateRange
         self.delegate = animation.delegate
         self.isRemovedOnCompletion = animation.isRemovedOnCompletion
         // Runtime state (isFinished / attachedLayer / animationKey)
@@ -76,6 +77,9 @@ open class CAAnimation: CAMediaTiming, CAAction {
 
     /// The timing function defining the pacing of the animation.
     open var timingFunction: CAMediaTimingFunction?
+
+    /// A hint describing the range of frame rates preferred while this animation is active.
+    open var preferredFrameRateRange: CAFrameRateRange = .default
 
     /// The animation's delegate object.
     open weak var delegate: (any CAAnimationDelegate)?
