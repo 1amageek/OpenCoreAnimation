@@ -1096,6 +1096,7 @@ open class CALayer: CAMediaTiming, Hashable {
         case "strokeColor": return (self as? CAShapeLayer)?._strokeColor
         case "startPoint": return (self as? CAGradientLayer)?._startPoint
         case "endPoint": return (self as? CAGradientLayer)?._endPoint
+        case "colors": return (self as? CAGradientLayer)?._colors
         case "locations": return (self as? CAGradientLayer)?._locations
         case "fontSize": return (self as? CATextLayer)?._fontSize
         case "foregroundColor": return (self as? CATextLayer)?._foregroundColor
@@ -1233,6 +1234,26 @@ open class CALayer: CAMediaTiming, Hashable {
                   let locations = gradient._locations,
                   locations.count == value.count else { return }
             gradient._locations = zip(locations, value).map { $0 + $1 * count }
+        case "colors":
+            guard let gradient = layer as? CAGradientLayer,
+                  let value = contribution as? [Any] else { return }
+            let initial = gradient._colors ?? (zeroAnimationValue(matching: value) as? [Any])
+            guard let initial, initial.count == value.count else { return }
+            var colors: [Any] = []
+            colors.reserveCapacity(initial.count)
+            for (initialValue, contributionValue) in zip(initial, value) {
+                guard let initialColor = extractColor(initialValue),
+                      let contributionColor = extractColor(contributionValue) else { return }
+                let base = extractRGBA(from: initialColor)
+                let addition = extractRGBA(from: contributionColor)
+                colors.append(CGColor(
+                    red: base.r + addition.r * count,
+                    green: base.g + addition.g * count,
+                    blue: base.b + addition.b * count,
+                    alpha: base.a + addition.a * count
+                ))
+            }
+            gradient._colors = colors
         case "emitterPosition": if let emitter = layer as? CAEmitterLayer, let value = contribution as? CGPoint {
             emitter._emitterPosition.x += value.x * count; emitter._emitterPosition.y += value.y * count
         }
@@ -2715,6 +2736,24 @@ open class CALayer: CAMediaTiming, Hashable {
             return
         }
 
+        if additive {
+            if keyPath.hasPrefix("transform.") {
+                applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: true)
+                return
+            }
+            guard let combined = additiveKeyframeValue(value, to: layer, keyPath: keyPath) else {
+                return
+            }
+            applyKeyframeValue(
+                combined,
+                layer: layer,
+                keyPath: keyPath,
+                additive: false,
+                valueFunction: nil
+            )
+            return
+        }
+
         switch keyPath {
         case "contents":
             layer._contents = value
@@ -2849,7 +2888,10 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // CAReplicatorLayer properties
         case "instanceDelay":
-            if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? CFTimeInterval { replicatorLayer._instanceDelay = v }
+            if let replicatorLayer = layer as? CAReplicatorLayer,
+               let scalar = transformScalarValue(value) {
+                replicatorLayer._instanceDelay = CFTimeInterval(scalar)
+            }
         case "instanceTransform":
             if let replicatorLayer = layer as? CAReplicatorLayer, let v = value as? CATransform3D { replicatorLayer._instanceTransform = v }
         case "instanceColor":
@@ -2866,6 +2908,28 @@ open class CALayer: CAMediaTiming, Hashable {
         default:
             break
         }
+    }
+
+    private func additiveKeyframeValue(
+        _ value: Any,
+        to layer: CALayer,
+        keyPath: String
+    ) -> Any? {
+        let current = layer.currentAnimationValue(for: keyPath)
+            ?? zeroAnimationValue(matching: value)
+        guard let current else { return nil }
+        if let value = value as? CATransform3D,
+           let current = current as? CATransform3D {
+            return CATransform3DConcat(value, current)
+        }
+        if let combined = combineAnimationValues(current, value, subtract: false) {
+            return combined
+        }
+        if let current = transformScalarValue(current),
+           let value = transformScalarValue(value) {
+            return current + value
+        }
+        return nil
     }
 
     /// Interpolates between two keyframe values.
@@ -2887,315 +2951,82 @@ open class CALayer: CAMediaTiming, Hashable {
             applyValueFunctionTransform(transform, to: layer, additive: additive)
             return
         }
+        guard let value = linearKeyframeValue(
+            from: fromValue,
+            to: toValue,
+            progress: CGFloat(progress),
+            keyPath: keyPath
+        ) else { return }
+        applyKeyframeValue(
+            value,
+            layer: layer,
+            keyPath: keyPath,
+            additive: additive,
+            valueFunction: nil
+        )
+    }
 
-        switch keyPath {
-        case "contents":
-            layer._contents = progress < 0.5 ? fromValue : toValue
-        case "opacity":
-            if let f = fromValue as? Float, let t = toValue as? Float {
-                layer._opacity = f + Float(progress) * (t - f)
-            }
-        case "position":
-            if let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
-                layer._position = CGPoint(
-                    x: f.x + CGFloat(progress) * (t.x - f.x),
-                    y: f.y + CGFloat(progress) * (t.y - f.y)
-                )
-            }
-        case "position.x", "position.y":
-            if let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                let value = f + CGFloat(progress) * (t - f)
-                if keyPath == "position.x" { layer._position.x = value }
-                else { layer._position.y = value }
-            }
-        case "bounds":
-            if let f = fromValue as? CGRect, let t = toValue as? CGRect {
-                layer._bounds = CGRect(
-                    x: f.origin.x + CGFloat(progress) * (t.origin.x - f.origin.x),
-                    y: f.origin.y + CGFloat(progress) * (t.origin.y - f.origin.y),
-                    width: f.size.width + CGFloat(progress) * (t.size.width - f.size.width),
-                    height: f.size.height + CGFloat(progress) * (t.size.height - f.size.height)
-                )
-            }
-        case "cornerRadius", "borderWidth", "shadowRadius", "zPosition",
-             "anchorPointZ", "contentsScale", "rasterizationScale":
-            if let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                let value = f + CGFloat(progress) * (t - f)
-                switch keyPath {
-                case "cornerRadius": layer._cornerRadius = value
-                case "borderWidth": layer._borderWidth = value
-                case "shadowRadius": layer._shadowRadius = value
-                case "zPosition": layer._zPosition = value
-                case "anchorPointZ": layer._anchorPointZ = value
-                case "contentsScale": layer._contentsScale = value
-                case "rasterizationScale": layer._rasterizationScale = value
-                default: break
-                }
-            }
-        case "shadowOpacity":
-            if let f = fromValue as? Float, let t = toValue as? Float {
-                layer._shadowOpacity = f + Float(progress) * (t - f)
-            }
-        case "hidden", "isHidden", "masksToBounds", "doubleSided", "isDoubleSided", "shouldRasterize":
-            if let f = fromValue as? Bool, let t = toValue as? Bool {
-                let fromScalar: CFTimeInterval = f ? 1 : 0
-                let toScalar: CFTimeInterval = t ? 1 : 0
-                applyBooleanAnimationValue(
-                    fromScalar + progress * (toScalar - fromScalar) != 0,
-                    to: layer,
-                    keyPath: keyPath
-                )
-            }
-        case "anchorPoint":
-            if let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
-                layer._anchorPoint = CGPoint(
-                    x: f.x + CGFloat(progress) * (t.x - f.x),
-                    y: f.y + CGFloat(progress) * (t.y - f.y)
-                )
-            }
-        case "bounds.origin":
-            if let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
-                layer._bounds.origin = CGPoint(
-                    x: f.x + CGFloat(progress) * (t.x - f.x),
-                    y: f.y + CGFloat(progress) * (t.y - f.y)
-                )
-            }
-        case "shadowOffset":
-            if let f = fromValue as? CGSize, let t = toValue as? CGSize {
-                layer._shadowOffset = CGSize(
-                    width: f.width + CGFloat(progress) * (t.width - f.width),
-                    height: f.height + CGFloat(progress) * (t.height - f.height)
-                )
-            }
-        case "bounds.size":
-            if let f = fromValue as? CGSize, let t = toValue as? CGSize {
-                layer._bounds.size = CGSize(
-                    width: f.width + CGFloat(progress) * (t.width - f.width),
-                    height: f.height + CGFloat(progress) * (t.height - f.height)
-                )
-            }
-        case "contentsRect", "contentsCenter":
-            if let f = fromValue as? CGRect, let t = toValue as? CGRect {
-                let value = CGRect(
-                    x: f.origin.x + CGFloat(progress) * (t.origin.x - f.origin.x),
-                    y: f.origin.y + CGFloat(progress) * (t.origin.y - f.origin.y),
-                    width: f.size.width + CGFloat(progress) * (t.size.width - f.size.width),
-                    height: f.size.height + CGFloat(progress) * (t.size.height - f.size.height)
-                )
-                switch keyPath {
-                case "contentsRect": layer._contentsRect = value
-                case "contentsCenter": layer._contentsCenter = value
-                default: break
-                }
-            }
-        case "transform":
-            if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
-                let value = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
-                layer._transform = additive ? CATransform3DConcat(value, layer._transform) : value
-            }
-        case _ where keyPath.hasPrefix("transform."):
-            if let f = fromValue as? CGSize, let t = toValue as? CGSize {
-                let value = CGSize(
-                    width: f.width + CGFloat(progress) * (t.width - f.width),
-                    height: f.height + CGFloat(progress) * (t.height - f.height)
-                )
-                applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: additive)
-            } else if let f = transformScalarValue(fromValue),
-                      let t = transformScalarValue(toValue) {
-                let value = f + CGFloat(progress) * (t - f)
-                applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: additive)
-            }
-        case "sublayerTransform":
-            if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
-                layer._sublayerTransform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
-            }
-
-        // Color properties
-        case "backgroundColor":
-            if let f = extractColor(fromValue), let t = extractColor(toValue) {
-                layer._backgroundColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
-            }
-        case "borderColor":
-            if let f = extractColor(fromValue), let t = extractColor(toValue) {
-                layer._borderColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
-            }
-        case "shadowColor":
-            if let f = extractColor(fromValue), let t = extractColor(toValue) {
-                layer._shadowColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
-            }
-
-        // CAShapeLayer float properties
-        case "strokeStart":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                shapeLayer._strokeStart = f + CGFloat(progress) * (t - f)
-            }
-        case "strokeEnd":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                shapeLayer._strokeEnd = f + CGFloat(progress) * (t - f)
-            }
-        case "lineWidth":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                shapeLayer._lineWidth = f + CGFloat(progress) * (t - f)
-            }
-        case "lineDashPhase":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                shapeLayer._lineDashPhase = f + CGFloat(progress) * (t - f)
-            }
-        case "miterLimit":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                shapeLayer._miterLimit = f + CGFloat(progress) * (t - f)
-            }
-
-        // CAShapeLayer color properties
-        case "fillColor":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = extractColor(fromValue), let t = extractColor(toValue) {
-                shapeLayer._fillColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
-            }
-        case "strokeColor":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = extractColor(fromValue), let t = extractColor(toValue) {
-                shapeLayer._strokeColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
-            }
-
-        // CAGradientLayer properties
-        case "startPoint":
-            if let gradientLayer = layer as? CAGradientLayer,
-               let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
-                gradientLayer._startPoint = CGPoint(
-                    x: f.x + CGFloat(progress) * (t.x - f.x),
-                    y: f.y + CGFloat(progress) * (t.y - f.y)
-                )
-            }
-        case "endPoint":
-            if let gradientLayer = layer as? CAGradientLayer,
-               let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
-                gradientLayer._endPoint = CGPoint(
-                    x: f.x + CGFloat(progress) * (t.x - f.x),
-                    y: f.y + CGFloat(progress) * (t.y - f.y)
-                )
-            }
-        case "colors":
-            if let gradientLayer = layer as? CAGradientLayer,
-               let fromColors = fromValue as? [Any], let toColors = toValue as? [Any] {
-                let count = min(fromColors.count, toColors.count)
-                var interpolatedColors: [Any] = []
-                for i in 0..<count {
-                    if let fromColor = extractColor(fromColors[i]),
-                       let toColor = extractColor(toColors[i]) {
-                        interpolatedColors.append(interpolateColor(from: fromColor, to: toColor, progress: CGFloat(progress)))
-                    } else {
-                        interpolatedColors.append(fromColors[i])
-                    }
-                }
-                gradientLayer._colors = interpolatedColors
-            }
-        case "locations":
-            if let gradientLayer = layer as? CAGradientLayer,
-               let fromLocations = fromValue as? [CGFloat], let toLocations = toValue as? [CGFloat] {
-                let count = min(fromLocations.count, toLocations.count)
-                var interpolatedLocations: [CGFloat] = []
-                for i in 0..<count {
-                    interpolatedLocations.append(fromLocations[i] + CGFloat(progress) * (toLocations[i] - fromLocations[i]))
-                }
-                gradientLayer._locations = interpolatedLocations
-            }
-
-        // CATextLayer properties
-        case "fontSize":
-            if let textLayer = layer as? CATextLayer,
-               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                textLayer._fontSize = f + CGFloat(progress) * (t - f)
-            }
-        case "foregroundColor":
-            if let textLayer = layer as? CATextLayer,
-               let f = extractColor(fromValue), let t = extractColor(toValue) {
-                textLayer._foregroundColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
-            }
-
-        // CAEmitterLayer properties
-        case "emitterPosition":
-            if let emitterLayer = layer as? CAEmitterLayer,
-               let f = fromValue as? CGPoint, let t = toValue as? CGPoint {
-                emitterLayer._emitterPosition = CGPoint(
-                    x: f.x + CGFloat(progress) * (t.x - f.x),
-                    y: f.y + CGFloat(progress) * (t.y - f.y)
-                )
-            }
-        case "emitterSize":
-            if let emitterLayer = layer as? CAEmitterLayer,
-               let f = fromValue as? CGSize, let t = toValue as? CGSize {
-                emitterLayer._emitterSize = CGSize(
-                    width: f.width + CGFloat(progress) * (t.width - f.width),
-                    height: f.height + CGFloat(progress) * (t.height - f.height)
-                )
-            }
-        case "emitterZPosition", "emitterDepth":
-            if let emitterLayer = layer as? CAEmitterLayer,
-               let f = fromValue as? CGFloat, let t = toValue as? CGFloat {
-                let value = f + CGFloat(progress) * (t - f)
-                if keyPath == "emitterZPosition" { emitterLayer._emitterZPosition = value }
-                else { emitterLayer._emitterDepth = value }
-            }
-        case "birthRate", "lifetime", "velocity", "scale", "spin":
-            if let emitterLayer = layer as? CAEmitterLayer,
-               let f = fromValue as? Float, let t = toValue as? Float {
-                let value = f + Float(progress) * (t - f)
-                switch keyPath {
-                case "birthRate": emitterLayer._birthRate = value
-                case "lifetime": emitterLayer._lifetime = value
-                case "velocity": emitterLayer._velocity = value
-                case "scale": emitterLayer._scale = value
-                default: emitterLayer._spin = value
-                }
-            }
-
-        // CAReplicatorLayer properties
-        case "instanceDelay":
-            if let replicatorLayer = layer as? CAReplicatorLayer,
-               let f = fromValue as? CFTimeInterval, let t = toValue as? CFTimeInterval {
-                replicatorLayer._instanceDelay = f + progress * (t - f)
-            }
-        case "instanceTransform":
-            if let replicatorLayer = layer as? CAReplicatorLayer,
-               let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
-                replicatorLayer._instanceTransform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
-            }
-        case "instanceColor":
-            if let replicatorLayer = layer as? CAReplicatorLayer,
-               let f = extractColor(fromValue), let t = extractColor(toValue) {
-                replicatorLayer._instanceColor = interpolateColor(from: f, to: t, progress: CGFloat(progress))
-            }
-        case "instanceRedOffset", "instanceGreenOffset", "instanceBlueOffset", "instanceAlphaOffset":
-            if let replicatorLayer = layer as? CAReplicatorLayer,
-               let f = fromValue as? Float, let t = toValue as? Float {
-                let value = f + Float(progress) * (t - f)
-                switch keyPath {
-                case "instanceRedOffset": replicatorLayer._instanceRedOffset = value
-                case "instanceGreenOffset": replicatorLayer._instanceGreenOffset = value
-                case "instanceBlueOffset": replicatorLayer._instanceBlueOffset = value
-                default: replicatorLayer._instanceAlphaOffset = value
-                }
-            }
-
-        case "path":
-            if let shapeLayer = layer as? CAShapeLayer,
-               let f = extractPath(fromValue), let t = extractPath(toValue) {
-                shapeLayer._path = interpolatePath(from: f, to: t, progress: CGFloat(progress))
-            }
-        case "shadowPath":
-            if let f = extractPath(fromValue), let t = extractPath(toValue) {
-                layer._shadowPath = interpolatePath(from: f, to: t, progress: CGFloat(progress))
-            }
-
-        default:
-            break
+    private func linearKeyframeValue(
+        from fromValue: Any,
+        to toValue: Any,
+        progress: CGFloat,
+        keyPath: String
+    ) -> Any? {
+        if keyPath == "contents" {
+            return progress < 0.5 ? fromValue : toValue
         }
+        if let from = fromValue as? Bool, let to = toValue as? Bool {
+            let fromScalar: CGFloat = from ? 1 : 0
+            let toScalar: CGFloat = to ? 1 : 0
+            return fromScalar + progress * (toScalar - fromScalar) != 0
+        }
+        if let from = fromValue as? Float, let to = toValue as? Float {
+            return from + Float(progress) * (to - from)
+        }
+        if let from = fromValue as? CGFloat, let to = toValue as? CGFloat {
+            return from + progress * (to - from)
+        }
+        if let from = fromValue as? Int, let to = toValue as? Int {
+            return CGFloat(from) + progress * CGFloat(to - from)
+        }
+        if let from = fromValue as? CGPoint, let to = toValue as? CGPoint {
+            return CGPoint(
+                x: from.x + progress * (to.x - from.x),
+                y: from.y + progress * (to.y - from.y)
+            )
+        }
+        if let from = fromValue as? CGSize, let to = toValue as? CGSize {
+            return CGSize(
+                width: from.width + progress * (to.width - from.width),
+                height: from.height + progress * (to.height - from.height)
+            )
+        }
+        if let from = fromValue as? CGRect, let to = toValue as? CGRect {
+            return CGRect(
+                x: from.origin.x + progress * (to.origin.x - from.origin.x),
+                y: from.origin.y + progress * (to.origin.y - from.origin.y),
+                width: from.size.width + progress * (to.size.width - from.size.width),
+                height: from.size.height + progress * (to.size.height - from.size.height)
+            )
+        }
+        if let from = fromValue as? CATransform3D, let to = toValue as? CATransform3D {
+            return interpolateTransform(from: from, to: to, progress: progress)
+        }
+        if let from = extractColor(fromValue), let to = extractColor(toValue) {
+            return interpolateColor(from: from, to: to, progress: progress)
+        }
+        if let from = fromValue as? [CGFloat],
+           let to = toValue as? [CGFloat],
+           from.count == to.count {
+            return zip(from, to).map { $0 + progress * ($1 - $0) }
+        }
+        if let from = fromValue as? [Any], let to = toValue as? [Any] {
+            return interpolateColorArray(from: from, to: to, progress: progress)
+        }
+        if let from = extractPath(fromValue), let to = extractPath(toValue) {
+            return interpolatePath(from: from, to: to, progress: progress)
+        }
+        return nil
     }
 
     private struct CubicParameters {

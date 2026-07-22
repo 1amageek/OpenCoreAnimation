@@ -46,6 +46,7 @@ nonisolated(unsafe) var shadowPathKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var transformComponentProbeResult: String = "pending"
 nonisolated(unsafe) var constraintLayoutProbeResult: String = "pending"
 nonisolated(unsafe) var aggregateByValueProbeResult: String = "pending"
+nonisolated(unsafe) var additiveKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -167,6 +168,7 @@ public func setup() {
             transformComponentProbeResult = "pending"
             constraintLayoutProbeResult = "pending"
             aggregateByValueProbeResult = "pending"
+            additiveKeyframeProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -368,6 +370,9 @@ func installHarness() {
         })
         h.expose("getAggregateByValueProbeResult", returning: {
             .string(aggregateByValueProbeResult)
+        })
+        h.expose("getAdditiveKeyframeProbeResult", returning: {
+            .string(additiveKeyframeProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1859,6 +1864,107 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     aggregateByValueProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginAdditiveKeyframeProbe", action: {
+            Task { @MainActor in
+                additiveKeyframeProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    additiveKeyframeProbeResult = "error: additive keyframe dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                let layer = CALayer()
+                layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                layer.position = CGPoint(x: 80, y: 150)
+                layer.zPosition = 100
+                layer.backgroundColor = CGColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1)
+                root.addSublayer(layer)
+
+                func configure(_ animation: CAKeyframeAnimation) {
+                    animation.duration = 1
+                    animation.speed = 0
+                    animation.timeOffset = 0.5
+                    animation.fillMode = .both
+                    animation.isRemovedOnCompletion = false
+                    animation.isAdditive = true
+                }
+
+                let position = CAKeyframeAnimation(keyPath: "position")
+                position.values = [CGPoint.zero, CGPoint(x: 40, y: 0)]
+                configure(position)
+                layer.add(position, forKey: "browserAdditivePosition")
+
+                let bounds = CAKeyframeAnimation(keyPath: "bounds")
+                bounds.values = [
+                    CGRect.zero,
+                    CGRect(x: 0, y: 0, width: 40, height: 0),
+                ]
+                configure(bounds)
+                layer.add(bounds, forKey: "browserAdditiveBounds")
+
+                let color = CAKeyframeAnimation(keyPath: "backgroundColor")
+                color.values = [
+                    CGColor(red: 0, green: 0, blue: 0, alpha: 0),
+                    CGColor(red: 0.8, green: 0, blue: 0, alpha: 0),
+                ]
+                configure(color)
+                layer.add(color, forKey: "browserAdditiveColor")
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    layer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (existingLayer, wasHidden) in existingLayerStates {
+                        existingLayer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                guard let presentation = layer.presentation(),
+                      let components = presentation.backgroundColor?.components,
+                      components.count == 4 else {
+                    restoreScene()
+                    additiveKeyframeProbeResult = "error: additive keyframe presentation unavailable"
+                    return
+                }
+                let presentationMatches = abs(presentation.position.x - 100) < 0.001
+                    && abs(presentation.bounds.width - 60) < 0.001
+                    && abs(components[0] - 0.6) < 0.001
+                    && abs(components[1] - 0.2) < 0.001
+                    && abs(components[2] - 0.2) < 0.001
+                    && abs(components[3] - 1) < 0.001
+
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 65, y: 150),
+                        CGPoint(x: 72, y: 150),
+                        CGPoint(x: 100, y: 150),
+                        CGPoint(x: 135, y: 150),
+                    ])
+                    restoreScene()
+                    additiveKeyframeProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                        + ",presentation=\(presentationMatches)"
+                } catch {
+                    restoreScene()
+                    additiveKeyframeProbeResult = "error: \(error)"
                 }
             }
         })
