@@ -866,6 +866,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var gradientRenderFailureCount: Int = 0
 
+    /// The most recent typed gradient-rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastGradientRenderFailure: CAGradientRenderFailure?
+
     /// Number of layers rejected because their requested corner curve is unsupported.
     @_spi(RendererDiagnostics)
     public private(set) var cornerCurveRenderFailureCount: Int = 0
@@ -4474,6 +4478,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         shapeRenderFailureCount = 0
         lastShapeRenderFailure = nil
         gradientRenderFailureCount = 0
+        lastGradientRenderFailure = nil
         cornerCurveRenderFailureCount = 0
         contentsRenderFailureCount = 0
         textRenderFailureCount = 0
@@ -7693,16 +7698,25 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Gradient Layer Rendering
 
+    private func recordGradientRenderFailure(
+        _ failure: CAGradientRenderFailure
+    ) {
+        gradientRenderFailureCount += 1
+        lastGradientRenderFailure = failure
+    }
+
     private func gradientStopBinding(
         for gradientLayer: CAGradientLayer,
         configuration: GradientRenderConfiguration,
         device: GPUDevice
-    ) -> (stopOffset: UInt32, bindGroup: GPUBindGroup)? {
+    ) throws(CAGradientRenderFailure) -> (
+        stopOffset: UInt32,
+        bindGroup: GPUBindGroup
+    ) {
         guard let uniformBuffer,
               let bindGroupLayout,
               let gradientStopBufferPool else {
-            gradientRenderFailureCount += 1
-            return nil
+            throw .rendererResourcesUnavailable
         }
 
         let identifier = ObjectIdentifier(gradientLayer)
@@ -7715,9 +7729,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
             .multipliedReportingOverflow(by: Self.gradientStopStride)
         let (requiredCapacity, capacityOverflow) = gradientStopByteOffset
             .addingReportingOverflow(byteCount)
-        guard !byteCountOverflow, !capacityOverflow else {
-            gradientRenderFailureCount += 1
-            return nil
+        guard !byteCountOverflow else {
+            throw .stopByteCountOverflow(colorCount: configuration.colors.count)
+        }
+        guard !capacityOverflow else {
+            throw .stopCapacityOverflow(
+                byteOffset: gradientStopByteOffset,
+                byteCount: byteCount
+            )
         }
 
         do {
@@ -7730,14 +7749,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 gradientBindGroup = nil
             }
         } catch {
-            gradientRenderFailureCount += 1
-            return nil
+            throw .stopBufferFailure(error)
         }
 
         let stopOffsetValue = gradientStopByteOffset / Self.gradientStopStride
         guard stopOffsetValue <= UInt64(UInt32.max) else {
-            gradientRenderFailureCount += 1
-            return nil
+            throw .stopOffsetOutOfRange(stopOffsetValue)
         }
         let stopOffset = UInt32(stopOffsetValue)
 
@@ -7746,8 +7763,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // the JavaScript Float32Array itself is pooled and reused.
         var stopData: [Float] = []
         stopData.reserveCapacity(Int(byteCount / UInt64(MemoryLayout<Float>.stride)))
-        for (color, location) in zip(configuration.colors, configuration.locations) {
-            let components = rgbaComponents(color)
+        for (components, location) in zip(
+            configuration.colorComponents,
+            configuration.locations
+        ) {
             stopData.append(contentsOf: [
                 components.x, components.y, components.z, components.w,
                 location, 0, 0, 0,
@@ -7797,9 +7816,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
+        guard let colors = gradientLayer.colors, !colors.isEmpty else { return }
         guard let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
-              let colors = gradientLayer.colors, !colors.isEmpty else { return }
+              let uniformBuffer = uniformBuffer else {
+            recordGradientRenderFailure(.rendererResourcesUnavailable)
+            return
+        }
 
         let configuration: GradientRenderConfiguration
         do {
@@ -7811,15 +7833,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 endPoint: gradientLayer.endPoint
             )
         } catch {
-            gradientRenderFailureCount += 1
+            recordGradientRenderFailure(.invalidConfiguration(error))
             return
         }
 
-        guard let stopBinding = gradientStopBinding(
-            for: gradientLayer,
-            configuration: configuration,
-            device: device
-        ) else {
+        let stopBinding: (stopOffset: UInt32, bindGroup: GPUBindGroup)
+        do {
+            stopBinding = try gradientStopBinding(
+                for: gradientLayer,
+                configuration: configuration,
+                device: device
+            )
+        } catch {
+            recordGradientRenderFailure(error)
             return
         }
 
@@ -7866,7 +7892,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: dummyColor),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            recordGradientRenderFailure(.vertexCapacityExceeded)
+            return
+        }
         let (vertexOffset, layerIndex) = allocation
 
         // Write uniforms

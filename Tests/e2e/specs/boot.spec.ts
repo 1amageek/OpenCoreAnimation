@@ -157,7 +157,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginGradientTypeProbe();
         await expect.poll(() => h.getGradientTypeProbeResult(), { timeout: 10_000 }).toBe(
-            "242,13,0,255;0,242,13,255;0,0,255,255;232,23,0,255;0,239,16,255;0,0,255,255;253,2,0,255;130,125,0,255;0,252,3,255;0,125,130,255;25,25,38,255;0,0,255,255,failures=1"
+            "242,13,0,255;0,242,13,255;0,0,255,255;232,23,0,255;0,239,16,255;0,0,255,255;253,2,0,255;130,125,0,255;0,252,3,255;0,125,130,255;25,25,38,255;0,0,255,255,failures=1,typed=true"
         );
 
         await h.beginCornerCurveProbe();

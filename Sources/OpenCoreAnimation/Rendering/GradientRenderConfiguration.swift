@@ -3,6 +3,7 @@ import Foundation
 struct GradientRenderConfiguration {
     let renderMode: Float
     let colors: [CGColor]
+    let colorComponents: [SIMD4<Float>]
     let locations: [Float]
 
     init(
@@ -11,24 +12,44 @@ struct GradientRenderConfiguration {
         locations locationValues: [CGFloat]?,
         startPoint: CGPoint,
         endPoint: CGPoint
-    ) throws {
+    ) throws(GradientRenderConfigurationError) {
         renderMode = try Self.renderMode(for: type)
         try Self.validateGeometry(startPoint: startPoint, endPoint: endPoint)
 
         var validatedColors: [CGColor] = []
         validatedColors.reserveCapacity(colorValues.count)
+        var validatedColorComponents: [SIMD4<Float>] = []
+        validatedColorComponents.reserveCapacity(colorValues.count)
         for (index, value) in colorValues.enumerated() {
             guard let color = value as? CGColor else {
                 throw GradientRenderConfigurationError.invalidColor(index: index)
             }
-            guard let components = color.components,
-                  !components.isEmpty,
+            guard let converted = color.converted(
+                to: .deviceRGB,
+                intent: .defaultIntent,
+                options: nil
+            ), let components = converted.components,
+                  components.count == 4,
                   components.allSatisfy(\.isFinite) else {
                 throw GradientRenderConfigurationError.invalidColorComponents(index: index)
             }
-            validatedColors.append(color)
+            let floatComponents = SIMD4<Float>(
+                Float(components[0]),
+                Float(components[1]),
+                Float(components[2]),
+                Float(components[3])
+            )
+            guard floatComponents.x.isFinite,
+                  floatComponents.y.isFinite,
+                  floatComponents.z.isFinite,
+                  floatComponents.w.isFinite else {
+                throw GradientRenderConfigurationError.invalidColorComponents(index: index)
+            }
+            validatedColors.append(converted)
+            validatedColorComponents.append(floatComponents)
         }
         colors = validatedColors
+        colorComponents = validatedColorComponents
 
         if let locationValues {
             guard locationValues.count == colorValues.count else {
@@ -66,7 +87,7 @@ struct GradientRenderConfiguration {
         type: CAGradientLayerType,
         startPoint: CGPoint,
         endPoint: CGPoint
-    ) throws -> CGFloat? {
+    ) throws(GradientRenderConfigurationError) -> CGFloat? {
         try validateGeometry(startPoint: startPoint, endPoint: endPoint)
         guard point.x.isFinite, point.y.isFinite else {
             throw GradientRenderConfigurationError.nonFiniteGeometry
@@ -99,7 +120,9 @@ struct GradientRenderConfiguration {
         }
     }
 
-    private static func renderMode(for type: CAGradientLayerType) throws -> Float {
+    private static func renderMode(
+        for type: CAGradientLayerType
+    ) throws(GradientRenderConfigurationError) -> Float {
         switch type {
         case .axial:
             return 2
@@ -115,7 +138,7 @@ struct GradientRenderConfiguration {
     private static func validateGeometry(
         startPoint: CGPoint,
         endPoint: CGPoint
-    ) throws {
+    ) throws(GradientRenderConfigurationError) {
         guard startPoint.x.isFinite,
               startPoint.y.isFinite,
               endPoint.x.isFinite,

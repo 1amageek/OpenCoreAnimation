@@ -46,7 +46,9 @@ final class GradientStopBufferPool {
     }
 
     @discardableResult
-    func ensureCapacity(_ requiredCapacity: UInt64) throws -> Bool {
+    func ensureCapacity(
+        _ requiredCapacity: UInt64
+    ) throws(GradientStopBufferPoolError) -> Bool {
         guard requiredCapacity <= maximumCapacity else {
             throw GradientStopBufferPoolError.capacityExceeded(
                 required: requiredCapacity,

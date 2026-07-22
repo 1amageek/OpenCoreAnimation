@@ -5094,7 +5094,9 @@ func installHarness() {
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
-                    gradientTypeProbeResult = "\(pixelText),failures=\(renderer.gradientRenderFailureCount)"
+                    let hasTypedFailure = renderer.lastGradientRenderFailure
+                        == .invalidConfiguration(.unsupportedType("future-gradient"))
+                    gradientTypeProbeResult = "\(pixelText),failures=\(renderer.gradientRenderFailureCount),typed=\(hasTypedFailure)"
                 } catch {
                     gradientTypeProbeResult = "error: \(error)"
                 }

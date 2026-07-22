@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@_spi(RendererDiagnostics)
 @testable import OpenCoreAnimation
 
 @Suite("Gradient render configuration")
@@ -41,6 +42,17 @@ struct GradientRenderConfigurationTests {
         )
 
         #expect(result.locations == [0.25, 0.25, 0.75])
+    }
+
+    @Test("Colors convert to finite device-RGB upload components")
+    func deviceRGBComponents() throws {
+        let result = try configuration(
+            type: .axial,
+            colors: [CGColor(gray: 0.25, alpha: 0.5)]
+        )
+
+        #expect(result.colors.first?.colorSpace == .deviceRGB)
+        #expect(result.colorComponents == [SIMD4<Float>(0.25, 0.25, 0.25, 0.5)])
     }
 
     @Test("Unknown types and invalid colors are rejected without limiting valid stop counts")

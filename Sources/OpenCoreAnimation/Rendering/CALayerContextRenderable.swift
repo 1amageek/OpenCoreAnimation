@@ -88,10 +88,8 @@ extension CAGradientLayer: CALayerContextRenderable {
                 startPoint: startPoint,
                 endPoint: endPoint
             )
-        } catch let error as GradientRenderConfigurationError {
-            throw Self.contextRenderError(for: error)
         } catch {
-            throw .gradientCreationFailed
+            throw Self.contextRenderError(for: error)
         }
         guard let gradient = CGGradient(
             colors: configuration.colors,

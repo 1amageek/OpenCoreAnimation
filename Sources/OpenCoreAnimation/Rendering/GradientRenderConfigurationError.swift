@@ -1,6 +1,7 @@
 import Foundation
 
-enum GradientRenderConfigurationError: Error, Equatable {
+@_spi(RendererDiagnostics)
+public enum GradientRenderConfigurationError: Error, Equatable, Sendable {
     case unsupportedType(String)
     case nonFiniteGeometry
     case invalidColor(index: Int)
