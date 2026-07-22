@@ -3697,7 +3697,38 @@ func installHarness() {
                         )
                     invalidComposition.removeFromSuperlayer()
                     engine.renderFrame()
-                    compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),maskBackdrop=\(maskBackdropEffectsAreRendered),typed=\(typedFailure),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
+
+                    let invalidMaskComposition = CALayer()
+                    invalidMaskComposition.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                    invalidMaskComposition.position = CGPoint(x: 20, y: 20)
+                    invalidMaskComposition.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    invalidMaskComposition.compositingFilter = screen
+                    invalidMaskComposition.backgroundFilters = [invert]
+                    let invalidFilterMask = CALayer()
+                    invalidFilterMask.frame = invalidMaskComposition.bounds
+                    invalidFilterMask.backgroundColor = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    invalidFilterMask.filters = [sourceOver]
+                    invalidMaskComposition.mask = invalidFilterMask
+                    let failuresBeforeInvalidMask = renderer.compositionFilterFailureCount
+                    root.addSublayer(invalidMaskComposition)
+                    engine.renderFrame()
+                    let maskTypedFailure = renderer.compositionFilterFailureCount
+                            == failuresBeforeInvalidMask + 1
+                        && renderer.lastCompositionFilterFailure
+                            == .contentMaskFilterExecutionFailed(.coreImageExecutionFailed)
+                    invalidMaskComposition.removeFromSuperlayer()
+                    engine.renderFrame()
+                    compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),maskBackdrop=\(maskBackdropEffectsAreRendered),typed=\(typedFailure),maskTyped=\(maskTypedFailure),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
                 } catch {
                     compositionProbeResult = "error: \(error)"
                 }

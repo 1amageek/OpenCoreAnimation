@@ -255,9 +255,9 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginCompositionProbe();
         await expect.poll(() => h.getCompositionProbeResult(), { timeout: 10_000 }).toBe(
-            "ordered=true,unbounded=true,maskBackdrop=true,typed=true,pixels=0,0,0,255;255,255,0,255;128,0,0,255;0,0,255,255;0,255,255,255;255,0,0,255;6,133,10,191;128,0,0,255;255,255,0,255;255,0,0,255;255,0,0,255;255,128,0,255;128,0,0,255;128,128,0,255;255,0,255,255;255,255,0,255;255,0,0,255;255,0,0,255;255,0,0,255;0,255,255,255;255,0,0,255;255,0,0,255;255,128,0,255;255,0,0,255;0,255,255,255;255,0,0,255;0,255,255,255;0,255,255,255;9,9,78,160;53,10,16,149,failures=1,after=0"
+            "ordered=true,unbounded=true,maskBackdrop=true,typed=true,maskTyped=true,pixels=0,0,0,255;255,255,0,255;128,0,0,255;0,0,255,255;0,255,255,255;255,0,0,255;6,133,10,191;128,0,0,255;255,255,0,255;255,0,0,255;255,0,0,255;255,128,0,255;128,0,0,255;128,128,0,255;255,0,255,255;255,255,0,255;255,0,0,255;255,0,0,255;255,0,0,255;0,255,255,255;255,0,0,255;255,0,0,255;255,128,0,255;255,0,0,255;0,255,255,255;255,0,0,255;0,255,255,255;0,255,255,255;9,9,78,160;53,10,16,149,failures=2,after=0"
         );
-        expect(await h.getCompositionFilterFailureCount()).toBe(1);
+        expect(await h.getCompositionFilterFailureCount()).toBe(2);
         expect(await h.getActiveCompositionResourceCount()).toBe(0);
 
         await h.beginShadowProbe();

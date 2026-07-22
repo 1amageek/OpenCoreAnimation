@@ -4,6 +4,7 @@ import Foundation
 @_spi(RendererDiagnostics)
 public enum CACompositionFilterRenderFailure: Error, Equatable, Sendable {
     case backgroundFilterPlanningFailed(CALayerFilterRenderFailure)
+    case contentMaskFilterPlanningFailed(CALayerFilterRenderFailure)
     case unsupportedCompositingFilterValue(String)
     case defaultCompositingFilterUnavailable
     case invalidBackdropPrefix
@@ -13,7 +14,8 @@ public enum CACompositionFilterRenderFailure: Error, Equatable, Sendable {
     case sourceAdjustmentFailed
     case backdropCaptureIncomplete
     case alphaConversionFailed
-    case backgroundFilterExecutionFailed
+    case backgroundFilterExecutionFailed(CALayerFilterRenderFailure)
+    case contentMaskFilterExecutionFailed(CALayerFilterRenderFailure)
     case backgroundFilterMaskFailed
     case backgroundFilterMixFailed
     case compositionExecutionFailed

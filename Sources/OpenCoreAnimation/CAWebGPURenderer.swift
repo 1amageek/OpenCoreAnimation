@@ -9341,21 +9341,23 @@ public final class CAWebGPURenderer: CARendererDelegate {
         inputView: GPUTextureView,
         inputAlphaMode: FilterTextureAlphaMode = .straight,
         resources: FilterLayerResources,
+        device: GPUDevice,
+        processor: CIWebGPUFilterProcessor?,
         encoder: GPUCommandEncoder
-    ) -> (texture: GPUTexture, view: GPUTextureView)? {
-        guard let device else { return nil }
-
+    ) throws(CALayerFilterRenderFailure) -> (texture: GPUTexture, view: GPUTextureView) {
         var currentTexture = inputTexture
         var currentView = inputView
         var currentAlphaMode = inputAlphaMode
         var conversionIndex = 0
 
-        func convert(to targetMode: FilterTextureAlphaMode) -> Bool {
-            guard currentAlphaMode != targetMode else { return true }
+        func convert(to targetMode: FilterTextureAlphaMode) throws(CALayerFilterRenderFailure) {
+            guard currentAlphaMode != targetMode else { return }
             let outputTexture = currentTexture === resources.resultTexture
                 ? resources.sourceTexture
                 : resources.resultTexture
-            guard let outputView = resources.view(for: outputTexture) else { return false }
+            guard let outputView = resources.view(for: outputTexture) else {
+                throw .rendererResourcesUnavailable
+            }
             let uniformBuffer = resources.uniformBuffer(
                 forOperationAt: stages.count + conversionIndex,
                 device: device
@@ -9368,21 +9370,24 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 uniformBuffer: uniformBuffer,
                 resources: resources,
                 encoder: encoder
-            ) else { return false }
+            ) else {
+                throw .alphaConversionFailed
+            }
             currentTexture = outputTexture
             currentView = outputView
             currentAlphaMode = targetMode
-            return true
         }
 
         for (stageIndex, stage) in stages.enumerated() {
             switch stage {
             case let .renderer(operation):
-                guard convert(to: .premultiplied) else { return nil }
+                try convert(to: .premultiplied)
                 let outputTexture = currentTexture === resources.resultTexture
                     ? resources.sourceTexture
                     : resources.resultTexture
-                guard let outputView = resources.view(for: outputTexture) else { return nil }
+                guard let outputView = resources.view(for: outputTexture) else {
+                    throw .rendererResourcesUnavailable
+                }
                 let operationUniformBuffer = resources.uniformBuffer(
                     forOperationAt: stageIndex,
                     device: device
@@ -9411,13 +9416,17 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         encoder: encoder
                     )
                 }
-                guard applied else { return nil }
+                guard applied else {
+                    throw .rendererOperationFailed
+                }
                 currentTexture = outputTexture
                 currentView = outputView
 
             case let .coreImage(filter):
-                guard convert(to: .straight),
-                      let processor = layerFilterProcessor else { return nil }
+                try convert(to: .straight)
+                guard let processor else {
+                    throw .coreImageProcessorUnavailable
+                }
                 do {
                     let execution = try processor.makeExecution(
                         filter: filter,
@@ -9432,12 +9441,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     currentView = execution.outputTexture.createView()
                     currentAlphaMode = .straight
                 } catch {
-                    return nil
+                    throw .coreImageExecutionFailed
                 }
             }
         }
 
-        guard convert(to: .straight) else { return nil }
+        try convert(to: .straight)
         return (currentTexture, currentView)
     }
 
@@ -9760,24 +9769,26 @@ public final class CAWebGPURenderer: CARendererDelegate {
         resources: CompositionLayerResources,
         contentMaskIndex: Int,
         encoder: GPUCommandEncoder
-    ) -> Bool {
+    ) throws(CACompositionFilterRenderFailure) {
         guard let device else {
-            return false
+            throw .contentMaskFilterExecutionFailed(.rendererResourcesUnavailable)
         }
         let stages: [LayerFilterStage]
         do {
             stages = try layerFilterStages(from: target.presentationLayer.filters ?? [])
         } catch {
-            recordLayerFilterFailure(error, for: target.renderKey)
-            return false
+            throw .contentMaskFilterPlanningFailed(error)
         }
         guard !stages.isEmpty else {
-            return renderRawCompositionContentMask(
+            guard renderRawCompositionContentMask(
                 target,
                 outputView: outputView,
                 suppressRootFilters: false,
                 encoder: encoder
-            )
+            ) else {
+                throw .clipMaskFailed
+            }
+            return
         }
 
         let filterResources = resources.contentMaskResources(
@@ -9792,7 +9803,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
             outputView: filterResources.sourceView,
             suppressRootFilters: true,
             encoder: encoder
-        ) else { return false }
+        ) else {
+            throw .clipMaskFailed
+        }
 
         var inputTexture = filterResources.sourceTexture
         var inputView = filterResources.sourceView
@@ -9807,30 +9820,41 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 outputView: filterResources.resultView,
                 uniformBuffer: opacityUniformBuffer,
                 encoder: encoder
-            ) else { return false }
+            ) else {
+                throw .contentMaskFilterExecutionFailed(.rendererOperationFailed)
+            }
             inputTexture = filterResources.resultTexture
             inputView = filterResources.resultView
         }
 
-        guard let filteredMask = executeBackdropFilterStages(
-            stages,
-            inputTexture: inputTexture,
-            inputView: inputView,
-            inputAlphaMode: .premultiplied,
-            resources: filterResources,
-            encoder: encoder
-        ) else { return false }
+        let filteredMask: (texture: GPUTexture, view: GPUTextureView)
+        do {
+            filteredMask = try executeBackdropFilterStages(
+                stages,
+                inputTexture: inputTexture,
+                inputView: inputView,
+                inputAlphaMode: .premultiplied,
+                resources: filterResources,
+                device: device,
+                processor: layerFilterProcessor,
+                encoder: encoder
+            )
+        } catch {
+            throw .contentMaskFilterExecutionFailed(error)
+        }
         let outputUniformBuffer = filterResources.uniformBuffer(
             forOperationAt: stages.count + 17,
             device: device
         )
-        return applyAlphaConversion(
+        guard applyAlphaConversion(
             from: .straight,
             inputTexture: filteredMask.texture,
             outputView: outputView,
             uniformBuffer: outputUniformBuffer,
             encoder: encoder
-        )
+        ) else {
+            throw .contentMaskFilterExecutionFailed(.alphaConversionFailed)
+        }
     }
 
     private func buildCompositionClipMask(
@@ -9838,30 +9862,33 @@ public final class CAWebGPURenderer: CARendererDelegate {
         contentMaskTargets: [LayerPrepassTarget],
         resources: CompositionLayerResources,
         encoder: GPUCommandEncoder
-    ) -> GPUTextureView? {
+    ) throws(CACompositionFilterRenderFailure) -> GPUTextureView? {
         let maskTargets = clipTargets.map(CompositionMaskTarget.clipShape)
             + contentMaskTargets.map(CompositionMaskTarget.layerContent)
+        guard !maskTargets.isEmpty else { return nil }
         guard let device,
-              let compositionMaskIntersectPipeline,
-              !maskTargets.isEmpty else { return nil }
+              let compositionMaskIntersectPipeline else {
+            throw .clipMaskFailed
+        }
 
         var currentView = resources.clipCumulativeViewA
         for (index, maskTarget) in maskTargets.enumerated() {
             let outputView = index == 0
                 ? resources.clipCumulativeViewA
                 : resources.clipShapeView
-            let didRender: Bool
             switch maskTarget {
             case let .clipShape(clipTarget):
-                didRender = renderCompositionClipShape(
+                guard renderCompositionClipShape(
                     clipTarget,
                     outputView: outputView,
                     uniformBuffer: resources.clipUniformBuffer(at: index, device: device),
                     vertexBuffer: resources.backdropMaskVertexBuffer,
                     encoder: encoder
-                )
+                ) else {
+                    throw .clipMaskFailed
+                }
             case let .layerContent(contentTarget):
-                didRender = renderCompositionContentMask(
+                try renderCompositionContentMask(
                     contentTarget,
                     outputView: outputView,
                     resources: resources,
@@ -9869,7 +9896,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     encoder: encoder
                 )
             }
-            guard didRender else { return nil }
 
             guard index > 0 else { continue }
             let intersectionView = currentView === resources.clipCumulativeViewA
@@ -9881,7 +9907,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 secondView: resources.clipShapeView,
                 outputView: intersectionView,
                 encoder: encoder
-            ) else { return nil }
+            ) else {
+                throw .clipMaskFailed
+            }
             currentView = intersectionView
         }
         return currentView
@@ -10224,12 +10252,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 filterPrerenderRootLayer = savedFilterPrerenderRoot
                 backdropPass.end()
 
-                let clipMaskView = buildCompositionClipMask(
-                    clipTargets: compositionTarget.clipAncestors,
-                    contentMaskTargets: compositionTarget.contentMaskAncestors,
-                    resources: resources,
-                    encoder: encoder
-                )
+                let clipMaskView: GPUTextureView?
+                do {
+                    clipMaskView = try buildCompositionClipMask(
+                        clipTargets: compositionTarget.clipAncestors,
+                        contentMaskTargets: compositionTarget.contentMaskAncestors,
+                        resources: resources,
+                        encoder: encoder
+                    )
+                } catch {
+                    recordFailure(key, error)
+                    continue
+                }
                 var premultipliedSourceTexture = source.outputTexture
                 if !compositionTarget.clipAncestors.isEmpty
                     || !compositionTarget.contentMaskAncestors.isEmpty {
@@ -10289,14 +10323,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
                 var compositionBackdropTexture = resources.backdropStraightTexture
                 if !backgroundStages.isEmpty {
-                    guard let filteredBackdrop = executeBackdropFilterStages(
-                        backgroundStages,
-                        inputTexture: resources.backdropStraightTexture,
-                        inputView: resources.backdropStraightView,
-                        resources: resources.backgroundFilterResources,
-                        encoder: encoder
-                    ) else {
-                        recordFailure(key, .backgroundFilterExecutionFailed)
+                    let filteredBackdrop: (texture: GPUTexture, view: GPUTextureView)
+                    do {
+                        filteredBackdrop = try executeBackdropFilterStages(
+                            backgroundStages,
+                            inputTexture: resources.backdropStraightTexture,
+                            inputView: resources.backdropStraightView,
+                            resources: resources.backgroundFilterResources,
+                            device: device,
+                            processor: processor,
+                            encoder: encoder
+                        )
+                    } catch {
+                        recordFailure(key, .backgroundFilterExecutionFailed(error))
                         continue
                     }
                     guard renderBackdropFilterMask(
@@ -10310,13 +10349,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     var backgroundMaskView = resources.backdropMaskView
                     let backgroundClipMaskView: GPUTextureView?
                     if let targetContentMask = compositionTarget.targetContentMask {
-                        backgroundClipMaskView = buildCompositionClipMask(
-                            clipTargets: compositionTarget.clipAncestors,
-                            contentMaskTargets: compositionTarget.contentMaskAncestors
-                                + [targetContentMask],
-                            resources: resources,
-                            encoder: encoder
-                        )
+                        do {
+                            backgroundClipMaskView = try buildCompositionClipMask(
+                                clipTargets: compositionTarget.clipAncestors,
+                                contentMaskTargets: compositionTarget.contentMaskAncestors
+                                    + [targetContentMask],
+                                resources: resources,
+                                encoder: encoder
+                            )
+                        } catch {
+                            recordFailure(key, error)
+                            continue
+                        }
                     } else {
                         backgroundClipMaskView = clipMaskView
                     }
