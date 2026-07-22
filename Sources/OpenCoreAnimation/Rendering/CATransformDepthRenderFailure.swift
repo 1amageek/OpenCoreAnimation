@@ -6,4 +6,5 @@ public enum CATransformDepthRenderFailure: Error, Equatable, Sendable {
     case invalidNestingDepth(Int)
     case nestingDepthOverflow
     case depthClearPipelineUnavailable
+    case invalidProjectedDepth(sublayerIndex: Int, reason: CAProjectedDepthError)
 }

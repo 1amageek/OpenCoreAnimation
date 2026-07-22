@@ -12,6 +12,11 @@ public enum CAReplicatorRenderFailure: Error, Equatable, Sendable {
     case instanceColorOverflow(instanceIndex: Int)
     case cumulativeTransformOverflow(instanceIndex: Int)
     case depthResourcesUnavailable
+    case invalidProjectedDepth(
+        instanceIndex: Int,
+        sublayerIndex: Int,
+        reason: CAProjectedDepthError
+    )
 }
 
 /// Validated, renderer-independent replicator input.

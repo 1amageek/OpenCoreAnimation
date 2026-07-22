@@ -1220,19 +1220,31 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private func depthOrderedSublayers(
         for layer: CALayer,
         parentMatrix: Matrix4x4
-    ) -> [CALayer] {
-        (layer.sublayers ?? []).enumerated().sorted { lhs, rhs in
-            let lhsDepth = projectedCenterDepth(of: lhs.element, parentMatrix: parentMatrix)
-            let rhsDepth = projectedCenterDepth(of: rhs.element, parentMatrix: parentMatrix)
-            return lhsDepth == rhsDepth ? lhs.offset < rhs.offset : lhsDepth < rhsDepth
-        }.map(\.element)
+    ) throws(CATransformDepthRenderFailure) -> [CALayer] {
+        var projectedSublayers: [(index: Int, layer: CALayer, depth: Float)] = []
+        for (index, sublayer) in (layer.sublayers ?? []).enumerated() {
+            let depth: Float
+            do {
+                depth = try projectedCenterDepth(
+                    of: sublayer,
+                    parentMatrix: parentMatrix
+                )
+            } catch {
+                throw .invalidProjectedDepth(sublayerIndex: index, reason: error)
+            }
+            projectedSublayers.append((index, sublayer, depth))
+        }
+        projectedSublayers.sort { lhs, rhs in
+            lhs.depth == rhs.depth ? lhs.index < rhs.index : lhs.depth < rhs.depth
+        }
+        return projectedSublayers.map(\.layer)
     }
 
     private func projectedCenterDepth(
         of layer: CALayer,
         parentMatrix: Matrix4x4
-    ) -> Float {
-        projectedCenterDepth(
+    ) throws(CAProjectedDepthError) -> Float {
+        try projectedCenterDepth(
             of: layer,
             parentMatrix: parentMatrix,
             timeOffset: currentReplicatorTimeOffset
@@ -1243,7 +1255,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         of layer: CALayer,
         parentMatrix: Matrix4x4,
         timeOffset: CFTimeInterval
-    ) -> Float {
+    ) throws(CAProjectedDepthError) -> Float {
         let presentation = timeOffset == 0
             ? layer._renderTimePresentation()
             : layer.presentationAtTimeOffset(timeOffset)
@@ -1255,10 +1267,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             1
         )
         let projected = matrix * center
-        guard projected.z.isFinite, projected.w.isFinite, projected.w != 0 else {
-            return 0
-        }
-        return projected.z / projected.w
+        return try CAProjectedDepth.resolve(z: projected.z, w: projected.w)
     }
 
     private func forEachPrepassSublayer(
@@ -6771,18 +6780,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
             let insertionOrder: Int
         }
 
-        let beginsIndependentDepthGroup = transformDepthNesting == 0
-        if beginsIndependentDepthGroup {
-            guard let depthClearPipeline else {
-                recordReplicatorRenderFailure(.depthResourcesUnavailable)
-                return
-            }
-            renderPass.setPipeline(depthClearPipeline)
-            renderPass.draw(vertexCount: 3)
-        }
-        transformDepthNesting += 1
-        defer { transformDepthNesting -= 1 }
-
         let inheritedColor = currentReplicatorColor
         let inheritedTimeOffset = currentReplicatorTimeOffset
         var items: [DrawItem] = []
@@ -6814,18 +6811,29 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 return
             }
 
-            for sublayer in sublayers {
+            for (sublayerIndex, sublayer) in sublayers.enumerated() {
+                let depth: Float
+                do {
+                    depth = try projectedCenterDepth(
+                        of: sublayer,
+                        parentMatrix: instanceMatrix,
+                        timeOffset: timeOffset
+                    )
+                } catch {
+                    recordReplicatorRenderFailure(.invalidProjectedDepth(
+                        instanceIndex: instanceIndex,
+                        sublayerIndex: sublayerIndex,
+                        reason: error
+                    ))
+                    return
+                }
                 items.append(DrawItem(
                     layer: sublayer,
                     parentMatrix: instanceMatrix,
                     color: inheritedColor * instanceColor,
                     timeOffset: timeOffset,
                     instanceIndex: instanceIndex,
-                    depth: projectedCenterDepth(
-                        of: sublayer,
-                        parentMatrix: instanceMatrix,
-                        timeOffset: timeOffset
-                    ),
+                    depth: depth,
                     insertionOrder: insertionOrder
                 ))
                 insertionOrder += 1
@@ -6842,6 +6850,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 }
             }
         }
+
+        // Resolve every CPU-side input before clearing or otherwise mutating
+        // the active depth state.
+        let beginsIndependentDepthGroup = transformDepthNesting == 0
+        if beginsIndependentDepthGroup {
+            guard let depthClearPipeline else {
+                recordReplicatorRenderFailure(.depthResourcesUnavailable)
+                return
+            }
+            renderPass.setPipeline(depthClearPipeline)
+            renderPass.draw(vertexCount: 3)
+        }
+        transformDepthNesting += 1
+        defer { transformDepthNesting -= 1 }
 
         // Depth testing resolves opaque intersections. Far-to-near submission
         // preserves source-over blending for translucent replicated planes.
@@ -12363,6 +12385,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
     ) {
         guard layer.sublayers?.isEmpty == false else { return }
 
+        // Resolve ordering before depth clear so invalid homogeneous geometry
+        // cannot partially mutate the active render pass.
+        let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
+        let orderedSublayers: [CALayer]
+        do {
+            orderedSublayers = try depthOrderedSublayers(
+                for: layer,
+                parentMatrix: sublayerMatrix
+            )
+        } catch {
+            recordTransformDepthRenderFailure(error)
+            return
+        }
+
         let configuration: CATransformDepthRenderConfiguration
         do {
             configuration = try CATransformDepthRenderConfiguration(
@@ -12386,9 +12422,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // `renderLayer` already applied this transform layer's presentation transform.
         // Only the sublayer transform and bounds origin remain before traversing children.
-        let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
-
-        for sublayer in depthOrderedSublayers(for: layer, parentMatrix: sublayerMatrix) {
+        for sublayer in orderedSublayers {
             self.renderLayer(sublayer, renderPass: renderPass, parentMatrix: sublayerMatrix)
         }
     }

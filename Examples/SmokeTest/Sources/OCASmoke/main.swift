@@ -3126,6 +3126,37 @@ func installHarness() {
                             == .invalidRasterizationScale(0)
                     invalidRasterization.removeFromSuperlayer()
                     engine.renderFrame()
+
+                    let invalidDepthGroup = CATransformLayer()
+                    invalidDepthGroup.bounds = root.bounds
+                    invalidDepthGroup.position = root.position
+                    let invalidDepthChild = CALayer()
+                    invalidDepthChild.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                    invalidDepthChild.position = CGPoint(x: 20, y: 20)
+                    invalidDepthChild.backgroundColor = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    var invalidDepthTransform = CATransform3DIdentity
+                    invalidDepthTransform.m44 = 0
+                    invalidDepthChild.transform = invalidDepthTransform
+                    invalidDepthGroup.addSublayer(invalidDepthChild)
+                    let depthFailuresBeforeInvalidProjection =
+                        renderer.transformDepthRenderFailureCount
+                    root.addSublayer(invalidDepthGroup)
+                    engine.renderFrame()
+                    let invalidProjectionWasRejected = renderer.transformDepthRenderFailureCount
+                            == depthFailuresBeforeInvalidProjection + 1
+                        && renderer.lastTransformDepthRenderFailure
+                            == .invalidProjectedDepth(
+                                sublayerIndex: 0,
+                                reason: .zeroHomogeneousCoordinate
+                            )
+                    invalidDepthGroup.removeFromSuperlayer()
+                    engine.renderFrame()
+
                     let frameFailuresBeforeInvalidResize = renderer.frameRenderFailureCount
                     let sizeBeforeInvalidResize = renderer.size
                     renderer.resize(width: 0, height: 16)
@@ -3156,7 +3187,8 @@ func installHarness() {
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
                         + ",rasterFailure=\(hasTypedRasterizationFailure)"
-                        + ",depthFailures=\(renderer.transformDepthRenderFailureCount)"
+                        + ",depthFailures=\(depthFailuresBeforeInvalidProjection)"
+                        + ",depthTyped=\(invalidProjectionWasRejected)"
                         + ",frameFailures=\(frameFailuresBeforeInvalidResize)"
                         + ",resizeTyped=\(invalidResizeWasRejected)"
                 } catch {
