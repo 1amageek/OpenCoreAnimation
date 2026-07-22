@@ -1,11 +1,17 @@
 import Foundation
 
-/// Validated state transition for entering a transform-layer depth group.
-internal struct CATransformDepthRenderConfiguration: Equatable {
+/// Describes an invalid renderer depth-group state transition.
+internal enum CADepthGroupStateFailure: Error, Equatable, Sendable {
+    case invalidNestingDepth(Int)
+    case nestingDepthOverflow
+}
+
+/// Validated state transition for entering any renderer depth group.
+internal struct CADepthGroupRenderConfiguration: Equatable, Sendable {
     let requiresDepthClear: Bool
     let enteredNestingDepth: Int
 
-    init(currentNestingDepth: Int) throws(CATransformDepthRenderFailure) {
+    init(currentNestingDepth: Int) throws(CADepthGroupStateFailure) {
         guard currentNestingDepth >= 0 else {
             throw .invalidNestingDepth(currentNestingDepth)
         }

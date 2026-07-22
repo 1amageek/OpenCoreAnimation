@@ -7,4 +7,15 @@ public enum CATransformDepthRenderFailure: Error, Equatable, Sendable {
     case nestingDepthOverflow
     case depthClearPipelineUnavailable
     case invalidProjectedDepth(sublayerIndex: Int, reason: CAProjectedDepthError)
+
+    internal static func depthGroupStateFailure(
+        _ failure: CADepthGroupStateFailure
+    ) -> Self {
+        switch failure {
+        case .invalidNestingDepth(let depth):
+            return .invalidNestingDepth(depth)
+        case .nestingDepthOverflow:
+            return .nestingDepthOverflow
+        }
+    }
 }

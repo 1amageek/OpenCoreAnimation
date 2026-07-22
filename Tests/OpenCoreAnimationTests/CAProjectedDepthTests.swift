@@ -1,4 +1,5 @@
 import Testing
+@_spi(RendererDiagnostics)
 @testable import OpenCoreAnimation
 
 @Suite("Projected depth")

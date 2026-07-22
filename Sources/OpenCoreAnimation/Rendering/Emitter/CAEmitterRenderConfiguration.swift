@@ -18,11 +18,24 @@ public enum CAEmitterFailure: Error, Equatable, Sendable {
     case particleCapacityExceeded(maximum: Int)
     case flatteningCaptureUnavailable
     case depthResourcesUnavailable
+    case invalidDepthNesting(Int)
+    case depthNestingOverflow
     case rendererResourcesUnavailable
     case additivePipelineUnavailable
     case imageConversionFailed(CAImageContentsConversionError)
     case textureResourcesUnavailable
     case vertexCapacityExceeded
+
+    internal static func depthGroupStateFailure(
+        _ failure: CADepthGroupStateFailure
+    ) -> Self {
+        switch failure {
+        case .invalidNestingDepth(let depth):
+            return .invalidDepthNesting(depth)
+        case .nestingDepthOverflow:
+            return .depthNestingOverflow
+        }
+    }
 }
 
 /// Validated, renderer-independent emitter-layer input.

@@ -12,11 +12,24 @@ public enum CAReplicatorRenderFailure: Error, Equatable, Sendable {
     case instanceColorOverflow(instanceIndex: Int)
     case cumulativeTransformOverflow(instanceIndex: Int)
     case depthResourcesUnavailable
+    case invalidDepthNesting(Int)
+    case depthNestingOverflow
     case invalidProjectedDepth(
         instanceIndex: Int,
         sublayerIndex: Int,
         reason: CAProjectedDepthError
     )
+
+    internal static func depthGroupStateFailure(
+        _ failure: CADepthGroupStateFailure
+    ) -> Self {
+        switch failure {
+        case .invalidNestingDepth(let depth):
+            return .invalidDepthNesting(depth)
+        case .nestingDepthOverflow:
+            return .depthNestingOverflow
+        }
+    }
 }
 
 /// Validated, renderer-independent replicator input.

@@ -6853,8 +6853,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Resolve every CPU-side input before clearing or otherwise mutating
         // the active depth state.
-        let beginsIndependentDepthGroup = transformDepthNesting == 0
-        if beginsIndependentDepthGroup {
+        let depthConfiguration: CADepthGroupRenderConfiguration
+        do {
+            depthConfiguration = try CADepthGroupRenderConfiguration(
+                currentNestingDepth: transformDepthNesting
+            )
+        } catch {
+            recordReplicatorRenderFailure(.depthGroupStateFailure(error))
+            return
+        }
+        if depthConfiguration.requiresDepthClear {
             guard let depthClearPipeline else {
                 recordReplicatorRenderFailure(.depthResourcesUnavailable)
                 return
@@ -6862,8 +6870,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
             renderPass.setPipeline(depthClearPipeline)
             renderPass.draw(vertexCount: 3)
         }
-        transformDepthNesting += 1
-        defer { transformDepthNesting -= 1 }
+        let previousDepthNesting = transformDepthNesting
+        transformDepthNesting = depthConfiguration.enteredNestingDepth
+        defer { transformDepthNesting = previousDepthNesting }
 
         // Depth testing resolves opaque intersections. Far-to-near submission
         // preserves source-over blending for translucent replicated planes.
@@ -12399,13 +12408,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
             return
         }
 
-        let configuration: CATransformDepthRenderConfiguration
+        let configuration: CADepthGroupRenderConfiguration
         do {
-            configuration = try CATransformDepthRenderConfiguration(
+            configuration = try CADepthGroupRenderConfiguration(
                 currentNestingDepth: transformDepthNesting
             )
         } catch {
-            recordTransformDepthRenderFailure(error)
+            recordTransformDepthRenderFailure(.depthGroupStateFailure(error))
             return
         }
         if configuration.requiresDepthClear {
@@ -12482,8 +12491,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
             return
         }
         let entersDepthSpace = configuration.preservesDepth
-        let beginsIndependentDepthGroup = entersDepthSpace && transformDepthNesting == 0
-        if beginsIndependentDepthGroup {
+        let depthConfiguration: CADepthGroupRenderConfiguration?
+        if entersDepthSpace {
+            do {
+                depthConfiguration = try CADepthGroupRenderConfiguration(
+                    currentNestingDepth: transformDepthNesting
+                )
+            } catch {
+                recordEmitterRenderFailure(.depthGroupStateFailure(error))
+                return
+            }
+        } else {
+            depthConfiguration = nil
+        }
+        if depthConfiguration?.requiresDepthClear == true {
             guard let depthClearPipeline else {
                 recordEmitterRenderFailure(.depthResourcesUnavailable)
                 return
@@ -12491,13 +12512,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
             renderPass.setPipeline(depthClearPipeline)
             renderPass.draw(vertexCount: 3)
         }
-        if entersDepthSpace {
-            transformDepthNesting += 1
+        let previousDepthNesting = transformDepthNesting
+        if let depthConfiguration {
+            transformDepthNesting = depthConfiguration.enteredNestingDepth
         }
         defer {
-            if entersDepthSpace {
-                transformDepthNesting -= 1
-            }
+            transformDepthNesting = previousDepthNesting
         }
         let emitterCells = configuration.emitterCells
 
