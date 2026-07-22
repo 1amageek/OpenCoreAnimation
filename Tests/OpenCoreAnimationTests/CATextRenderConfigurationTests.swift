@@ -68,6 +68,11 @@ struct CATextRenderConfigurationTests {
             try CATextRenderConfiguration(layer: layer)
         }
 
+        layer.fontSize = CGFloat.greatestFiniteMagnitude
+        #expect(throws: CATextRenderFailure.invalidFontSize) {
+            try CATextRenderConfiguration(layer: layer)
+        }
+
         layer.fontSize = 12
         layer.contentsScale = 0
         #expect(throws: CATextRenderFailure.invalidContentsScale) {

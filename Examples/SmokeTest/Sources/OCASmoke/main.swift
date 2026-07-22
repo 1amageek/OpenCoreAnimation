@@ -1035,6 +1035,21 @@ func installHarness() {
                         CGPoint(x: 138, y: 70),
                     ])
 
+                    let invalidLayer = CATextLayer()
+                    invalidLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
+                    invalidLayer.position = CGPoint(x: 200, y: 100)
+                    invalidLayer.string = "invalid"
+                    invalidLayer.font = "monospace"
+                    invalidLayer.fontSize = 12
+                    invalidLayer.opacity = .infinity
+                    root.addSublayer(invalidLayer)
+                    let failureCountBeforeInvalid = renderer.textRenderFailureCount
+                    engine.renderFrame()
+                    let typedFailure = renderer.textRenderFailureCount
+                            - failureCountBeforeInvalid == 1
+                        && renderer.lastTextRenderFailure == .invalidOpacity(.infinity)
+                    invalidLayer.removeFromSuperlayer()
+
                     restoreScene()
 
                     textProbeResult = "initial="
@@ -1043,6 +1058,7 @@ func installHarness() {
                         + mutatedPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
                         + ",multiline="
                         + multilinePixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",typed=\(typedFailure)"
                 } catch {
                     restoreScene()
                     textProbeResult = "error: \(error)"

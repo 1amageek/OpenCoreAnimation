@@ -1037,16 +1037,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// - Parameter count: The number of vertices to allocate.
     /// - Returns: A tuple of (vertexOffset, uniformIndex) if allocation succeeds, nil if buffer is full.
     private func allocateVertices(count: Int) -> (vertexOffset: UInt64, uniformIndex: Int)? {
-        let requiredSize = UInt64(count * MemoryLayout<CARendererVertex>.stride)
-
-        // Check vertex buffer capacity
-        guard currentVertexOffset + requiredSize <= Self.maxVertexBufferSize else {
-            droppedLayerCount += 1
-            return nil
-        }
-
-        // Check uniform count limit
-        guard currentLayerIndex < Self.maxLayers else {
+        guard let requiredSize = availableVertexAllocationSize(count: count) else {
             droppedLayerCount += 1
             return nil
         }
@@ -1058,6 +1049,23 @@ public final class CAWebGPURenderer: CARendererDelegate {
         currentLayerIndex += 1
 
         return result
+    }
+
+    /// Returns the byte count when a vertex allocation can be committed without
+    /// overflowing either the vertex buffer or the per-frame uniform table.
+    private func availableVertexAllocationSize(count: Int) -> UInt64? {
+        guard count >= 0 else { return nil }
+        let byteCount = count.multipliedReportingOverflow(
+            by: MemoryLayout<CARendererVertex>.stride
+        )
+        guard !byteCount.overflow,
+              let requiredSize = UInt64(exactly: byteCount.partialValue),
+              currentVertexOffset <= Self.maxVertexBufferSize,
+              requiredSize <= Self.maxVertexBufferSize - currentVertexOffset,
+              currentLayerIndex < Self.maxLayers else {
+            return nil
+        }
+        return requiredSize
     }
 
     // MARK: - Clipping (masksToBounds)
@@ -7464,16 +7472,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
             recordTextRenderFailure(error)
             return
         }
-        guard let texturedBindGroupLayout = texturedBindGroupLayout,
-              let textureSampler = textureSampler,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
-              let pipeline = pipeline,
-              let selectedPipeline = selectTexturedPipeline(for: textLayer) else {
-            recordTextRenderFailure(.rendererResourcesUnavailable)
-            return
-        }
-
         let text = configuration.text
         guard !text.isEmpty else {
             return
@@ -7481,6 +7479,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         let logicalSize = configuration.bounds.size
         guard logicalSize.width > 0, logicalSize.height > 0 else {
+            return
+        }
+        guard let texturedBindGroupLayout = texturedBindGroupLayout,
+              let textureSampler = textureSampler,
+              let vertexBuffer = vertexBuffer,
+              let uniformBuffer = uniformBuffer,
+              let pipeline = pipeline,
+              let selectedPipeline = selectTexturedPipeline(for: textLayer) else {
+            recordTextRenderFailure(.rendererResourcesUnavailable)
             return
         }
         let maximumTextureDimension = max(1, Int(device.limits.maxTextureDimension2D))
@@ -7502,6 +7509,50 @@ public final class CAWebGPURenderer: CARendererDelegate {
             return
         }
 
+        let quadConfiguration: CATextQuadRenderConfiguration
+        do {
+            quadConfiguration = try CATextQuadRenderConfiguration(
+                bounds: configuration.bounds,
+                color: currentReplicatorColor,
+                opacity: currentEffectiveOpacity,
+                masksToBounds: textLayer.masksToBounds,
+                cornerRadius: textLayer.cornerRadius,
+                cornerCurveExponent: textLayer.cornerCurveRenderExponent
+                    ?? Float(CornerCurveRenderConfiguration.circularExponent),
+                cornerRadii: textLayer.cornerRadiiComponents
+            )
+        } catch let failure {
+            recordTextRenderFailure(failure)
+            return
+        }
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(quadConfiguration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, quadConfiguration.size.y, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = modelMatrix * scaleMatrix
+        guard matrixIsFinite(finalMatrix) else {
+            recordTextRenderFailure(.invalidTransform)
+            return
+        }
+
+        var vertices: [CARendererVertex] = [
+            // Canvas text uses top-left texture coordinates while layer space is Y-up.
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: quadConfiguration.color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: quadConfiguration.color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: quadConfiguration.color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: quadConfiguration.color),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: quadConfiguration.color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: quadConfiguration.color),
+        ]
+        guard availableVertexAllocationSize(count: vertices.count) != nil else {
+            droppedLayerCount += 1
+            recordTextRenderFailure(.vertexCapacityExceeded)
+            return
+        }
+
         // Create cache key based on text content and properties.
         // Includes font fingerprint and foreground color so that two layers
         // with the same text but different font / color do not collide.
@@ -7514,9 +7565,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Check cache first
         let gpuTexture: GPUTexture
+        let shouldCacheTexture: Bool
         if let cached = textTextureCache[cacheKey] {
             touchTextTexture(cacheKey)
             gpuTexture = cached
+            shouldCacheTexture = false
         } else {
             // Create offscreen canvas for text rendering
             let document = JSObject.global.document
@@ -7591,7 +7644,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     y: 0,
                     maxWidth: Double(logicalSize.width),
                     maxHeight: Double(logicalSize.height),
-                    lineHeight: configuration.fontSize * 1.2,
+                    lineHeight: configuration.lineHeight,
                     truncationMode: configuration.truncationMode,
                     alignmentMode: configuration.alignmentMode,
                     wrapsToWidth: configuration.isWrapped
@@ -7645,8 +7698,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 size: GPUExtent3D(width: UInt32(pixelWidth), height: UInt32(pixelHeight))
             )
 
-            cacheTextTexture(texture, for: cacheKey)
             gpuTexture = texture
+            shouldCacheTexture = true
+        }
+
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            if shouldCacheTexture {
+                gpuTexture.destroy()
+            }
+            recordTextRenderFailure(.vertexCapacityExceeded)
+            return
+        }
+        let (vertexOffset, layerIndex) = allocation
+        if shouldCacheTexture {
+            cacheTextTexture(gpuTexture, for: cacheKey)
         }
 
         // Create texture view
@@ -7664,68 +7729,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
             )
         )
 
-        // MARK: Text Texture V-Coordinate Flipping for Y-up Coordinate System
-        //
-        // OpenCoreAnimation uses SpriteKit-compatible Y-up coordinates (origin at bottom-left),
-        // but HTML Canvas (used for text rendering) uses Y-down coordinates (origin at top-left).
-        //
-        // Coordinate systems:
-        //   Screen (Y-up):              Canvas/Texture:
-        //   Y=1   ─────────             V=0 ─────────  (Canvas Y=0, top)
-        //         │ TOP   │                 │ TOP   │
-        //         │ text  │                 │ text  │
-        //         │BOTTOM │                 │BOTTOM │
-        //   Y=0   ─────────             V=1 ─────────  (Canvas Y=height, bottom)
-        //   (bottom of screen)
-        //
-        // To display text right-side up, we must flip the V coordinate:
-        //   - Screen bottom (Y=0) → Texture bottom (V=1)
-        //   - Screen top (Y=1) → Texture top (V=0)
-        //
-        // Reference: https://developer.apple.com/documentation/spritekit/about-spritekit-coordinate-systems
-        let white = currentReplicatorColor
-        var vertices: [CARendererVertex] = [
-            // Triangle 1: bottom-left, bottom-right, top-left
-            // Y=0 (screen bottom) uses V=1 (texture bottom) - V-flipped
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: white),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
-            // Triangle 2: bottom-right, top-right, top-left
-            // Y=1 (screen top) uses V=0 (texture top) - V-flipped
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: white),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: white),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
-        ]
-
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
-        let (vertexOffset, layerIndex) = allocation
-
-        // Setup matrices using measured/actual text size
-        let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(logicalSize.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(logicalSize.height), 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
-        ))
-
-        let finalMatrix = modelMatrix * scaleMatrix
-
-        // Apple's spec: text contents are only clipped to cornerRadius when masksToBounds == true.
-        let effectiveCornerRadius: Float = textLayer.masksToBounds ? Float(textLayer.cornerRadius) : 0
-        let effectiveCornerRadii: SIMD4<Float> = textLayer.masksToBounds ? textLayer.cornerRadiiComponents : .zero
-        let effectiveCornerCurveExponent = textLayer.masksToBounds
-            ? (textLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent))
-            : Float(CornerCurveRenderConfiguration.circularExponent)
-
         // Update uniforms
         var uniforms = TexturedUniforms(
             mvpMatrix: finalMatrix,
-            opacity: currentEffectiveOpacity,
-            cornerRadius: effectiveCornerRadius,
-            layerSize: SIMD2<Float>(Float(logicalSize.width), Float(logicalSize.height)),
-            cornerRadii: effectiveCornerRadii,
+            opacity: quadConfiguration.opacity,
+            cornerRadius: quadConfiguration.cornerRadius,
+            layerSize: quadConfiguration.size,
+            cornerRadii: quadConfiguration.cornerRadii,
             edgeAntialiasingMask: textLayer.edgeAntialiasingMaskValue,
-            cornerCurveExponent: effectiveCornerCurveExponent
+            cornerCurveExponent: quadConfiguration.cornerCurveExponent
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -7806,7 +7818,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         alignmentMode: CATextLayerAlignmentMode,
         wrapsToWidth: Bool
     ) {
-        guard lineHeight.isFinite, lineHeight > 0 else { return }
+        guard lineHeight.isFinite, lineHeight > 0 else {
+            textMeasurementFailureDetected = true
+            return
+        }
         let lines = CATextLayoutEngine.wrappedLines(
             text,
             maximumWidth: CGFloat(maxWidth),

@@ -1,24 +1,5 @@
 import Foundation
 
-/// Describes why a text layer could not enter the renderer's text pipeline.
-@_spi(RendererDiagnostics)
-public enum CATextRenderFailure: Error, Equatable, Sendable {
-    case unsupportedStringValue
-    case unsupportedFontValue
-    case invalidFontSize
-    case invalidContentsScale
-    case invalidBounds
-    case invalidForegroundColor
-    case unsupportedAlignmentMode(String)
-    case unsupportedTruncationMode(String)
-    case rendererResourcesUnavailable
-    case canvas2DUnavailable
-    case textMeasurementUnavailable
-    case textureDimensionsUnsupported
-    case imageDataUnavailable
-    case imageDataStorageUnavailable
-}
-
 /// Validated, renderer-independent text input.
 internal struct CATextRenderConfiguration {
     let text: String
@@ -31,6 +12,7 @@ internal struct CATextRenderConfiguration {
     let truncationMode: CATextLayerTruncationMode
     let bounds: CGRect
     let isWrapped: Bool
+    let lineHeight: CGFloat
 
     init(layer: CATextLayer) throws(CATextRenderFailure) {
         guard let text = layer.string as? String else {
@@ -40,7 +22,10 @@ internal struct CATextRenderConfiguration {
               !fontFamily.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw .unsupportedFontValue
         }
-        guard layer.fontSize.isFinite, layer.fontSize > 0 else {
+        let lineHeight = layer.fontSize * 1.2
+        guard layer.fontSize.isFinite,
+              layer.fontSize > 0,
+              lineHeight.isFinite else {
             throw .invalidFontSize
         }
         guard layer.contentsScale.isFinite, layer.contentsScale > 0 else {
@@ -94,6 +79,7 @@ internal struct CATextRenderConfiguration {
         self.truncationMode = layer.truncationMode
         self.bounds = layer.bounds
         self.isWrapped = layer.isWrapped
+        self.lineHeight = lineHeight
     }
 
     private static func cssFontFamily(from fontFamily: String) -> String {
