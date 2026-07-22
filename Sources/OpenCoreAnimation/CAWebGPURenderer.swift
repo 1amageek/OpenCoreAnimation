@@ -849,6 +849,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var contentsRenderFailureCount: Int = 0
 
+    /// Number of text draws rejected because their input, browser rasterizer, or GPU resources failed.
+    @_spi(RendererDiagnostics)
+    public private(set) var textRenderFailureCount: Int = 0
+
+    /// The most recent typed text-rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastTextRenderFailure: CATextRenderFailure?
+
     /// The most recent typed image-conversion failure in the current frame.
     @_spi(RendererDiagnostics)
     public private(set) var lastContentsConversionError: CAImageContentsConversionError?
@@ -4409,6 +4417,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         gradientRenderFailureCount = 0
         cornerCurveRenderFailureCount = 0
         contentsRenderFailureCount = 0
+        textRenderFailureCount = 0
+        lastTextRenderFailure = nil
         lastContentsConversionError = nil
         dynamicRangeRenderFailureCount = 0
         lastDynamicRangeRenderFailure = nil
@@ -4431,8 +4441,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         shadowMaskPipeline = nil
         shadowBindGroupLayout = nil
         blurSampler = nil
+        for texture in textTextureCache.values {
+            texture.destroy()
+        }
         textTextureCache.removeAll()
         textTextureAccessOrder.removeAll()
+        textTextureCacheByteCount = 0
 
         // Filter resources
         filterCompositePipeline = nil
@@ -4927,7 +4941,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         if let textLayer = presentationLayer as? CATextLayer {
             if textLayer.string != nil {
                 renderTextLayer(textLayer, device: device, renderPass: renderPass,
-                               modelMatrix: modelMatrix, bindGroup: bindGroup)
+                               modelMatrix: modelMatrix)
             }
         } else if let shapeLayer = presentationLayer as? CAShapeLayer {
             if shapeLayer.path != nil {
@@ -6841,36 +6855,81 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
         filterLayerResources.removeAll(keepingCapacity: true)
         prerenderedFilters.removeAll(keepingCapacity: true)
+        for texture in textTextureCache.values {
+            texture.destroy()
+        }
         textTextureCache.removeAll()
         textTextureAccessOrder.removeAll()
+        textTextureCacheByteCount = 0
         texturedTextureViewCache.removeAll(keepingCapacity: true)
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: true)
     }
 
     // MARK: - Text Layer Rendering
 
+    private struct TextTextureCacheKey: Hashable {
+        let text: String
+        let pixelWidth: Int
+        let pixelHeight: Int
+        let fontSize: CGFloat
+        let contentsScale: CGFloat
+        let alignmentMode: CATextLayerAlignmentMode
+        let truncationMode: CATextLayerTruncationMode
+        let fontFamily: String
+        let red: Float
+        let green: Float
+        let blue: Float
+        let alpha: Float
+        let isWrapped: Bool
+
+        var byteCount: UInt64 {
+            UInt64(pixelWidth) * UInt64(pixelHeight) * 4
+        }
+    }
+
     /// Cache for text textures to avoid recreating them every frame.
-    private var textTextureCache: [String: GPUTexture] = [:]
+    private var textTextureCache: [TextTextureCacheKey: GPUTexture] = [:]
 
     /// LRU order for text textures. Dynamic labels can otherwise create one
     /// GPU texture per distinct string for the lifetime of the renderer.
-    private var textTextureAccessOrder: [String] = []
+    private var textTextureAccessOrder: [TextTextureCacheKey] = []
+
+    /// Estimated GPU storage retained by the text texture cache.
+    private var textTextureCacheByteCount: UInt64 = 0
+
+    /// Set when Canvas2D returns a missing or invalid width inside a nonthrowing
+    /// layout callback. The complete offscreen result is rejected before upload.
+    private var textMeasurementFailureDetected = false
 
     private let maxTextTextureCacheEntries = 128
+    private let maxTextTextureCacheBytes: UInt64 = 64 * 1024 * 1024
 
-    private func touchTextTexture(_ key: String) {
+    private func touchTextTexture(_ key: TextTextureCacheKey) {
         textTextureAccessOrder.removeAll { $0 == key }
         textTextureAccessOrder.append(key)
     }
 
-    private func cacheTextTexture(_ texture: GPUTexture, for key: String) {
-        textTextureCache[key] = texture
+    private func cacheTextTexture(_ texture: GPUTexture, for key: TextTextureCacheKey) {
+        if let replacedTexture = textTextureCache.updateValue(texture, forKey: key) {
+            replacedTexture.destroy()
+            textTextureCacheByteCount -= min(textTextureCacheByteCount, key.byteCount)
+        }
+        textTextureCacheByteCount += key.byteCount
         touchTextTexture(key)
-        while textTextureCache.count > maxTextTextureCacheEntries,
+        while (textTextureCache.count > maxTextTextureCacheEntries
+               || textTextureCacheByteCount > maxTextTextureCacheBytes),
               let oldest = textTextureAccessOrder.first {
             textTextureAccessOrder.removeFirst()
-            textTextureCache.removeValue(forKey: oldest)
+            if let removedTexture = textTextureCache.removeValue(forKey: oldest) {
+                removedTexture.destroy()
+                textTextureCacheByteCount -= min(textTextureCacheByteCount, oldest.byteCount)
+            }
         }
+    }
+
+    private func recordTextRenderFailure(_ failure: CATextRenderFailure) {
+        textRenderFailureCount += 1
+        lastTextRenderFailure = failure
     }
 
     /// Renders a CATextLayer using Canvas2D for text rasterization and texture-based rendering.
@@ -6881,10 +6940,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         _ textLayer: CATextLayer,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
-        modelMatrix: Matrix4x4,
-        bindGroup: GPUBindGroup
+        modelMatrix: Matrix4x4
     ) {
-        guard let string = textLayer.string else {
+        let configuration: CATextRenderConfiguration
+        do {
+            configuration = try CATextRenderConfiguration(layer: textLayer)
+        } catch {
+            recordTextRenderFailure(error)
             return
         }
         guard let texturedBindGroupLayout = texturedBindGroupLayout,
@@ -6893,43 +6955,35 @@ public final class CAWebGPURenderer: CARendererDelegate {
               let uniformBuffer = uniformBuffer,
               let pipeline = pipeline,
               let selectedPipeline = selectTexturedPipeline(for: textLayer) else {
+            recordTextRenderFailure(.rendererResourcesUnavailable)
             return
         }
 
-        let text: String
-        if let str = string as? String {
-            text = str
-        } else {
-            text = String(describing: string)
-        }
-
+        let text = configuration.text
         guard !text.isEmpty else {
             return
         }
-        guard textLayer.fontSize.isFinite, textLayer.fontSize > 0 else {
+
+        let logicalSize = configuration.bounds.size
+        guard logicalSize.width > 0, logicalSize.height > 0 else {
             return
         }
-
-        // Determine text size: use bounds if set, otherwise measure with Canvas2D
-        let width: Int
-        let height: Int
-        if textLayer.bounds.width > 0 && textLayer.bounds.height > 0 {
-            width = Int(textLayer.bounds.width)
-            height = Int(textLayer.bounds.height)
-        } else {
-            // Measure text size using Canvas2D
-            let measuredSize = measureTextSize(
-                text: text,
-                font: textLayer.font as? String,
-                fontSize: textLayer.fontSize,
-                isWrapped: textLayer.isWrapped,
-                maxWidth: textLayer.bounds.width > 0 ? textLayer.bounds.width : nil
-            )
-            width = Int(ceil(measuredSize.width))
-            height = Int(ceil(measuredSize.height))
+        let maximumTextureDimension = max(1, Int(device.limits.maxTextureDimension2D))
+        let scaledWidth = logicalSize.width * configuration.contentsScale
+        let scaledHeight = logicalSize.height * configuration.contentsScale
+        guard scaledWidth.isFinite,
+              scaledHeight.isFinite,
+              scaledWidth > 0,
+              scaledHeight > 0,
+              scaledWidth <= CGFloat(maximumTextureDimension),
+              scaledHeight <= CGFloat(maximumTextureDimension) else {
+            recordTextRenderFailure(.textureDimensionsUnsupported)
+            return
         }
-
-        guard width > 0 && height > 0 else {
+        let pixelWidth = Int(ceil(scaledWidth))
+        let pixelHeight = Int(ceil(scaledHeight))
+        guard UInt64(pixelWidth) * UInt64(pixelHeight) * 4 <= maxTextTextureCacheBytes else {
+            recordTextRenderFailure(.textureDimensionsUnsupported)
             return
         }
 
@@ -6938,9 +6992,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // with the same text but different font / color do not collide.
         let cacheKey = textCacheKey(
             text: text,
-            width: width,
-            height: height,
-            layer: textLayer
+            width: pixelWidth,
+            height: pixelHeight,
+            configuration: configuration
         )
 
         // Check cache first
@@ -6952,47 +7006,40 @@ public final class CAWebGPURenderer: CARendererDelegate {
             // Create offscreen canvas for text rendering
             let document = JSObject.global.document
             let offscreenCanvas = document.createElement("canvas")
-            offscreenCanvas.width = .number(Double(width))
-            offscreenCanvas.height = .number(Double(height))
+            offscreenCanvas.width = .number(Double(pixelWidth))
+            offscreenCanvas.height = .number(Double(pixelHeight))
 
-            guard let ctx = offscreenCanvas.getContext("2d").object else { return }
-
-            // Clear canvas with background color if set
-            if let bgColor = textLayer.backgroundColor {
-                let components = bgColor.components ?? [0, 0, 0, 1]
-                let r = Int((components.count > 0 ? components[0] : 0) * 255)
-                let g = Int((components.count > 1 ? components[1] : 0) * 255)
-                let b = Int((components.count > 2 ? components[2] : 0) * 255)
-                let a = components.count > 3 ? components[3] : 1.0
-                ctx.fillStyle = .string("rgba(\(r),\(g),\(b),\(a))")
-                _ = ctx.fillRect!(0, 0, width, height)
-            } else {
-                _ = ctx.clearRect!(0, 0, width, height)
+            guard let ctx = offscreenCanvas.getContext("2d").object else {
+                recordTextRenderFailure(.canvas2DUnavailable)
+                return
             }
+
+            // The layer background is rendered by the normal background pass.
+            // Keeping the text texture transparent prevents translucent backgrounds
+            // from being composited twice.
+            _ = ctx.clearRect!(0, 0, pixelWidth, pixelHeight)
+            _ = ctx.scale!(
+                Double(configuration.contentsScale),
+                Double(configuration.contentsScale)
+            )
 
             // Set font
-            let fontName: String
-            if let font = textLayer.font as? String {
-                fontName = font
-            } else {
-                fontName = "sans-serif"
-            }
-            ctx.font = .string("\(Int(textLayer.fontSize))px \(fontName)")
+            let escapedFontFamily = configuration.fontFamily.replacingOccurrences(
+                of: "\"",
+                with: "\\\""
+            )
+            ctx.font = .string("\(configuration.fontSize)px \"\(escapedFontFamily)\"")
 
             // Set text color
-            if let fgColor = textLayer.foregroundColor {
-                let components = fgColor.components ?? [0, 0, 0, 1]
-                let r = Int((components.count > 0 ? components[0] : 0) * 255)
-                let g = Int((components.count > 1 ? components[1] : 0) * 255)
-                let b = Int((components.count > 2 ? components[2] : 0) * 255)
-                let a = components.count > 3 ? components[3] : 1.0
-                ctx.fillStyle = .string("rgba(\(r),\(g),\(b),\(a))")
-            } else {
-                ctx.fillStyle = .string("rgba(255,255,255,1)")
-            }
+            let color = configuration.foregroundRGBA
+            ctx.fillStyle = .string(
+                "rgba(\(Int((color.x * 255).rounded())),"
+                    + "\(Int((color.y * 255).rounded())),"
+                    + "\(Int((color.z * 255).rounded())),\(color.w))"
+            )
 
             // Set text alignment
-            switch textLayer.alignmentMode {
+            switch configuration.alignmentMode {
             case .left:
                 ctx.textAlign = .string("left")
             case .right:
@@ -7002,55 +7049,71 @@ public final class CAWebGPURenderer: CARendererDelegate {
             case .justified, .natural:
                 ctx.textAlign = .string("start")
             default:
-                ctx.textAlign = .string("start")
+                recordTextRenderFailure(
+                    .unsupportedAlignmentMode(configuration.alignmentMode.rawValue)
+                )
+                return
             }
 
             ctx.textBaseline = .string("top")
 
             // Calculate text position based on alignment
             let x: Double
-            switch textLayer.alignmentMode {
+            switch configuration.alignmentMode {
             case .center:
-                x = Double(width) / 2
+                x = Double(logicalSize.width) / 2
             case .right:
-                x = Double(width)
+                x = Double(logicalSize.width)
             default:
                 x = 0
             }
 
             // Draw measured single-line or multiline text into the layer texture.
-            if textLayer.isWrapped || CATextLayoutEngine.containsParagraphBreak(text) {
+            textMeasurementFailureDetected = false
+            if configuration.isWrapped || CATextLayoutEngine.containsParagraphBreak(text) {
                 drawMultilineText(
                     ctx: ctx,
                     text: text,
                     x: x,
                     y: 0,
-                    maxWidth: Double(width),
-                    maxHeight: Double(height),
-                    lineHeight: textLayer.fontSize * 1.2,
-                    truncationMode: textLayer.truncationMode,
-                    alignmentMode: textLayer.alignmentMode,
-                    wrapsToWidth: textLayer.isWrapped
+                    maxWidth: Double(logicalSize.width),
+                    maxHeight: Double(logicalSize.height),
+                    lineHeight: configuration.fontSize * 1.2,
+                    truncationMode: configuration.truncationMode,
+                    alignmentMode: configuration.alignmentMode,
+                    wrapsToWidth: configuration.isWrapped
                 )
             } else {
                 let displayedText = CATextLayoutEngine.truncatedText(
                     text,
-                    mode: textLayer.truncationMode,
-                    maximumWidth: CGFloat(width),
+                    mode: configuration.truncationMode,
+                    maximumWidth: logicalSize.width,
                     measure: { candidate in
                         CGFloat(self.measureWidth(ctx: ctx, candidate))
                     }
                 )
-                _ = ctx.fillText!(displayedText, x, Double(textLayer.fontSize * 0.1))
+                _ = ctx.fillText!(displayedText, x, Double(configuration.fontSize * 0.1))
+            }
+            if textMeasurementFailureDetected {
+                recordTextRenderFailure(.textMeasurementUnavailable)
+                return
             }
 
             // Get image data from canvas
-            guard let imageData = ctx.getImageData!(0, 0, width, height).object else { return }
-            guard let dataArray = imageData.data.object else { return }
+            // Reset the transform because getImageData uses untransformed pixel coordinates.
+            _ = ctx.resetTransform!()
+            guard let imageData = ctx.getImageData!(0, 0, pixelWidth, pixelHeight).object else {
+                recordTextRenderFailure(.imageDataUnavailable)
+                return
+            }
+            guard let dataArray = imageData.data.object else {
+                recordTextRenderFailure(.imageDataStorageUnavailable)
+                return
+            }
 
             // Create WebGPU texture
             let textureDescriptor = GPUTextureDescriptor(
-                size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
+                size: GPUExtent3D(width: UInt32(pixelWidth), height: UInt32(pixelHeight)),
                 format: .rgba8unorm,
                 usage: [.textureBinding, .copyDst, .renderAttachment]
             )
@@ -7063,10 +7126,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 data: dataArray,
                 dataLayout: GPUImageDataLayout(
                     offset: 0,
-                    bytesPerRow: UInt32(width * 4),
-                    rowsPerImage: UInt32(height)
+                    bytesPerRow: UInt32(pixelWidth * 4),
+                    rowsPerImage: UInt32(pixelHeight)
                 ),
-                size: GPUExtent3D(width: UInt32(width), height: UInt32(height))
+                size: GPUExtent3D(width: UInt32(pixelWidth), height: UInt32(pixelHeight))
             )
 
             cacheTextTexture(texture, for: cacheKey)
@@ -7126,8 +7189,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Setup matrices using measured/actual text size
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(width), 0, 0, 0),
-            SIMD4<Float>(0, Float(height), 0, 0),
+            SIMD4<Float>(Float(logicalSize.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(logicalSize.height), 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
@@ -7146,7 +7209,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             mvpMatrix: finalMatrix,
             opacity: currentEffectiveOpacity,
             cornerRadius: effectiveCornerRadius,
-            layerSize: SIMD2<Float>(Float(width), Float(height)),
+            layerSize: SIMD2<Float>(Float(logicalSize.width), Float(logicalSize.height)),
             cornerRadii: effectiveCornerRadii,
             edgeAntialiasingMask: textLayer.edgeAntialiasingMaskValue,
             cornerCurveExponent: effectiveCornerCurveExponent
@@ -7187,37 +7250,34 @@ public final class CAWebGPURenderer: CARendererDelegate {
         text: String,
         width: Int,
         height: Int,
-        layer: CATextLayer
-    ) -> String {
-        let fontFingerprint: String
-        if let fontString = layer.font as? String {
-            fontFingerprint = fontString
-        } else if let anyFont = layer.font {
-            // Any other font representation — rely on its reflection / description.
-            // This is deterministic for the same object reference during a frame.
-            fontFingerprint = String(describing: anyFont)
-        } else {
-            fontFingerprint = "sans-serif"
-        }
-
-        let colorHex: String
-        if let fg = layer.foregroundColor, let components = fg.components {
-            let r = Int((components.indices.contains(0) ? components[0] : 0) * 255) & 0xFF
-            let g = Int((components.indices.contains(1) ? components[1] : 0) * 255) & 0xFF
-            let b = Int((components.indices.contains(2) ? components[2] : 0) * 255) & 0xFF
-            let a = Int((components.indices.contains(3) ? components[3] : 1) * 255) & 0xFF
-            colorHex = String(format: "%02X%02X%02X%02X", r, g, b, a)
-        } else {
-            colorHex = "FFFFFFFF"
-        }
-
-        return "\(text)_\(width)x\(height)_\(layer.fontSize)_\(layer.alignmentMode.rawValue)_\(layer.truncationMode.rawValue)_\(fontFingerprint)_\(colorHex)_\(layer.isWrapped ? "w" : "n")"
+        configuration: CATextRenderConfiguration
+    ) -> TextTextureCacheKey {
+        let color = configuration.foregroundRGBA
+        return TextTextureCacheKey(
+            text: text,
+            pixelWidth: width,
+            pixelHeight: height,
+            fontSize: configuration.fontSize,
+            contentsScale: configuration.contentsScale,
+            alignmentMode: configuration.alignmentMode,
+            truncationMode: configuration.truncationMode,
+            fontFamily: configuration.fontFamily,
+            red: color.x,
+            green: color.y,
+            blue: color.z,
+            alpha: color.w,
+            isWrapped: configuration.isWrapped
+        )
     }
 
     /// Canvas2D text width for a string.
     private func measureWidth(ctx: JSObject, _ s: String) -> Double {
         let metrics = ctx.measureText!(s)
-        return metrics.width.number ?? 0
+        guard let width = metrics.width.number, width.isFinite, width >= 0 else {
+            textMeasurementFailureDetected = true
+            return 0
+        }
+        return width
     }
 
     /// Draws paragraph and width-driven line breaks, truncating visible lines when requested.
@@ -7315,84 +7375,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
         for segment in segments {
             _ = ctx.fillText!(segment, cursor, y)
             cursor += measureWidth(ctx: ctx, segment) + spacing
-        }
-    }
-
-    /// Measures text size using Canvas2D measureText API.
-    /// - Parameters:
-    ///   - text: The text to measure
-    ///   - font: Font family name (nil for system default)
-    ///   - fontSize: Font size in points
-    ///   - isWrapped: Whether text should wrap
-    ///   - maxWidth: Maximum width for wrapping (nil for single line)
-    /// - Returns: The measured size
-    private func measureTextSize(
-        text: String,
-        font: String?,
-        fontSize: CGFloat,
-        isWrapped: Bool,
-        maxWidth: CGFloat?
-    ) -> CGSize {
-        // Use shared measurement canvas or create one
-        let document = JSObject.global.document
-        let measureCanvas = document.createElement("canvas")
-        guard let ctx = measureCanvas.getContext("2d").object else {
-            // Fallback to estimation
-            let estimatedWidth = CGFloat(text.count) * fontSize * 0.6
-            let estimatedHeight = fontSize * 1.2
-            return CGSize(width: estimatedWidth, height: estimatedHeight)
-        }
-
-        // Set font
-        let fontFamily = font ?? "sans-serif"
-        ctx.font = .string("\(Int(fontSize))px \(fontFamily)")
-
-        // Measure text
-        let metrics = ctx.measureText!(text)
-        let measuredWidth = metrics.width.number ?? Double(text.count) * Double(fontSize) * 0.6
-
-        // Get height from font metrics if available, otherwise estimate
-        let ascent = metrics.actualBoundingBoxAscent.number ?? Double(fontSize) * 0.8
-        let descent = metrics.actualBoundingBoxDescent.number ?? Double(fontSize) * 0.2
-        let lineHeight = ascent + descent
-
-        if isWrapped, let maxWidth {
-            let lines = CATextLayoutEngine.wrappedLines(
-                text,
-                maximumWidth: maxWidth,
-                measure: { candidate in CGFloat(self.measureWidth(ctx: ctx, candidate)) }
-            )
-            return CGSize(
-                width: maxWidth,
-                height: fontSize * 1.2 * CGFloat(lines.count)
-            )
-        } else if CATextLayoutEngine.containsParagraphBreak(text) {
-            let lines = CATextLayoutEngine.wrappedLines(
-                text,
-                maximumWidth: maxWidth ?? .greatestFiniteMagnitude,
-                wrapsToWidth: false,
-                measure: { candidate in CGFloat(self.measureWidth(ctx: ctx, candidate)) }
-            )
-            let widestLine = lines.reduce(CGFloat.zero) { width, line in
-                max(width, CGFloat(measureWidth(ctx: ctx, line.text)))
-            }
-            return CGSize(
-                width: maxWidth ?? widestLine + fontSize * 0.1,
-                height: fontSize * 1.2 * CGFloat(lines.count)
-            )
-        } else if let maxWidth = maxWidth, CGFloat(measuredWidth) > maxWidth {
-            // Not wrapped but has maxWidth constraint - text will be clipped
-            // Return maxWidth as the size to match the canvas dimensions
-            return CGSize(
-                width: maxWidth,
-                height: CGFloat(lineHeight) * 1.2
-            )
-        } else {
-            // Single line, no constraints - add some padding
-            return CGSize(
-                width: CGFloat(measuredWidth) + fontSize * 0.1,
-                height: CGFloat(lineHeight) * 1.2
-            )
         }
     }
 
