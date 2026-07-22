@@ -164,4 +164,20 @@ open class CATextLayer: CALayer {
         }
     }
 
+    /// Returns whether a text-layer property differs from its archive default.
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "string": return string != nil
+        case "font": return (font as? String) != "Helvetica"
+        case "fontSize": return fontSize != 36
+        case "foregroundColor":
+            return foregroundColor != CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        case "wrapped": return isWrapped
+        case "truncationMode": return truncationMode != .none
+        case "alignmentMode": return alignmentMode != .natural
+        case "allowsFontSubpixelQuantization": return allowsFontSubpixelQuantization
+        default: return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
 }

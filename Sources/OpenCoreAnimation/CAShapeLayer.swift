@@ -200,4 +200,24 @@ open class CAShapeLayer: CALayer {
         }
     }
 
+    /// Returns whether a shape-layer property differs from its archive default.
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "path": return path != nil
+        case "fillColor":
+            return fillColor != CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        case "fillRule": return fillRule != .nonZero
+        case "lineCap": return lineCap != .butt
+        case "lineDashPattern": return lineDashPattern != nil
+        case "lineDashPhase": return lineDashPhase != 0
+        case "lineJoin": return lineJoin != .miter
+        case "lineWidth": return lineWidth != 1
+        case "miterLimit": return miterLimit != 10
+        case "strokeColor": return strokeColor != nil
+        case "strokeStart": return strokeStart != 0
+        case "strokeEnd": return strokeEnd != 1
+        default: return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
 }

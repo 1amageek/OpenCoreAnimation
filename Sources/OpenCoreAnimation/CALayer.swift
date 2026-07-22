@@ -5733,7 +5733,144 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Returns a Boolean indicating whether the value of the specified key should be archived.
     open func shouldArchiveValue(forKey key: String) -> Bool {
-        return true
+        switch key {
+        case "anchorPoint":
+            return anchorPoint != CGPoint(x: 0.5, y: 0.5)
+        case "anchorPointZ":
+            return anchorPointZ != 0
+        case "bounds":
+            return bounds != .zero
+        case "position":
+            return position != .zero
+        case "zPosition":
+            return zPosition != 0
+        case "opacity":
+            return opacity != 1
+        case "hidden":
+            return isHidden
+        case "masksToBounds":
+            return masksToBounds
+        case "mask":
+            return mask != nil
+        case "doubleSided":
+            return !isDoubleSided
+        case "cornerRadius":
+            return cornerRadius != 0
+        case "maskedCorners":
+            return maskedCorners != [
+                .layerMinXMinYCorner,
+                .layerMaxXMinYCorner,
+                .layerMinXMaxYCorner,
+                .layerMaxXMaxYCorner,
+            ]
+        case "cornerCurve", "contentsFormat", "allowsEdgeAntialiasing", "allowsGroupOpacity":
+            // QuartzCore archives these four rendering-policy keys even when
+            // their stored values equal the fresh-layer values.
+            return true
+        case "borderWidth":
+            return borderWidth != 0
+        case "borderColor":
+            return borderColor != CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        case "backgroundColor":
+            return backgroundColor != nil
+        case "shadowOpacity":
+            return shadowOpacity != 0
+        case "shadowRadius":
+            return shadowRadius != 3
+        case "shadowOffset":
+            return shadowOffset != CGSize(width: 0, height: -3)
+        case "shadowColor":
+            return shadowColor != CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        case "shadowPath":
+            return shadowPath != nil
+        case "style":
+            return style != nil
+        case "filters":
+            return filters != nil
+        case "compositingFilter":
+            return compositingFilter != nil
+        case "backgroundFilters":
+            return backgroundFilters != nil
+        case "contents":
+            return contents != nil
+        case "contentsRect":
+            return contentsRect != CGRect(x: 0, y: 0, width: 1, height: 1)
+        case "contentsCenter":
+            return contentsCenter != CGRect(x: 0, y: 0, width: 1, height: 1)
+        case "contentsGravity":
+            return contentsGravity != .resize
+        case "contentsScale":
+            return contentsScale != 1
+        case "minificationFilter":
+            return minificationFilter != .linear
+        case "magnificationFilter":
+            return magnificationFilter != .linear
+        case "minificationFilterBias":
+            return minificationFilterBias != 0
+        case "opaque":
+            return isOpaque
+        case "edgeAntialiasingMask":
+            return edgeAntialiasingMask != [
+                .layerLeftEdge,
+                .layerRightEdge,
+                .layerBottomEdge,
+                .layerTopEdge,
+            ]
+        case "geometryFlipped":
+            return isGeometryFlipped
+        case "drawsAsynchronously":
+            return drawsAsynchronously
+        case "shouldRasterize":
+            return shouldRasterize
+        case "rasterizationScale":
+            return rasterizationScale != 1
+        case "toneMapMode":
+            return toneMapMode != .automatic
+        case "preferredDynamicRange":
+            return preferredDynamicRange != .standard
+        case "contentsHeadroom":
+            return contentsHeadroom != 0
+        case "transform":
+            return !CATransform3DIsIdentity(transform)
+        case "sublayerTransform":
+            return !CATransform3DIsIdentity(sublayerTransform)
+        case "sublayers":
+            return sublayers?.isEmpty == false
+        case "needsDisplayOnBoundsChange":
+            return needsDisplayOnBoundsChange
+        case "layoutManager":
+            return layoutManager != nil
+        case "autoresizingMask":
+            return !autoresizingMask.isEmpty
+        case "constraints":
+            return constraints != nil
+        case "actions":
+            return actions != nil
+        case "delegate":
+            return delegate != nil
+        case "name":
+            return name != nil
+        case "beginTime":
+            return beginTime != 0
+        case "timeOffset":
+            return timeOffset != 0
+        case "repeatCount":
+            return repeatCount != 0
+        case "repeatDuration":
+            return repeatDuration != 0
+        case "duration":
+            return duration != .infinity
+        case "speed":
+            return speed != 1
+        case "autoreverses":
+            return autoreverses
+        case "fillMode":
+            return fillMode != .removed
+        case "frame", "superlayer", "visibleRect":
+            return false
+        default:
+            return false
+        }
     }
 
     /// Specifies the default value associated with the specified key.

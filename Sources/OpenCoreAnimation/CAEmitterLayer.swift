@@ -196,4 +196,26 @@ open class CAEmitterLayer: CALayer {
         didSet { markDirty(.contents) }
     }
 
+    /// Returns whether an emitter-layer property differs from its archive default.
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "emitterCells": return emitterCells != nil
+        case "emitterPosition": return emitterPosition != .zero
+        case "emitterZPosition": return emitterZPosition != 0
+        case "emitterSize": return emitterSize != .zero
+        case "emitterDepth": return emitterDepth != 0
+        case "emitterShape": return emitterShape != .point
+        case "emitterMode": return emitterMode != .volume
+        case "renderMode": return renderMode != .unordered
+        case "preservesDepth": return preservesDepth
+        case "birthRate": return birthRate != 1
+        case "lifetime": return lifetime != 1
+        case "velocity": return velocity != 1
+        case "scale": return scale != 1
+        case "spin": return spin != 1
+        case "seed": return seed != 0
+        default: return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
 }

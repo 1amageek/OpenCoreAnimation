@@ -143,4 +143,21 @@ open class CAReplicatorLayer: CALayer {
         }
     }
 
+    /// Returns whether a replicator-layer property differs from its archive default.
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "instanceCount": return instanceCount != 1
+        case "preservesDepth": return preservesDepth
+        case "instanceDelay": return instanceDelay != 0
+        case "instanceTransform": return !CATransform3DIsIdentity(instanceTransform)
+        case "instanceColor":
+            return instanceColor != CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        case "instanceRedOffset": return instanceRedOffset != 0
+        case "instanceGreenOffset": return instanceGreenOffset != 0
+        case "instanceBlueOffset": return instanceBlueOffset != 0
+        case "instanceAlphaOffset": return instanceAlphaOffset != 0
+        default: return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
 }

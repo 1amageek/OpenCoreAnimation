@@ -193,4 +193,14 @@ open class CATiledLayer: CALayer {
         let maximumLevel = min(requestedMaximum, dimensionLimit)
         return min(max(requestedLevel, minimumLevel), maximumLevel)
     }
+
+    /// Returns whether a tiled-layer property differs from its archive default.
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "levelsOfDetail": return levelsOfDetail != 1
+        case "levelsOfDetailBias": return levelsOfDetailBias != 0
+        case "tileSize": return tileSize != CGSize(width: 256, height: 256)
+        default: return super.shouldArchiveValue(forKey: key)
+        }
+    }
 }

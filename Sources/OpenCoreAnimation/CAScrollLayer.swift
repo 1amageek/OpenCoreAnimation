@@ -156,4 +156,12 @@ open class CAScrollLayer: CALayer {
 
         return newOffset
     }
+
+    /// Returns whether a scroll-layer property differs from its archive default.
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "scrollMode": return scrollMode != .both
+        default: return super.shouldArchiveValue(forKey: key)
+        }
+    }
 }

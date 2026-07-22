@@ -102,4 +102,16 @@ open class CAGradientLayer: CALayer {
         }
     }
 
+    /// Returns whether a gradient-layer property differs from its archive default.
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "colors": return colors != nil
+        case "locations": return locations != nil
+        case "startPoint": return startPoint != CGPoint(x: 0.5, y: 0)
+        case "endPoint": return endPoint != CGPoint(x: 0.5, y: 1)
+        case "type": return type != .axial
+        default: return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
 }
