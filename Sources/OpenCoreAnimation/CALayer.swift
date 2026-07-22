@@ -552,6 +552,13 @@ open class CALayer: CAMediaTiming, Hashable {
             group.markStarted()
         }
         guard timing.applies(fillMode: group.fillMode) else { return }
+        let childTime: CFTimeInterval
+        if let timingFunction = group.timingFunction {
+            let easedProgress = timingFunction.evaluate(at: Float(timing.progress))
+            childTime = CFTimeInterval(max(0, min(1, easedProgress))) * groupBaseDuration
+        } else {
+            childTime = timing.basicTime
+        }
 
         // Children are evaluated in the group's repeating basic time space.
         // The group's duration clips longer children without scaling them.
@@ -560,7 +567,7 @@ open class CALayer: CAMediaTiming, Hashable {
             applyAnimationWithContext(
                 animation,
                 to: layer,
-                at: timing.basicTime,
+                at: childTime,
                 effectiveDuration: effectiveDuration,
                 pass: pass
             )

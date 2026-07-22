@@ -75,6 +75,50 @@ struct CAAnimationGraphEvaluationTests {
         expectColor(try #require(result.backgroundColor), [0, 0, 1, 1])
     }
 
+    @Test("Group timing functions remap child basic time")
+    func groupTimingFunction() throws {
+        let layer = CALayer()
+        layer.opacity = 0
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.fromValue = Float(0)
+        child.toValue = Float(1)
+        child.duration = 1
+        child.fillMode = .both
+        let group = frozenGroup(animations: [child], elapsed: 0.5)
+        let timingFunction = CAMediaTimingFunction(name: .easeIn)
+        group.timingFunction = timingFunction
+
+        layer.add(group, forKey: "timed-group")
+        let result = try #require(layer.presentation())
+        let expected = timingFunction.evaluate(at: 0.5)
+
+        #expect(abs(result.opacity - expected) < Float(epsilon))
+        #expect(abs(result.opacity - 0.5) > 0.05)
+    }
+
+    @Test("Group and child timing functions compose hierarchically")
+    func nestedTimingFunctions() throws {
+        let layer = CALayer()
+        layer.opacity = 0
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.fromValue = Float(0)
+        child.toValue = Float(1)
+        child.duration = 1
+        child.fillMode = .both
+        let childTiming = CAMediaTimingFunction(name: .easeOut)
+        child.timingFunction = childTiming
+        let group = frozenGroup(animations: [child], elapsed: 0.5)
+        let groupTiming = CAMediaTimingFunction(name: .easeIn)
+        group.timingFunction = groupTiming
+
+        layer.add(group, forKey: "composed-timing-group")
+        let result = try #require(layer.presentation())
+        let groupProgress = groupTiming.evaluate(at: 0.5)
+        let expected = childTiming.evaluate(at: groupProgress)
+
+        #expect(abs(result.opacity - expected) < Float(epsilon))
+    }
+
     private func additiveOpacity() -> CABasicAnimation {
         let animation = replacementOpacity()
         animation.isAdditive = true
