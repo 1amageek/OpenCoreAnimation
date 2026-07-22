@@ -29,6 +29,20 @@ open class CAGradientLayer: CALayer {
         }
     }
 
+    /// Specifies the default value associated with a gradient-layer property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "startPoint":
+            return CGPoint(x: 0.5, y: 0)
+        case "endPoint":
+            return CGPoint(x: 0.5, y: 1)
+        case "type":
+            return CAGradientLayerType.axial
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     // MARK: - Gradient Properties
 
     internal var _colors: [Any]?

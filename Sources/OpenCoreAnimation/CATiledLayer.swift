@@ -52,6 +52,20 @@ open class CATiledLayer: CALayer {
         }
     }
 
+    /// Specifies the default value associated with a tiled-layer property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "levelsOfDetail":
+            return 1
+        case "levelsOfDetailBias":
+            return 0
+        case "tileSize":
+            return CGSize(width: 256, height: 256)
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     // MARK: - Tile Properties
 
     /// The number of levels of detail maintained by this layer.

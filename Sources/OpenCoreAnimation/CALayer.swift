@@ -3674,7 +3674,7 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    private var _borderColor: CGColor?
+    private var _borderColor: CGColor? = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
     /// The color of the layer's border. Animatable.
     open var borderColor: CGColor? {
         get { return _borderColor }
@@ -3771,7 +3771,7 @@ open class CALayer: CAMediaTiming, Hashable {
     open var style: [AnyHashable: Any]?
 
     /// A Boolean indicating whether the layer is allowed to perform edge antialiasing.
-    open var allowsEdgeAntialiasing: Bool = false {
+    open var allowsEdgeAntialiasing: Bool = true {
         didSet {
             guard oldValue != allowsEdgeAntialiasing else { return }
             markDirty(.rasterization)
@@ -5524,7 +5524,61 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Specifies the default value associated with the specified key.
     open class func defaultValue(forKey key: String) -> Any? {
-        return nil
+        switch key {
+        case "anchorPoint":
+            return CGPoint(x: 0.5, y: 0.5)
+        case "maskedCorners":
+            return CACornerMask([
+                .layerMinXMinYCorner,
+                .layerMaxXMinYCorner,
+                .layerMinXMaxYCorner,
+                .layerMaxXMaxYCorner
+            ])
+        case "cornerCurve":
+            return CALayerCornerCurve.circular
+        case "drawsAsynchronously":
+            return false
+        case "contentsRect", "contentsCenter":
+            return CGRect(x: 0, y: 0, width: 1, height: 1)
+        case "contentsGravity":
+            return CALayerContentsGravity.resize
+        case "contentsScale":
+            return CGFloat(1)
+        case "contentsFormat":
+            return CALayerContentsFormat.RGBA8Uint
+        case "minificationFilter", "magnificationFilter":
+            return CALayerContentsFilter.linear
+        case "opacity":
+            return Float(1)
+        case "hidden", "masksToBounds", "geometryFlipped", "opaque",
+             "shouldRasterize", "needsDisplayOnBoundsChange":
+            return false
+        case "doubleSided", "allowsEdgeAntialiasing", "allowsGroupOpacity":
+            return true
+        case "borderColor", "shadowColor":
+            return CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        case "shadowOffset":
+            return CGSize(width: 0, height: -3)
+        case "shadowRadius":
+            return CGFloat(3)
+        case "edgeAntialiasingMask":
+            return CAEdgeAntialiasingMask([
+                .layerLeftEdge,
+                .layerRightEdge,
+                .layerBottomEdge,
+                .layerTopEdge
+            ])
+        case "rasterizationScale":
+            return CGFloat(1)
+        case "duration":
+            return CFTimeInterval.infinity
+        case "speed":
+            return Float(1)
+        case "fillMode":
+            return CAMediaTimingFillMode.removed
+        default:
+            return nil
+        }
     }
 
     // MARK: - Corner Curve
@@ -5554,7 +5608,7 @@ open class CALayer: CAMediaTiming, Hashable {
     open var repeatDuration: CFTimeInterval = 0
 
     /// Specifies the basic duration of the animation, in seconds.
-    open var duration: CFTimeInterval = 0
+    open var duration: CFTimeInterval = .infinity
 
     /// Specifies how time is mapped to receiver's time space from the parent time space.
     open var speed: Float = 1

@@ -35,6 +35,18 @@ open class CAReplicatorLayer: CALayer {
         }
     }
 
+    /// Specifies the default value associated with a replicator-layer property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "instanceCount":
+            return 1
+        case "instanceColor":
+            return CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     // MARK: - Instance Properties
 
     /// The number of copies to create, including the source layer.

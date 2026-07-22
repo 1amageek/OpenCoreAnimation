@@ -41,6 +41,26 @@ open class CAShapeLayer: CALayer {
         }
     }
 
+    /// Specifies the default value associated with a shape-layer property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "fillColor":
+            return CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        case "fillRule":
+            return CAShapeLayerFillRule.nonZero
+        case "strokeEnd", "lineWidth":
+            return CGFloat(1)
+        case "miterLimit":
+            return CGFloat(10)
+        case "lineCap":
+            return CAShapeLayerLineCap.butt
+        case "lineJoin":
+            return CAShapeLayerLineJoin.miter
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     // MARK: - Specifying the Shape Path
 
     internal var _path: CGPath?

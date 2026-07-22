@@ -28,6 +28,16 @@ open class CAScrollLayer: CALayer {
         }
     }
 
+    /// Specifies the default value associated with a scroll-layer property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "scrollMode":
+            return CAScrollLayerScrollMode.both
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     // MARK: - Scroll Properties
 
     /// The scroll mode.

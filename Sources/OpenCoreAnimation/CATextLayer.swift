@@ -76,6 +76,24 @@ open class CATextLayer: CALayer {
         }
     }
 
+    /// Specifies the default value associated with a text-layer property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "font":
+            return "Helvetica"
+        case "fontSize":
+            return CGFloat(36)
+        case "foregroundColor":
+            return CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        case "truncationMode":
+            return CATextLayerTruncationMode.none
+        case "alignmentMode":
+            return CATextLayerAlignmentMode.natural
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     // MARK: - Text Properties
 
     /// The text to be rendered by the receiver.
@@ -84,7 +102,7 @@ open class CATextLayer: CALayer {
     }
 
     /// The font used to render the receiver's text.
-    open var font: Any? {
+    open var font: Any? = "Helvetica" {
         didSet { markDirty(.contents) }
     }
 

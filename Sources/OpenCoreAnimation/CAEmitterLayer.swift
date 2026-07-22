@@ -36,6 +36,22 @@ open class CAEmitterLayer: CALayer {
         }
     }
 
+    /// Specifies the default value associated with an emitter-layer property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "birthRate", "lifetime", "velocity", "scale", "spin":
+            return Float(1)
+        case "emitterShape":
+            return CAEmitterLayerEmitterShape.point
+        case "emitterMode":
+            return CAEmitterLayerEmitterMode.volume
+        case "renderMode":
+            return CAEmitterLayerRenderMode.unordered
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     // MARK: - Emitter Cells
 
     /// An array of CAEmitterCell objects that define the types of emitted objects.

@@ -155,7 +155,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginEdgeAntialiasingProbe();
         await expect.poll(() => h.getEdgeAntialiasingProbeResult(), { timeout: 10_000 }).toBe(
-            "initial=255,255,255,255;40,40,40,255;255,255,255,255;255,255,255,255;215,215,215,255;40,40,40,255,mutated=255,255,255,255;215,215,215,255,bottom=40,40,40,255;255,255,255,255,top=255,255,255,255;215,215,215,255"
+            "defaultEnabled=true,initial=40,40,40,255;40,40,40,255;255,255,255,255;255,255,255,255;215,215,215,255;40,40,40,255,defaultBorder=0,0,0,255;255,255,255,255,mutated=255,255,255,255;215,215,215,255,bottom=40,40,40,255;255,255,255,255,top=255,255,255,255;215,215,215,255"
         );
 
         await h.beginBooleanAnimationProbe();

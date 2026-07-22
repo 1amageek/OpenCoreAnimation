@@ -1002,7 +1002,7 @@ func installHarness() {
                     return layer
                 }
 
-                let disabledLayer = makeLayer(x: 50.25, edgeMask: nil)
+                let defaultLayer = makeLayer(x: 50.25, edgeMask: nil)
                 let mutableLayer = makeLayer(x: 120.25, edgeMask: [.layerLeftEdge])
                 let rightLayer = makeLayer(x: 190.25, edgeMask: [.layerRightEdge])
                 let texturedLayer = CALayer()
@@ -1018,7 +1018,7 @@ func installHarness() {
 
                 @MainActor
                 func restoreScene() {
-                    disabledLayer.removeFromSuperlayer()
+                    defaultLayer.removeFromSuperlayer()
                     mutableLayer.removeFromSuperlayer()
                     rightLayer.removeFromSuperlayer()
                     texturedLayer.removeFromSuperlayer()
@@ -1040,6 +1040,14 @@ func installHarness() {
                 engine.renderFrame()
                 do {
                     let initialPixels = try await renderer.readbackPixels(at: samplePoints)
+                    let defaultEdgeAntialiasingEnabled = defaultLayer.allowsEdgeAntialiasing
+                    defaultLayer.allowsEdgeAntialiasing = false
+                    defaultLayer.borderWidth = 4
+                    engine.renderFrame()
+                    let defaultBorderPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 32, y: 220),
+                        CGPoint(x: 50, y: 220),
+                    ])
                     mutableLayer.edgeAntialiasingMask = [.layerRightEdge]
                     engine.renderFrame()
                     let mutatedPixels = try await renderer.readbackPixels(at: [
@@ -1059,8 +1067,10 @@ func installHarness() {
                         CGPoint(x: 120, y: 200),
                     ])
                     restoreScene()
-                    edgeAntialiasingProbeResult = "initial="
+                    edgeAntialiasingProbeResult = "defaultEnabled=\(defaultEdgeAntialiasingEnabled),initial="
                         + initialPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",defaultBorder="
+                        + defaultBorderPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
                         + ",mutated="
                         + mutatedPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
                         + ",bottom="
@@ -2454,6 +2464,26 @@ func installHarness() {
                 secondIndependentPlane.transform = CATransform3DMakeTranslation(0, 0, -500)
                 secondIndependentGroup.addSublayer(secondIndependentPlane)
                 root.addSublayer(secondIndependentGroup)
+
+                func disableEdgeAntialiasingRecursively(_ layer: CALayer) {
+                    layer.allowsEdgeAntialiasing = false
+                    if let mask = layer.mask {
+                        disableEdgeAntialiasingRecursively(mask)
+                    }
+                    for sublayer in layer.sublayers ?? [] {
+                        disableEdgeAntialiasingRecursively(sublayer)
+                    }
+                }
+                for probeRoot in [
+                    crossingGroup,
+                    directMaskedGroup,
+                    rasterizedMaskedGroup,
+                    transparencyGroup,
+                    firstIndependentGroup,
+                    secondIndependentGroup,
+                ] {
+                    disableEdgeAntialiasingRecursively(probeRoot)
+                }
                 CATransaction.commit()
 
                 do {
