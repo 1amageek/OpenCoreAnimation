@@ -1523,6 +1523,17 @@ func installHarness() {
                 rotation.values = [CGFloat(0), CGFloat.pi / 2]
                 configure(rotation)
                 rotationLayer.add(rotation, forKey: "browserRotationComponent")
+
+                let valueFunctionLayer = makeLayer(
+                    position: CGPoint(x: 330, y: 150),
+                    size: CGSize(width: 20, height: 20),
+                    color: CGColor(red: 1, green: 0, blue: 1, alpha: 1)
+                )
+                let valueFunction = CAKeyframeAnimation(keyPath: "transform")
+                valueFunction.valueFunction = CAValueFunction(name: .translateX)
+                valueFunction.values = [0, 40]
+                configure(valueFunction)
+                valueFunctionLayer.add(valueFunction, forKey: "browserValueFunction")
                 CATransaction.commit()
 
                 @MainActor
@@ -1530,6 +1541,7 @@ func installHarness() {
                     translationLayer.removeFromSuperlayer()
                     scaleLayer.removeFromSuperlayer()
                     rotationLayer.removeFromSuperlayer()
+                    valueFunctionLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
@@ -1540,7 +1552,8 @@ func installHarness() {
                 engine.renderFrame()
                 guard let translationPresentation = translationLayer.presentation(),
                       let scalePresentation = scaleLayer.presentation(),
-                      let rotationPresentation = rotationLayer.presentation() else {
+                      let rotationPresentation = rotationLayer.presentation(),
+                      let valueFunctionPresentation = valueFunctionLayer.presentation() else {
                     restoreScene()
                     transformComponentProbeResult = "error: presentation unavailable"
                     return
@@ -1550,6 +1563,8 @@ func installHarness() {
                     && abs(scalePresentation.transform.m11 - 2) < 0.001
                     && abs(rotationPresentation.transform.m11 - sqrt(0.5)) < 0.001
                     && abs(rotationPresentation.transform.m12 - sqrt(0.5)) < 0.001
+                    && abs(valueFunctionPresentation.transform.m11 - 1) < 0.001
+                    && abs(valueFunctionPresentation.transform.m41 - 20) < 0.001
 
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
@@ -1558,6 +1573,8 @@ func installHarness() {
                         CGPoint(x: 177, y: 150),
                         CGPoint(x: 271, y: 139),
                         CGPoint(x: 275, y: 150),
+                        CGPoint(x: 330, y: 150),
+                        CGPoint(x: 350, y: 150),
                     ])
                     restoreScene()
                     transformComponentProbeResult = pixels

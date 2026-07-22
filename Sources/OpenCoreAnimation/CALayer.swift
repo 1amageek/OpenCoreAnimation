@@ -622,8 +622,15 @@ open class CALayer: CAMediaTiming, Hashable {
             terminalValue = nil
         }
         if let terminalValue {
+            let contribution: Any
+            if let valueFunction = animation.valueFunction {
+                guard let scalar = transformScalarValue(terminalValue) else { return }
+                contribution = valueFunction.apply(values: [scalar])
+            } else {
+                contribution = terminalValue
+            }
             applyCumulativeContribution(
-                terminalValue,
+                contribution,
                 cycles: completedCycles,
                 to: layer,
                 keyPath: keyPath
@@ -751,47 +758,29 @@ open class CALayer: CAMediaTiming, Hashable {
         to layer: CALayer,
         progress: CFTimeInterval
     ) {
-        // Get scalar values from the animation
-        let fromValue: CGFloat
-        if let from = animation.fromValue as? CGFloat {
-            fromValue = from
-        } else if let from = animation.fromValue as? Double {
-            fromValue = CGFloat(from)
-        } else if let from = animation.fromValue as? Float {
-            fromValue = CGFloat(from)
-        } else if let from = animation.fromValue as? Int {
-            fromValue = CGFloat(from)
-        } else {
-            // Default starting value depends on the function type
-            fromValue = defaultValueForFunction(valueFunction)
-        }
+        guard let resolved = resolveFromTo(
+            animation,
+            currentValue: defaultValueForFunction(valueFunction)
+        ) else { return }
+        let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+        applyValueFunctionValue(
+            value,
+            valueFunction: valueFunction,
+            to: layer,
+            additive: animation.isAdditive
+        )
+    }
 
-        let toValue: CGFloat
-        if let to = animation.toValue as? CGFloat {
-            toValue = to
-        } else if let to = animation.toValue as? Double {
-            toValue = CGFloat(to)
-        } else if let to = animation.toValue as? Float {
-            toValue = CGFloat(to)
-        } else if let to = animation.toValue as? Int {
-            toValue = CGFloat(to)
-        } else {
-            // Default ending value depends on the function type
-            toValue = defaultValueForFunction(valueFunction)
-        }
-
-        // Use the value function to interpolate and get the transform
-        let transform = valueFunction.interpolate(from: fromValue, to: toValue, progress: CGFloat(progress))
-
-        // Apply the transform to the layer
-        // Read from presentation layer so value function animations compose
-        // with other transform animations applied earlier in the same frame.
-        let baseTransform = layer._transform
-        if CATransform3DIsIdentity(baseTransform) {
-            layer._transform = transform
-        } else {
-            layer._transform = CATransform3DConcat(baseTransform, transform)
-        }
+    private func applyValueFunctionValue(
+        _ value: CGFloat,
+        valueFunction: CAValueFunction,
+        to layer: CALayer,
+        additive: Bool
+    ) {
+        let transform = valueFunction.apply(values: [value])
+        layer._transform = additive
+            ? CATransform3DConcat(transform, layer._transform)
+            : transform
     }
 
     /// Returns the default value for a given value function type.
@@ -822,9 +811,9 @@ open class CALayer: CAMediaTiming, Hashable {
     /// - `from` only: to = currentValue
     /// - `to` only: from = currentValue
     private func resolveFromTo(_ animation: CABasicAnimation, currentValue: CGFloat) -> (from: CGFloat, to: CGFloat)? {
-        let fromVal = (animation.fromValue as? CGFloat) ?? (animation.fromValue as? Double).map { CGFloat($0) } ?? (animation.fromValue as? Float).map { CGFloat($0) }
-        let toVal = (animation.toValue as? CGFloat) ?? (animation.toValue as? Double).map { CGFloat($0) } ?? (animation.toValue as? Float).map { CGFloat($0) }
-        let byVal = (animation.byValue as? CGFloat) ?? (animation.byValue as? Double).map { CGFloat($0) } ?? (animation.byValue as? Float).map { CGFloat($0) }
+        let fromVal = animation.fromValue.flatMap { transformScalarValue($0) }
+        let toVal = animation.toValue.flatMap { transformScalarValue($0) }
+        let byVal = animation.byValue.flatMap { transformScalarValue($0) }
 
         if let from = fromVal, let to = toVal {
             return (from, to)
@@ -938,6 +927,7 @@ open class CALayer: CAMediaTiming, Hashable {
     private func zeroAnimationValue(matching value: Any?) -> Any? {
         switch value {
         case is Float: return Float(0)
+        case is Int: return Int(0)
         case is CGFloat, is Double: return CGFloat(0)
         case is CGPoint: return CGPoint.zero
         case is CGSize: return CGSize.zero
@@ -953,6 +943,9 @@ open class CALayer: CAMediaTiming, Hashable {
         let sign: CGFloat = subtract ? -1 : 1
         if let lhs = lhs as? Float, let rhs = rhs as? Float {
             return lhs + Float(sign) * rhs
+        }
+        if let lhs = lhs as? Int, let rhs = rhs as? Int {
+            return lhs + Int(sign) * rhs
         }
         if let lhs = lhs as? CGFloat, let rhs = rhs as? CGFloat {
             return lhs + sign * rhs
@@ -1643,6 +1636,7 @@ open class CALayer: CAMediaTiming, Hashable {
         if let value = value as? CGFloat { return value }
         if let value = value as? Double { return CGFloat(value) }
         if let value = value as? Float { return CGFloat(value) }
+        if let value = value as? Int { return CGFloat(value) }
         return nil
     }
 
@@ -2088,7 +2082,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 values[0],
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
             return
         }
@@ -2124,7 +2119,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 values[0],
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
             return
         }
@@ -2133,7 +2129,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 values[values.count - 1],
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
             return
         }
@@ -2143,7 +2140,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 values[valueIndex],
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
             return
         }
@@ -2184,7 +2182,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 fromValue,
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
         case .linear, .paced:
             // Linear interpolation between values
@@ -2194,7 +2193,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 progress: CFTimeInterval(adjustedProgress),
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
         case .cubic, .cubicPaced:
             // Catmull-Rom spline interpolation
@@ -2217,7 +2217,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 endParameters: cubicParameters(for: animation, at: endIndex),
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
         default:
             interpolateKeyframeValue(
@@ -2226,7 +2227,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 progress: CFTimeInterval(adjustedProgress),
                 layer: layer,
                 keyPath: keyPath,
-                additive: animation.isAdditive
+                additive: animation.isAdditive,
+                valueFunction: animation.valueFunction
             )
         }
     }
@@ -2288,14 +2290,10 @@ open class CALayer: CAMediaTiming, Hashable {
             return sqrt(dx * dx + dy * dy)
         }
 
-        // CGFloat distance (absolute)
-        if let fromFloat = from as? CGFloat, let toFloat = to as? CGFloat {
-            return abs(toFloat - fromFloat)
-        }
-
-        // Float distance (absolute)
-        if let fromFloat = from as? Float, let toFloat = to as? Float {
-            return CGFloat(abs(toFloat - fromFloat))
+        // Scalar distance (absolute)
+        if let fromScalar = transformScalarValue(from),
+           let toScalar = transformScalarValue(to) {
+            return abs(toScalar - fromScalar)
         }
 
         if let fromBool = from as? Bool, let toBool = to as? Bool {
@@ -2428,8 +2426,20 @@ open class CALayer: CAMediaTiming, Hashable {
         _ value: Any,
         layer: CALayer,
         keyPath: String,
-        additive: Bool
+        additive: Bool,
+        valueFunction: CAValueFunction?
     ) {
+        if let valueFunction {
+            guard let scalar = transformScalarValue(value) else { return }
+            applyValueFunctionValue(
+                scalar,
+                valueFunction: valueFunction,
+                to: layer,
+                additive: additive
+            )
+            return
+        }
+
         switch keyPath {
         case "contents":
             layer._contents = value
@@ -2590,8 +2600,22 @@ open class CALayer: CAMediaTiming, Hashable {
         progress: CFTimeInterval,
         layer: CALayer,
         keyPath: String,
-        additive: Bool
+        additive: Bool,
+        valueFunction: CAValueFunction?
     ) {
+        if let valueFunction {
+            guard let from = transformScalarValue(fromValue),
+                  let to = transformScalarValue(toValue) else { return }
+            let value = from + CGFloat(progress) * (to - from)
+            applyValueFunctionValue(
+                value,
+                valueFunction: valueFunction,
+                to: layer,
+                additive: additive
+            )
+            return
+        }
+
         switch keyPath {
         case "contents":
             layer._contents = progress < 0.5 ? fromValue : toValue
@@ -2935,7 +2959,8 @@ open class CALayer: CAMediaTiming, Hashable {
         endParameters: CubicParameters,
         layer: CALayer,
         keyPath: String,
-        additive: Bool
+        additive: Bool,
+        valueFunction: CAValueFunction?
     ) {
         if keyPath == "contents" {
             layer._contents = t < 0.5 ? p1 : p2
@@ -2952,7 +2977,13 @@ open class CALayer: CAMediaTiming, Hashable {
         ) else {
             return
         }
-        applyKeyframeValue(value, layer: layer, keyPath: keyPath, additive: additive)
+        applyKeyframeValue(
+            value,
+            layer: layer,
+            keyPath: keyPath,
+            additive: additive,
+            valueFunction: valueFunction
+        )
     }
 
     private func cubicValue(
@@ -2983,6 +3014,12 @@ open class CALayer: CAMediaTiming, Hashable {
            let v2 = p2 as? Float,
            let v3 = p3 as? Float {
             return Float(scalar(CGFloat(v0), CGFloat(v1), CGFloat(v2), CGFloat(v3)))
+        }
+        if let v0 = p0 as? Int,
+           let v1 = p1 as? Int,
+           let v2 = p2 as? Int,
+           let v3 = p3 as? Int {
+            return scalar(CGFloat(v0), CGFloat(v1), CGFloat(v2), CGFloat(v3))
         }
         if let v0 = p0 as? Bool,
            let v1 = p1 as? Bool,
