@@ -39,6 +39,7 @@ nonisolated(unsafe) var transitionFilterProbeResult: String = "pending"
 nonisolated(unsafe) var layerFilterProbeResult: String = "pending"
 nonisolated(unsafe) var textProbeResult: String = "pending"
 nonisolated(unsafe) var edgeAntialiasingProbeResult: String = "pending"
+nonisolated(unsafe) var contentsGeometryProbeResult: String = "pending"
 nonisolated(unsafe) var booleanAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var contentsAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var rasterizationScaleProbeResult: String = "pending"
@@ -180,6 +181,7 @@ public func setup() {
             layerFilterProbeResult = "pending"
             textProbeResult = "pending"
             edgeAntialiasingProbeResult = "pending"
+            contentsGeometryProbeResult = "pending"
             booleanAnimationProbeResult = "pending"
             contentsAnimationProbeResult = "pending"
             rasterizationScaleProbeResult = "pending"
@@ -373,6 +375,9 @@ func installHarness() {
         })
         h.expose("getEdgeAntialiasingProbeResult", returning: {
             .string(edgeAntialiasingProbeResult)
+        })
+        h.expose("getContentsGeometryProbeResult", returning: {
+            .string(contentsGeometryProbeResult)
         })
         h.expose("getBooleanAnimationProbeResult", returning: {
             .string(booleanAnimationProbeResult)
@@ -1002,6 +1007,133 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     textProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginContentsGeometryProbe", action: {
+            Task { @MainActor in
+                contentsGeometryProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
+                    contentsGeometryProbeResult = "error: contents geometry dependencies unavailable"
+                    return
+                }
+
+                var imageData = Data(count: 60 * 20 * 4)
+                imageData.withUnsafeMutableBytes { bytes in
+                    guard let pixels = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+                    for y in 0..<20 {
+                        for x in 0..<60 {
+                            let color: (UInt8, UInt8, UInt8)
+                            switch x {
+                            case 30..<40: color = (0, 0, 255)
+                            case 40..<50: color = (255, 0, 255)
+                            case 50..<60: color = (255, 255, 0)
+                            default: color = (0, 255, 0)
+                            }
+                            let offset = (y * 60 + x) * 4
+                            pixels[offset] = color.0
+                            pixels[offset + 1] = color.1
+                            pixels[offset + 2] = color.2
+                            pixels[offset + 3] = 255
+                        }
+                    }
+                }
+                guard let image = CGImage(
+                    width: 60,
+                    height: 20,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 60 * 4,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                    provider: CGDataProvider(data: imageData),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    contentsGeometryProbeResult = "error: contents geometry image unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0.1, green: 0.1, blue: 0.15, alpha: 1)
+
+                func makeContentsLayer(position: CGPoint, gravity: CALayerContentsGravity) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 120, height: 60)
+                    layer.position = position
+                    layer.zPosition = 100
+                    layer.contents = image
+                    layer.contentsRect = CGRect(x: 0.5, y: 0, width: 0.5, height: 1)
+                    layer.contentsCenter = CGRect(
+                        x: 1.0 / 3.0,
+                        y: 0,
+                        width: 1.0 / 3.0,
+                        height: 1
+                    )
+                    layer.contentsGravity = gravity
+                    layer.magnificationFilter = .nearest
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                let stretchedLayer = makeContentsLayer(
+                    position: CGPoint(x: 80, y: 150),
+                    gravity: .resize
+                )
+                let centeredLayer = makeContentsLayer(
+                    position: CGPoint(x: 280, y: 150),
+                    gravity: .center
+                )
+                let invalidLayer = makeContentsLayer(
+                    position: CGPoint(x: 200, y: 40),
+                    gravity: .resize
+                )
+                invalidLayer.contentsCenter = CGRect(x: -0.25, y: 0, width: 0.5, height: 1)
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    stretchedLayer.removeFromSuperlayer()
+                    centeredLayer.removeFromSuperlayer()
+                    invalidLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                let failureCountBeforeRender = renderer.contentsRenderFailureCount
+                engine.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 25, y: 150),
+                        CGPoint(x: 80, y: 150),
+                        CGPoint(x: 135, y: 150),
+                        CGPoint(x: 225, y: 150),
+                        CGPoint(x: 267, y: 150),
+                        CGPoint(x: 280, y: 150),
+                        CGPoint(x: 293, y: 150),
+                        CGPoint(x: 335, y: 150),
+                    ])
+                    let failures = renderer.contentsRenderFailureCount - failureCountBeforeRender
+                    restoreScene()
+                    contentsGeometryProbeResult = pixels.map {
+                        $0.map(String.init).joined(separator: ",")
+                    }.joined(separator: ";") + ",failures=\(failures)"
+                } catch {
+                    restoreScene()
+                    contentsGeometryProbeResult = "error: \(error)"
                 }
             }
         })

@@ -23,6 +23,8 @@ interface OCA extends Harness {
     getTransitionFilterProbeResult: () => string;
     getLayerFilterProbeResult: () => string;
     getTextProbeResult: () => string;
+    getEdgeAntialiasingProbeResult: () => string;
+    getContentsGeometryProbeResult: () => string;
     getDelegateDrawProbeResult: () => string;
     getBooleanAnimationProbeResult: () => string;
     getContentsAnimationProbeResult: () => string;
@@ -62,6 +64,8 @@ interface OCA extends Harness {
     beginTransitionFilterProbes: () => void;
     beginLayerFilterProbe: () => void;
     beginTextProbe: () => void;
+    beginEdgeAntialiasingProbe: () => void;
+    beginContentsGeometryProbe: () => void;
     beginDelegateDrawProbe: () => void;
     beginBooleanAnimationProbe: () => void;
     beginContentsAnimationProbe: () => void;
@@ -132,6 +136,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getFirstUncapturedGPUError()).toBe("none");
         expect(await h.getPixelReadback()).toBe(
             "255,0,0,255;0,255,0,255;0,0,255,255;25,25,38,255;255,0,255,255;77,13,83,255;191,255,64,255"
+        );
+
+        await h.beginContentsGeometryProbe();
+        await expect.poll(() => h.getContentsGeometryProbeResult(), { timeout: 10_000 }).toBe(
+            "0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255,failures=1"
         );
 
         await h.beginDynamicRangeProbe();

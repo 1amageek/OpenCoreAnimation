@@ -845,6 +845,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var cornerCurveRenderFailureCount: Int = 0
 
+    /// Number of image-content draws rejected because their geometry is invalid.
+    @_spi(RendererDiagnostics)
+    public private(set) var contentsRenderFailureCount: Int = 0
+
     /// Number of frames rejected because their dynamic-range contract could not be honored.
     @_spi(RendererDiagnostics)
     public private(set) var dynamicRangeRenderFailureCount: Int = 0
@@ -4329,6 +4333,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         shapeRenderFailureCount = 0
         gradientRenderFailureCount = 0
         cornerCurveRenderFailureCount = 0
+        contentsRenderFailureCount = 0
         dynamicRangeRenderFailureCount = 0
         lastDynamicRangeRenderFailure = nil
         supportsExtendedDynamicRangeOutput = false
@@ -6184,86 +6189,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Contents Layer Rendering (CGImage)
 
-    /// Calculates the destination rectangle for contents based on contentsGravity.
-    ///
-    /// This determines where and how the image is positioned within the layer's bounds.
-    private func calculateContentsDestRect(
-        layer: CALayer,
-        imageWidth: Int,
-        imageHeight: Int
-    ) -> CGRect {
-        // Convert pixel dimensions to point dimensions using contentsScale.
-        // A @2x image (200x200 pixels, contentsScale=2) displays as 100x100 points.
-        let contentsScale = max(layer.contentsScale, 1.0)
-        let imageSize = CGSize(
-            width: CGFloat(imageWidth) / contentsScale,
-            height: CGFloat(imageHeight) / contentsScale
-        )
-        let boundsSize = layer.bounds.size
-
-        switch layer.contentsGravity {
-        case .center:
-            return CGRect(
-                x: (boundsSize.width - imageSize.width) / 2,
-                y: (boundsSize.height - imageSize.height) / 2,
-                width: imageSize.width,
-                height: imageSize.height
-            )
-        case .resize:
-            return CGRect(origin: .zero, size: boundsSize)
-        case .resizeAspect:
-            let scale = min(boundsSize.width / imageSize.width, boundsSize.height / imageSize.height)
-            let scaledSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-            return CGRect(
-                x: (boundsSize.width - scaledSize.width) / 2,
-                y: (boundsSize.height - scaledSize.height) / 2,
-                width: scaledSize.width,
-                height: scaledSize.height
-            )
-        case .resizeAspectFill:
-            let scale = max(boundsSize.width / imageSize.width, boundsSize.height / imageSize.height)
-            let scaledSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-            return CGRect(
-                x: (boundsSize.width - scaledSize.width) / 2,
-                y: (boundsSize.height - scaledSize.height) / 2,
-                width: scaledSize.width,
-                height: scaledSize.height
-            )
-        case .top:
-            // Y-up: top = high Y value
-            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
-        case .bottom:
-            // Y-up: bottom = Y=0
-            return CGRect(x: (boundsSize.width - imageSize.width) / 2, y: 0, width: imageSize.width, height: imageSize.height)
-        case .left:
-            return CGRect(x: 0, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
-        case .right:
-            return CGRect(x: boundsSize.width - imageSize.width, y: (boundsSize.height - imageSize.height) / 2, width: imageSize.width, height: imageSize.height)
-        case .topLeft:
-            // Y-up: top-left = (0, boundsHeight - imageHeight)
-            return CGRect(x: 0, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
-        case .topRight:
-            // Y-up: top-right = (boundsWidth - imageWidth, boundsHeight - imageHeight)
-            return CGRect(x: boundsSize.width - imageSize.width, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
-        case .bottomLeft:
-            // Y-up: bottom-left = origin
-            return CGRect(origin: .zero, size: imageSize)
-        case .bottomRight:
-            // Y-up: bottom-right = (boundsWidth - imageWidth, 0)
-            return CGRect(x: boundsSize.width - imageSize.width, y: 0, width: imageSize.width, height: imageSize.height)
-        default:
-            return CGRect(origin: .zero, size: boundsSize)
-        }
-    }
-
     /// Checks if 9-patch (contentsCenter) scaling is needed.
     ///
     /// Returns true if contentsCenter is not the default (0, 0, 1, 1),
     /// indicating that 9-slice scaling should be applied.
     private func needs9PatchScaling(_ layer: CALayer) -> Bool {
-        let center = layer.contentsCenter
-        return center.origin.x != 0 || center.origin.y != 0 ||
-               center.size.width != 1 || center.size.height != 1
+        ContentsRenderConfiguration.usesNineSlice(
+            gravity: layer.contentsGravity,
+            contentsCenter: layer.contentsCenter
+        )
     }
 
     /// Renders contents using 9-patch (9-slice) scaling.
@@ -6295,96 +6229,31 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
-        guard let texturedPipeline = texturedPipeline,
-              let texturedBindGroupLayout = texturedBindGroupLayout,
+        guard let texturedBindGroupLayout = texturedBindGroupLayout,
               let textureSampler = textureSampler,
               let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
+              let uniformBuffer = uniformBuffer,
+              let selectedPipeline = selectTexturedPipeline(for: layer) else {
+            contentsRenderFailureCount += 1
+            return
+        }
 
         let boundsWidth = layer.bounds.width
         let boundsHeight = layer.bounds.height
-        guard boundsWidth > 0 && boundsHeight > 0 else { return }
-
-        let imgW = CGFloat(imageWidth)
-        let imgH = CGFloat(imageHeight)
-
-        // contentsCenter defines the stretchable center region in normalized coordinates (0-1)
-        let center = layer.contentsCenter
-
-        // Calculate UV coordinates for the 9-patch grid
-        // UV coordinates (texture space, 0-1)
-        let uvLeft: Float = 0
-        let uvCenterLeft: Float = Float(center.origin.x)
-        let uvCenterRight: Float = Float(center.origin.x + center.size.width)
-        let uvRight: Float = 1
-
-        let uvTop: Float = 0
-        let uvCenterTop: Float = Float(center.origin.y)
-        let uvCenterBottom: Float = Float(center.origin.y + center.size.height)
-        let uvBottom: Float = 1
-
-        // Calculate destination positions in layer bounds
-        // The corner regions maintain their pixel size from the source image
-        // The center region stretches to fill the remaining space
-
-        // Source pixel sizes for corners/edges
-        let srcLeftWidth = center.origin.x * imgW
-        let srcCenterWidth = center.size.width * imgW
-        let srcRightWidth = (1 - center.origin.x - center.size.width) * imgW
-
-        let srcTopHeight = center.origin.y * imgH
-        let srcCenterHeight = center.size.height * imgH
-        let srcBottomHeight = (1 - center.origin.y - center.size.height) * imgH
-
-        // Calculate destination contentsScale factor
-        let contentsScale = layer.contentsScale > 0 ? layer.contentsScale : 1
-
-        // Destination sizes - corners/edges use source pixel size (accounting for contentsScale)
-        let destLeftWidth = srcLeftWidth / contentsScale
-        let destRightWidth = srcRightWidth / contentsScale
-        let destTopHeight = srcTopHeight / contentsScale
-        let destBottomHeight = srcBottomHeight / contentsScale
-
-        // Center region fills remaining space
-        let destCenterWidth = boundsWidth - destLeftWidth - destRightWidth
-        let destCenterHeight = boundsHeight - destTopHeight - destBottomHeight
-
-        // Handle case where layer is smaller than the fixed regions
-        // In this case, scale down proportionally
-        var scaleX: CGFloat = 1
-        var scaleY: CGFloat = 1
-
-        if destCenterWidth < 0 {
-            let totalFixedWidth = destLeftWidth + destRightWidth
-            scaleX = boundsWidth / totalFixedWidth
+        let configuration: ContentsRenderConfiguration
+        do {
+            configuration = try ContentsRenderConfiguration(
+                imageSize: CGSize(width: imageWidth, height: imageHeight),
+                boundsSize: layer.bounds.size,
+                contentsRect: layer.contentsRect,
+                contentsCenter: layer.contentsCenter,
+                contentsScale: layer.contentsScale,
+                gravity: layer.contentsGravity
+            )
+        } catch {
+            contentsRenderFailureCount += 1
+            return
         }
-        if destCenterHeight < 0 {
-            let totalFixedHeight = destTopHeight + destBottomHeight
-            scaleY = boundsHeight / totalFixedHeight
-        }
-
-        // Apply scale if needed
-        let finalLeftWidth = destLeftWidth * scaleX
-        let finalRightWidth = destRightWidth * scaleX
-        let finalCenterWidth = max(0, boundsWidth - finalLeftWidth - finalRightWidth)
-
-        let finalTopHeight = destTopHeight * scaleY
-        let finalBottomHeight = destBottomHeight * scaleY
-        let finalCenterHeight = max(0, boundsHeight - finalTopHeight - finalBottomHeight)
-
-        // Position coordinates in layer bounds (normalized 0-1)
-        // X coordinates (left to right)
-        let posLeft: Float = 0
-        let posCenterLeft: Float = Float(finalLeftWidth / boundsWidth)
-        let posCenterRight: Float = Float((finalLeftWidth + finalCenterWidth) / boundsWidth)
-        let posRight: Float = 1
-
-        // Y coordinates for Y-up system (Y=0 at bottom, Y=1 at top)
-        // Image top border maps to layer top, image bottom border maps to layer bottom
-        let posBottom: Float = 0
-        let posCenterBottom: Float = Float(finalBottomHeight / boundsHeight)
-        let posCenterTop: Float = Float((boundsHeight - finalTopHeight) / boundsHeight)
-        let posTop: Float = 1
 
         // Create scale matrix for layer bounds
         let scaleMatrix = Matrix4x4(columns: (
@@ -6403,7 +6272,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             : Float(CornerCurveRenderConfiguration.circularExponent)
 
         // Create uniforms (shared for all 9 patches)
-        var uniforms = TexturedUniforms(
+        let uniforms = TexturedUniforms(
             mvpMatrix: finalMatrix,
             opacity: currentEffectiveOpacity,
             cornerRadius: effectiveCornerRadius,
@@ -6415,34 +6284,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         let white = currentReplicatorColor
 
-        // Define the 9 patches as (posXMin, posXMax, posYMin, posYMax, uvXMin, uvXMax, uvYMin, uvYMax)
-        // Note: In Y-up screen coordinates, posYMin < posYMax (bottom to top)
-        // In texture coordinates, uvYMin < uvYMax (top to bottom, V=0 at top)
-        let patches: [(Float, Float, Float, Float, Float, Float, Float, Float)] = [
-            // Row 1: Top (high Y positions in screen space, low V in texture space)
-            (posLeft, posCenterLeft, posCenterTop, posTop, uvLeft, uvCenterLeft, uvTop, uvCenterTop),           // 1: Top-left corner
-            (posCenterLeft, posCenterRight, posCenterTop, posTop, uvCenterLeft, uvCenterRight, uvTop, uvCenterTop), // 2: Top edge
-            (posCenterRight, posRight, posCenterTop, posTop, uvCenterRight, uvRight, uvTop, uvCenterTop),       // 3: Top-right corner
-
-            // Row 2: Middle
-            (posLeft, posCenterLeft, posCenterBottom, posCenterTop, uvLeft, uvCenterLeft, uvCenterTop, uvCenterBottom),           // 4: Left edge
-            (posCenterLeft, posCenterRight, posCenterBottom, posCenterTop, uvCenterLeft, uvCenterRight, uvCenterTop, uvCenterBottom), // 5: Center
-            (posCenterRight, posRight, posCenterBottom, posCenterTop, uvCenterRight, uvRight, uvCenterTop, uvCenterBottom),       // 6: Right edge
-
-            // Row 3: Bottom (low Y positions in screen space, high V in texture space)
-            (posLeft, posCenterLeft, posBottom, posCenterBottom, uvLeft, uvCenterLeft, uvCenterBottom, uvBottom),           // 7: Bottom-left corner
-            (posCenterLeft, posCenterRight, posBottom, posCenterBottom, uvCenterLeft, uvCenterRight, uvCenterBottom, uvBottom), // 8: Bottom edge
-            (posCenterRight, posRight, posBottom, posCenterBottom, uvCenterRight, uvRight, uvCenterBottom, uvBottom),       // 9: Bottom-right corner
-        ]
-
         // Render each patch
-        for (index, patch) in patches.enumerated() {
-            let (pMinX, pMaxX, pMinY, pMaxY, uMinX, uMaxX, uMinY, uMaxY) = patch
-
-            // Skip patches with zero size (can happen when center is at edges)
-            if pMaxX <= pMinX || pMaxY <= pMinY {
-                continue
-            }
+        for patch in configuration.patches {
+            let destination = patch.destinationRect
+            let source = patch.sourceUnitRect
+            let pMinX = Float(destination.minX / boundsWidth)
+            let pMaxX = Float(destination.maxX / boundsWidth)
+            let pMinY = Float(destination.minY / boundsHeight)
+            let pMaxY = Float(destination.maxY / boundsHeight)
+            let uMinX = Float(source.minX)
+            let uMaxX = Float(source.maxX)
+            let uMinY = Float(source.minY)
+            let uMaxY = Float(source.maxY)
 
             // Create vertices for this patch (2 triangles = 6 vertices)
             // Note: Screen coordinates have Y=0 at bottom (pMinY), but texture coordinates have V=0 at top
@@ -6491,9 +6344,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             )
 
             // Render this patch
-            if let selected = selectTexturedPipeline(for: layer) {
-                renderPass.setPipeline(selected)
-            }
+            renderPass.setPipeline(selectedPipeline)
             renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
             renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
             renderPass.draw(vertexCount: 6)
@@ -6513,11 +6364,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
-        guard let texturedPipeline = texturedPipeline,
-              let texturedBindGroupLayout = texturedBindGroupLayout,
+        guard let texturedBindGroupLayout = texturedBindGroupLayout,
               let textureSampler = textureSampler,
               let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
+              let uniformBuffer = uniformBuffer,
+              let selectedPipeline = selectTexturedPipeline(for: layer) else {
+            contentsRenderFailureCount += 1
+            return
+        }
 
         // Get or create GPU texture from CGImage using the texture manager.
         // The manager retains `contents` for as long as the texture is
@@ -6550,9 +6404,21 @@ public final class CAWebGPURenderer: CARendererDelegate {
             return
         }
 
-        // Standard single-quad rendering
-        // Calculate destination rectangle based on contentsGravity
-        let destRect = calculateContentsDestRect(layer: layer, imageWidth: imageWidth, imageHeight: imageHeight)
+        // Standard single-quad rendering. The selected contentsRect controls
+        // both the UV range and the logical size used by contentsGravity.
+        let destRect: CGRect
+        do {
+            destRect = try ContentsRenderConfiguration.destinationRect(
+                imageSize: CGSize(width: imageWidth, height: imageHeight),
+                boundsSize: layer.bounds.size,
+                contentsRect: layer.contentsRect,
+                contentsScale: layer.contentsScale,
+                gravity: layer.contentsGravity
+            )
+        } catch {
+            contentsRenderFailureCount += 1
+            return
+        }
 
         // Calculate source UV coordinates based on contentsRect
         // contentsRect is in unit coordinate space (0-1), defining which portion of the image to use
@@ -6666,9 +6532,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
 
         // Switch to textured pipeline and render
-        if let selected = selectTexturedPipeline(for: layer) {
-            renderPass.setPipeline(selected)
-        }
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -7027,12 +6891,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         guard let string = textLayer.string else {
             return
         }
-        guard let texturedPipeline = texturedPipeline,
-              let texturedBindGroupLayout = texturedBindGroupLayout,
+        guard let texturedBindGroupLayout = texturedBindGroupLayout,
               let textureSampler = textureSampler,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let pipeline = pipeline else {
+              let pipeline = pipeline,
+              let selectedPipeline = selectTexturedPipeline(for: textLayer) else {
             return
         }
 
@@ -7307,9 +7171,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
 
         // Switch to textured pipeline and draw
-        if let selected = selectTexturedPipeline(for: textLayer) {
-            renderPass.setPipeline(selected)
-        }
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)

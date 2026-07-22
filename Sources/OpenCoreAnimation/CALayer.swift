@@ -4277,8 +4277,21 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Draws the contents image into the context.
     private func drawContents(_ image: CGImage, in ctx: CGContext) {
+        guard contentsScale.isFinite,
+              contentsScale > 0,
+              contentsRect.origin.x.isFinite,
+              contentsRect.origin.y.isFinite,
+              contentsRect.width.isFinite,
+              contentsRect.height.isFinite,
+              contentsRect.width > 0,
+              contentsRect.height > 0 else {
+            return
+        }
         let sourceImage = applyContentsRect(to: image)
-        if shouldUseNineSliceScaling, contentsCenter != CGRect(x: 0, y: 0, width: 1, height: 1) {
+        if ContentsRenderConfiguration.usesNineSlice(
+            gravity: contentsGravity,
+            contentsCenter: contentsCenter
+        ) {
             drawNineSliceContents(sourceImage, in: ctx)
         } else {
             let destRect = calculateContentsRect(for: sourceImage)
@@ -4288,7 +4301,10 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Calculates the destination rectangle for drawing contents based on contentsGravity.
     private func calculateContentsRect(for image: CGImage) -> CGRect {
-        let imageSize = CGSize(width: CGFloat(image.width), height: CGFloat(image.height))
+        let imageSize = CGSize(
+            width: CGFloat(image.width) / contentsScale,
+            height: CGFloat(image.height) / contentsScale
+        )
         let boundsSize = bounds.size
 
         switch contentsGravity {
@@ -4340,15 +4356,6 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    private var shouldUseNineSliceScaling: Bool {
-        switch contentsGravity {
-        case .resize, .resizeAspect, .resizeAspectFill:
-            return true
-        default:
-            return false
-        }
-    }
-
     private func applyContentsRect(to image: CGImage) -> CGImage {
         let unitRect = CGRect(x: 0, y: 0, width: 1, height: 1)
         guard contentsRect != unitRect else { return image }
@@ -4368,6 +4375,7 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func drawNineSliceContents(_ image: CGImage, in ctx: CGContext) {
+        guard contentsScale.isFinite, contentsScale > 0 else { return }
         let destinationRect = calculateContentsRect(for: image)
         let centerRect = resolvedContentsCenter(in: image)
 
@@ -4378,8 +4386,8 @@ open class CALayer: CAMediaTiming, Hashable {
         let centerSourceHeight = centerRect.height
         let bottomSourceHeight = CGFloat(image.height) - centerRect.maxY
 
-        var leftDestinationWidth = leftSourceWidth
-        var rightDestinationWidth = rightSourceWidth
+        var leftDestinationWidth = leftSourceWidth / contentsScale
+        var rightDestinationWidth = rightSourceWidth / contentsScale
         let fixedHorizontalWidth = leftDestinationWidth + rightDestinationWidth
         if fixedHorizontalWidth > destinationRect.width, fixedHorizontalWidth > 0 {
             let scale = destinationRect.width / fixedHorizontalWidth
@@ -4388,8 +4396,8 @@ open class CALayer: CAMediaTiming, Hashable {
         }
         let centerDestinationWidth = max(0, destinationRect.width - leftDestinationWidth - rightDestinationWidth)
 
-        var topDestinationHeight = topSourceHeight
-        var bottomDestinationHeight = bottomSourceHeight
+        var topDestinationHeight = topSourceHeight / contentsScale
+        var bottomDestinationHeight = bottomSourceHeight / contentsScale
         let fixedVerticalHeight = topDestinationHeight + bottomDestinationHeight
         if fixedVerticalHeight > destinationRect.height, fixedVerticalHeight > 0 {
             let scale = destinationRect.height / fixedVerticalHeight
