@@ -913,6 +913,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var lastMaskRenderFailure: CAMaskRenderFailure?
 
+    /// Number of background or border solid quads rejected before GPU submission.
+    @_spi(RendererDiagnostics)
+    public private(set) var solidRenderFailureCount: Int = 0
+
+    /// The most recent typed background or border failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastSolidRenderFailure: CASolidRenderFailure?
+
     /// Number of image-content draws rejected because their geometry, resources, or pixels are invalid.
     @_spi(RendererDiagnostics)
     public private(set) var contentsRenderFailureCount: Int = 0
@@ -4531,6 +4539,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         lastCornerCurveRenderFailure = nil
         maskRenderFailureCount = 0
         lastMaskRenderFailure = nil
+        solidRenderFailureCount = 0
+        lastSolidRenderFailure = nil
         contentsRenderFailureCount = 0
         lastContentsRenderFailure = nil
         textRenderFailureCount = 0
@@ -5970,6 +5980,25 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
     }
 
+    private func solidRenderConfiguration(
+        for layer: CALayer,
+        color: SIMD4<Float>,
+        borderWidth: CGFloat,
+        context: CASolidRenderContext
+    ) throws(CASolidRenderFailure) -> CASolidRenderConfiguration {
+        try CASolidRenderConfiguration(
+            bounds: layer.bounds,
+            color: color,
+            opacity: currentEffectiveOpacity,
+            cornerRadius: layer.cornerRadius,
+            cornerCurveExponent: layer.cornerCurveRenderExponent
+                ?? Float(CornerCurveRenderConfiguration.circularExponent),
+            cornerRadii: layer.cornerRadiiComponents,
+            borderWidth: borderWidth,
+            context: context
+        )
+    }
+
     /// Renders the layer's backgroundColor as a rounded-rect quad.
     /// Drawn BEFORE contents per Apple's CoreAnimation spec (backgroundColor coexists with contents).
     private func renderLayerBackgroundColor(
@@ -5980,39 +6009,61 @@ public final class CAWebGPURenderer: CARendererDelegate {
         bindGroup: GPUBindGroup
     ) {
         guard let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
-
-        let color = replicatedColor(presentationLayer.backgroundColorComponents)
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-        ]
-
-        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+              let uniformBuffer = uniformBuffer else {
+            recordSolidRenderFailure(.resourcesUnavailable(.background))
             return
         }
 
+        let color = replicatedColor(presentationLayer.backgroundColorComponents)
+        let configuration: CASolidRenderConfiguration
+        do {
+            configuration = try solidRenderConfiguration(
+                for: presentationLayer,
+                color: color,
+                borderWidth: 0,
+                context: .background
+            )
+        } catch let failure {
+            recordSolidRenderFailure(failure)
+            return
+        }
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
+            SIMD4<Float>(configuration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, configuration.size.y, 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
-
         let finalMatrix = modelMatrix * scaleMatrix
+        guard matrixIsFinite(finalMatrix) else {
+            recordSolidRenderFailure(.invalidTransform(.background))
+            return
+        }
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            recordSolidRenderFailure(.pipelineUnavailable(.background))
+            return
+        }
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: configuration.color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: configuration.color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: configuration.color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: configuration.color),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: configuration.color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: configuration.color),
+        ]
+
+        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+            recordSolidRenderFailure(.vertexCapacityExceeded(.background))
+            return
+        }
 
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
-            opacity: currentEffectiveOpacity,
-            cornerRadius: Float(presentationLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
+            opacity: configuration.opacity,
+            cornerRadius: configuration.cornerRadius,
+            layerSize: configuration.size,
             edgeAntialiasingMask: presentationLayer.edgeAntialiasingMaskValue,
-            cornerCurveExponent: presentationLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent),
-            cornerRadii: presentationLayer.cornerRadiiComponents
+            cornerCurveExponent: configuration.cornerCurveExponent,
+            cornerRadii: configuration.cornerRadii
         )
 
         let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
@@ -6032,10 +6083,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Stencil-aware pipeline selection: if a mask or rounded-corner stencil is active,
         // use the stencil-testing variant so the bg respects the mask shape.
-        guard let selectedPipeline = stencilAwarePipeline() else {
-            recordMaskRenderFailure(.pipelineUnavailable(.activeStencil))
-            return
-        }
         renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
@@ -6052,41 +6099,63 @@ public final class CAWebGPURenderer: CARendererDelegate {
         bindGroup: GPUBindGroup
     ) {
         guard let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
-
-        let color = replicatedColor(presentationLayer.borderColorComponents)
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-        ]
-
-        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+              let uniformBuffer = uniformBuffer else {
+            recordSolidRenderFailure(.resourcesUnavailable(.border))
             return
         }
 
+        let color = replicatedColor(presentationLayer.borderColorComponents)
+        let configuration: CASolidRenderConfiguration
+        do {
+            configuration = try solidRenderConfiguration(
+                for: presentationLayer,
+                color: color,
+                borderWidth: presentationLayer.borderWidth,
+                context: .border
+            )
+        } catch let failure {
+            recordSolidRenderFailure(failure)
+            return
+        }
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(presentationLayer.bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(presentationLayer.bounds.height), 0, 0),
+            SIMD4<Float>(configuration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, configuration.size.y, 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
-
         let finalMatrix = modelMatrix * scaleMatrix
+        guard matrixIsFinite(finalMatrix) else {
+            recordSolidRenderFailure(.invalidTransform(.border))
+            return
+        }
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            recordSolidRenderFailure(.pipelineUnavailable(.border))
+            return
+        }
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: configuration.color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: configuration.color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: configuration.color),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: configuration.color),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: configuration.color),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: configuration.color),
+        ]
+
+        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
+            recordSolidRenderFailure(.vertexCapacityExceeded(.border))
+            return
+        }
 
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
-            opacity: currentEffectiveOpacity,
-            cornerRadius: Float(presentationLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
-            borderWidth: Float(presentationLayer.borderWidth),
+            opacity: configuration.opacity,
+            cornerRadius: configuration.cornerRadius,
+            layerSize: configuration.size,
+            borderWidth: configuration.borderWidth,
             renderMode: 1.0,  // Border mode
             edgeAntialiasingMask: presentationLayer.edgeAntialiasingMaskValue,
-            cornerCurveExponent: presentationLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent),
-            cornerRadii: presentationLayer.cornerRadiiComponents
+            cornerCurveExponent: configuration.cornerCurveExponent,
+            cornerRadii: configuration.cornerRadii
         )
 
         let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
@@ -6105,10 +6174,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
 
         // Stencil-aware pipeline selection so border respects any active mask/rounded clip.
-        guard let selectedPipeline = stencilAwarePipeline() else {
-            recordMaskRenderFailure(.pipelineUnavailable(.activeStencil))
-            return
-        }
         renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
@@ -6146,6 +6211,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private func recordMaskRenderFailure(_ failure: CAMaskRenderFailure) {
         maskRenderFailureCount += 1
         lastMaskRenderFailure = failure
+    }
+
+    private func recordSolidRenderFailure(_ failure: CASolidRenderFailure) {
+        solidRenderFailureCount += 1
+        lastSolidRenderFailure = failure
     }
 
     private var stencilStateIsValid: Bool {
