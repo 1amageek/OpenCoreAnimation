@@ -26,6 +26,7 @@ interface OCA extends Harness {
     getEdgeAntialiasingProbeResult: () => string;
     getContentsGeometryProbeResult: () => string;
     getDelegateDrawProbeResult: () => string;
+    getDelegateFormatProbeResult: () => string;
     getBooleanAnimationProbeResult: () => string;
     getContentsAnimationProbeResult: () => string;
     getRasterizationScaleProbeResult: () => string;
@@ -67,6 +68,7 @@ interface OCA extends Harness {
     beginEdgeAntialiasingProbe: () => void;
     beginContentsGeometryProbe: () => void;
     beginDelegateDrawProbe: () => void;
+    beginDelegateFormatProbe: () => void;
     beginBooleanAnimationProbe: () => void;
     beginContentsAnimationProbe: () => void;
     beginRasterizationScaleProbe: () => void;
@@ -188,6 +190,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         await h.beginDelegateDrawProbe();
         await expect.poll(() => h.getDelegateDrawProbeResult(), { timeout: 10_000 }).toBe(
             "initial=255,0,0,255;0,255,0,255,updated=0,0,255,255;0,255,0,255,normalVertical=255,0,0,255;255,255,255,255,flippedVertical=255,255,255,255;0,0,255,255,callbacks=true,display=true,retained=true,replaced=true,released=true,rejected=true,failures=1"
+        );
+
+        await h.beginDelegateFormatProbe();
+        await expect.poll(() => h.getDelegateFormatProbeResult(), { timeout: 10_000 }).toBe(
+            "rgba16=2.0:0.5:0.25:1.0,rgba16Format=RGBAh,gray=128:128:128:255,grayFormat=Gray8,unknown=true,failures=1"
         );
 
         await h.beginGeometryFlipProbe();

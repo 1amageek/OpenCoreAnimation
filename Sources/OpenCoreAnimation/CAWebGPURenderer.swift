@@ -885,6 +885,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var delegateDrawFailureCount: Int = 0
 
+    /// The most recent typed delegate backing-store failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastDelegateBackingStoreError: CADelegateBackingStoreError?
+
+    /// The concrete storage format used for the most recently completed delegate draw.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastDelegateBackingStoreFormat: CALayerContentsFormat?
+
     /// Number of live delegate-generated backing stores retained by the renderer.
     @_spi(RendererDiagnostics)
     public var activeDelegateBackingStoreCount: Int {
@@ -4053,8 +4061,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
               bounds.height > 0,
               scale.isFinite,
               scale > 0 else {
-            delegateBackingStores.removeValue(forKey: identifier)
-            delegateDrawFailureCount += 1
+            rejectDelegateBackingStore(identifier: identifier, error: .invalidGeometry)
             return
         }
 
@@ -4065,23 +4072,73 @@ public final class CAWebGPURenderer: CARendererDelegate {
               pixelHeightValue.isFinite,
               pixelWidthValue <= maximumDimension,
               pixelHeightValue <= maximumDimension else {
-            delegateBackingStores.removeValue(forKey: identifier)
-            delegateDrawFailureCount += 1
+            let reportedWidth = pixelWidthValue.isFinite && pixelWidthValue <= CGFloat(Int.max)
+                ? Int(pixelWidthValue)
+                : Int.max
+            let reportedHeight = pixelHeightValue.isFinite && pixelHeightValue <= CGFloat(Int.max)
+                ? Int(pixelHeightValue)
+                : Int.max
+            rejectDelegateBackingStore(
+                identifier: identifier,
+                error: .dimensionsExceedTextureLimit(
+                    width: reportedWidth,
+                    height: reportedHeight,
+                    maximum: maximumTextureDimension
+                )
+            )
             return
         }
         let pixelWidth = Int(pixelWidthValue)
         let pixelHeight = Int(pixelHeightValue)
+        let backingStoreFormat: CADelegateBackingStoreFormat
+        do {
+            backingStoreFormat = try CADelegateBackingStoreFormat.resolve(
+                contentsFormat: layer.contentsFormat,
+                contentsHeadroom: layer.contentsHeadroom
+            )
+        } catch {
+            rejectDelegateBackingStore(identifier: identifier, error: error)
+            return
+        }
+
+        let colorSpace: CGColorSpace
+        let bitmapInfo: CGBitmapInfo
+        switch backingStoreFormat {
+        case .rgba8Uint:
+            colorSpace = .deviceRGB
+            bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        case .rgba16Float:
+            guard let extendedColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) else {
+                rejectDelegateBackingStore(identifier: identifier, error: .extendedColorSpaceUnavailable)
+                return
+            }
+            colorSpace = extendedColorSpace
+            bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+                .union(.floatComponents)
+                .union(.byteOrder16Little)
+        case .gray8Uint:
+            colorSpace = .deviceGray
+            bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
+        }
         guard let context = CGContext(
             softwareData: nil,
             width: pixelWidth,
             height: pixelHeight,
-            bitsPerComponent: 8,
+            bitsPerComponent: backingStoreFormat.bitsPerComponent,
             bytesPerRow: 0,
-            space: .deviceRGB,
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
         ) else {
-            delegateBackingStores.removeValue(forKey: identifier)
-            delegateDrawFailureCount += 1
+            rejectDelegateBackingStore(identifier: identifier, error: .contextCreationFailed)
+            return
+        }
+        if backingStoreFormat == .rgba16Float,
+           layer.contentsHeadroom > 1,
+           !context.setEDRTargetHeadroom(Float(layer.contentsHeadroom)) {
+            rejectDelegateBackingStore(
+                identifier: identifier,
+                error: .extendedHeadroomRejected(layer.contentsHeadroom)
+            )
             return
         }
 
@@ -4094,9 +4151,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
             if let previousImage = delegateBackingStores[identifier],
                previousImage.width == pixelWidth,
                previousImage.height == pixelHeight,
-               previousImage.bitsPerComponent == 8,
-               previousImage.bitsPerPixel == 32,
+               previousImage.bitsPerComponent == backingStoreFormat.bitsPerComponent,
+               previousImage.bitsPerPixel == backingStoreFormat.bitsPerPixel,
                previousImage.bytesPerRow == context.bytesPerRow,
+               previousImage.colorSpace == colorSpace,
+               previousImage.bitmapInfo == bitmapInfo,
                let previousData = previousImage.data,
                previousData.count >= context.bytesPerRow * pixelHeight,
                let destination = CGBitmapContextGetData(context) {
@@ -4137,11 +4196,22 @@ public final class CAWebGPURenderer: CARendererDelegate {
             layer.draw(in: context)
         }
         guard let image = context.makeImage() else {
-            delegateBackingStores.removeValue(forKey: identifier)
-            delegateDrawFailureCount += 1
+            rejectDelegateBackingStore(identifier: identifier, error: .snapshotFailed)
             return
         }
         delegateBackingStores[identifier] = image
+        lastDelegateBackingStoreError = nil
+        lastDelegateBackingStoreFormat = backingStoreFormat.contentsFormat
+    }
+
+    private func rejectDelegateBackingStore(
+        identifier: ObjectIdentifier,
+        error: CADelegateBackingStoreError
+    ) {
+        delegateBackingStores.removeValue(forKey: identifier)
+        delegateDrawFailureCount += 1
+        lastDelegateBackingStoreError = error
+        lastDelegateBackingStoreFormat = nil
     }
 
     private func collectEmitterLayerIDs(

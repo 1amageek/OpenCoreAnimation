@@ -49,6 +49,7 @@ nonisolated(unsafe) var constraintLayoutProbeResult: String = "pending"
 nonisolated(unsafe) var aggregateByValueProbeResult: String = "pending"
 nonisolated(unsafe) var additiveKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
+nonisolated(unsafe) var delegateFormatProbeResult: String = "pending"
 nonisolated(unsafe) var geometryFlipProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -109,6 +110,19 @@ final class DelegateDrawProbeDelegate: CALayerDelegate {
             width: layer.bounds.width,
             height: layer.bounds.height / 4
         ))
+    }
+}
+
+final class SolidColorProbeDelegate: CALayerDelegate {
+    var color: CGColor
+
+    init(color: CGColor) {
+        self.color = color
+    }
+
+    func draw(_ layer: CALayer, in context: CGContext) {
+        context.setFillColor(color)
+        context.fill(layer.bounds)
     }
 }
 
@@ -405,6 +419,9 @@ func installHarness() {
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
+        })
+        h.expose("getDelegateFormatProbeResult", returning: {
+            .string(delegateFormatProbeResult)
         })
         h.expose("getGeometryFlipProbeResult", returning: {
             .string(geometryFlipProbeResult)
@@ -2381,6 +2398,109 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     delegateDrawProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginDelegateFormatProbe", action: {
+            Task { @MainActor in
+                delegateFormatProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
+                    delegateFormatProbeResult = "error: delegate format dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+                CATransaction.commit()
+
+                let formatDelegate = SolidColorProbeDelegate(
+                    color: CGColor(red: 2, green: 0.5, blue: 0.25, alpha: 1)
+                )
+
+                func makeProbe(
+                    format: CALayerContentsFormat,
+                    delegate: CALayerDelegate,
+                    headroom: CGFloat = 0
+                ) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = CGPoint(x: 200, y: 150)
+                    layer.zPosition = 100
+                    layer.contentsFormat = format
+                    layer.contentsHeadroom = headroom
+                    if headroom > 1 {
+                        layer.preferredDynamicRange = .high
+                        layer.toneMapMode = .never
+                    }
+                    layer.delegate = delegate
+                    layer.setNeedsDisplay()
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                @MainActor
+                func restoreScene(_ activeLayer: CALayer?) {
+                    activeLayer?.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                var activeLayer: CALayer?
+                do {
+                    activeLayer = makeProbe(
+                        format: .RGBA16Float,
+                        delegate: formatDelegate,
+                        headroom: 4
+                    )
+                    engine.renderFrame()
+                    let extendedPixel = try await renderer.readbackFloatPixel(x: 200, y: 150)
+                    let extendedFormat = renderer.lastDelegateBackingStoreFormat?.rawValue ?? "nil"
+
+                    formatDelegate.color = CGColor(gray: 0.5, alpha: 1)
+                    activeLayer?.contentsHeadroom = 0
+                    activeLayer?.preferredDynamicRange = .standard
+                    activeLayer?.toneMapMode = .automatic
+                    activeLayer?.contentsFormat = .gray8Uint
+                    engine.renderFrame()
+                    let grayPixel = try await renderer.readbackPixel(x: 200, y: 150)
+                    let grayFormat = renderer.lastDelegateBackingStoreFormat?.rawValue ?? "nil"
+
+                    let failureCountBefore = renderer.delegateDrawFailureCount
+                    formatDelegate.color = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                    activeLayer?.contentsFormat = CALayerContentsFormat(rawValue: "FutureFormat")
+                    engine.renderFrame()
+                    let rejectedUnknown: Bool
+                    if case .unsupportedContentsFormat("FutureFormat")? = renderer.lastDelegateBackingStoreError {
+                        rejectedUnknown = true
+                    } else {
+                        rejectedUnknown = false
+                    }
+                    let failureDelta = renderer.delegateDrawFailureCount - failureCountBefore
+
+                    restoreScene(activeLayer)
+                    delegateFormatProbeResult = [
+                        "rgba16=\(extendedPixel.map { String($0) }.joined(separator: ":"))",
+                        "rgba16Format=\(extendedFormat)",
+                        "gray=\(grayPixel.map(String.init).joined(separator: ":"))",
+                        "grayFormat=\(grayFormat)",
+                        "unknown=\(rejectedUnknown)",
+                        "failures=\(failureDelta)",
+                    ].joined(separator: ",")
+                } catch {
+                    restoreScene(activeLayer)
+                    delegateFormatProbeResult = "error: \(error)"
                 }
             }
         })

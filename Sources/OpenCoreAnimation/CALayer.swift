@@ -3916,6 +3916,7 @@ open class CALayer: CAMediaTiming, Hashable {
         didSet {
             guard oldValue != contentsFormat else { return }
             markDirty(.contents)
+            if delegate != nil { setNeedsDisplay() }
         }
     }
 
@@ -3940,6 +3941,7 @@ open class CALayer: CAMediaTiming, Hashable {
         didSet {
             guard oldValue != contentsHeadroom else { return }
             markDirty(.contents)
+            if delegate != nil { setNeedsDisplay() }
         }
     }
 
@@ -4627,7 +4629,9 @@ open class CALayer: CAMediaTiming, Hashable {
             guard oldValue != newValue else { return }
             _contentsScale = newValue
             markDirty(.contents)
-            if Self.needsDisplay(forKey: "contentsScale") { setNeedsDisplay() }
+            if delegate != nil || Self.needsDisplay(forKey: "contentsScale") {
+                setNeedsDisplay()
+            }
             CATransaction.registerChange(layer: self, keyPath: "contentsScale", oldValue: oldValue, newValue: newValue)
         }
     }
