@@ -140,7 +140,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginContentsGeometryProbe();
         await expect.poll(() => h.getContentsGeometryProbeResult(), { timeout: 10_000 }).toBe(
-            "0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255,failures=1"
+            "0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;141,13,19,255;25,25,38,255,failures=2,typed=true"
         );
 
         await h.beginDynamicRangeProbe();

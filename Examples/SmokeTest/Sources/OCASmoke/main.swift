@@ -1057,6 +1057,38 @@ func installHarness() {
                     contentsGeometryProbeResult = "error: contents geometry image unavailable"
                     return
                 }
+                guard let translucentImage = CGImage(
+                    width: 1,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 4,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(
+                        rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                    ),
+                    provider: CGDataProvider(data: Data([128, 0, 0, 128])),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ), let malformedImage = CGImage(
+                    width: 1,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 4,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(
+                        rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+                    ),
+                    provider: CGDataProvider(data: Data([255, 0, 0])),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    contentsGeometryProbeResult = "error: contents alpha images unavailable"
+                    return
+                }
 
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
@@ -1099,6 +1131,20 @@ func installHarness() {
                     gravity: .resize
                 )
                 invalidLayer.contentsCenter = CGRect(x: -0.25, y: 0, width: 0.5, height: 1)
+                let translucentLayer = CALayer()
+                translucentLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                translucentLayer.position = CGPoint(x: 180, y: 150)
+                translucentLayer.zPosition = 100
+                translucentLayer.contents = translucentImage
+                translucentLayer.magnificationFilter = .nearest
+                root.addSublayer(translucentLayer)
+                let malformedLayer = CALayer()
+                malformedLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                malformedLayer.position = CGPoint(x: 200, y: 150)
+                malformedLayer.zPosition = 100
+                malformedLayer.contents = malformedImage
+                malformedLayer.magnificationFilter = .nearest
+                root.addSublayer(malformedLayer)
                 CATransaction.commit()
 
                 @MainActor
@@ -1106,6 +1152,8 @@ func installHarness() {
                     stretchedLayer.removeFromSuperlayer()
                     centeredLayer.removeFromSuperlayer()
                     invalidLayer.removeFromSuperlayer()
+                    translucentLayer.removeFromSuperlayer()
+                    malformedLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
@@ -1125,12 +1173,17 @@ func installHarness() {
                         CGPoint(x: 280, y: 150),
                         CGPoint(x: 293, y: 150),
                         CGPoint(x: 335, y: 150),
+                        CGPoint(x: 180, y: 150),
+                        CGPoint(x: 200, y: 150),
                     ])
                     let failures = renderer.contentsRenderFailureCount - failureCountBeforeRender
+                    let typedFailure = renderer.lastContentsConversionError
+                        == .insufficientPixelData(required: 4, actual: 3)
                     restoreScene()
                     contentsGeometryProbeResult = pixels.map {
                         $0.map(String.init).joined(separator: ",")
-                    }.joined(separator: ";") + ",failures=\(failures)"
+                    }.joined(separator: ";")
+                        + ",failures=\(failures),typed=\(typedFailure)"
                 } catch {
                     restoreScene()
                     contentsGeometryProbeResult = "error: \(error)"
