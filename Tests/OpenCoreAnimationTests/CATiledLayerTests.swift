@@ -67,6 +67,61 @@ struct CATiledLayerTests {
         #expect(layer.tileOpacity(for: key, at: 10) == 1)
     }
 
+    @Test("Display invalidation rejects stale asynchronous tile results")
+    func staleTileGenerationIsRejected() throws {
+        let layer = CATiledLayer()
+        let key = CATiledLayer.TileKey(column: 0, row: 0, lodLevel: 0)
+        let staleGeneration = layer.tileCacheGeneration
+        layer.loadingTiles.insert(key)
+        layer.loadingTileGenerations[key] = staleGeneration
+
+        layer.setNeedsDisplay()
+
+        let currentGeneration = layer.tileCacheGeneration
+        layer.loadingTiles.insert(key)
+        layer.loadingTileGenerations[key] = currentGeneration
+        #expect(!layer.cacheImage(
+            try makeImage(),
+            for: key,
+            requestGeneration: staleGeneration,
+            at: 10
+        ))
+        #expect(layer.loadingTileGenerations[key] == currentGeneration)
+        #expect(layer.cachedImage(for: key) == nil)
+
+        #expect(layer.cacheImage(
+            try makeImage(),
+            for: key,
+            requestGeneration: currentGeneration,
+            at: 11
+        ))
+        #expect(layer.cachedImage(for: key) != nil)
+        #expect(!layer.loadingTiles.contains(key))
+    }
+
+    @Test("Tile geometry changes clear cache without dirtying copies")
+    func tileConfigurationInvalidationAndCopy() throws {
+        let layer = CATiledLayer()
+        let key = CATiledLayer.TileKey(column: 0, row: 0, lodLevel: 0)
+        layer.cacheImage(try makeImage(), for: key, at: 10)
+        layer.displayIfNeeded()
+
+        layer.tileSize = CGSize(width: 128, height: 128)
+
+        #expect(layer.cachedImage(for: key) == nil)
+        #expect(layer.needsDisplay())
+        layer.levelsOfDetail = 3
+        layer.levelsOfDetailBias = 2
+        layer.displayIfNeeded()
+
+        let copy = CATiledLayer(layer: layer)
+        #expect(copy.tileSize == layer.tileSize)
+        #expect(copy.levelsOfDetail == 3)
+        #expect(copy.levelsOfDetailBias == 2)
+        #expect(!copy.needsDisplay())
+        #expect(copy.tileCache.isEmpty)
+    }
+
     private func makeImage() throws -> CGImage {
         let pixelData = Data([255, 0, 255, 255])
         let provider = CGDataProvider(data: pixelData)

@@ -45,9 +45,9 @@ open class CATiledLayer: CALayer {
     public required init(layer: Any) {
         super.init(layer: layer)
         if let tiledLayer = layer as? CATiledLayer {
-            self.levelsOfDetail = tiledLayer.levelsOfDetail
-            self.levelsOfDetailBias = tiledLayer.levelsOfDetailBias
-            self.tileSize = tiledLayer.tileSize
+            self._levelsOfDetail = tiledLayer._levelsOfDetail
+            self._levelsOfDetailBias = tiledLayer._levelsOfDetailBias
+            self._tileSize = tiledLayer._tileSize
             // Note: tileCache and loadingTiles are not copied as they are internal state
         }
     }
@@ -73,24 +73,42 @@ open class CATiledLayer: CALayer {
     /// Each level of detail is rendered at half the resolution of the previous level.
     /// For example, if levelsOfDetail is 3, the layer maintains tiles at full resolution,
     /// half resolution, and quarter resolution.
-    open var levelsOfDetail: Int = 1 {
-        didSet { markDirty(.contents) }
+    private var _levelsOfDetail = 1
+    open var levelsOfDetail: Int {
+        get { _levelsOfDetail }
+        set {
+            guard _levelsOfDetail != newValue else { return }
+            _levelsOfDetail = newValue
+            setNeedsDisplay()
+        }
     }
 
     /// The number of magnified levels of detail for this layer.
     ///
     /// Positive values add levels of detail for zooming in beyond the layer's normal size.
     /// A value of 2 means the layer can display tiles at 2x and 4x the normal resolution.
-    open var levelsOfDetailBias: Int = 0 {
-        didSet { markDirty(.contents) }
+    private var _levelsOfDetailBias = 0
+    open var levelsOfDetailBias: Int {
+        get { _levelsOfDetailBias }
+        set {
+            guard _levelsOfDetailBias != newValue else { return }
+            _levelsOfDetailBias = newValue
+            setNeedsDisplay()
+        }
     }
 
     /// The maximum size of each tile.
     ///
     /// Tiles are the unit of asynchronous loading. Larger tiles require fewer draw calls
     /// but use more memory and take longer to render.
-    open var tileSize: CGSize = CGSize(width: 256, height: 256) {
-        didSet { markDirty(.contents) }
+    private var _tileSize = CGSize(width: 256, height: 256)
+    open var tileSize: CGSize {
+        get { _tileSize }
+        set {
+            guard _tileSize != newValue else { return }
+            _tileSize = newValue
+            setNeedsDisplay()
+        }
     }
 
     /// Returns the fading duration for a given view.
@@ -127,24 +145,33 @@ open class CATiledLayer: CALayer {
     /// Set of tiles currently being loaded.
     internal var loadingTiles: Set<TileKey> = []
 
+    /// Cache generation associated with each in-flight tile request.
+    internal var loadingTileGenerations: [TileKey: UInt64] = [:]
+
+    /// Advances whenever cached content becomes invalid.
+    internal private(set) var tileCacheGeneration: UInt64 = 0
+
     /// Clears all cached tiles.
     ///
     /// Call this when the layer's content needs to be completely redrawn,
     /// such as when the underlying data changes.
     internal func clearTileCache() {
-        tileCache.removeAll()
-        tileFadeStartTimes.removeAll()
-        loadingTiles.removeAll()
-        setNeedsDisplay()
+        invalidateTileStorage()
+        super.setNeedsDisplay()
     }
 
     /// Clears a specific tile from the cache.
     ///
     /// Use this to invalidate individual tiles when only part of the content changes.
     internal func clearTile(at key: TileKey) {
+        // Advancing the generation prevents a replacement request for this key
+        // from aliasing an older request that completes later. Other cached tiles
+        // remain valid, while in-flight requests are conservatively restarted.
+        tileCacheGeneration &+= 1
+        loadingTiles.removeAll(keepingCapacity: true)
+        loadingTileGenerations.removeAll(keepingCapacity: true)
         tileCache.removeValue(forKey: key)
         tileFadeStartTimes.removeValue(forKey: key)
-        loadingTiles.remove(key)
     }
 
     /// Returns the cached image for a tile, or nil if not cached.
@@ -153,14 +180,57 @@ open class CATiledLayer: CALayer {
     }
 
     /// Stores a rendered tile image in the cache.
+    @discardableResult
     internal func cacheImage(
         _ image: CGImage,
         for key: TileKey,
+        requestGeneration: UInt64? = nil,
         at mediaTime: CFTimeInterval = CACurrentMediaTime()
-    ) {
+    ) -> Bool {
+        if let requestGeneration {
+            guard requestGeneration == tileCacheGeneration,
+                  loadingTileGenerations[key] == requestGeneration else {
+                return false
+            }
+        }
         tileCache[key] = image
         tileFadeStartTimes[key] = mediaTime
         loadingTiles.remove(key)
+        loadingTileGenerations.removeValue(forKey: key)
+        return true
+    }
+
+    /// Invalidates all cached and in-flight tile content.
+    open override func setNeedsDisplay() {
+        invalidateTileStorage()
+        super.setNeedsDisplay()
+    }
+
+    /// Invalidates tile content after a regional display request.
+    ///
+    /// Device-clamped tile rectangles depend on renderer limits, so a regional
+    /// request conservatively advances the complete generation. This guarantees
+    /// that no stale cached or in-flight tile survives the requested update.
+    open override func setNeedsDisplay(_ r: CGRect) {
+        invalidateTileStorage()
+        super.setNeedsDisplay(r)
+    }
+
+    open override class func needsDisplay(forKey key: String) -> Bool {
+        switch key {
+        case "bounds", "contentsScale":
+            return true
+        default:
+            return super.needsDisplay(forKey: key)
+        }
+    }
+
+    private func invalidateTileStorage() {
+        tileCacheGeneration &+= 1
+        tileCache.removeAll(keepingCapacity: true)
+        tileFadeStartTimes.removeAll(keepingCapacity: true)
+        loadingTiles.removeAll(keepingCapacity: true)
+        loadingTileGenerations.removeAll(keepingCapacity: true)
     }
 
     /// Returns the opacity for a newly cached tile at the supplied media time.

@@ -154,6 +154,7 @@ private struct PendingTileDraw {
     let scale: CGFloat
     let pixelWidth: Int
     let pixelHeight: Int
+    let cacheGeneration: UInt64
 }
 
 private struct PrerasterizedTexture {
@@ -4530,7 +4531,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
         suppressShadowRendering = false
         contentMaskCaptureSuppressedRootLayer = nil
         for request in pendingTileDraws {
-            request.tiledLayer.loadingTiles.remove(request.tileKey)
+            if request.tiledLayer.loadingTileGenerations[request.tileKey]
+                == request.cacheGeneration {
+                request.tiledLayer.loadingTiles.remove(request.tileKey)
+                request.tiledLayer.loadingTileGenerations.removeValue(forKey: request.tileKey)
+            }
         }
         pendingTileDraws.removeAll(keepingCapacity: false)
 
@@ -12383,7 +12388,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         let pixelWidth = min(maximumTextureDimension, max(1, Int(ceil(tileRect.width * scale))))
         let pixelHeight = min(maximumTextureDimension, max(1, Int(ceil(tileRect.height * scale))))
+        let cacheGeneration = tiledLayer.tileCacheGeneration
         tiledLayer.loadingTiles.insert(tileKey)
+        tiledLayer.loadingTileGenerations[tileKey] = cacheGeneration
 
         pendingTileDraws.append(PendingTileDraw(
             tiledLayer: tiledLayer,
@@ -12392,7 +12399,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
             tileRect: tileRect,
             scale: scale,
             pixelWidth: pixelWidth,
-            pixelHeight: pixelHeight
+            pixelHeight: pixelHeight,
+            cacheGeneration: cacheGeneration
         ))
     }
 
@@ -12407,7 +12415,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 tileRect: request.tileRect,
                 scale: request.scale,
                 pixelWidth: request.pixelWidth,
-                pixelHeight: request.pixelHeight
+                pixelHeight: request.pixelHeight,
+                cacheGeneration: request.cacheGeneration
             )
         }
     }
@@ -12419,7 +12428,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         tileRect: CGRect,
         scale: CGFloat,
         pixelWidth: Int,
-        pixelHeight: Int
+        pixelHeight: Int,
+        cacheGeneration: UInt64
     ) {
         guard let context = CGContext(
                 softwareData: nil,
@@ -12430,7 +12440,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 space: .deviceRGB,
                 bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
               ) else {
-            tiledLayer.loadingTiles.remove(tileKey)
+            if tiledLayer.loadingTileGenerations[tileKey] == cacheGeneration {
+                tiledLayer.loadingTiles.remove(tileKey)
+                tiledLayer.loadingTileGenerations.removeValue(forKey: tileKey)
+            }
             return
         }
 
@@ -12440,11 +12453,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         Task { @MainActor in
             guard let image = await context.makeImageAsync() else {
-                tiledLayer.loadingTiles.remove(tileKey)
+                if tiledLayer.loadingTileGenerations[tileKey] == cacheGeneration {
+                    tiledLayer.loadingTiles.remove(tileKey)
+                    tiledLayer.loadingTileGenerations.removeValue(forKey: tileKey)
+                }
                 return
             }
-            tiledLayer.cacheImage(image, for: tileKey)
-            tiledLayer.markDirty(.contents)
+            if tiledLayer.cacheImage(
+                image,
+                for: tileKey,
+                requestGeneration: cacheGeneration
+            ) {
+                tiledLayer.markDirty(.contents)
+            }
         }
     }
 }
