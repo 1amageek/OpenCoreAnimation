@@ -613,7 +613,15 @@ open class CALayer: CAMediaTiming, Hashable {
 
         guard animation.isCumulative, completedCycles > 0 else { return }
         let terminalValue: Any?
-        if let basicAnimation = animation as? CABasicAnimation {
+        if let basicAnimation = animation as? CABasicAnimation,
+           let valueFunction = basicAnimation.valueFunction {
+            let resolved = valueFunction.resolveInputs(
+                from: basicAnimation.fromValue,
+                to: basicAnimation.toValue,
+                by: basicAnimation.byValue
+            )
+            terminalValue = basicAnimation.autoreverses ? resolved?.from : resolved?.to
+        } else if let basicAnimation = animation as? CABasicAnimation {
             terminalValue = cumulativeTerminalValue(for: basicAnimation, keyPath: keyPath)
         } else if let keyframeAnimation = animation as? CAKeyframeAnimation,
                   let values = keyframeAnimation.values, !values.isEmpty {
@@ -624,8 +632,8 @@ open class CALayer: CAMediaTiming, Hashable {
         if let terminalValue {
             let contribution: Any
             if let valueFunction = animation.valueFunction {
-                guard let scalar = transformScalarValue(terminalValue) else { return }
-                contribution = valueFunction.apply(values: [scalar])
+                guard let transform = valueFunction.transform(for: terminalValue) else { return }
+                contribution = transform
             } else {
                 contribution = terminalValue
             }
@@ -758,45 +766,27 @@ open class CALayer: CAMediaTiming, Hashable {
         to layer: CALayer,
         progress: CFTimeInterval
     ) {
-        guard let resolved = resolveFromTo(
-            animation,
-            currentValue: defaultValueForFunction(valueFunction)
+        guard let resolved = valueFunction.resolveInputs(
+            from: animation.fromValue,
+            to: animation.toValue,
+            by: animation.byValue
+        ),
+        let transform = valueFunction.interpolatedTransform(
+            fromComponents: resolved.from,
+            toComponents: resolved.to,
+            progress: CGFloat(progress)
         ) else { return }
-        let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
-        applyValueFunctionValue(
-            value,
-            valueFunction: valueFunction,
-            to: layer,
-            additive: animation.isAdditive
-        )
+        applyValueFunctionTransform(transform, to: layer, additive: animation.isAdditive)
     }
 
-    private func applyValueFunctionValue(
-        _ value: CGFloat,
-        valueFunction: CAValueFunction,
+    private func applyValueFunctionTransform(
+        _ transform: CATransform3D,
         to layer: CALayer,
         additive: Bool
     ) {
-        let transform = valueFunction.apply(values: [value])
         layer._transform = additive
             ? CATransform3DConcat(transform, layer._transform)
             : transform
-    }
-
-    /// Returns the default value for a given value function type.
-    ///
-    /// For rotation functions, 0 is the natural starting value.
-    /// For scale functions, 1 is the natural starting value.
-    /// For translation functions, 0 is the natural starting value.
-    private func defaultValueForFunction(_ valueFunction: CAValueFunction) -> CGFloat {
-        switch valueFunction.name {
-        case .scale, .scaleX, .scaleY, .scaleZ:
-            return 1.0  // Scale defaults to 1 (no scaling)
-        case .rotateX, .rotateY, .rotateZ, .translateX, .translateY, .translateZ:
-            return 0.0  // Rotation and translation default to 0
-        default:
-            return 0.0
-        }
     }
 
     // MARK: - byValue Resolution Helpers
@@ -2218,7 +2208,9 @@ open class CALayer: CAMediaTiming, Hashable {
                 layer: layer,
                 keyPath: keyPath,
                 additive: animation.isAdditive,
-                valueFunction: animation.valueFunction
+                valueFunction: animation.valueFunction,
+                isFirstSegment: startIndex == 0,
+                isLastSegment: endIndex == values.count - 1
             )
         default:
             interpolateKeyframeValue(
@@ -2243,11 +2235,42 @@ open class CALayer: CAMediaTiming, Hashable {
     ) -> (CGFloat, [CGFloat]) {
         guard values.count > 1 else { return (progress, [0]) }
 
+        // QuartzCore preserves even keyframe spacing for the aggregate scale
+        // and translate value functions. Scalar value functions are paced by
+        // their transformed component distance.
+        if let valueFunction = animation.valueFunction,
+           valueFunction.componentCount > 1 {
+            return (progress, defaultKeyTimes(for: values.count))
+        }
+
         // Calculate distances between consecutive keyframes
         var distances: [CGFloat] = []
         for i in 0..<(values.count - 1) {
             let distance: CGFloat
-            if animation.calculationMode == .cubicPaced {
+            if let valueFunction = animation.valueFunction {
+                let measuredDistance: CGFloat?
+                if animation.calculationMode == .cubicPaced {
+                    let p0Index = max(0, i - 1)
+                    let p3Index = min(values.count - 1, i + 2)
+                    measuredDistance = estimateValueFunctionCubicArcLength(
+                        p0: values[p0Index],
+                        p1: values[i],
+                        p2: values[i + 1],
+                        p3: values[p3Index],
+                        valueFunction: valueFunction,
+                        startParameters: cubicParameters(for: animation, at: i),
+                        endParameters: cubicParameters(for: animation, at: i + 1),
+                        isFirstSegment: i == 0,
+                        isLastSegment: i + 1 == values.count - 1
+                    )
+                } else {
+                    measuredDistance = valueFunction.distance(from: values[i], to: values[i + 1])
+                }
+                guard let measuredDistance, measuredDistance.isFinite else {
+                    return (progress, Array(repeating: .nan, count: values.count))
+                }
+                distance = measuredDistance
+            } else if animation.calculationMode == .cubicPaced {
                 // For cubic paced, estimate the Kochanek-Bartels segment length.
                 let p0Index = max(0, i - 1)
                 let p3Index = min(values.count - 1, i + 2)
@@ -2372,6 +2395,54 @@ open class CALayer: CAMediaTiming, Hashable {
         return arcLength
     }
 
+    private func estimateValueFunctionCubicArcLength(
+        p0: Any,
+        p1: Any,
+        p2: Any,
+        p3: Any,
+        valueFunction: CAValueFunction,
+        startParameters: CubicParameters,
+        endParameters: CubicParameters,
+        isFirstSegment: Bool,
+        isLastSegment: Bool
+    ) -> CGFloat? {
+        guard let c0 = valueFunction.components(from: p0),
+              let c1 = valueFunction.components(from: p1),
+              let c2 = valueFunction.components(from: p2),
+              let c3 = valueFunction.components(from: p3) else {
+            return nil
+        }
+
+        func components(at progress: CGFloat) -> [CGFloat] {
+            c0.indices.map { index in
+                let previous = isFirstSegment ? 2 * c1[index] - c2[index] : c0[index]
+                let following = isLastSegment ? 2 * c2[index] - c1[index] : c3[index]
+                return cubicInterpolate(
+                    previous, c1[index], c2[index], following, progress,
+                    startParameters: startParameters,
+                    endParameters: endParameters
+                )
+            }
+        }
+
+        func distance(_ lhs: [CGFloat], _ rhs: [CGFloat]) -> CGFloat {
+            sqrt(zip(lhs, rhs).reduce(CGFloat(0)) { partialResult, pair in
+                let difference = pair.1 - pair.0
+                return partialResult + difference * difference
+            })
+        }
+
+        let sampleCount = 10
+        var previous = components(at: 0)
+        var length: CGFloat = 0
+        for index in 1...sampleCount {
+            let current = components(at: CGFloat(index) / CGFloat(sampleCount))
+            length += distance(previous, current)
+            previous = current
+        }
+        return length
+    }
+
     /// Interpolates a point on the Kochanek-Bartels spline for distance calculation.
     private func interpolateForDistance(
         p0: Any,
@@ -2430,13 +2501,8 @@ open class CALayer: CAMediaTiming, Hashable {
         valueFunction: CAValueFunction?
     ) {
         if let valueFunction {
-            guard let scalar = transformScalarValue(value) else { return }
-            applyValueFunctionValue(
-                scalar,
-                valueFunction: valueFunction,
-                to: layer,
-                additive: additive
-            )
+            guard let transform = valueFunction.transform(for: value) else { return }
+            applyValueFunctionTransform(transform, to: layer, additive: additive)
             return
         }
 
@@ -2604,15 +2670,12 @@ open class CALayer: CAMediaTiming, Hashable {
         valueFunction: CAValueFunction?
     ) {
         if let valueFunction {
-            guard let from = transformScalarValue(fromValue),
-                  let to = transformScalarValue(toValue) else { return }
-            let value = from + CGFloat(progress) * (to - from)
-            applyValueFunctionValue(
-                value,
-                valueFunction: valueFunction,
-                to: layer,
-                additive: additive
-            )
+            guard let transform = valueFunction.interpolatedTransform(
+                from: fromValue,
+                to: toValue,
+                progress: CGFloat(progress)
+            ) else { return }
+            applyValueFunctionTransform(transform, to: layer, additive: additive)
             return
         }
 
@@ -2960,10 +3023,32 @@ open class CALayer: CAMediaTiming, Hashable {
         layer: CALayer,
         keyPath: String,
         additive: Bool,
-        valueFunction: CAValueFunction?
+        valueFunction: CAValueFunction?,
+        isFirstSegment: Bool,
+        isLastSegment: Bool
     ) {
         if keyPath == "contents" {
             layer._contents = t < 0.5 ? p1 : p2
+            return
+        }
+        if let valueFunction {
+            guard let c0 = valueFunction.components(from: p0),
+                  let c1 = valueFunction.components(from: p1),
+                  let c2 = valueFunction.components(from: p2),
+                  let c3 = valueFunction.components(from: p3) else {
+                return
+            }
+            let components = c0.indices.map { index in
+                let previous = isFirstSegment ? 2 * c1[index] - c2[index] : c0[index]
+                let following = isLastSegment ? 2 * c2[index] - c1[index] : c3[index]
+                return cubicInterpolate(
+                    previous, c1[index], c2[index], following, t,
+                    startParameters: startParameters,
+                    endParameters: endParameters
+                )
+            }
+            guard let transform = valueFunction.transform(for: components) else { return }
+            applyValueFunctionTransform(transform, to: layer, additive: additive)
             return
         }
         guard let value = cubicValue(

@@ -189,7 +189,7 @@ struct CAValueFunctionAnimationTests {
 
         let animation = CABasicAnimation(keyPath: "transform")
         animation.valueFunction = CAValueFunction(name: .scale)
-        animation.toValue = CGFloat(3)
+        animation.toValue = [CGFloat(3), CGFloat(4), CGFloat(5)]
         animation.duration = 1
         animation.speed = 0
         animation.timeOffset = 0.5
@@ -201,8 +201,8 @@ struct CAValueFunctionAnimationTests {
         }
 
         #expect(abs(presentation.transform.m11 - 2) < epsilon)
-        #expect(abs(presentation.transform.m22 - 2) < epsilon)
-        #expect(abs(presentation.transform.m33 - 2) < epsilon)
+        #expect(abs(presentation.transform.m22 - 2.5) < epsilon)
+        #expect(abs(presentation.transform.m33 - 3) < epsilon)
     }
 }
 

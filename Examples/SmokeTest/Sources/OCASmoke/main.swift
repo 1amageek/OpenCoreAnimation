@@ -1530,8 +1530,11 @@ func installHarness() {
                     color: CGColor(red: 1, green: 0, blue: 1, alpha: 1)
                 )
                 let valueFunction = CAKeyframeAnimation(keyPath: "transform")
-                valueFunction.valueFunction = CAValueFunction(name: .translateX)
-                valueFunction.values = [0, 40]
+                valueFunction.valueFunction = CAValueFunction(name: .translate)
+                valueFunction.values = [
+                    [CGFloat(0), CGFloat(0), CGFloat(0)],
+                    [CGFloat(40), CGFloat(0), CGFloat(0)],
+                ]
                 configure(valueFunction)
                 valueFunctionLayer.add(valueFunction, forKey: "browserValueFunction")
                 CATransaction.commit()

@@ -28,6 +28,9 @@ public struct CAValueFunctionName: Hashable, Equatable, RawRepresentable, Sendab
     /// A value function that scales by the input value along the z-axis.
     public static let scaleZ = CAValueFunctionName(rawValue: "scaleZ")
 
+    /// A value function that translates by the three input values along each axis.
+    public static let translate = CAValueFunctionName(rawValue: "translate")
+
     /// A value function translates by the input value along the x-axis.
     public static let translateX = CAValueFunctionName(rawValue: "translateX")
 
