@@ -606,6 +606,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         caRendererAlignedUniformSize
     }
 
+    /// WGSL `GradientStop` stores one vec4 color and one padded location vector.
+    private static let gradientStopStride: UInt64 = 32
+
     // MARK: - Properties
 
     /// The WebGPU device.
@@ -650,6 +653,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     private var bindGroup: GPUBindGroup? {
         return uniformBufferPool?.currentBindGroup
     }
+
+    /// Placeholder required by solid draws whose shader layout also exposes gradient storage.
+    private var dummyGradientStopBuffer: GPUBuffer?
+
+    /// Dynamically sized, triple-buffered storage for the current frame's gradient stops.
+    private var gradientStopBufferPool: GradientStopBufferPool?
+
+    /// Next byte offset in the active gradient-stop buffer.
+    private var gradientStopByteOffset: UInt64 = 0
+
+    /// Storage offsets already uploaded for presentation-layer objects in this frame.
+    private var gradientStopOffsets: [ObjectIdentifier: UInt32] = [:]
+
+    /// Bind group pairing the current uniform buffer with the active gradient-stop buffer.
+    private var gradientBindGroup: GPUBindGroup?
 
     /// The depth texture.
     private var depthTexture: GPUTexture?
@@ -1630,6 +1648,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                         hasDynamicOffset: true,
                         minBindingSize: UInt64(MemoryLayout<CARendererUniforms>.stride)
                     )
+                ),
+                GPUBindGroupLayoutEntry(
+                    binding: 1,
+                    visibility: [.fragment],
+                    buffer: GPUBufferBindingLayout(
+                        type: .readOnlyStorage,
+                        minBindingSize: Self.gradientStopStride
+                    )
                 )
             ]
         ))
@@ -1756,13 +1782,38 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             bufferCount: 3
         )
 
-        // Create triple-buffered uniform buffer pool with bind groups
+        guard device.limits.maxStorageBufferBindingSize >= Self.gradientStopStride else {
+            throw CARendererError.pipelineCreationFailed
+        }
+        let dummyGradientStopBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
+            size: Self.gradientStopStride,
+            usage: [.storage]
+        ))
+        self.dummyGradientStopBuffer = dummyGradientStopBuffer
+        gradientStopBufferPool = GradientStopBufferPool(
+            device: device,
+            initialCapacity: Self.gradientStopStride,
+            maximumCapacity: device.limits.maxStorageBufferBindingSize
+        )
+
+        // Create triple-buffered uniform buffer pool with bind groups.
+        // Solid draws bind the placeholder at binding 1; gradient draws replace
+        // it with the dynamically sized stop buffer for the active frame.
         let uniformBufferSize = Self.alignedUniformSize * UInt64(Self.maxLayers)
         uniformBufferPool = UniformBufferPool(
             device: device,
             bufferSize: uniformBufferSize,
             bindGroupLayout: layout,
             bindingSize: UInt64(MemoryLayout<CARendererUniforms>.stride),
+            additionalEntries: [
+                GPUBindGroupEntry(
+                    binding: 1,
+                    resource: .bufferBinding(GPUBufferBinding(
+                        buffer: dummyGradientStopBuffer,
+                        size: Self.gradientStopStride
+                    ))
+                )
+            ],
             bufferCount: 3
         )
 
@@ -3428,6 +3479,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         droppedLayerCount = 0
         shapeFillDrawCount = 0
         shapeFillVertexCount = 0
+        gradientStopByteOffset = 0
+        gradientStopOffsets.removeAll(keepingCapacity: true)
+        gradientBindGroup = nil
         opacityStack.removeAll()
         replicatorColorStack.removeAll()
         replicatorTimeOffsetStack.removeAll()
@@ -3679,6 +3733,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Advance buffer pools, texture manager, and geometry cache to the next frame
         vertexBufferPool?.advanceFrame()
         uniformBufferPool?.advanceFrame()
+        gradientStopBufferPool?.advanceFrame()
         textureManager?.advanceFrame()
         geometryCache?.advanceFrame()
 
@@ -3938,6 +3993,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         geometryCache = nil
 
         bindGroupLayout = nil
+        dummyGradientStopBuffer?.destroy()
+        dummyGradientStopBuffer = nil
+        gradientStopBufferPool?.invalidate()
+        gradientStopBufferPool = nil
+        gradientStopByteOffset = 0
+        gradientStopOffsets.removeAll(keepingCapacity: false)
+        gradientBindGroup = nil
         depthTexture = nil
         pipeline = nil
         depthPipeline = nil
@@ -4170,6 +4232,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             for i in 0..<floatCount {
                 array[i] = .number(Double(typed[i]))
             }
+        }
+        return array
+    }
+
+    /// Writes scalar storage-buffer data into a pooled JavaScript typed array.
+    private func createFloat32Array(from values: inout [Float]) -> JSObject {
+        let array = stagingFloat32Array(floatCount: values.count)
+        for index in values.indices {
+            array[index] = .number(Double(values[index]))
         }
         return array
     }
@@ -4437,7 +4508,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         } else if let gradientLayer = presentationLayer as? CAGradientLayer,
                   let colors = gradientLayer.colors, !colors.isEmpty {
             renderGradientLayer(gradientLayer, device: device, renderPass: renderPass,
-                              modelMatrix: modelMatrix, bindGroup: bindGroup)
+                              modelMatrix: modelMatrix)
         } else if let contents = delegateBackingStores[ObjectIdentifier(layer)] {
             renderContentsLayer(presentationLayer, contents: contents, device: device,
                                renderPass: renderPass, modelMatrix: modelMatrix)
@@ -7135,13 +7206,109 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Gradient Layer Rendering
 
+    private func gradientStopBinding(
+        for gradientLayer: CAGradientLayer,
+        configuration: GradientRenderConfiguration,
+        device: GPUDevice
+    ) -> (stopOffset: UInt32, bindGroup: GPUBindGroup)? {
+        guard let uniformBuffer,
+              let bindGroupLayout,
+              let gradientStopBufferPool else {
+            gradientRenderFailureCount += 1
+            return nil
+        }
+
+        let identifier = ObjectIdentifier(gradientLayer)
+        if let stopOffset = gradientStopOffsets[identifier],
+           let gradientBindGroup {
+            return (stopOffset, gradientBindGroup)
+        }
+
+        let (byteCount, byteCountOverflow) = UInt64(configuration.colors.count)
+            .multipliedReportingOverflow(by: Self.gradientStopStride)
+        let (requiredCapacity, capacityOverflow) = gradientStopByteOffset
+            .addingReportingOverflow(byteCount)
+        guard !byteCountOverflow, !capacityOverflow else {
+            gradientRenderFailureCount += 1
+            return nil
+        }
+
+        do {
+            if try gradientStopBufferPool.ensureCapacity(requiredCapacity) {
+                // Draws already encoded in this pass retain the superseded buffer
+                // through their bind groups. New draws restart at offset zero in
+                // the replacement buffer.
+                gradientStopByteOffset = 0
+                gradientStopOffsets.removeAll(keepingCapacity: true)
+                gradientBindGroup = nil
+            }
+        } catch {
+            gradientRenderFailureCount += 1
+            return nil
+        }
+
+        let stopOffsetValue = gradientStopByteOffset / Self.gradientStopStride
+        guard stopOffsetValue <= UInt64(UInt32.max) else {
+            gradientRenderFailureCount += 1
+            return nil
+        }
+        let stopOffset = UInt32(stopOffsetValue)
+
+        // The storage-buffer ABI requires interleaved color/location records.
+        // This is the single materialization at the external GPU upload boundary;
+        // the JavaScript Float32Array itself is pooled and reused.
+        var stopData: [Float] = []
+        stopData.reserveCapacity(Int(byteCount / UInt64(MemoryLayout<Float>.stride)))
+        for (color, location) in zip(configuration.colors, configuration.locations) {
+            let components = rgbaComponents(color)
+            stopData.append(contentsOf: [
+                components.x, components.y, components.z, components.w,
+                location, 0, 0, 0,
+            ])
+        }
+        let data = createFloat32Array(from: &stopData)
+        device.queue.writeBuffer(
+            gradientStopBufferPool.currentBuffer,
+            bufferOffset: gradientStopByteOffset,
+            data: data
+        )
+        gradientStopByteOffset += byteCount
+        gradientStopOffsets[identifier] = stopOffset
+
+        let activeBindGroup: GPUBindGroup
+        if let gradientBindGroup {
+            activeBindGroup = gradientBindGroup
+        } else {
+            activeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
+                layout: bindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .bufferBinding(GPUBufferBinding(
+                            buffer: uniformBuffer,
+                            size: UInt64(MemoryLayout<CARendererUniforms>.stride)
+                        ))
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .bufferBinding(GPUBufferBinding(
+                            buffer: gradientStopBufferPool.currentBuffer,
+                            size: gradientStopBufferPool.currentCapacity
+                        ))
+                    ),
+                ]
+            ))
+            gradientBindGroup = activeBindGroup
+        }
+        return (stopOffset, activeBindGroup)
+    }
+
     /// Renders a CAGradientLayer with its gradient colors.
     private func renderGradientLayer(
         _ gradientLayer: CAGradientLayer,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
-        modelMatrix: Matrix4x4,
-        bindGroup: GPUBindGroup
+        modelMatrix: Matrix4x4
     ) {
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
@@ -7158,6 +7325,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
         } catch {
             gradientRenderFailureCount += 1
+            return
+        }
+
+        guard let stopBinding = gradientStopBinding(
+            for: gradientLayer,
+            configuration: configuration,
+            device: device
+        ) else {
             return
         }
 
@@ -7186,36 +7361,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             gradientStartPoint: SIMD2<Float>(Float(gradientLayer.startPoint.x), Float(gradientLayer.startPoint.y)),
             gradientEndPoint: SIMD2<Float>(Float(gradientLayer.endPoint.x), Float(gradientLayer.endPoint.y)),
             gradientColorCount: Float(configuration.colors.count),
+            gradientColorMultiplier: currentReplicatorColor,
+            gradientStopOffset: Float(stopBinding.stopOffset),
             edgeAntialiasingMask: gradientLayer.edgeAntialiasingMaskValue,
             cornerRadii: gradientLayer.cornerRadiiComponents
         )
-
-        // Extract gradient colors
-        var gradientColors: [SIMD4<Float>] = []
-        for color in configuration.colors {
-            gradientColors.append(replicatedColor(rgbaComponents(color)))
-        }
-
-        // Pad to 8 colors
-        while gradientColors.count < kMaxGradientStops {
-            gradientColors.append(.zero)
-        }
-
-        uniforms.gradientColors = (
-            gradientColors[0], gradientColors[1], gradientColors[2], gradientColors[3],
-            gradientColors[4], gradientColors[5], gradientColors[6], gradientColors[7]
-        )
-
-        // Extract or generate locations
-        var locations = configuration.locations
-
-        // Pad locations to 8
-        while locations.count < kMaxGradientStops {
-            locations.append(1.0)
-        }
-
-        uniforms.gradientLocations = SIMD4<Float>(locations[0], locations[1], locations[2], locations[3])
-        uniforms.gradientLocations2 = SIMD4<Float>(locations[4], locations[5], locations[6], locations[7])
 
         // Create vertices (color doesn't matter for gradient, shader uses gradient uniforms)
         let dummyColor = SIMD4<Float>(1, 1, 1, 1)
@@ -7247,7 +7397,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         // Draw
-        renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+        renderPass.setBindGroup(
+            0,
+            bindGroup: stopBinding.bindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
     }
@@ -7321,6 +7475,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let pipeline = pipeline,
               let depthTextureView = depthTextureView,
               let bindGroupLayout = bindGroupLayout,
+              let dummyGradientStopBuffer = dummyGradientStopBuffer,
               let shadowMaskPipeline = shadowMaskPipeline,
               let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
               let shadowBlurVerticalPipeline = shadowBlurVerticalPipeline,
@@ -7417,6 +7572,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                                 resources.maskUniformBuffer,
                                 offset: 0,
                                 size: Self.alignedUniformSize
+                            )
+                        ),
+                        GPUBindGroupEntry(
+                            binding: 1,
+                            resource: .buffer(
+                                dummyGradientStopBuffer,
+                                offset: 0,
+                                size: Self.gradientStopStride
                             )
                         )
                     ]
@@ -8150,6 +8313,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) -> Bool {
         guard let device,
               let bindGroupLayout,
+              let dummyGradientStopBuffer,
               let shadowMaskPipeline else { return false }
 
         let presentation = target.presentationLayer
@@ -8197,6 +8361,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     uniformBuffer,
                     offset: 0,
                     size: Self.alignedUniformSize
+                )),
+                GPUBindGroupEntry(binding: 1, resource: .buffer(
+                    dummyGradientStopBuffer,
+                    offset: 0,
+                    size: Self.gradientStopStride
                 )),
             ]
         ))
@@ -9851,6 +10020,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) -> GPUTexture? {
         guard let device,
               let bindGroupLayout,
+              let dummyGradientStopBuffer,
               let shadowMaskPipeline,
               let shadowBlurHorizontalPipeline,
               let shadowBlurVerticalPipeline,
@@ -9894,6 +10064,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                             resources.maskUniformBuffer,
                             offset: 0,
                             size: Self.alignedUniformSize
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .buffer(
+                            dummyGradientStopBuffer,
+                            offset: 0,
+                            size: Self.gradientStopStride
                         )
                     )
                 ]

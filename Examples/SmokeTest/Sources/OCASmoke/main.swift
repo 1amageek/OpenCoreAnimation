@@ -4342,6 +4342,15 @@ func installHarness() {
                     startPoint: CGPoint(x: 0, y: 0.5),
                     endPoint: CGPoint(x: 1, y: 0.5)
                 )
+                let manyStops = makeGradient(
+                    position: CGPoint(x: 350, y: 100),
+                    type: .axial,
+                    startPoint: CGPoint(x: 0.25, y: 0.5),
+                    endPoint: CGPoint(x: 0.75, y: 0.5)
+                )
+                manyStops.colors = Array(repeating: colors[0], count: 8)
+                    + Array(repeating: colors[2], count: 4)
+                manyStops.locations = nil
                 CATransaction.commit()
 
                 CAAnimationEngine.shared.renderFrame()
@@ -4358,6 +4367,7 @@ func installHarness() {
                         CGPoint(x: 234, y: 150),
                         CGPoint(x: 250, y: 166),
                         CGPoint(x: 350, y: 150),
+                        CGPoint(x: 360, y: 200),
                     ])
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
@@ -4371,6 +4381,7 @@ func installHarness() {
                 radial.removeFromSuperlayer()
                 conic.removeFromSuperlayer()
                 unsupported.removeFromSuperlayer()
+                manyStops.removeFromSuperlayer()
                 CAAnimationEngine.shared.renderFrame()
             }
         })

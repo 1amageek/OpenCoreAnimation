@@ -43,8 +43,8 @@ struct GradientRenderConfigurationTests {
         #expect(result.locations == [0.25, 0.25, 0.75])
     }
 
-    @Test("Unknown types, invalid colors, and excess stops are rejected")
-    func invalidStops() {
+    @Test("Unknown types and invalid colors are rejected without limiting valid stop counts")
+    func invalidStops() throws {
         let nonFiniteColor = CGColor(red: .nan, green: 0, blue: 0, alpha: 1)
 
         #expect(throws: GradientRenderConfigurationError.unsupportedType("future")) {
@@ -56,9 +56,13 @@ struct GradientRenderConfigurationTests {
         #expect(throws: GradientRenderConfigurationError.invalidColorComponents(index: 0)) {
             try configuration(type: .axial, colors: [nonFiniteColor])
         }
-        #expect(throws: GradientRenderConfigurationError.tooManyStops(actual: 9, maximum: 8)) {
-            try configuration(type: .axial, colors: Array(repeating: red as Any, count: 9))
-        }
+        let manyStops = try configuration(
+            type: .axial,
+            colors: Array(repeating: red as Any, count: 257)
+        )
+        #expect(manyStops.colors.count == 257)
+        #expect(manyStops.locations.count == 257)
+        #expect(manyStops.locations.last == 1)
         #expect(throws: GradientRenderConfigurationError.nonFiniteGeometry) {
             try GradientRenderConfiguration(
                 type: .axial,

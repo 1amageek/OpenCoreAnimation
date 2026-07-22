@@ -1,8 +1,6 @@
 import Foundation
 
 struct GradientRenderConfiguration {
-    static let maximumStopCount = 8
-
     let renderMode: Float
     let colors: [CGColor]
     let locations: [Float]
@@ -12,18 +10,10 @@ struct GradientRenderConfiguration {
         colors colorValues: [Any],
         locations locationValues: [CGFloat]?,
         startPoint: CGPoint,
-        endPoint: CGPoint,
-        maximumStopCount: Int = GradientRenderConfiguration.maximumStopCount
+        endPoint: CGPoint
     ) throws {
         renderMode = try Self.renderMode(for: type)
         try Self.validateGeometry(startPoint: startPoint, endPoint: endPoint)
-
-        guard colorValues.count <= maximumStopCount else {
-            throw GradientRenderConfigurationError.tooManyStops(
-                actual: colorValues.count,
-                maximum: maximumStopCount
-            )
-        }
 
         var validatedColors: [CGColor] = []
         validatedColors.reserveCapacity(colorValues.count)

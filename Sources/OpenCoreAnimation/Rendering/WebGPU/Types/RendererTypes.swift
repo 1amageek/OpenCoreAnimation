@@ -16,9 +16,6 @@ public struct CARendererVertex {
     }
 }
 
-/// Maximum number of gradient color stops supported.
-public let kMaxGradientStops: Int = 8
-
 /// Uniform data passed to shaders for each layer (WASM version).
 public struct CARendererUniforms {
     public var mvpMatrix: Matrix4x4
@@ -35,12 +32,10 @@ public struct CARendererUniforms {
     /// Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
     /// Corresponds to CACornerMask corners for selective corner rounding.
     public var cornerRadii: SIMD4<Float>
-    // Gradient color stops: each is vec4 color + vec4 (location, 0, 0, 0) = 8 bytes per stop
-    // For simplicity, we'll pack 8 colors and 8 locations separately
-    public var gradientColors: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>,
-                                SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>)
-    public var gradientLocations: SIMD4<Float>  // First 4 locations
-    public var gradientLocations2: SIMD4<Float> // Next 4 locations
+    /// Replicator color applied to every stop after storage-buffer lookup.
+    public var gradientColorMultiplier: SIMD4<Float>
+    /// First stop index in the frame's read-only gradient storage buffer.
+    public var gradientStopOffset: Float
 
     public init(
         mvpMatrix: Matrix4x4 = .identity,
@@ -52,6 +47,8 @@ public struct CARendererUniforms {
         gradientStartPoint: SIMD2<Float> = .zero,
         gradientEndPoint: SIMD2<Float> = SIMD2(0, 1),
         gradientColorCount: Float = 0,
+        gradientColorMultiplier: SIMD4<Float> = SIMD4(repeating: 1),
+        gradientStopOffset: Float = 0,
         edgeAntialiasingMask: Float = 0,
         cornerRadii: SIMD4<Float> = .zero
     ) {
@@ -66,9 +63,8 @@ public struct CARendererUniforms {
         self.gradientColorCount = gradientColorCount
         self.edgeAntialiasingParameters = SIMD3(edgeAntialiasingMask, 0, 0)
         self.cornerRadii = cornerRadii
-        self.gradientColors = (.zero, .zero, .zero, .zero, .zero, .zero, .zero, .zero)
-        self.gradientLocations = .zero
-        self.gradientLocations2 = .zero
+        self.gradientColorMultiplier = gradientColorMultiplier
+        self.gradientStopOffset = gradientStopOffset
     }
 }
 

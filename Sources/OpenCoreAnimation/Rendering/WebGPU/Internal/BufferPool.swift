@@ -125,12 +125,14 @@ public final class UniformBufferPool {
     ///   - bufferSize: The size of each uniform buffer in bytes.
     ///   - bindGroupLayout: The layout for creating bind groups.
     ///   - bindingSize: The size of the buffer binding (may be smaller than bufferSize for dynamic offsets).
+    ///   - additionalEntries: Resources shared by every bind group in the pool.
     ///   - bufferCount: Number of buffers in the pool (default: 3).
     public init(
         device: GPUDevice,
         bufferSize: UInt64,
         bindGroupLayout: GPUBindGroupLayout,
         bindingSize: UInt64,
+        additionalEntries: [GPUBindGroupEntry] = [],
         bufferCount: Int = 3
     ) {
         self.bindGroupLayout = bindGroupLayout
@@ -145,17 +147,18 @@ public final class UniformBufferPool {
         // Create bind groups for each buffer
         for i in 0..<bufferCount {
             let buffer = bufferPool.buffer(at: i)
+            let entries = [
+                GPUBindGroupEntry(
+                    binding: 0,
+                    resource: .bufferBinding(GPUBufferBinding(
+                        buffer: buffer,
+                        size: bindingSize
+                    ))
+                )
+            ] + additionalEntries
             let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
                 layout: bindGroupLayout,
-                entries: [
-                    GPUBindGroupEntry(
-                        binding: 0,
-                        resource: .bufferBinding(GPUBufferBinding(
-                            buffer: buffer,
-                            size: bindingSize
-                        ))
-                    )
-                ]
+                entries: entries
             ))
             bindGroups.append(bindGroup)
         }

@@ -80,7 +80,7 @@ public enum CAWebGPUShaders {
         cornerRadius: f32,
         layerSize: vec2<f32>,
         borderWidth: f32,
-        renderMode: f32,  // 0 = fill, 1 = border, 2 = gradient
+        renderMode: f32,  // 0 = fill, 1 = border, 2 = axial, 3 = radial, 4 = conic
         gradientStartPoint: vec2<f32>,
         gradientEndPoint: vec2<f32>,
         gradientColorCount: f32,
@@ -88,19 +88,18 @@ public enum CAWebGPUShaders {
         // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
         // Corresponds to: (bottom-left, bottom-right, top-left, top-right)
         cornerRadii: vec4<f32>,
-        gradientColor0: vec4<f32>,
-        gradientColor1: vec4<f32>,
-        gradientColor2: vec4<f32>,
-        gradientColor3: vec4<f32>,
-        gradientColor4: vec4<f32>,
-        gradientColor5: vec4<f32>,
-        gradientColor6: vec4<f32>,
-        gradientColor7: vec4<f32>,
-        gradientLocations: vec4<f32>,
-        gradientLocations2: vec4<f32>,
+        gradientColorMultiplier: vec4<f32>,
+        gradientStopOffset: f32,
     }
 
     @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+    struct GradientStop {
+        color: vec4<f32>,
+        locationAndPadding: vec4<f32>,
+    }
+
+    @group(0) @binding(1) var<storage, read> gradientStops: array<GradientStop>;
 
     struct VertexInput {
         @location(0) position: vec2<f32>,
@@ -207,32 +206,14 @@ public enum CAWebGPUShaders {
 
     // Get gradient color at index
     fn getGradientColor(index: i32) -> vec4<f32> {
-        switch (index) {
-            case 0: { return uniforms.gradientColor0; }
-            case 1: { return uniforms.gradientColor1; }
-            case 2: { return uniforms.gradientColor2; }
-            case 3: { return uniforms.gradientColor3; }
-            case 4: { return uniforms.gradientColor4; }
-            case 5: { return uniforms.gradientColor5; }
-            case 6: { return uniforms.gradientColor6; }
-            case 7: { return uniforms.gradientColor7; }
-            default: { return vec4<f32>(0.0); }
-        }
+        let stopIndex = u32(uniforms.gradientStopOffset) + u32(index);
+        return gradientStops[stopIndex].color * uniforms.gradientColorMultiplier;
     }
 
     // Get gradient location at index
     fn getGradientLocation(index: i32) -> f32 {
-        switch (index) {
-            case 0: { return uniforms.gradientLocations.x; }
-            case 1: { return uniforms.gradientLocations.y; }
-            case 2: { return uniforms.gradientLocations.z; }
-            case 3: { return uniforms.gradientLocations.w; }
-            case 4: { return uniforms.gradientLocations2.x; }
-            case 5: { return uniforms.gradientLocations2.y; }
-            case 6: { return uniforms.gradientLocations2.z; }
-            case 7: { return uniforms.gradientLocations2.w; }
-            default: { return 0.0; }
-        }
+        let stopIndex = u32(uniforms.gradientStopOffset) + u32(index);
+        return gradientStops[stopIndex].locationAndPadding.x;
     }
 
     // Calculate gradient color at position t (0-1)
