@@ -3774,7 +3774,12 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// An optional dictionary used to store property values that aren't explicitly defined by the layer.
-    open var style: [AnyHashable: Any]?
+    open var style: [AnyHashable: Any]? {
+        didSet {
+            guard !CALayer.storedValuesEqual(oldValue, style) else { return }
+            if Self.needsDisplay(forKey: "style") { setNeedsDisplay() }
+        }
+    }
 
     /// A Boolean indicating whether the layer is allowed to perform edge antialiasing.
     open var allowsEdgeAntialiasing: Bool = true {
@@ -4979,6 +4984,50 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Returns a Boolean indicating whether changes to the specified key require the layer to be redisplayed.
     open class func needsDisplay(forKey key: String) -> Bool {
+        return false
+    }
+
+    /// Compares heterogeneous stored values without requiring Objective-C equality.
+    /// Collections recurse so redraw invalidation can distinguish an unchanged
+    /// style or text payload from a real mutation.
+    internal static func storedValuesEqual(_ lhs: Any?, _ rhs: Any?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case (nil, _), (_, nil):
+            return false
+        default:
+            break
+        }
+
+        guard let lhs, let rhs else { return false }
+        if let left = lhs as? [AnyHashable: Any],
+           let right = rhs as? [AnyHashable: Any] {
+            guard left.count == right.count else { return false }
+            for (key, leftValue) in left {
+                guard let rightValue = right[key],
+                      storedValuesEqual(leftValue, rightValue) else {
+                    return false
+                }
+            }
+            return true
+        }
+        if let left = lhs as? [Any], let right = rhs as? [Any] {
+            guard left.count == right.count else { return false }
+            return zip(left, right).allSatisfy { pair in
+                storedValuesEqual(pair.0, pair.1)
+            }
+        }
+        if let left = lhs as? CGColor, let right = rhs as? CGColor {
+            return left == right
+        }
+        if let left = lhs as? AnyHashable, let right = rhs as? AnyHashable {
+            return left == right
+        }
+        if Mirror(reflecting: lhs).displayStyle == .class,
+           Mirror(reflecting: rhs).displayStyle == .class {
+            return (lhs as AnyObject) === (rhs as AnyObject)
+        }
         return false
     }
 

@@ -65,14 +65,14 @@ open class CATextLayer: CALayer {
     public required init(layer: Any) {
         super.init(layer: layer)
         if let textLayer = layer as? CATextLayer {
-            self.string = textLayer.string
-            self.font = textLayer.font
+            self._string = textLayer._string
+            self._font = textLayer._font
             self._fontSize = textLayer._fontSize
             self._foregroundColor = textLayer._foregroundColor
-            self.isWrapped = textLayer.isWrapped
-            self.truncationMode = textLayer.truncationMode
-            self.alignmentMode = textLayer.alignmentMode
-            self.allowsFontSubpixelQuantization = textLayer.allowsFontSubpixelQuantization
+            self._isWrapped = textLayer._isWrapped
+            self._truncationMode = textLayer._truncationMode
+            self._alignmentMode = textLayer._alignmentMode
+            self._allowsFontSubpixelQuantization = textLayer._allowsFontSubpixelQuantization
         }
     }
 
@@ -96,14 +96,28 @@ open class CATextLayer: CALayer {
 
     // MARK: - Text Properties
 
+    internal var _string: Any?
     /// The text to be rendered by the receiver.
     open var string: Any? {
-        didSet { markDirty(.contents) }
+        get { _string }
+        set {
+            guard !CALayer.storedValuesEqual(_string, newValue) else { return }
+            _string = newValue
+            markDirty(.contents)
+            if Self.needsDisplay(forKey: "string") { setNeedsDisplay() }
+        }
     }
 
+    internal var _font: Any? = "Helvetica"
     /// The font used to render the receiver's text.
-    open var font: Any? = "Helvetica" {
-        didSet { markDirty(.contents) }
+    open var font: Any? {
+        get { _font }
+        set {
+            guard !CALayer.storedValuesEqual(_font, newValue) else { return }
+            _font = newValue
+            markDirty(.contents)
+            if Self.needsDisplay(forKey: "font") { setNeedsDisplay() }
+        }
     }
 
     internal var _fontSize: CGFloat = 36
@@ -112,8 +126,10 @@ open class CATextLayer: CALayer {
         get { return _fontSize }
         set {
             let oldValue = _fontSize
+            guard oldValue != newValue else { return }
             _fontSize = newValue
             markDirty(.contents)
+            if Self.needsDisplay(forKey: "fontSize") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "fontSize", oldValue: oldValue, newValue: newValue)
         }
     }
@@ -124,43 +140,73 @@ open class CATextLayer: CALayer {
         get { return _foregroundColor }
         set {
             let oldValue = _foregroundColor
+            guard oldValue != newValue else { return }
             _foregroundColor = newValue
             markDirty(.appearance)
+            if Self.needsDisplay(forKey: "foregroundColor") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "foregroundColor", oldValue: oldValue, newValue: newValue)
         }
     }
 
     // MARK: - Layout Properties
 
+    internal var _isWrapped = false
     /// Determines whether the text is wrapped to fit within the receiver's bounds.
-    open var isWrapped: Bool = false {
-        didSet {
-            guard oldValue != isWrapped else { return }
+    open var isWrapped: Bool {
+        get { _isWrapped }
+        set {
+            guard _isWrapped != newValue else { return }
+            _isWrapped = newValue
             markDirty(.contents)
+            if Self.needsDisplay(forKey: "wrapped") { setNeedsDisplay() }
         }
     }
 
+    internal var _truncationMode: CATextLayerTruncationMode = .none
     /// The truncation mode to use when the text is too long.
-    open var truncationMode: CATextLayerTruncationMode = .none {
-        didSet {
-            guard oldValue != truncationMode else { return }
+    open var truncationMode: CATextLayerTruncationMode {
+        get { _truncationMode }
+        set {
+            guard _truncationMode != newValue else { return }
+            _truncationMode = newValue
             markDirty(.contents)
+            if Self.needsDisplay(forKey: "truncationMode") { setNeedsDisplay() }
         }
     }
 
+    internal var _alignmentMode: CATextLayerAlignmentMode = .natural
     /// The text alignment mode.
-    open var alignmentMode: CATextLayerAlignmentMode = .natural {
-        didSet {
-            guard oldValue != alignmentMode else { return }
+    open var alignmentMode: CATextLayerAlignmentMode {
+        get { _alignmentMode }
+        set {
+            guard _alignmentMode != newValue else { return }
+            _alignmentMode = newValue
             markDirty(.contents)
+            if Self.needsDisplay(forKey: "alignmentMode") { setNeedsDisplay() }
         }
     }
 
+    internal var _allowsFontSubpixelQuantization = false
     /// Determines whether font smoothing is allowed.
-    open var allowsFontSubpixelQuantization: Bool = false {
-        didSet {
-            guard oldValue != allowsFontSubpixelQuantization else { return }
+    open var allowsFontSubpixelQuantization: Bool {
+        get { _allowsFontSubpixelQuantization }
+        set {
+            guard _allowsFontSubpixelQuantization != newValue else { return }
+            _allowsFontSubpixelQuantization = newValue
             markDirty(.contents)
+            if Self.needsDisplay(forKey: "allowsFontSubpixelQuantization") { setNeedsDisplay() }
+        }
+    }
+
+    /// Returns whether a text-layer property change requires content redraw.
+    open override class func needsDisplay(forKey key: String) -> Bool {
+        switch key {
+        case "string", "font", "fontSize", "foregroundColor", "wrapped",
+             "truncationMode", "alignmentMode", "allowsFontSubpixelQuantization",
+             "style", "contentsScale":
+            return true
+        default:
+            return super.needsDisplay(forKey: key)
         }
     }
 
