@@ -3534,7 +3534,19 @@ func installHarness() {
                         layer.isHidden = wasHidden
                     }
                     engine.renderFrame()
-                    compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),maskBackdrop=\(maskBackdropEffectsAreRendered),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
+                    let invalidComposition = CALayer()
+                    invalidComposition.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                    invalidComposition.position = CGPoint(x: 20, y: 20)
+                    invalidComposition.compositingFilter = "unsupported"
+                    root.addSublayer(invalidComposition)
+                    engine.renderFrame()
+                    let typedFailure = renderer.lastCompositionFilterFailure
+                        == .unsupportedCompositingFilterValue(
+                            String(reflecting: String.self)
+                        )
+                    invalidComposition.removeFromSuperlayer()
+                    engine.renderFrame()
+                    compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),maskBackdrop=\(maskBackdropEffectsAreRendered),typed=\(typedFailure),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
                 } catch {
                     compositionProbeResult = "error: \(error)"
                 }

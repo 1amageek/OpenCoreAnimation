@@ -1514,6 +1514,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var compositionFilterFailureCount: Int = 0
 
+    /// The most recent typed backdrop-composition failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastCompositionFilterFailure: CACompositionFilterRenderFailure?
+
     @_spi(RendererDiagnostics)
     public var activeCompositionResourceCount: Int {
         compositionLayerResources.count
@@ -4533,6 +4537,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         capturesOnlyDeferredCompositionRasterizations = false
         failedCompositionKeys.removeAll(keepingCapacity: false)
         compositionFilterFailureCount = 0
+        lastCompositionFilterFailure = nil
 
         // Rasterization cache (R3.2 / R3.4)
         rasterizationCache?.removeAll()
@@ -9292,8 +9297,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 )
             }
             var prefixIsValid = true
-            let recordFailure: (LayerRenderKey) -> Void = { key in
+            let recordFailure: (
+                LayerRenderKey,
+                CACompositionFilterRenderFailure
+            ) -> Void = { key, failure in
                 failedKeys.insert(key)
+                self.lastCompositionFilterFailure = failure
                 if self.failedCompositionKeys.insert(key).inserted {
                     self.compositionFilterFailureCount += 1
                 }
@@ -9325,25 +9334,39 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 do {
                     backgroundStages = try layerFilterStages(from: requestedBackgroundFilters)
                 } catch {
-                    recordFailure(key)
+                    recordFailure(key, .backgroundFilterPlanningFailed(error))
                     continue
                 }
                 let compositionFilter: CIFilter
                 if let requestedFilter = presentation.compositingFilter as? CIFilter {
                     compositionFilter = requestedFilter
-                } else if presentation.compositingFilter != nil {
-                    recordFailure(key)
+                } else if let requestedFilter = presentation.compositingFilter {
+                    recordFailure(
+                        key,
+                        .unsupportedCompositingFilterValue(
+                            String(reflecting: type(of: requestedFilter))
+                        )
+                    )
                     continue
                 } else if let sourceOver = CIFilter(name: "CISourceOverCompositing") {
                     compositionFilter = sourceOver
                 } else {
-                    recordFailure(key)
+                    recordFailure(key, .defaultCompositingFilterUnavailable)
                     continue
                 }
-                guard prefixIsValid,
-                      processor.supports(compositionFilter, inputMode: .foregroundAndBackground),
-                      let source = prerenderedFilters[key] else {
-                    recordFailure(key)
+                guard prefixIsValid else {
+                    recordFailure(key, .invalidBackdropPrefix)
+                    continue
+                }
+                guard processor.supports(
+                    compositionFilter,
+                    inputMode: .foregroundAndBackground
+                ) else {
+                    recordFailure(key, .unsupportedCompositingFilter(compositionFilter.name))
+                    continue
+                }
+                guard let source = prerenderedFilters[key] else {
+                    recordFailure(key, .sourceCaptureUnavailable)
                     continue
                 }
 
@@ -9467,7 +9490,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                             outputView: resources.clippedSourceView,
                             encoder: encoder
                           ) else {
-                        recordFailure(key)
+                        recordFailure(key, .clipMaskFailed)
                         continue
                     }
                     premultipliedSourceTexture = resources.clippedSourceTexture
@@ -9484,14 +9507,17 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         uniformBuffer: resources.sourceOpacityUniformBuffer,
                         encoder: encoder
                     ) else {
-                        recordFailure(key)
+                        recordFailure(key, .sourceAdjustmentFailed)
                         continue
                     }
                     premultipliedSourceTexture = resources.sourcePremultipliedTexture
                 }
 
-                guard didReachTarget,
-                      applyAlphaConversion(
+                guard didReachTarget else {
+                    recordFailure(key, .backdropCaptureIncomplete)
+                    continue
+                }
+                guard applyAlphaConversion(
                         from: .premultiplied,
                         inputTexture: premultipliedSourceTexture,
                         outputView: resources.sourceStraightView,
@@ -9505,7 +9531,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         uniformBuffer: resources.backdropUniformBuffer,
                         encoder: encoder
                       ) else {
-                    recordFailure(key)
+                    recordFailure(key, .alphaConversionFailed)
                     continue
                 }
 
@@ -9517,13 +9543,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         inputView: resources.backdropStraightView,
                         resources: resources.backgroundFilterResources,
                         encoder: encoder
-                    ),
-                    renderBackdropFilterMask(
+                    ) else {
+                        recordFailure(key, .backgroundFilterExecutionFailed)
+                        continue
+                    }
+                    guard renderBackdropFilterMask(
                         for: compositionTarget,
                         resources: resources,
                         encoder: encoder
                     ) else {
-                        recordFailure(key)
+                        recordFailure(key, .backgroundFilterMaskFailed)
                         continue
                     }
                     var backgroundMaskView = resources.backdropMaskView
@@ -9548,7 +9577,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                                 outputView: resources.combinedBackdropMaskView,
                                 encoder: encoder
                               ) else {
-                            recordFailure(key)
+                            recordFailure(key, .backgroundFilterMaskFailed)
                             continue
                         }
                         backgroundMaskView = resources.combinedBackdropMaskView
@@ -9560,7 +9589,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         resources: resources,
                         encoder: encoder
                     ) else {
-                        recordFailure(key)
+                        recordFailure(key, .backgroundFilterMixFailed)
                         continue
                     }
                     compositionBackdropTexture = resources.mixedBackdropStraightTexture
@@ -9584,7 +9613,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         uniformBuffer: resources.resultConversionUniformBuffer,
                         encoder: encoder
                     ) else {
-                        recordFailure(key)
+                        recordFailure(key, .alphaConversionFailed)
                         continue
                     }
                     failedCompositionKeys.remove(key)
@@ -9597,7 +9626,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         )
                     )
                 } catch {
-                    recordFailure(key)
+                    recordFailure(key, .compositionExecutionFailed)
                 }
             }
 
