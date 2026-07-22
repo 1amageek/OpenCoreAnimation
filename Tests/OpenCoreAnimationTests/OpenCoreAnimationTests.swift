@@ -1304,6 +1304,133 @@ struct CAKeyframeAnimationTests {
         #expect(abs((layer.presentation()?.opacity ?? -.infinity) - 0.5) < 0.001)
     }
 
+    @Test("Cubic endpoint tangents extrapolate adjacent keyframe differences")
+    func cubicEndpointTangentsMatchQuartzCore() throws {
+        func animation(keyPath: String, values: [Any]) -> CAKeyframeAnimation {
+            let animation = CAKeyframeAnimation(keyPath: keyPath)
+            animation.values = values
+            animation.calculationMode = .cubic
+            animation.duration = 1
+            animation.speed = 0
+            animation.timeOffset = 0.75
+            return animation
+        }
+
+        let scalarLayer = CALayer()
+        scalarLayer.add(
+            animation(keyPath: "zPosition", values: [CGFloat(0), CGFloat(10), CGFloat(10)]),
+            forKey: "endpointScalar"
+        )
+        let pointLayer = CALayer()
+        pointLayer.add(
+            animation(
+                keyPath: "position",
+                values: [
+                    CGPoint(x: 0, y: 0),
+                    CGPoint(x: 10, y: 0),
+                    CGPoint(x: 10, y: 30),
+                ]
+            ),
+            forKey: "endpointPoint"
+        )
+
+        let scalar = try #require(scalarLayer.presentation()).zPosition
+        let point = try #require(pointLayer.presentation()).position
+        #expect(abs(scalar - 10.625) < 0.001)
+        #expect(abs(point.x - 10.625) < 0.001)
+        #expect(abs(point.y - 13.125) < 0.001)
+    }
+
+    @Test("Cubic endpoint tangents reach every interpolated value family")
+    func cubicEndpointTangentsReachValueFamilies() throws {
+        func animation(keyPath: String, values: [Any]) -> CAKeyframeAnimation {
+            let animation = CAKeyframeAnimation(keyPath: keyPath)
+            animation.values = values
+            animation.calculationMode = .cubic
+            animation.duration = 1
+            animation.speed = 0
+            animation.timeOffset = 0.75
+            return animation
+        }
+
+        let layer = CALayer()
+        layer.add(
+            animation(
+                keyPath: "backgroundColor",
+                values: [CGFloat(0), CGFloat(0.5), CGFloat(0.5)].map {
+                    CGColor(red: $0, green: 0, blue: 0, alpha: 1)
+                }
+            ),
+            forKey: "endpointColor"
+        )
+        layer.add(
+            animation(
+                keyPath: "bounds",
+                values: [
+                    CGRect(x: 0, y: 0, width: 10, height: 20),
+                    CGRect(x: 10, y: 0, width: 20, height: 20),
+                    CGRect(x: 10, y: 30, width: 20, height: 20),
+                ]
+            ),
+            forKey: "endpointRect"
+        )
+
+        let transformLayer = CALayer()
+        transformLayer.add(
+            animation(
+                keyPath: "transform",
+                values: [
+                    CATransform3DMakeTranslation(0, 0, 0),
+                    CATransform3DMakeTranslation(10, 0, 0),
+                    CATransform3DMakeTranslation(10, 30, 0),
+                ]
+            ),
+            forKey: "endpointTransform"
+        )
+
+        let gradientLayer = CAGradientLayer()
+        gradientLayer.add(
+            animation(
+                keyPath: "locations",
+                values: [
+                    [CGFloat(0), CGFloat(1)],
+                    [CGFloat(0.5), CGFloat(1.5)],
+                    [CGFloat(0.5), CGFloat(1.5)],
+                ]
+            ),
+            forKey: "endpointLocations"
+        )
+
+        let paths: [Any] = [CGFloat(0), CGFloat(10), CGFloat(10)].map { x in
+            let path = CGMutablePath()
+            path.addRect(CGRect(x: x, y: 0, width: 10, height: 10))
+            return path
+        }
+        let shapeLayer = CAShapeLayer()
+        shapeLayer.add(
+            animation(keyPath: "path", values: paths),
+            forKey: "endpointPath"
+        )
+
+        let presentation = try #require(layer.presentation())
+        let red = try #require(presentation.backgroundColor?.components?.first)
+        let transform = try #require(transformLayer.presentation()).transform
+        let gradientPresentation = try #require(gradientLayer.presentation())
+        let locations = try #require(gradientPresentation.locations)
+        let pathBounds = try #require(shapeLayer.presentation()?.path).boundingBox
+
+        #expect(abs(red - 0.53125) < 0.001)
+        #expect(abs(presentation.bounds.origin.x - 10.625) < 0.001)
+        #expect(abs(presentation.bounds.origin.y - 13.125) < 0.001)
+        #expect(abs(presentation.bounds.width - 20.625) < 0.001)
+        #expect(abs(transform.m41 - 10.625) < 0.001)
+        #expect(abs(transform.m42 - 13.125) < 0.001)
+        #expect(abs(locations[0] - 0.53125) < 0.001)
+        #expect(abs(locations[1] - 1.53125) < 0.001)
+        #expect(abs(pathBounds.minX - 10.625) < 0.001)
+        #expect(abs(pathBounds.width - 10) < 0.001)
+    }
+
     @Test("Cubic interpolation applies to colors and rectangles")
     func cubicInterpolationAppliesToValueFamilies() {
         let layer = CALayer()

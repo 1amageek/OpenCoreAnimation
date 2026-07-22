@@ -1486,10 +1486,10 @@ func installHarness() {
                     return layer
                 }
 
-                func configure(_ animation: CAAnimation) {
+                func configure(_ animation: CAAnimation, timeOffset: CFTimeInterval = 0.5) {
                     animation.duration = 1
                     animation.speed = 0
-                    animation.timeOffset = 0.5
+                    animation.timeOffset = timeOffset
                     animation.fillMode = .both
                     animation.isRemovedOnCompletion = false
                 }
@@ -1537,6 +1537,21 @@ func installHarness() {
                 ]
                 configure(valueFunction)
                 valueFunctionLayer.add(valueFunction, forKey: "browserValueFunction")
+
+                let cubicEndpointLayer = makeLayer(
+                    position: CGPoint(x: 40, y: 100),
+                    size: CGSize(width: 20, height: 20),
+                    color: CGColor(red: 0, green: 1, blue: 1, alpha: 1)
+                )
+                let cubicEndpoint = CAKeyframeAnimation(keyPath: "position")
+                cubicEndpoint.values = [
+                    CGPoint(x: 40, y: 100),
+                    CGPoint(x: 80, y: 100),
+                    CGPoint(x: 80, y: 160),
+                ]
+                cubicEndpoint.calculationMode = .cubic
+                configure(cubicEndpoint, timeOffset: 0.75)
+                cubicEndpointLayer.add(cubicEndpoint, forKey: "browserCubicEndpoint")
                 CATransaction.commit()
 
                 @MainActor
@@ -1545,6 +1560,7 @@ func installHarness() {
                     scaleLayer.removeFromSuperlayer()
                     rotationLayer.removeFromSuperlayer()
                     valueFunctionLayer.removeFromSuperlayer()
+                    cubicEndpointLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
@@ -1556,7 +1572,8 @@ func installHarness() {
                 guard let translationPresentation = translationLayer.presentation(),
                       let scalePresentation = scaleLayer.presentation(),
                       let rotationPresentation = rotationLayer.presentation(),
-                      let valueFunctionPresentation = valueFunctionLayer.presentation() else {
+                      let valueFunctionPresentation = valueFunctionLayer.presentation(),
+                      let cubicEndpointPresentation = cubicEndpointLayer.presentation() else {
                     restoreScene()
                     transformComponentProbeResult = "error: presentation unavailable"
                     return
@@ -1568,6 +1585,8 @@ func installHarness() {
                     && abs(rotationPresentation.transform.m12 - sqrt(0.5)) < 0.001
                     && abs(valueFunctionPresentation.transform.m11 - 1) < 0.001
                     && abs(valueFunctionPresentation.transform.m41 - 20) < 0.001
+                    && abs(cubicEndpointPresentation.position.x - 82.5) < 0.001
+                    && abs(cubicEndpointPresentation.position.y - 126.25) < 0.001
 
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
@@ -1578,6 +1597,8 @@ func installHarness() {
                         CGPoint(x: 275, y: 150),
                         CGPoint(x: 330, y: 150),
                         CGPoint(x: 350, y: 150),
+                        CGPoint(x: 40, y: 100),
+                        CGPoint(x: 83, y: 174),
                     ])
                     restoreScene()
                     transformComponentProbeResult = pixels

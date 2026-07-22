@@ -2280,7 +2280,9 @@ open class CALayer: CAMediaTiming, Hashable {
                     p2: values[i + 1],
                     p3: values[p3Index],
                     startParameters: cubicParameters(for: animation, at: i),
-                    endParameters: cubicParameters(for: animation, at: i + 1)
+                    endParameters: cubicParameters(for: animation, at: i + 1),
+                    isFirstSegment: i == 0,
+                    isLastSegment: i + 1 == values.count - 1
                 )
             } else {
                 distance = calculateDistance(from: values[i], to: values[i + 1])
@@ -2354,7 +2356,9 @@ open class CALayer: CAMediaTiming, Hashable {
         p2: Any,
         p3: Any,
         startParameters: CubicParameters,
-        endParameters: CubicParameters
+        endParameters: CubicParameters,
+        isFirstSegment: Bool,
+        isLastSegment: Bool
     ) -> CGFloat {
         // Sample the curve at multiple points and sum the chord lengths.
         let numSamples = 10
@@ -2367,7 +2371,9 @@ open class CALayer: CAMediaTiming, Hashable {
             p3: p3,
             t: 0,
             startParameters: startParameters,
-            endParameters: endParameters
+            endParameters: endParameters,
+            isFirstSegment: isFirstSegment,
+            isLastSegment: isLastSegment
         ) else {
             // Fallback to linear distance
             return calculateDistance(from: p1, to: p2)
@@ -2384,7 +2390,9 @@ open class CALayer: CAMediaTiming, Hashable {
                 p3: p3,
                 t: t,
                 startParameters: startParameters,
-                endParameters: endParameters
+                endParameters: endParameters,
+                isFirstSegment: isFirstSegment,
+                isLastSegment: isLastSegment
             ) else {
                 return calculateDistance(from: p1, to: p2)
             }
@@ -2415,12 +2423,12 @@ open class CALayer: CAMediaTiming, Hashable {
 
         func components(at progress: CGFloat) -> [CGFloat] {
             c0.indices.map { index in
-                let previous = isFirstSegment ? 2 * c1[index] - c2[index] : c0[index]
-                let following = isLastSegment ? 2 * c2[index] - c1[index] : c3[index]
                 return cubicInterpolate(
-                    previous, c1[index], c2[index], following, progress,
+                    c0[index], c1[index], c2[index], c3[index], progress,
                     startParameters: startParameters,
-                    endParameters: endParameters
+                    endParameters: endParameters,
+                    isFirstSegment: isFirstSegment,
+                    isLastSegment: isLastSegment
                 )
             }
         }
@@ -2451,18 +2459,24 @@ open class CALayer: CAMediaTiming, Hashable {
         p3: Any,
         t: CGFloat,
         startParameters: CubicParameters,
-        endParameters: CubicParameters
+        endParameters: CubicParameters,
+        isFirstSegment: Bool,
+        isLastSegment: Bool
     ) -> (x: CGFloat, y: CGFloat)? {
         if let v0 = p0 as? CGPoint, let v1 = p1 as? CGPoint, let v2 = p2 as? CGPoint, let v3 = p3 as? CGPoint {
             let x = cubicInterpolate(
                 v0.x, v1.x, v2.x, v3.x, t,
                 startParameters: startParameters,
-                endParameters: endParameters
+                endParameters: endParameters,
+                isFirstSegment: isFirstSegment,
+                isLastSegment: isLastSegment
             )
             let y = cubicInterpolate(
                 v0.y, v1.y, v2.y, v3.y, t,
                 startParameters: startParameters,
-                endParameters: endParameters
+                endParameters: endParameters,
+                isFirstSegment: isFirstSegment,
+                isLastSegment: isLastSegment
             )
             return (x, y)
         }
@@ -3039,12 +3053,12 @@ open class CALayer: CAMediaTiming, Hashable {
                 return
             }
             let components = c0.indices.map { index in
-                let previous = isFirstSegment ? 2 * c1[index] - c2[index] : c0[index]
-                let following = isLastSegment ? 2 * c2[index] - c1[index] : c3[index]
                 return cubicInterpolate(
-                    previous, c1[index], c2[index], following, t,
+                    c0[index], c1[index], c2[index], c3[index], t,
                     startParameters: startParameters,
-                    endParameters: endParameters
+                    endParameters: endParameters,
+                    isFirstSegment: isFirstSegment,
+                    isLastSegment: isLastSegment
                 )
             }
             guard let transform = valueFunction.transform(for: components) else { return }
@@ -3058,7 +3072,9 @@ open class CALayer: CAMediaTiming, Hashable {
             p3: p3,
             t: t,
             startParameters: startParameters,
-            endParameters: endParameters
+            endParameters: endParameters,
+            isFirstSegment: isFirstSegment,
+            isLastSegment: isLastSegment
         ) else {
             return
         }
@@ -3078,13 +3094,17 @@ open class CALayer: CAMediaTiming, Hashable {
         p3: Any,
         t: CGFloat,
         startParameters: CubicParameters,
-        endParameters: CubicParameters
+        endParameters: CubicParameters,
+        isFirstSegment: Bool,
+        isLastSegment: Bool
     ) -> Any? {
         func scalar(_ v0: CGFloat, _ v1: CGFloat, _ v2: CGFloat, _ v3: CGFloat) -> CGFloat {
             cubicInterpolate(
                 v0, v1, v2, v3, t,
                 startParameters: startParameters,
-                endParameters: endParameters
+                endParameters: endParameters,
+                isFirstSegment: isFirstSegment,
+                isLastSegment: isLastSegment
             )
         }
 
@@ -3153,7 +3173,9 @@ open class CALayer: CAMediaTiming, Hashable {
             return cubicTransform(
                 v0, v1, v2, v3, t,
                 startParameters: startParameters,
-                endParameters: endParameters
+                endParameters: endParameters,
+                isFirstSegment: isFirstSegment,
+                isLastSegment: isLastSegment
             )
         }
         if let v0 = extractColor(p0),
@@ -3199,7 +3221,9 @@ open class CALayer: CAMediaTiming, Hashable {
                     p3: v3[index],
                     t: t,
                     startParameters: startParameters,
-                    endParameters: endParameters
+                    endParameters: endParameters,
+                    isFirstSegment: isFirstSegment,
+                    isLastSegment: isLastSegment
                 ) as? CGColor else {
                     return nil
                 }
@@ -3214,7 +3238,9 @@ open class CALayer: CAMediaTiming, Hashable {
             return cubicPath(
                 v0, v1, v2, v3, t,
                 startParameters: startParameters,
-                endParameters: endParameters
+                endParameters: endParameters,
+                isFirstSegment: isFirstSegment,
+                isLastSegment: isLastSegment
             )
         }
         return nil
@@ -3227,17 +3253,21 @@ open class CALayer: CAMediaTiming, Hashable {
         _ p3: CGFloat,
         _ t: CGFloat,
         startParameters: CubicParameters,
-        endParameters: CubicParameters
+        endParameters: CubicParameters,
+        isFirstSegment: Bool = false,
+        isLastSegment: Bool = false
     ) -> CGFloat {
+        let previous = isFirstSegment ? 2 * p1 - p2 : p0
+        let following = isLastSegment ? 2 * p2 - p1 : p3
         let startScale = 0.5 * (1 - startParameters.tension)
         let outgoing = startScale * (
-            (1 + startParameters.continuity) * (1 + startParameters.bias) * (p1 - p0)
+            (1 + startParameters.continuity) * (1 + startParameters.bias) * (p1 - previous)
                 + (1 - startParameters.continuity) * (1 - startParameters.bias) * (p2 - p1)
         )
         let endScale = 0.5 * (1 - endParameters.tension)
         let incoming = endScale * (
             (1 - endParameters.continuity) * (1 + endParameters.bias) * (p2 - p1)
-                + (1 + endParameters.continuity) * (1 - endParameters.bias) * (p3 - p2)
+                + (1 + endParameters.continuity) * (1 - endParameters.bias) * (following - p2)
         )
         let t2 = t * t
         let t3 = t2 * t
@@ -3255,13 +3285,17 @@ open class CALayer: CAMediaTiming, Hashable {
         _ p3: CATransform3D,
         _ t: CGFloat,
         startParameters: CubicParameters,
-        endParameters: CubicParameters
+        endParameters: CubicParameters,
+        isFirstSegment: Bool,
+        isLastSegment: Bool
     ) -> CATransform3D {
         func scalar(_ v0: CGFloat, _ v1: CGFloat, _ v2: CGFloat, _ v3: CGFloat) -> CGFloat {
             cubicInterpolate(
                 v0, v1, v2, v3, t,
                 startParameters: startParameters,
-                endParameters: endParameters
+                endParameters: endParameters,
+                isFirstSegment: isFirstSegment,
+                isLastSegment: isLastSegment
             )
         }
         return CATransform3D(
@@ -3291,7 +3325,9 @@ open class CALayer: CAMediaTiming, Hashable {
         _ p3: CGPath,
         _ t: CGFloat,
         startParameters: CubicParameters,
-        endParameters: CubicParameters
+        endParameters: CubicParameters,
+        isFirstSegment: Bool,
+        isLastSegment: Bool
     ) -> CGPath? {
         let elements0 = pathElements(p0)
         let elements1 = pathElements(p1)
@@ -3326,7 +3362,9 @@ open class CALayer: CAMediaTiming, Hashable {
                         e3.points[pointIndex].x,
                         t,
                         startParameters: startParameters,
-                        endParameters: endParameters
+                        endParameters: endParameters,
+                        isFirstSegment: isFirstSegment,
+                        isLastSegment: isLastSegment
                     ),
                     y: cubicInterpolate(
                         e0.points[pointIndex].y,
@@ -3335,7 +3373,9 @@ open class CALayer: CAMediaTiming, Hashable {
                         e3.points[pointIndex].y,
                         t,
                         startParameters: startParameters,
-                        endParameters: endParameters
+                        endParameters: endParameters,
+                        isFirstSegment: isFirstSegment,
+                        isLastSegment: isLastSegment
                     )
                 )
             }
