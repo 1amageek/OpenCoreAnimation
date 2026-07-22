@@ -7217,6 +7217,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     textureConversionError = error
                     return nil
                 } catch {
+                    textureConversionError = .conversionFailed
                     return nil
                 }
             }
@@ -13123,6 +13124,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     textureConversionError = error
                     return nil
                 } catch {
+                    textureConversionError = .conversionFailed
                     return nil
                 }
             }
@@ -13512,6 +13514,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     textureConversionError = error
                     return nil
                 } catch {
+                    textureConversionError = .conversionFailed
                     return nil
                 }
             }
