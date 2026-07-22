@@ -122,12 +122,6 @@ public enum CAWebGPUShaders {
         return output;
     }
 
-    // Signed distance function for a rounded rectangle with uniform radius
-    fn sdRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, radius: f32) -> f32 {
-        let q = abs(p) - halfSize + radius;
-        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
-    }
-
     // Signed distance function for a rounded rectangle with per-corner radii
     // radii: (minXminY, maxXminY, minXmaxY, maxXmaxY) - corresponds to CACornerMask corners
     // In screen space with texCoord centered (Y-up coordinate system):
@@ -161,7 +155,13 @@ public enum CAWebGPUShaders {
         r = min(r, maxRadius);
 
         let q = abs(p) - halfSize + r;
-        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        let outside = max(q, vec2<f32>(0.0));
+        let exponent = max(uniforms.edgeAntialiasingParameters.y, 1.0);
+        let curveLength = pow(
+            pow(outside.x, exponent) + pow(outside.y, exponent),
+            1.0 / exponent
+        );
+        return curveLength + min(max(q.x, q.y), 0.0) - r;
     }
 
     // Check if all corner radii are the same (for optimization)
@@ -402,7 +402,7 @@ public enum CAWebGPUShaders {
         cornerRadii: vec4<f32>,
         samplingBias: f32,
         edgeAntialiasingMask: f32,
-        padding1: f32,
+        cornerCurveExponent: f32,
         padding2: f32,
     }
 
@@ -474,7 +474,13 @@ public enum CAWebGPUShaders {
         let maxRadius = min(halfSize.x, halfSize.y);
         r = min(r, maxRadius);
         let q = abs(p) - halfSize + r;
-        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        let outside = max(q, vec2<f32>(0.0));
+        let exponent = max(uniforms.cornerCurveExponent, 1.0);
+        let curveLength = pow(
+            pow(outside.x, exponent) + pow(outside.y, exponent),
+            1.0 / exponent
+        );
+        return curveLength + min(max(q.x, q.y), 0.0) - r;
     }
 
     // Get effective corner radii
@@ -626,8 +632,16 @@ public enum CAWebGPUShaders {
         opacity: f32,
         cornerRadius: f32,
         layerSize: vec2<f32>,
+        borderWidth: f32,
+        renderMode: f32,
+        gradientStartPoint: vec2<f32>,
+        gradientEndPoint: vec2<f32>,
+        gradientColorCount: f32,
+        edgeAntialiasingParameters: vec3<f32>,
         // Per-corner radii: (minXminY, maxXminY, minXmaxY, maxXmaxY)
         cornerRadii: vec4<f32>,
+        gradientColorMultiplier: vec4<f32>,
+        gradientStopOffset: f32,
     }
 
     @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -661,7 +675,13 @@ public enum CAWebGPUShaders {
         }
         r = min(r, min(halfSize.x, halfSize.y));
         let q = abs(p) - halfSize + r;
-        return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        let outside = max(q, vec2<f32>(0.0));
+        let exponent = max(uniforms.edgeAntialiasingParameters.y, 1.0);
+        let curveLength = pow(
+            pow(outside.x, exponent) + pow(outside.y, exponent),
+            1.0 / exponent
+        );
+        return curveLength + min(max(q.x, q.y), 0.0) - r;
     }
 
     fn getEffectiveRadii() -> vec4<f32> {

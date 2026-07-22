@@ -468,6 +468,7 @@ private struct ShadowCaptureState: Equatable {
     let layerSize: SIMD2<Float>
     let cornerRadius: Float
     let cornerRadii: SIMD4<Float>
+    let cornerCurveExponent: Float
     let blurRadius: Float
     let detachedMaskRevisionHash: Int
 
@@ -476,6 +477,7 @@ private struct ShadowCaptureState: Equatable {
         layerSize: SIMD2<Float>,
         cornerRadius: Float,
         cornerRadii: SIMD4<Float>,
+        cornerCurveExponent: Float,
         blurRadius: Float,
         detachedMaskRevisionHash: Int
     ) {
@@ -488,6 +490,7 @@ private struct ShadowCaptureState: Equatable {
         self.layerSize = layerSize
         self.cornerRadius = cornerRadius
         self.cornerRadii = cornerRadii
+        self.cornerCurveExponent = cornerCurveExponent
         self.blurRadius = blurRadius
         self.detachedMaskRevisionHash = detachedMaskRevisionHash
     }
@@ -827,6 +830,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     /// Number of gradient draws rejected because their configuration was invalid.
     @_spi(RendererDiagnostics)
     public private(set) var gradientRenderFailureCount: Int = 0
+
+    /// Number of layers rejected because their requested corner curve is unsupported.
+    @_spi(RendererDiagnostics)
+    public private(set) var cornerCurveRenderFailureCount: Int = 0
 
     /// Number of shape-fill draw calls encoded in the latest frame.
     @_spi(RendererDiagnostics)
@@ -4093,6 +4100,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         shadowRenderFailureCount = 0
         shapeRenderFailureCount = 0
         gradientRenderFailureCount = 0
+        cornerCurveRenderFailureCount = 0
         shapeFillDrawCount = 0
         shapeFillVertexCount = 0
         rasterizationFailureCount = 0
@@ -4325,6 +4333,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         // Skip hidden layers (using presentation layer values)
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
+        if presentationLayer.cornerRadius > 0,
+           presentationLayer.cornerCurveRenderExponent == nil {
+            cornerCurveRenderFailureCount += 1
+            return
+        }
 
         let currentRenderKey = renderKey(for: layer)
         if compositionCaptureDidReachStop {
@@ -4450,14 +4463,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let hasMask = presentationLayer.mask != nil
             && contentMaskCaptureSuppressedRootLayer !== layer
             && !hasPreparedContentMask
+        var didApplyContentMask = false
         if hasMask, let maskLayer = presentationLayer.mask {
             // Render mask to stencil buffer
-            renderMaskToStencil(maskLayer, renderPass: renderPass, parentMatrix: modelMatrix)
+            didApplyContentMask = renderMaskToStencil(
+                maskLayer,
+                renderPass: renderPass,
+                parentMatrix: modelMatrix
+            )
         }
         defer {
-            if hasMask {
+            if didApplyContentMask {
                 clearStencilMask(renderPass: renderPass)
             }
+        }
+        if hasMask && !didApplyContentMask {
+            // A requested mask is part of the layer's rendering contract.
+            // Never fall through to an unmasked draw when stencil generation fails.
+            return
         }
 
         // Render shadow before layer content. Filters apply to the layer subtree capture, but
@@ -4616,6 +4639,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             // Apply masksToBounds clipping if enabled
             let shouldClip = presentationLayer.masksToBounds
             let useStencilClip = shouldClip && presentationLayer.cornerRadius > 0
+            var didApplyRoundedClip = false
             if shouldClip {
                 // Scissor rect for axis-aligned rectangular clipping (always applied as optimization)
                 let layerClipRect = calculateClipRect(layer: presentationLayer, modelMatrix: modelMatrix)
@@ -4625,8 +4649,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
                 // Rounded corner clipping via stencil buffer (only when cornerRadius > 0)
                 if useStencilClip {
-                    renderRoundedRectToStencil(presentationLayer, renderPass: renderPass,
-                                               modelMatrix: modelMatrix, device: device)
+                    didApplyRoundedClip = renderRoundedRectToStencil(
+                        presentationLayer,
+                        renderPass: renderPass,
+                        modelMatrix: modelMatrix,
+                        device: device
+                    )
+                    if !didApplyRoundedClip {
+                        _ = clipRectStack.popLast()
+                        applyScissorRect(renderPass)
+                        return
+                    }
                 }
             }
 
@@ -4651,7 +4684,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
             // Restore clipping state
             if shouldClip {
-                if useStencilClip {
+                if didApplyRoundedClip {
                     clearStencilMask(renderPass: renderPass)
                 }
                 _ = clipRectStack.popLast()
@@ -5392,6 +5425,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadius: Float(presentationLayer.cornerRadius),
             layerSize: SIMD2<Float>(Float(presentationLayer.bounds.width), Float(presentationLayer.bounds.height)),
             edgeAntialiasingMask: presentationLayer.edgeAntialiasingMaskValue,
+            cornerCurveExponent: presentationLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent),
             cornerRadii: presentationLayer.cornerRadiiComponents
         )
 
@@ -5461,6 +5495,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             borderWidth: Float(presentationLayer.borderWidth),
             renderMode: 1.0,  // Border mode
             edgeAntialiasingMask: presentationLayer.edgeAntialiasingMaskValue,
+            cornerCurveExponent: presentationLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent),
             cornerRadii: presentationLayer.cornerRadiiComponents
         )
 
@@ -5515,22 +5550,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         _ maskLayer: CALayer,
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
-    ) {
+    ) -> Bool {
         guard let device = device,
               let stencilWritePipeline = stencilWritePipeline,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup else { return }
+              let bindGroup = bindGroup else { return false }
 
-        // Increment stencil reference for nested masks
-        currentStencilValue += 1
-
-        // Switch to stencil write pipeline
-        renderPass.setPipeline(stencilWritePipeline)
-        renderPass.setStencilReference(currentStencilValue)
+        // Validate before mutating the stencil state. A failed mask must not clear
+        // or decrement an enclosing mask when the caller unwinds.
+        let maskPresentationLayer = renderPresentation(for: maskLayer)
+        guard maskPresentationLayer.cornerRadius <= 0
+                || maskPresentationLayer.cornerCurveRenderExponent != nil else {
+            cornerCurveRenderFailureCount += 1
+            return false
+        }
 
         // Render the mask layer (this writes to stencil buffer)
-        let maskPresentationLayer = renderPresentation(for: maskLayer)
         let maskModelMatrix = maskPresentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
         // Render mask layer content to stencil - use dynamic vertex allocation
@@ -5544,8 +5580,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: maskColor),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        guard let allocation = allocateVertices(count: vertices.count) else { return false }
         let (vertexOffset, layerIndex) = allocation
+
+        // Mutate stencil state only after every CPU-side prerequisite succeeds.
+        currentStencilValue += 1
+        renderPass.setPipeline(stencilWritePipeline)
+        renderPass.setStencilReference(currentStencilValue)
 
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(Float(maskPresentationLayer.bounds.width), 0, 0, 0),
@@ -5561,6 +5602,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             opacity: 1.0,  // Full opacity for stencil write
             cornerRadius: Float(maskPresentationLayer.cornerRadius),
             layerSize: SIMD2<Float>(Float(maskPresentationLayer.bounds.width), Float(maskPresentationLayer.bounds.height)),
+            cornerCurveExponent: maskPresentationLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent),
             cornerRadii: maskPresentationLayer.cornerRadiiComponents
         )
 
@@ -5579,6 +5621,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             renderPass.setPipeline(stencilTestPipeline)
         }
         maskNestingDepth += 1
+        return true
     }
 
     /// Clears the stencil mask after layer rendering is complete.
@@ -5617,17 +5660,16 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4,
         device: GPUDevice
-    ) {
+    ) -> Bool {
         guard let stencilWriteRoundedPipeline = stencilWriteRoundedPipeline,
               let stencilTestPipeline = stencilTestPipeline,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup else { return }
-
-        currentStencilValue += 1
-
-        renderPass.setPipeline(stencilWriteRoundedPipeline)
-        renderPass.setStencilReference(currentStencilValue)
+              let bindGroup = bindGroup else { return false }
+        guard layer.cornerCurveRenderExponent != nil else {
+            cornerCurveRenderFailureCount += 1
+            return false
+        }
 
         // Build transform that maps the unit quad to the layer bounds
         let scaleMatrix = Matrix4x4(columns: (
@@ -5649,15 +5691,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        guard let allocation = allocateVertices(count: vertices.count) else { return false }
         let (vertexOffset, layerIndex) = allocation
+
+        // Mutate stencil state only after every CPU-side prerequisite succeeds.
+        currentStencilValue += 1
+        renderPass.setPipeline(stencilWriteRoundedPipeline)
+        renderPass.setStencilReference(currentStencilValue)
 
         // Set uniforms with corner radius info for SDF calculation in the shader
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
             opacity: 1.0,
             cornerRadius: Float(layer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(layer.bounds.width), Float(layer.bounds.height))
+            layerSize: SIMD2<Float>(Float(layer.bounds.width), Float(layer.bounds.height)),
+            cornerCurveExponent: layer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent)
         )
 
         uniforms.cornerRadii = layer.cornerRadiiComponents
@@ -5677,6 +5725,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         maskNestingDepth += 1
         renderPass.setPipeline(stencilTestPipeline)
         renderPass.setStencilReference(currentStencilValue)
+        return true
     }
 
     // MARK: - Replicator Layer Rendering
@@ -6115,6 +6164,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Apple's spec: contents are only clipped to cornerRadius when masksToBounds == true.
         let effectiveCornerRadius: Float = layer.masksToBounds ? Float(layer.cornerRadius) : 0
         let effectiveCornerRadii: SIMD4<Float> = layer.masksToBounds ? layer.cornerRadiiComponents : .zero
+        let effectiveCornerCurveExponent = layer.masksToBounds
+            ? (layer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent))
+            : Float(CornerCurveRenderConfiguration.circularExponent)
 
         // Create uniforms (shared for all 9 patches)
         var uniforms = TexturedUniforms(
@@ -6123,7 +6175,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
             cornerRadii: effectiveCornerRadii,
-            edgeAntialiasingMask: layer.edgeAntialiasingMaskValue
+            edgeAntialiasingMask: layer.edgeAntialiasingMaskValue,
+            cornerCurveExponent: effectiveCornerCurveExponent
         )
 
         let white = currentReplicatorColor
@@ -6335,6 +6388,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Without this gate, images would always be corner-clipped, diverging from CoreAnimation.
         let effectiveCornerRadius: Float = layer.masksToBounds ? Float(layer.cornerRadius) : 0
         let effectiveCornerRadii: SIMD4<Float> = layer.masksToBounds ? layer.cornerRadiiComponents : .zero
+        let effectiveCornerCurveExponent = layer.masksToBounds
+            ? (layer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent))
+            : Float(CornerCurveRenderConfiguration.circularExponent)
 
         // Create uniforms for textured rendering
         var uniforms = TexturedUniforms(
@@ -6343,7 +6399,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
             cornerRadii: effectiveCornerRadii,
-            edgeAntialiasingMask: layer.edgeAntialiasingMaskValue
+            edgeAntialiasingMask: layer.edgeAntialiasingMaskValue,
+            cornerCurveExponent: effectiveCornerCurveExponent
         )
 
         // Write uniforms
@@ -6986,6 +7043,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Apple's spec: text contents are only clipped to cornerRadius when masksToBounds == true.
         let effectiveCornerRadius: Float = textLayer.masksToBounds ? Float(textLayer.cornerRadius) : 0
         let effectiveCornerRadii: SIMD4<Float> = textLayer.masksToBounds ? textLayer.cornerRadiiComponents : .zero
+        let effectiveCornerCurveExponent = textLayer.masksToBounds
+            ? (textLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent))
+            : Float(CornerCurveRenderConfiguration.circularExponent)
 
         // Update uniforms
         var uniforms = TexturedUniforms(
@@ -6994,7 +7054,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(width), Float(height)),
             cornerRadii: effectiveCornerRadii,
-            edgeAntialiasingMask: textLayer.edgeAntialiasingMaskValue
+            edgeAntialiasingMask: textLayer.edgeAntialiasingMaskValue,
+            cornerCurveExponent: effectiveCornerCurveExponent
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -7563,6 +7624,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             gradientColorMultiplier: currentReplicatorColor,
             gradientStopOffset: Float(stopBinding.stopOffset),
             edgeAntialiasingMask: gradientLayer.edgeAntialiasingMaskValue,
+            cornerCurveExponent: gradientLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent),
             cornerRadii: gradientLayer.cornerRadiiComponents
         )
 
@@ -7691,6 +7753,14 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             let shadowLayer = target.layer
             let shadowRenderKey = target.renderKey
             activeRenderKeys.insert(shadowRenderKey)
+            let presentationLayer = target.presentationLayer
+            guard presentationLayer.cornerRadius <= 0
+                    || presentationLayer.cornerCurveRenderExponent != nil else {
+                // The main traversal records the diagnostic exactly once and
+                // rejects the layer. Do not populate a cache with a circular
+                // fallback before that rejection occurs.
+                continue
+            }
 
             let resources: ShadowLayerResources
             if let existing = shadowLayerResources[shadowRenderKey] {
@@ -7705,7 +7775,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 shadowLayerResources[shadowRenderKey] = resources
             }
 
-            let presentationLayer = target.presentationLayer
             // Capture the silhouette at the layer's actual position. The display
             // shader applies `shadowOffset` uniformly for raw, filtered, masked,
             // and explicit-path silhouettes.
@@ -7716,12 +7785,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             )
             let cornerRadius = Float(presentationLayer.cornerRadius)
             let cornerRadii = presentationLayer.cornerRadiiComponents
+            let cornerCurveExponent = presentationLayer.cornerCurveRenderExponent
+                ?? Float(CornerCurveRenderConfiguration.circularExponent)
             let blurRadius = max(0, Float(presentationLayer.shadowRadius)) * 0.5
             let captureState = ShadowCaptureState(
                 matrix: finalMatrix,
                 layerSize: layerSize,
                 cornerRadius: cornerRadius,
                 cornerRadii: cornerRadii,
+                cornerCurveExponent: cornerCurveExponent,
                 blurRadius: blurRadius,
                 detachedMaskRevisionHash: shadowDetachedMaskRevisionHash(
                     of: shadowLayer
@@ -7753,6 +7825,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     opacity: 1,
                     cornerRadius: cornerRadius,
                     layerSize: layerSize,
+                    cornerCurveExponent: cornerCurveExponent,
                     cornerRadii: cornerRadii
                 )
                 let maskUniformData = createFloat32Array(from: &maskUniforms)
@@ -8525,6 +8598,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let presentation = target.presentationLayer
         let bounds = presentation.bounds
         guard bounds.width > 0, bounds.height > 0 else { return false }
+        guard presentation.cornerRadius <= 0
+                || presentation.cornerCurveRenderExponent != nil else {
+            return false
+        }
 
         let modelMatrix = presentation.modelMatrix(parentMatrix: target.parentMatrix)
         let scaleMatrix = Matrix4x4(columns: (
@@ -8538,6 +8615,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             opacity: 1,
             cornerRadius: Float(presentation.cornerRadius),
             layerSize: SIMD2<Float>(Float(bounds.width), Float(bounds.height)),
+            cornerCurveExponent: presentation.cornerCurveRenderExponent
+                ?? Float(CornerCurveRenderConfiguration.circularExponent),
             cornerRadii: presentation.cornerRadiiComponents
         )
         device.queue.writeBuffer(

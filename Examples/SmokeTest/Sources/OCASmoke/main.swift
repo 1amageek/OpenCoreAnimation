@@ -57,6 +57,7 @@ nonisolated(unsafe) var compositionProbeResult: String = "pending"
 nonisolated(unsafe) var transformDepthProbeResult: String = "pending"
 nonisolated(unsafe) var shapeFillRuleProbeResult: String = "pending"
 nonisolated(unsafe) var gradientTypeProbeResult: String = "pending"
+nonisolated(unsafe) var cornerCurveProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -182,6 +183,7 @@ public func setup() {
             transformDepthProbeResult = "pending"
             shapeFillRuleProbeResult = "pending"
             gradientTypeProbeResult = "pending"
+            cornerCurveProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -409,6 +411,9 @@ func installHarness() {
         })
         h.expose("getGradientTypeProbeResult", returning: {
             .string(gradientTypeProbeResult)
+        })
+        h.expose("getCornerCurveProbeResult", returning: {
+            .string(cornerCurveProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -4559,6 +4564,171 @@ func installHarness() {
                 conic.removeFromSuperlayer()
                 unsupported.removeFromSuperlayer()
                 manyStops.removeFromSuperlayer()
+                CAAnimationEngine.shared.renderFrame()
+            }
+        })
+        h.expose("beginCornerCurveProbe", action: {
+            Task { @MainActor in
+                guard let root = rootLayerRef,
+                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                    cornerCurveProbeResult = "error: renderer unavailable"
+                    return
+                }
+
+                let imageData = Data([0, 0, 255, 255])
+                guard let blueImage = CGImage(
+                    width: 1,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: 4,
+                    space: .deviceRGB,
+                    bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                    provider: CGDataProvider(data: imageData),
+                    decode: nil,
+                    shouldInterpolate: false,
+                    intent: .defaultIntent
+                ) else {
+                    cornerCurveProbeResult = "error: probe image unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+
+                func makeRoundedLayer(
+                    position: CGPoint,
+                    color: CGColor,
+                    curve: CALayerCornerCurve
+                ) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                    layer.position = position
+                    layer.backgroundColor = color
+                    layer.cornerRadius = 30
+                    layer.cornerCurve = curve
+                    layer.zPosition = 100
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                let circular = makeRoundedLayer(
+                    position: CGPoint(x: 50, y: 100),
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                    curve: .circular
+                )
+                let continuous = makeRoundedLayer(
+                    position: CGPoint(x: 130, y: 100),
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+                    curve: .continuous
+                )
+
+                let textured = CALayer()
+                textured.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                textured.position = CGPoint(x: 210, y: 100)
+                textured.contents = blueImage
+                textured.cornerRadius = 30
+                textured.cornerCurve = .continuous
+                textured.masksToBounds = true
+                textured.zPosition = 100
+                root.addSublayer(textured)
+
+                let clipped = CALayer()
+                clipped.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                clipped.position = CGPoint(x: 290, y: 100)
+                clipped.cornerRadius = 30
+                clipped.cornerCurve = .continuous
+                clipped.masksToBounds = true
+                clipped.zPosition = 100
+                let clippedChild = CALayer()
+                clippedChild.frame = clipped.bounds
+                clippedChild.backgroundColor = CGColor(red: 1, green: 1, blue: 0, alpha: 1)
+                clipped.addSublayer(clippedChild)
+                root.addSublayer(clipped)
+
+                let gradient = CAGradientLayer()
+                gradient.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                gradient.position = CGPoint(x: 70, y: 200)
+                gradient.colors = [
+                    CGColor(red: 1, green: 0, blue: 1, alpha: 1),
+                    CGColor(red: 1, green: 0, blue: 1, alpha: 1),
+                ]
+                gradient.cornerRadius = 30
+                gradient.cornerCurve = .continuous
+                gradient.zPosition = 100
+                root.addSublayer(gradient)
+
+                let masked = CALayer()
+                masked.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                masked.position = CGPoint(x: 150, y: 200)
+                masked.backgroundColor = CGColor(red: 0, green: 1, blue: 1, alpha: 1)
+                masked.zPosition = 100
+                let contentMask = CALayer()
+                contentMask.frame = masked.bounds
+                contentMask.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                contentMask.cornerRadius = 30
+                contentMask.cornerCurve = .continuous
+                masked.mask = contentMask
+                root.addSublayer(masked)
+
+                let unsupported = makeRoundedLayer(
+                    position: CGPoint(x: 230, y: 200),
+                    color: CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+                    curve: CALayerCornerCurve(rawValue: "future-curve")
+                )
+
+                let maskFailureBacking = CALayer()
+                maskFailureBacking.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                maskFailureBacking.position = CGPoint(x: 310, y: 200)
+                maskFailureBacking.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+                maskFailureBacking.zPosition = 99
+                root.addSublayer(maskFailureBacking)
+
+                let rejectedMaskedLayer = CALayer()
+                rejectedMaskedLayer.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+                rejectedMaskedLayer.position = CGPoint(x: 310, y: 200)
+                rejectedMaskedLayer.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                rejectedMaskedLayer.zPosition = 100
+                let unsupportedMask = CALayer()
+                unsupportedMask.frame = rejectedMaskedLayer.bounds
+                unsupportedMask.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                unsupportedMask.cornerRadius = 30
+                unsupportedMask.cornerCurve = CALayerCornerCurve(rawValue: "future-mask-curve")
+                rejectedMaskedLayer.mask = unsupportedMask
+                root.addSublayer(rejectedMaskedLayer)
+                CATransaction.commit()
+
+                let failureCountBefore = renderer.cornerCurveRenderFailureCount
+                CAAnimationEngine.shared.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 24, y: 216),
+                        CGPoint(x: 104, y: 216),
+                        CGPoint(x: 184, y: 216),
+                        CGPoint(x: 264, y: 216),
+                        CGPoint(x: 44, y: 116),
+                        CGPoint(x: 124, y: 116),
+                        CGPoint(x: 230, y: 100),
+                        CGPoint(x: 310, y: 100),
+                    ])
+                    let pixelText = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                    let failureDelta = renderer.cornerCurveRenderFailureCount - failureCountBefore
+                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta)"
+                } catch {
+                    cornerCurveProbeResult = "error: \(error)"
+                }
+
+                circular.removeFromSuperlayer()
+                continuous.removeFromSuperlayer()
+                textured.removeFromSuperlayer()
+                clipped.removeFromSuperlayer()
+                gradient.removeFromSuperlayer()
+                masked.removeFromSuperlayer()
+                unsupported.removeFromSuperlayer()
+                maskFailureBacking.removeFromSuperlayer()
+                rejectedMaskedLayer.removeFromSuperlayer()
                 CAAnimationEngine.shared.renderFrame()
             }
         })

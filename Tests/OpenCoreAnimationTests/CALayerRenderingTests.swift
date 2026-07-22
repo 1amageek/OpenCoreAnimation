@@ -260,6 +260,45 @@ struct CALayerRenderingTests {
         #expect(clipPath.rule == .winding)
     }
 
+    @Test("continuous corner curves preserve more corner area than circular curves")
+    func continuousCornerCurveChangesRenderedGeometry() {
+        func renderedPath(for curve: CALayerCornerCurve) -> CGPath? {
+            let renderer = RecordingRenderer()
+            let context = makeContext(renderer: renderer)
+            let layer = CALayer()
+            layer.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+            layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+            layer.cornerRadius = 30
+            layer.cornerCurve = curve
+            layer.render(in: context)
+            return renderer.fillCalls.first?.path
+        }
+
+        let discriminatingPoint = CGPoint(x: 4, y: 14)
+        let circularPath = renderedPath(for: .circular)
+        let continuousPath = renderedPath(for: .continuous)
+
+        #expect(circularPath?.contains(discriminatingPoint) == false)
+        #expect(continuousPath?.contains(discriminatingPoint) == true)
+        guard let continuousPath else { return }
+        #expect(curveElementCount(in: continuousPath) == 64)
+    }
+
+    @Test("unsupported corner curves do not render a fallback shape")
+    func unsupportedCornerCurveDoesNotRenderFallbackShape() {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
+        layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        layer.cornerRadius = 30
+        layer.cornerCurve = CALayerCornerCurve(rawValue: "future-curve")
+
+        layer.render(in: context)
+
+        #expect(renderer.fillCalls.isEmpty)
+    }
+
     @Test("mask renders through a transparency layer using destinationIn blending")
     func maskUsesTransparencyLayerAndDestinationInBlendMode() {
         let renderer = RecordingRenderer()

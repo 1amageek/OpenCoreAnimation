@@ -4,6 +4,14 @@ import Foundation
 // MARK: - WASM Helper Extensions
 
 extension CALayer {
+    internal var cornerCurveRenderExponent: Float? {
+        do {
+            return Float(try CornerCurveRenderConfiguration(curve: cornerCurve).exponent)
+        } catch {
+            return nil
+        }
+    }
+
     /// Raw edge-antialiasing bits consumed by the WebGPU fragment shaders.
     internal var edgeAntialiasingMaskValue: Float {
         guard allowsEdgeAntialiasing else { return 0 }

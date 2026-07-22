@@ -4042,12 +4042,31 @@ open class CALayer: CAMediaTiming, Hashable {
         let bottomLeft = maskedCorners.contains(.layerMinXMaxYCorner) ? radius : 0
         let bottomRight = maskedCorners.contains(.layerMaxXMaxYCorner) ? radius : 0
 
-        if topLeft == radius, topRight == radius, bottomLeft == radius, bottomRight == radius {
-            return CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
-        }
-
         if topLeft == 0, topRight == 0, bottomLeft == 0, bottomRight == 0 {
             return CGPath(rect: rect, transform: nil)
+        }
+
+        switch cornerCurve {
+        case .continuous:
+            return continuousCornerPath(
+                in: rect,
+                bottomLeftRadius: topLeft,
+                bottomRightRadius: topRight,
+                topLeftRadius: bottomLeft,
+                topRightRadius: bottomRight
+            )
+        case .circular:
+            if topLeft == radius, topRight == radius,
+               bottomLeft == radius, bottomRight == radius {
+                return CGPath(
+                    roundedRect: rect,
+                    cornerWidth: radius,
+                    cornerHeight: radius,
+                    transform: nil
+                )
+            }
+        default:
+            return CGMutablePath()
         }
 
         let path = CGMutablePath()
@@ -4102,6 +4121,121 @@ open class CALayer: CAMediaTiming, Hashable {
             path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
         }
 
+        path.closeSubpath()
+        return path
+    }
+
+    private func continuousCornerPath(
+        in rect: CGRect,
+        bottomLeftRadius: CGFloat,
+        bottomRightRadius: CGFloat,
+        topLeftRadius: CGFloat,
+        topRightRadius: CGFloat
+    ) -> CGPath {
+        let path = CGMutablePath()
+        let parameterPower = 2 / CornerCurveRenderConfiguration.continuousExponent
+        let segmentCount = 16
+
+        func cornerPoint(
+            center: CGPoint,
+            radius: CGFloat,
+            angle: CGFloat
+        ) -> CGPoint {
+            guard radius > 0 else { return center }
+            let cosine = cos(angle)
+            let sine = sin(angle)
+            let x = cosine.sign == .minus
+                ? -pow(abs(cosine), parameterPower)
+                : pow(abs(cosine), parameterPower)
+            let y = sine.sign == .minus
+                ? -pow(abs(sine), parameterPower)
+                : pow(abs(sine), parameterPower)
+            return CGPoint(x: center.x + radius * x, y: center.y + radius * y)
+        }
+
+        func appendCorner(
+            center: CGPoint,
+            radius: CGFloat,
+            startAngle: CGFloat,
+            endAngle: CGFloat
+        ) {
+            guard radius > 0 else {
+                path.addLine(to: center)
+                return
+            }
+
+            let points = (0...segmentCount).map { step in
+                let progress = CGFloat(step) / CGFloat(segmentCount)
+                let angle = startAngle + (endAngle - startAngle) * progress
+                return cornerPoint(center: center, radius: radius, angle: angle)
+            }
+
+            func tangent(at index: Int) -> CGPoint {
+                if index == 0 || index == segmentCount {
+                    let neighborIndex = index == 0 ? 1 : segmentCount - 1
+                    let chord = CGPoint(
+                        x: points[neighborIndex].x - points[index].x,
+                        y: points[neighborIndex].y - points[index].y
+                    )
+                    let magnitude = 2 * hypot(chord.x, chord.y)
+                    let angle = index == 0 ? startAngle : endAngle
+                    return CGPoint(
+                        x: -sin(angle) * magnitude,
+                        y: cos(angle) * magnitude
+                    )
+                }
+                return CGPoint(
+                    x: (points[index + 1].x - points[index - 1].x) / 2,
+                    y: (points[index + 1].y - points[index - 1].y) / 2
+                )
+            }
+
+            for index in 0..<segmentCount {
+                let startTangent = tangent(at: index)
+                let endTangent = tangent(at: index + 1)
+                path.addCurve(
+                    to: points[index + 1],
+                    control1: CGPoint(
+                        x: points[index].x + startTangent.x / 3,
+                        y: points[index].y + startTangent.y / 3
+                    ),
+                    control2: CGPoint(
+                        x: points[index + 1].x - endTangent.x / 3,
+                        y: points[index + 1].y - endTangent.y / 3
+                    )
+                )
+            }
+        }
+
+        path.move(to: CGPoint(x: rect.minX + bottomLeftRadius, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX - bottomRightRadius, y: rect.minY))
+        appendCorner(
+            center: CGPoint(x: rect.maxX - bottomRightRadius, y: rect.minY + bottomRightRadius),
+            radius: bottomRightRadius,
+            startAngle: -.pi / 2,
+            endAngle: 0
+        )
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - topRightRadius))
+        appendCorner(
+            center: CGPoint(x: rect.maxX - topRightRadius, y: rect.maxY - topRightRadius),
+            radius: topRightRadius,
+            startAngle: 0,
+            endAngle: .pi / 2
+        )
+        path.addLine(to: CGPoint(x: rect.minX + topLeftRadius, y: rect.maxY))
+        appendCorner(
+            center: CGPoint(x: rect.minX + topLeftRadius, y: rect.maxY - topLeftRadius),
+            radius: topLeftRadius,
+            startAngle: .pi / 2,
+            endAngle: .pi
+        )
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + bottomLeftRadius))
+        appendCorner(
+            center: CGPoint(x: rect.minX + bottomLeftRadius, y: rect.minY + bottomLeftRadius),
+            radius: bottomLeftRadius,
+            startAngle: .pi,
+            endAngle: .pi * 1.5
+        )
         path.closeSubpath()
         return path
     }
