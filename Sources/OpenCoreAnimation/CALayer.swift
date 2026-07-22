@@ -1008,6 +1008,8 @@ open class CALayer: CAMediaTiming, Hashable {
         case "anchorPoint": return _anchorPoint
         case "anchorPointZ": return _anchorPointZ
         case "transform": return _transform
+        case _ where keyPath.hasPrefix("transform."):
+            return CATransform3DInterpolation.componentValue(for: keyPath, in: _transform)
         case "sublayerTransform": return _sublayerTransform
         case "backgroundColor": return _backgroundColor
         case "cornerRadius": return _cornerRadius
@@ -1107,6 +1109,13 @@ open class CALayer: CAMediaTiming, Hashable {
         case "transform": if let value = contribution as? CATransform3D {
             for _ in 0..<cycles { layer._transform = CATransform3DConcat(layer._transform, value) }
         }
+        case _ where keyPath.hasPrefix("transform."):
+            if let value = contribution as? CGSize {
+                let scaled = CGSize(width: value.width * count, height: value.height * count)
+                applyTransformComponentValue(scaled, to: layer, keyPath: keyPath, additive: true)
+            } else if let value = transformScalarValue(contribution) {
+                applyTransformComponentValue(value * count, to: layer, keyPath: keyPath, additive: true)
+            }
         case "sublayerTransform": if let value = contribution as? CATransform3D {
             for _ in 0..<cycles { layer._sublayerTransform = CATransform3DConcat(layer._sublayerTransform, value) }
         }
@@ -1563,88 +1572,31 @@ open class CALayer: CAMediaTiming, Hashable {
                 layer._transform = value
             }
 
-        case "transform.scale":
-            // Scale animation: apply scale to the base transform
-            let from = (animation.fromValue as? CGFloat) ?? 1.0
-            let to = (animation.toValue as? CGFloat) ?? 1.0
-            let scale = from + CGFloat(progress) * (to - from)
-            // Apply scale to base transform instead of replacing it
-            layer._transform = CATransform3DScale(baseTransform, scale, scale, scale)
+        case _ where keyPath.hasPrefix("transform."):
+            let additive = animation.isAdditive
+            guard let currentValue = CATransform3DInterpolation.componentValue(
+                for: keyPath,
+                in: _transform
+            ) else { return }
 
-        case "transform.scale.x":
-            // Scale X: modify only the X scale component
-            let from = (animation.fromValue as? CGFloat) ?? 1.0
-            let to = (animation.toValue as? CGFloat) ?? 1.0
-            let scaleX = from + CGFloat(progress) * (to - from)
-            // Apply X scale to base transform
-            layer._transform = CATransform3DScale(baseTransform, scaleX, 1, 1)
-
-        case "transform.scale.y":
-            // Scale Y: modify only the Y scale component
-            let from = (animation.fromValue as? CGFloat) ?? 1.0
-            let to = (animation.toValue as? CGFloat) ?? 1.0
-            let scaleY = from + CGFloat(progress) * (to - from)
-            // Apply Y scale to base transform
-            layer._transform = CATransform3DScale(baseTransform, 1, scaleY, 1)
-
-        case "transform.scale.z":
-            // Scale Z: modify only the Z scale component
-            let from = (animation.fromValue as? CGFloat) ?? 1.0
-            let to = (animation.toValue as? CGFloat) ?? 1.0
-            let scaleZ = from + CGFloat(progress) * (to - from)
-            // Apply Z scale to base transform
-            layer._transform = CATransform3DScale(baseTransform, 1, 1, scaleZ)
-
-        case "transform.rotation", "transform.rotation.z":
-            // Rotation around Z axis: apply rotation to base transform
-            let from = (animation.fromValue as? CGFloat) ?? 0
-            let to = (animation.toValue as? CGFloat) ?? 0
-            let angle = from + CGFloat(progress) * (to - from)
-            // Apply rotation to base transform instead of replacing it
-            layer._transform = CATransform3DRotate(baseTransform, angle, 0, 0, 1)
-
-        case "transform.rotation.x":
-            // Rotation around X axis
-            let from = (animation.fromValue as? CGFloat) ?? 0
-            let to = (animation.toValue as? CGFloat) ?? 0
-            let angle = from + CGFloat(progress) * (to - from)
-            layer._transform = CATransform3DRotate(baseTransform, angle, 1, 0, 0)
-
-        case "transform.rotation.y":
-            // Rotation around Y axis
-            let from = (animation.fromValue as? CGFloat) ?? 0
-            let to = (animation.toValue as? CGFloat) ?? 0
-            let angle = from + CGFloat(progress) * (to - from)
-            layer._transform = CATransform3DRotate(baseTransform, angle, 0, 1, 0)
-
-        case "transform.translation":
-            // Translation animation: apply translation to base transform
-            guard let from = (animation.fromValue as? CGSize) ?? CGSize.zero as CGSize?,
-                  let to = (animation.toValue as? CGSize) ?? CGSize.zero as CGSize? else { return }
-            let tx = from.width + CGFloat(progress) * (to.width - from.width)
-            let ty = from.height + CGFloat(progress) * (to.height - from.height)
-            layer._transform = CATransform3DTranslate(baseTransform, tx, ty, 0)
-
-        case "transform.translation.x":
-            // Translation X: apply X translation to base transform
-            let from = (animation.fromValue as? CGFloat) ?? 0
-            let to = (animation.toValue as? CGFloat) ?? 0
-            let tx = from + CGFloat(progress) * (to - from)
-            layer._transform = CATransform3DTranslate(baseTransform, tx, 0, 0)
-
-        case "transform.translation.y":
-            // Translation Y: apply Y translation to base transform
-            let from = (animation.fromValue as? CGFloat) ?? 0
-            let to = (animation.toValue as? CGFloat) ?? 0
-            let ty = from + CGFloat(progress) * (to - from)
-            layer._transform = CATransform3DTranslate(baseTransform, 0, ty, 0)
-
-        case "transform.translation.z":
-            // Translation Z: apply Z translation to base transform
-            let from = (animation.fromValue as? CGFloat) ?? 0
-            let to = (animation.toValue as? CGFloat) ?? 0
-            let tz = from + CGFloat(progress) * (to - from)
-            layer._transform = CATransform3DTranslate(baseTransform, 0, 0, tz)
+            if let currentSize = currentValue as? CGSize {
+                guard let resolved = resolveFromToSize(
+                    animation,
+                    currentValue: additive ? .zero : currentSize
+                ) else { return }
+                let value = CGSize(
+                    width: resolved.from.width + CGFloat(progress) * (resolved.to.width - resolved.from.width),
+                    height: resolved.from.height + CGFloat(progress) * (resolved.to.height - resolved.from.height)
+                )
+                applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: additive)
+            } else if let currentScalar = transformScalarValue(currentValue) {
+                guard let resolved = resolveFromTo(
+                    animation,
+                    currentValue: additive ? 0 : currentScalar
+                ) else { return }
+                let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
+                applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: additive)
+            }
 
         case "sublayerTransform":
             // Full sublayerTransform animation: interpolate between from and to values
@@ -1670,6 +1622,28 @@ open class CALayer: CAMediaTiming, Hashable {
         default:
             break
         }
+    }
+
+    private func applyTransformComponentValue(
+        _ value: Any,
+        to layer: CALayer,
+        keyPath: String,
+        additive: Bool
+    ) {
+        guard let transform = CATransform3DInterpolation.applyingComponent(
+            value,
+            for: keyPath,
+            to: layer._transform,
+            additive: additive
+        ) else { return }
+        layer._transform = transform
+    }
+
+    private func transformScalarValue(_ value: Any) -> CGFloat? {
+        if let value = value as? CGFloat { return value }
+        if let value = value as? Double { return CGFloat(value) }
+        if let value = value as? Float { return CGFloat(value) }
+        return nil
     }
 
     /// Interpolates between two transforms by decomposing each into translation,
@@ -2110,7 +2084,12 @@ open class CALayer: CAMediaTiming, Hashable {
 
         guard let values = animation.values, !values.isEmpty else { return }
         if values.count == 1 {
-            applyKeyframeValue(values[0], layer: layer, keyPath: keyPath)
+            applyKeyframeValue(
+                values[0],
+                layer: layer,
+                keyPath: keyPath,
+                additive: animation.isAdditive
+            )
             return
         }
 
@@ -2141,16 +2120,31 @@ open class CALayer: CAMediaTiming, Hashable {
 
         let clampedProgress = CGFloat(effectiveProgress)
         if clampedProgress <= effectiveKeyTimes[0] {
-            applyKeyframeValue(values[0], layer: layer, keyPath: keyPath)
+            applyKeyframeValue(
+                values[0],
+                layer: layer,
+                keyPath: keyPath,
+                additive: animation.isAdditive
+            )
             return
         }
         if clampedProgress >= effectiveKeyTimes[values.count - 1] {
-            applyKeyframeValue(values[values.count - 1], layer: layer, keyPath: keyPath)
+            applyKeyframeValue(
+                values[values.count - 1],
+                layer: layer,
+                keyPath: keyPath,
+                additive: animation.isAdditive
+            )
             return
         }
         if animation.calculationMode == .discrete {
             let valueIndex = effectiveKeyTimes.lastIndex(where: { $0 <= clampedProgress }) ?? 0
-            applyKeyframeValue(values[valueIndex], layer: layer, keyPath: keyPath)
+            applyKeyframeValue(
+                values[valueIndex],
+                layer: layer,
+                keyPath: keyPath,
+                additive: animation.isAdditive
+            )
             return
         }
 
@@ -2186,10 +2180,22 @@ open class CALayer: CAMediaTiming, Hashable {
         switch animation.calculationMode {
         case .discrete:
             // No interpolation, use the from value
-            applyKeyframeValue(fromValue, layer: layer, keyPath: keyPath)
+            applyKeyframeValue(
+                fromValue,
+                layer: layer,
+                keyPath: keyPath,
+                additive: animation.isAdditive
+            )
         case .linear, .paced:
             // Linear interpolation between values
-            interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
+            interpolateKeyframeValue(
+                from: fromValue,
+                to: toValue,
+                progress: CFTimeInterval(adjustedProgress),
+                layer: layer,
+                keyPath: keyPath,
+                additive: animation.isAdditive
+            )
         case .cubic, .cubicPaced:
             // Catmull-Rom spline interpolation
             // Get the 4 control points: P0, P1, P2, P3
@@ -2210,10 +2216,18 @@ open class CALayer: CAMediaTiming, Hashable {
                 startParameters: cubicParameters(for: animation, at: startIndex),
                 endParameters: cubicParameters(for: animation, at: endIndex),
                 layer: layer,
-                keyPath: keyPath
+                keyPath: keyPath,
+                additive: animation.isAdditive
             )
         default:
-            interpolateKeyframeValue(from: fromValue, to: toValue, progress: CFTimeInterval(adjustedProgress), layer: layer, keyPath: keyPath)
+            interpolateKeyframeValue(
+                from: fromValue,
+                to: toValue,
+                progress: CFTimeInterval(adjustedProgress),
+                layer: layer,
+                keyPath: keyPath,
+                additive: animation.isAdditive
+            )
         }
     }
 
@@ -2410,7 +2424,12 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// Applies a single keyframe value without interpolation.
-    private func applyKeyframeValue(_ value: Any, layer: CALayer, keyPath: String) {
+    private func applyKeyframeValue(
+        _ value: Any,
+        layer: CALayer,
+        keyPath: String,
+        additive: Bool
+    ) {
         switch keyPath {
         case "contents":
             layer._contents = value
@@ -2431,7 +2450,11 @@ open class CALayer: CAMediaTiming, Hashable {
         case "zPosition":
             if let v = value as? CGFloat { layer._zPosition = v }
         case "transform":
-            if let v = value as? CATransform3D { layer._transform = v }
+            if let v = value as? CATransform3D {
+                layer._transform = additive ? CATransform3DConcat(v, layer._transform) : v
+            }
+        case _ where keyPath.hasPrefix("transform."):
+            applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: additive)
         case "shadowPath":
             if let v = extractPath(value) { layer._shadowPath = v }
         case "hidden", "isHidden", "masksToBounds", "doubleSided", "isDoubleSided", "shouldRasterize":
@@ -2561,7 +2584,14 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// Interpolates between two keyframe values.
-    private func interpolateKeyframeValue(from fromValue: Any, to toValue: Any, progress: CFTimeInterval, layer: CALayer, keyPath: String) {
+    private func interpolateKeyframeValue(
+        from fromValue: Any,
+        to toValue: Any,
+        progress: CFTimeInterval,
+        layer: CALayer,
+        keyPath: String,
+        additive: Bool
+    ) {
         switch keyPath {
         case "contents":
             layer._contents = progress < 0.5 ? fromValue : toValue
@@ -2664,7 +2694,20 @@ open class CALayer: CAMediaTiming, Hashable {
             }
         case "transform":
             if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
-                layer._transform = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
+                let value = interpolateTransform(from: f, to: t, progress: CGFloat(progress))
+                layer._transform = additive ? CATransform3DConcat(value, layer._transform) : value
+            }
+        case _ where keyPath.hasPrefix("transform."):
+            if let f = fromValue as? CGSize, let t = toValue as? CGSize {
+                let value = CGSize(
+                    width: f.width + CGFloat(progress) * (t.width - f.width),
+                    height: f.height + CGFloat(progress) * (t.height - f.height)
+                )
+                applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: additive)
+            } else if let f = transformScalarValue(fromValue),
+                      let t = transformScalarValue(toValue) {
+                let value = f + CGFloat(progress) * (t - f)
+                applyTransformComponentValue(value, to: layer, keyPath: keyPath, additive: additive)
             }
         case "sublayerTransform":
             if let f = fromValue as? CATransform3D, let t = toValue as? CATransform3D {
@@ -2891,7 +2934,8 @@ open class CALayer: CAMediaTiming, Hashable {
         startParameters: CubicParameters,
         endParameters: CubicParameters,
         layer: CALayer,
-        keyPath: String
+        keyPath: String,
+        additive: Bool
     ) {
         if keyPath == "contents" {
             layer._contents = t < 0.5 ? p1 : p2
@@ -2908,7 +2952,7 @@ open class CALayer: CAMediaTiming, Hashable {
         ) else {
             return
         }
-        applyKeyframeValue(value, layer: layer, keyPath: keyPath)
+        applyKeyframeValue(value, layer: layer, keyPath: keyPath, additive: additive)
     }
 
     private func cubicValue(

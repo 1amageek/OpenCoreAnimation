@@ -43,6 +43,7 @@ nonisolated(unsafe) var booleanAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var contentsAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var rasterizationScaleProbeResult: String = "pending"
 nonisolated(unsafe) var shadowPathKeyframeProbeResult: String = "pending"
+nonisolated(unsafe) var transformComponentProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -161,6 +162,7 @@ public func setup() {
             contentsAnimationProbeResult = "pending"
             rasterizationScaleProbeResult = "pending"
             shadowPathKeyframeProbeResult = "pending"
+            transformComponentProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -353,6 +355,9 @@ func installHarness() {
         })
         h.expose("getShadowPathKeyframeProbeResult", returning: {
             .string(shadowPathKeyframeProbeResult)
+        })
+        h.expose("getTransformComponentProbeResult", returning: {
+            .string(transformComponentProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1444,6 +1449,124 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     shadowPathKeyframeProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginTransformComponentProbe", action: {
+            Task { @MainActor in
+                transformComponentProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    transformComponentProbeResult = "error: transform component dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func makeLayer(
+                    position: CGPoint,
+                    size: CGSize,
+                    color: CGColor
+                ) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(origin: .zero, size: size)
+                    layer.position = position
+                    layer.zPosition = 100
+                    layer.backgroundColor = color
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                func configure(_ animation: CAAnimation) {
+                    animation.duration = 1
+                    animation.speed = 0
+                    animation.timeOffset = 0.5
+                    animation.fillMode = .both
+                    animation.isRemovedOnCompletion = false
+                }
+
+                let translationLayer = makeLayer(
+                    position: CGPoint(x: 60, y: 150),
+                    size: CGSize(width: 20, height: 20),
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                )
+                let translation = CAKeyframeAnimation(keyPath: "transform.translation.x")
+                translation.values = [CGFloat(0), CGFloat(40)]
+                configure(translation)
+                translationLayer.add(translation, forKey: "browserTranslationComponent")
+
+                let scaleLayer = makeLayer(
+                    position: CGPoint(x: 160, y: 150),
+                    size: CGSize(width: 20, height: 20),
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                )
+                let scale = CAKeyframeAnimation(keyPath: "transform.scale.x")
+                scale.values = [CGFloat(1), CGFloat(3)]
+                configure(scale)
+                scaleLayer.add(scale, forKey: "browserScaleComponent")
+
+                let rotationLayer = makeLayer(
+                    position: CGPoint(x: 260, y: 150),
+                    size: CGSize(width: 40, height: 10),
+                    color: CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                )
+                let rotation = CAKeyframeAnimation(keyPath: "transform.rotation")
+                rotation.values = [CGFloat(0), CGFloat.pi / 2]
+                configure(rotation)
+                rotationLayer.add(rotation, forKey: "browserRotationComponent")
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    translationLayer.removeFromSuperlayer()
+                    scaleLayer.removeFromSuperlayer()
+                    rotationLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                guard let translationPresentation = translationLayer.presentation(),
+                      let scalePresentation = scaleLayer.presentation(),
+                      let rotationPresentation = rotationLayer.presentation() else {
+                    restoreScene()
+                    transformComponentProbeResult = "error: presentation unavailable"
+                    return
+                }
+                let presentationMatches =
+                    abs(translationPresentation.transform.m41 - 20) < 0.001
+                    && abs(scalePresentation.transform.m11 - 2) < 0.001
+                    && abs(rotationPresentation.transform.m11 - sqrt(0.5)) < 0.001
+                    && abs(rotationPresentation.transform.m12 - sqrt(0.5)) < 0.001
+
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 55, y: 150),
+                        CGPoint(x: 80, y: 150),
+                        CGPoint(x: 177, y: 150),
+                        CGPoint(x: 271, y: 139),
+                        CGPoint(x: 275, y: 150),
+                    ])
+                    restoreScene()
+                    transformComponentProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                        + ",presentation=\(presentationMatches)"
+                } catch {
+                    restoreScene()
+                    transformComponentProbeResult = "error: \(error)"
                 }
             }
         })

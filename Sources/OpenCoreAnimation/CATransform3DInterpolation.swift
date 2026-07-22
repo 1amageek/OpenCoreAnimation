@@ -21,6 +21,111 @@ import Foundation
 /// recomposed into a valid transform at each frame.
 internal enum CATransform3DInterpolation {
 
+    /// Synthetic transform key paths exposed by Core Animation. These values
+    /// are read from and written back through matrix decomposition so changing
+    /// one component preserves the remaining translation, rotation, scale,
+    /// skew, and perspective components.
+    static func componentValue(for keyPath: String, in transform: CATransform3D) -> Any? {
+        guard let decomposition = decompose(transform) else { return nil }
+        let rotation = eulerAngles(from: decomposition.quaternion)
+
+        switch keyPath {
+        case "transform.scale":
+            return (decomposition.scale.x + decomposition.scale.y + decomposition.scale.z) / 3
+        case "transform.scale.x":
+            return decomposition.scale.x
+        case "transform.scale.y":
+            return decomposition.scale.y
+        case "transform.scale.z":
+            return decomposition.scale.z
+        case "transform.rotation", "transform.rotation.z":
+            return rotation.z
+        case "transform.rotation.x":
+            return rotation.x
+        case "transform.rotation.y":
+            return rotation.y
+        case "transform.translation":
+            return CGSize(width: decomposition.translation.x, height: decomposition.translation.y)
+        case "transform.translation.x":
+            return decomposition.translation.x
+        case "transform.translation.y":
+            return decomposition.translation.y
+        case "transform.translation.z":
+            return decomposition.translation.z
+        default:
+            return nil
+        }
+    }
+
+    static func applyingComponent(
+        _ value: Any,
+        for keyPath: String,
+        to transform: CATransform3D,
+        additive: Bool
+    ) -> CATransform3D? {
+        guard var decomposition = decompose(transform) else { return nil }
+
+        switch keyPath {
+        case "transform.scale":
+            guard let scalar = scalarValue(value) else { return nil }
+            if additive {
+                decomposition.scale.x += scalar
+                decomposition.scale.y += scalar
+                decomposition.scale.z += scalar
+            } else {
+                decomposition.scale = (scalar, scalar, scalar)
+            }
+        case "transform.scale.x":
+            guard let scalar = scalarValue(value) else { return nil }
+            decomposition.scale.x = additive ? decomposition.scale.x + scalar : scalar
+        case "transform.scale.y":
+            guard let scalar = scalarValue(value) else { return nil }
+            decomposition.scale.y = additive ? decomposition.scale.y + scalar : scalar
+        case "transform.scale.z":
+            guard let scalar = scalarValue(value) else { return nil }
+            decomposition.scale.z = additive ? decomposition.scale.z + scalar : scalar
+        case "transform.rotation", "transform.rotation.z":
+            guard let scalar = scalarValue(value) else { return nil }
+            var rotation = eulerAngles(from: decomposition.quaternion)
+            rotation.z = additive ? rotation.z + scalar : scalar
+            guard let quaternion = quaternion(from: rotation) else { return nil }
+            decomposition.quaternion = quaternion
+        case "transform.rotation.x":
+            guard let scalar = scalarValue(value) else { return nil }
+            var rotation = eulerAngles(from: decomposition.quaternion)
+            rotation.x = additive ? rotation.x + scalar : scalar
+            guard let quaternion = quaternion(from: rotation) else { return nil }
+            decomposition.quaternion = quaternion
+        case "transform.rotation.y":
+            guard let scalar = scalarValue(value) else { return nil }
+            var rotation = eulerAngles(from: decomposition.quaternion)
+            rotation.y = additive ? rotation.y + scalar : scalar
+            guard let quaternion = quaternion(from: rotation) else { return nil }
+            decomposition.quaternion = quaternion
+        case "transform.translation":
+            guard let size = value as? CGSize else { return nil }
+            decomposition.translation.x = additive
+                ? decomposition.translation.x + size.width
+                : size.width
+            decomposition.translation.y = additive
+                ? decomposition.translation.y + size.height
+                : size.height
+        case "transform.translation.x":
+            guard let scalar = scalarValue(value) else { return nil }
+            decomposition.translation.x = additive ? decomposition.translation.x + scalar : scalar
+        case "transform.translation.y":
+            guard let scalar = scalarValue(value) else { return nil }
+            decomposition.translation.y = additive ? decomposition.translation.y + scalar : scalar
+        case "transform.translation.z":
+            guard let scalar = scalarValue(value) else { return nil }
+            decomposition.translation.z = additive ? decomposition.translation.z + scalar : scalar
+        default:
+            return nil
+        }
+
+        return recompose(decomposition)
+    }
+
     /// Components of a decomposed transform, one component per independently
     /// interpolatable degree of freedom.
     struct Decomposition {
@@ -248,6 +353,56 @@ internal enum CATransform3DInterpolation {
         m.m31 *= d.scale.z; m.m32 *= d.scale.z; m.m33 *= d.scale.z
 
         return m
+    }
+
+    private static func scalarValue(_ value: Any) -> CGFloat? {
+        if let value = value as? CGFloat { return value }
+        if let value = value as? Double { return CGFloat(value) }
+        if let value = value as? Float { return CGFloat(value) }
+        return nil
+    }
+
+    /// Extracts the XYZ Euler representation used by Core Animation's
+    /// transform.rotation component key paths. The corresponding composition
+    /// order is Rx * Ry * Rz for CATransform3D's row-vector convention.
+    private static func eulerAngles(
+        from quaternion: (x: CGFloat, y: CGFloat, z: CGFloat, w: CGFloat)
+    ) -> (x: CGFloat, y: CGFloat, z: CGFloat) {
+        let qx = quaternion.x
+        let qy = quaternion.y
+        let qz = quaternion.z
+        let qw = quaternion.w
+        let r11 = 1 - 2 * (qy * qy + qz * qz)
+        let r12 = 2 * (qx * qy + qz * qw)
+        let r13 = 2 * (qx * qz - qy * qw)
+        let r21 = 2 * (qx * qy - qz * qw)
+        let r22 = 1 - 2 * (qx * qx + qz * qz)
+        let r23 = 2 * (qy * qz + qx * qw)
+        let r33 = 1 - 2 * (qx * qx + qy * qy)
+
+        let y = asin(max(-1, min(1, -r13)))
+        let cosY = cos(y)
+        if abs(cosY) > 1e-8 {
+            return (atan2(r23, r33), y, atan2(r12, r11))
+        }
+
+        // At gimbal lock infinitely many X/Z pairs represent the same
+        // rotation. Canonicalizing Z to zero preserves the matrix exactly.
+        let x = y > 0 ? atan2(r21, r22) : atan2(-r21, r22)
+        return (x, y, 0)
+    }
+
+    private static func quaternion(
+        from rotation: (x: CGFloat, y: CGFloat, z: CGFloat)
+    ) -> (x: CGFloat, y: CGFloat, z: CGFloat, w: CGFloat)? {
+        let transform = CATransform3DConcat(
+            CATransform3DConcat(
+                CATransform3DMakeRotation(rotation.x, 1, 0, 0),
+                CATransform3DMakeRotation(rotation.y, 0, 1, 0)
+            ),
+            CATransform3DMakeRotation(rotation.z, 0, 0, 1)
+        )
+        return decompose(transform)?.quaternion
     }
 
     // MARK: - Helpers
