@@ -403,37 +403,48 @@ open class CALayer: CAMediaTiming, Hashable {
         // Animation begin times live in the layer's local time space.
         let layerLocalTime = convertTime(currentTime, from: nil)
 
-        // Apply active animations: non-additive first, then additive.
-        // Additive animations accumulate deltas on top of the current value.
-        var additiveAnimations: [(String, CAAnimation)] = []
-        for (key, animation) in _animations {
-            if let propAnim = animation as? CAPropertyAnimation, propAnim.isAdditive {
-                additiveAnimations.append((key, animation))
-            } else {
-                applyAnimation(animation, to: presentation, at: layerLocalTime)
+        // Traverse the complete animation graph twice so additive descendants
+        // of groups cannot be overwritten by a later non-additive sibling.
+        for pass in [AnimationApplicationPass.nonAdditive, .additive] {
+            for animation in _animations.values {
+                applyAnimation(
+                    animation,
+                    to: presentation,
+                    at: layerLocalTime,
+                    pass: pass
+                )
             }
-        }
-        for (_, animation) in additiveAnimations {
-            applyAnimation(animation, to: presentation, at: layerLocalTime)
         }
     }
 
+    private enum AnimationApplicationPass {
+        case nonAdditive
+        case additive
+    }
+
     /// Applies an animation to the presentation layer at the given time.
-    private func applyAnimation(_ animation: CAAnimation, to layer: CALayer, at time: CFTimeInterval) {
+    private func applyAnimation(
+        _ animation: CAAnimation,
+        to layer: CALayer,
+        at time: CFTimeInterval,
+        pass: AnimationApplicationPass
+    ) {
         // Handle animation groups
         if let animationGroup = animation as? CAAnimationGroup {
-            applyAnimationGroup(animationGroup, to: layer, at: time)
+            applyAnimationGroup(animationGroup, to: layer, at: time, pass: pass)
             return
         }
 
         // Handle transitions
         if let transition = animation as? CATransition {
+            guard pass == .nonAdditive else { return }
             applyTransition(transition, to: layer, at: time)
             return
         }
 
         guard let propertyAnimation = animation as? CAPropertyAnimation,
               let keyPath = propertyAnimation.keyPath else { return }
+        guard propertyAnimation.isAdditive == (pass == .additive) else { return }
 
         let singleCycleDuration: CFTimeInterval
         if let springAnimation = animation as? CASpringAnimation {
@@ -485,9 +496,16 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Transitions provide animated effects when layer content changes.
     /// Unlike property animations, transitions affect the overall appearance
     /// of the layer during the transition period.
-    private func applyTransition(_ transition: CATransition, to layer: CALayer, at time: CFTimeInterval) {
+    private func applyTransition(
+        _ transition: CATransition,
+        to layer: CALayer,
+        at time: CFTimeInterval,
+        effectiveDuration: CFTimeInterval? = nil
+    ) {
         // Calculate transition progress
-        let duration = transition.duration > 0 ? transition.duration : CATransaction.animationDuration()
+        let duration = transition.duration > 0
+            ? transition.duration
+            : effectiveDuration ?? CATransaction.animationDuration()
         let timing = CAMediaTimingEvaluator.evaluate(transition, parentTime: time, duration: duration)
         if timing.phase != .before {
             transition.markStarted()
@@ -517,10 +535,18 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// Applies an animation group to the presentation layer.
-    private func applyAnimationGroup(_ group: CAAnimationGroup, to layer: CALayer, at time: CFTimeInterval) {
+    private func applyAnimationGroup(
+        _ group: CAAnimationGroup,
+        to layer: CALayer,
+        at time: CFTimeInterval,
+        effectiveDuration: CFTimeInterval? = nil,
+        pass: AnimationApplicationPass
+    ) {
         guard let animations = group.animations else { return }
 
-        let groupBaseDuration = group.duration > 0 ? group.duration : CATransaction.animationDuration()
+        let groupBaseDuration = group.duration > 0
+            ? group.duration
+            : effectiveDuration ?? CATransaction.animationDuration()
         let timing = CAMediaTimingEvaluator.evaluate(group, parentTime: time, duration: groupBaseDuration)
         if timing.phase != .before {
             group.markStarted()
@@ -535,7 +561,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 animation,
                 to: layer,
                 at: timing.basicTime,
-                effectiveDuration: effectiveDuration
+                effectiveDuration: effectiveDuration,
+                pass: pass
             )
         }
     }
@@ -545,16 +572,35 @@ open class CALayer: CAMediaTiming, Hashable {
         _ animation: CAAnimation,
         to layer: CALayer,
         at time: CFTimeInterval,
-        effectiveDuration: CFTimeInterval
+        effectiveDuration: CFTimeInterval,
+        pass: AnimationApplicationPass
     ) {
         // Handle nested animation groups
         if let animationGroup = animation as? CAAnimationGroup {
-            applyAnimationGroup(animationGroup, to: layer, at: time)
+            applyAnimationGroup(
+                animationGroup,
+                to: layer,
+                at: time,
+                effectiveDuration: effectiveDuration,
+                pass: pass
+            )
+            return
+        }
+
+        if let transition = animation as? CATransition {
+            guard pass == .nonAdditive else { return }
+            applyTransition(
+                transition,
+                to: layer,
+                at: time,
+                effectiveDuration: effectiveDuration
+            )
             return
         }
 
         guard let propertyAnimation = animation as? CAPropertyAnimation,
               let keyPath = propertyAnimation.keyPath else { return }
+        guard propertyAnimation.isAdditive == (pass == .additive) else { return }
 
         // Get the effective duration for a single cycle
         let singleCycleDuration: CFTimeInterval
@@ -4779,10 +4825,6 @@ open class CALayer: CAMediaTiming, Hashable {
         copied.attachedLayer = self
         copied.animationKey = animKey
 
-        if let transition = copied as? CATransition {
-            transition.sourceLayerSnapshot = makeTransitionSnapshot()
-        }
-
         _animations[animKey] = copied
         CATransaction.registerAnimation(copied)
         markDirty(.animations)
@@ -4811,6 +4853,9 @@ open class CALayer: CAMediaTiming, Hashable {
     ) {
         if animation.duration == 0 {
             animation.duration = inheritedDuration
+        }
+        if let transition = animation as? CATransition {
+            transition.sourceLayerSnapshot = makeTransitionSnapshot()
         }
         guard let group = animation as? CAAnimationGroup else { return }
         group.animations?.forEach {

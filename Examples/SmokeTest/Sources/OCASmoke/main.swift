@@ -1896,8 +1896,6 @@ func installHarness() {
 
                 func configure(_ animation: CAKeyframeAnimation) {
                     animation.duration = 1
-                    animation.speed = 0
-                    animation.timeOffset = 0.5
                     animation.fillMode = .both
                     animation.isRemovedOnCompletion = false
                     animation.isAdditive = true
@@ -1906,7 +1904,6 @@ func installHarness() {
                 let position = CAKeyframeAnimation(keyPath: "position")
                 position.values = [CGPoint.zero, CGPoint(x: 40, y: 0)]
                 configure(position)
-                layer.add(position, forKey: "browserAdditivePosition")
 
                 let bounds = CAKeyframeAnimation(keyPath: "bounds")
                 bounds.values = [
@@ -1914,7 +1911,6 @@ func installHarness() {
                     CGRect(x: 0, y: 0, width: 40, height: 0),
                 ]
                 configure(bounds)
-                layer.add(bounds, forKey: "browserAdditiveBounds")
 
                 let color = CAKeyframeAnimation(keyPath: "backgroundColor")
                 color.values = [
@@ -1922,7 +1918,25 @@ func installHarness() {
                     CGColor(red: 0.8, green: 0, blue: 0, alpha: 0),
                 ]
                 configure(color)
-                layer.add(color, forKey: "browserAdditiveColor")
+
+                let replacementColor = CAKeyframeAnimation(keyPath: "backgroundColor")
+                replacementColor.values = [
+                    CGColor(red: 0, green: 0, blue: 0, alpha: 1),
+                    CGColor(red: 0.4, green: 0.4, blue: 0.4, alpha: 1),
+                ]
+                replacementColor.duration = 1
+                replacementColor.fillMode = .both
+
+                let group = CAAnimationGroup()
+                // Additive color intentionally precedes its replacement to
+                // prove graph-wide pass ordering is independent of child order.
+                group.animations = [color, position, bounds, replacementColor]
+                group.duration = 1
+                group.speed = 0
+                group.timeOffset = 0.5
+                group.fillMode = .both
+                group.isRemovedOnCompletion = false
+                layer.add(group, forKey: "browserAdditiveGroup")
                 CATransaction.commit()
 
                 @MainActor
