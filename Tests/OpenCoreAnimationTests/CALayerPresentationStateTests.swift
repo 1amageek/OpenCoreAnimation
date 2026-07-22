@@ -76,21 +76,25 @@ struct CALayerPresentationStateTests {
         emitter.emitterPosition = CGPoint(x: 12, y: 34)
         emitter.birthRate = 4
         emitter.seed = 99
+        emitter.preservesDepth = true
 
         let replicator = CAReplicatorLayer()
         _ = replicator.presentation()
         replicator.instanceCount = 8
         replicator.instanceDelay = 0.2
         replicator.instanceAlphaOffset = -0.1
+        replicator.preservesDepth = true
 
         let emitterPresentation = emitter.presentation()
         let replicatorPresentation = replicator.presentation()
         #expect(emitterPresentation?.emitterPosition == CGPoint(x: 12, y: 34))
         #expect(emitterPresentation?.birthRate == 4)
         #expect(emitterPresentation?.seed == 99)
+        #expect(emitterPresentation?.preservesDepth == true)
         #expect(replicatorPresentation?.instanceCount == 8)
         #expect(replicatorPresentation?.instanceDelay == 0.2)
         #expect(replicatorPresentation?.instanceAlphaOffset == -0.1)
+        #expect(replicatorPresentation?.preservesDepth == true)
     }
 
     @Test("replacing sublayers transfers dirty subtree accounting")

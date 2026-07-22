@@ -3656,7 +3656,53 @@ func installHarness() {
                         && Int(rasterizedPixels[0][0]) + 40 < Int(rasterizedPixels[1][0])
                     rasterizedReplicator.removeFromSuperlayer()
 
-                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches),filter=\(filterMatches),shadow=\(shadowMatches),raster=\(rasterMatches)"
+                    func makeOverlappingReplicator(
+                        x: CGFloat,
+                        preservesDepth: Bool
+                    ) -> CAReplicatorLayer {
+                        let result = CAReplicatorLayer()
+                        result.bounds = root.bounds
+                        result.position = root.position
+                        result.zPosition = 100
+                        result.instanceCount = 2
+                        result.instanceTransform = CATransform3DMakeTranslation(0, 0, -200)
+                        result.instanceColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                        result.instanceRedOffset = -1
+                        result.instanceBlueOffset = 1
+                        result.preservesDepth = preservesDepth
+
+                        let plane = CALayer()
+                        plane.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+                        plane.position = CGPoint(x: x, y: 100)
+                        plane.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                        result.addSublayer(plane)
+                        return result
+                    }
+
+                    let flattenedDepthReplicator = makeOverlappingReplicator(
+                        x: 120,
+                        preservesDepth: false
+                    )
+                    let preservingDepthReplicator = makeOverlappingReplicator(
+                        x: 280,
+                        preservesDepth: true
+                    )
+                    root.addSublayer(flattenedDepthReplicator)
+                    root.addSublayer(preservingDepthReplicator)
+                    engine.renderFrame()
+                    let depthPixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 120, y: 200),
+                        CGPoint(x: 280, y: 200),
+                    ])
+                    let depthPreservationMatches = depthPixels == [
+                        [0, 0, 255, 255],
+                        [255, 0, 0, 255],
+                    ]
+                        && renderer.replicatorRenderFailureCount == 0
+                    flattenedDepthReplicator.removeFromSuperlayer()
+                    preservingDepthReplicator.removeFromSuperlayer()
+
+                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches),filter=\(filterMatches),shadow=\(shadowMatches),raster=\(rasterMatches),depth=\(depthPreservationMatches)"
                 } catch {
                     replicatorProbeResult = "error: \(error)"
                 }
@@ -4076,7 +4122,42 @@ func installHarness() {
                     }
                     parentEmitter.layer.removeFromSuperlayer()
                     engine.renderFrame()
-                    result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected),child=\(childMatches);blend=\(blendPixelsMatch),final=\(renderer.activeEmitterStateCount)"
+
+                    let depthContainer = CATransformLayer()
+                    depthContainer.bounds = root.bounds
+                    depthContainer.anchorPoint = .zero
+                    depthContainer.position = .zero
+                    let depthEmitter = makeEmitter(
+                        x: 200,
+                        color: CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+                        shape: .point,
+                        mode: .volume,
+                        size: .zero,
+                        latitude: 0,
+                        longitude: 0
+                    )
+                    depthEmitter.cell.birthRate = 20
+                    depthEmitter.cell.velocity = 0
+                    depthEmitter.layer.preservesDepth = false
+                    depthContainer.addSublayer(depthEmitter.layer)
+                    root.addSublayer(depthContainer)
+                    engine.renderFrame()
+                    try await Task.sleep(for: .milliseconds(100))
+                    engine.renderFrame()
+                    let flattenedEmitterMatches = renderer.transformFlatteningCaptureCount == 1
+                        && renderer.transformFlatteningCompositeCount == 1
+                        && !renderer.lastRenderedParticleSequences(for: depthEmitter.layer).isEmpty
+
+                    depthEmitter.layer.preservesDepth = true
+                    engine.renderFrame()
+                    let preservingEmitterMatches = renderer.transformFlatteningCaptureCount == 0
+                        && renderer.transformFlatteningCompositeCount == 0
+                        && !renderer.lastRenderedParticleSequences(for: depthEmitter.layer).isEmpty
+                    depthContainer.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    let depthMatches = flattenedEmitterMatches && preservingEmitterMatches
+                    result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected),child=\(childMatches);blend=\(blendPixelsMatch),depth=\(depthMatches),final=\(renderer.activeEmitterStateCount)"
                     emitterProbeResult = result
                 } catch {
                     first.removeFromSuperlayer()

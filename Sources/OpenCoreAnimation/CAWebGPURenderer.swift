@@ -812,6 +812,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var emitterRenderFailureCount: Int = 0
 
+    /// Number of depth-preserving replicator frames rejected before GPU submission.
+    @_spi(RendererDiagnostics)
+    public private(set) var replicatorRenderFailureCount: Int = 0
+
     /// Number of visible shadows that could not complete the GPU render path.
     @_spi(RendererDiagnostics)
     public private(set) var shadowRenderFailureCount: Int = 0
@@ -1000,7 +1004,13 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         modelLayer: CALayer,
         presentationLayer: CALayer
     ) -> Bool {
-        modelLayer.sublayers?.isEmpty == false
+        // An emitter normally flattens its particles into the layer plane. A
+        // depth-preserving emitter is the explicit exception: its particles
+        // remain in the containing 3D space and must reach the depth pipelines.
+        if let emitterLayer = presentationLayer as? CAEmitterLayer {
+            return !emitterLayer.preservesDepth
+        }
+        return modelLayer.sublayers?.isEmpty == false
             || presentationLayer.filters?.isEmpty == false
             || requiresGroupOpacity(presentationLayer)
             || presentationLayer.mask != nil
@@ -1046,7 +1056,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         of layer: CALayer,
         parentMatrix: Matrix4x4
     ) -> Float {
-        let presentation = renderPresentation(for: layer)
+        projectedCenterDepth(
+            of: layer,
+            parentMatrix: parentMatrix,
+            timeOffset: currentReplicatorTimeOffset
+        )
+    }
+
+    private func projectedCenterDepth(
+        of layer: CALayer,
+        parentMatrix: Matrix4x4,
+        timeOffset: CFTimeInterval
+    ) -> Float {
+        let presentation = timeOffset == 0
+            ? layer._renderTimePresentation()
+            : layer.presentationAtTimeOffset(timeOffset)
         let matrix = presentation.modelMatrix(parentMatrix: parentMatrix)
         let center = SIMD4<Float>(
             Float(presentation.bounds.width * 0.5),
@@ -4167,6 +4191,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
         emitterSpawnFailureCount = 0
         emitterRenderFailureCount = 0
+        replicatorRenderFailureCount = 0
 
         // Textured bind group / view caches (release JS-side handles)
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: false)
@@ -4323,6 +4348,23 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
+        // With preservesDepth enabled, CAReplicatorLayer has the same rendering
+        // restrictions as CATransformLayer: it contributes transforms and
+        // replicated descendants, but does not create a flattened drawable plane.
+        if let replicatorPresentation = presentationLayer as? CAReplicatorLayer,
+           replicatorPresentation.preservesDepth,
+           let replicatorModel = layer as? CAReplicatorLayer {
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
+            renderReplicatorSublayers(
+                replicatorModelLayer: replicatorModel,
+                replicatorLayer: replicatorPresentation,
+                sublayers: layer.sublayers ?? [],
+                renderPass: renderPass,
+                parentMatrix: sublayerMatrix
+            )
+            return
+        }
+
         let hasBackdropComposition = presentationLayer.compositingFilter != nil
             || presentationLayer.backgroundFilters?.isEmpty == false
         if rasterizePrerenderRootLayer !== layer,
@@ -4437,6 +4479,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // CAEmitterLayer: Render particle system
         if let emitterPresentation = presentationLayer as? CAEmitterLayer,
            let emitterModel = layer as? CAEmitterLayer {
+            // A non-preserving emitter below a depth container must have been
+            // captured as one plane. Never silently render its particles as
+            // independent 3D geometry if that capture was unavailable.
+            if transformDepthNesting > 0,
+               !emitterPresentation.preservesDepth,
+               rasterizePrerenderRootLayer !== layer {
+                emitterRenderFailureCount += 1
+                return
+            }
             renderEmitterLayer(
                 emitterModel,
                 presentation: emitterPresentation,
@@ -5618,7 +5669,19 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         let blueOffset = replicatorLayer.instanceBlueOffset
         let alphaOffset = replicatorLayer.instanceAlphaOffset
 
-        // Render each instance
+        if replicatorLayer.preservesDepth {
+            renderDepthPreservingReplicatorSublayers(
+                replicatorModelLayer: replicatorModelLayer,
+                replicatorLayer: replicatorLayer,
+                sublayers: sublayers,
+                renderPass: renderPass,
+                parentMatrix: parentMatrix,
+                baseColor: baseColor
+            )
+            return
+        }
+
+        // Render each flattened instance.
         var cumulativeTransform = CATransform3DIdentity
         for instanceIndex in 0..<instanceCount {
             // Calculate color multiplier for this instance
@@ -5664,6 +5727,102 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
             // Apply instance transform for next iteration
             cumulativeTransform = CATransform3DConcat(cumulativeTransform, instanceTransform)
+        }
+    }
+
+    private func renderDepthPreservingReplicatorSublayers(
+        replicatorModelLayer: CAReplicatorLayer,
+        replicatorLayer: CAReplicatorLayer,
+        sublayers: [CALayer],
+        renderPass: GPURenderPassEncoder,
+        parentMatrix: Matrix4x4,
+        baseColor: SIMD4<Float>
+    ) {
+        struct DrawItem {
+            let layer: CALayer
+            let parentMatrix: Matrix4x4
+            let color: SIMD4<Float>
+            let timeOffset: CFTimeInterval
+            let instanceIndex: Int
+            let depth: Float
+            let insertionOrder: Int
+        }
+
+        let beginsIndependentDepthGroup = transformDepthNesting == 0
+        if beginsIndependentDepthGroup {
+            guard let depthClearPipeline else {
+                replicatorRenderFailureCount += 1
+                return
+            }
+            renderPass.setPipeline(depthClearPipeline)
+            renderPass.draw(vertexCount: 3)
+        }
+        transformDepthNesting += 1
+        defer { transformDepthNesting -= 1 }
+
+        let inheritedColor = currentReplicatorColor
+        let inheritedTimeOffset = currentReplicatorTimeOffset
+        var items: [DrawItem] = []
+        items.reserveCapacity(max(0, replicatorLayer.instanceCount) * sublayers.count)
+        var cumulativeTransform = CATransform3DIdentity
+        var insertionOrder = 0
+
+        for instanceIndex in 0..<max(0, replicatorLayer.instanceCount) {
+            let instanceColor = SIMD4<Float>(
+                clamp(baseColor.x + Float(instanceIndex) * replicatorLayer.instanceRedOffset, 0, 1),
+                clamp(baseColor.y + Float(instanceIndex) * replicatorLayer.instanceGreenOffset, 0, 1),
+                clamp(baseColor.z + Float(instanceIndex) * replicatorLayer.instanceBlueOffset, 0, 1),
+                clamp(baseColor.w + Float(instanceIndex) * replicatorLayer.instanceAlphaOffset, 0, 1)
+            )
+            let instanceMatrix = parentMatrix * cumulativeTransform.matrix4x4
+            let timeOffset = inheritedTimeOffset
+                + CFTimeInterval(instanceIndex) * replicatorLayer.instanceDelay
+
+            for sublayer in sublayers {
+                items.append(DrawItem(
+                    layer: sublayer,
+                    parentMatrix: instanceMatrix,
+                    color: inheritedColor * instanceColor,
+                    timeOffset: timeOffset,
+                    instanceIndex: instanceIndex,
+                    depth: projectedCenterDepth(
+                        of: sublayer,
+                        parentMatrix: instanceMatrix,
+                        timeOffset: timeOffset
+                    ),
+                    insertionOrder: insertionOrder
+                ))
+                insertionOrder += 1
+            }
+            cumulativeTransform = CATransform3DConcat(
+                cumulativeTransform,
+                replicatorLayer.instanceTransform
+            )
+        }
+
+        // Depth testing resolves opaque intersections. Far-to-near submission
+        // preserves source-over blending for translucent replicated planes.
+        items.sort {
+            $0.depth == $1.depth
+                ? $0.insertionOrder < $1.insertionOrder
+                : $0.depth < $1.depth
+        }
+
+        for item in items {
+            replicatorColorStack.append(item.color)
+            replicatorTimeOffsetStack.append(item.timeOffset)
+            replicatorInstancePath.append(ReplicatorInstancePathComponent(
+                replicator: ObjectIdentifier(replicatorModelLayer),
+                instanceIndex: item.instanceIndex
+            ))
+            renderLayer(
+                item.layer,
+                renderPass: renderPass,
+                parentMatrix: item.parentMatrix
+            )
+            _ = replicatorInstancePath.popLast()
+            _ = replicatorTimeOffsetStack.popLast()
+            _ = replicatorColorStack.popLast()
         }
     }
 
@@ -9339,6 +9498,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
         let isTransformLayer = layer is CATransformLayer
+            || (presentationLayer as? CAReplicatorLayer)?.preservesDepth == true
         let requiresTransformFlattening = parentIsTransformLayer
             && !isTransformLayer
             && requiresTransformFlattening(
@@ -9692,6 +9852,12 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         purpose: RasterizationCachePurpose,
         contentBoundsHash: Int
     ) -> Bool {
+        // Particle simulation advances independently of CALayer dirty flags.
+        // Reusing a cached ancestor texture would freeze live particles even
+        // though the layer tree itself has not been mutated.
+        if subtreeContainsEmitter(layer) {
+            return false
+        }
         if let mask = layer.mask, subtreeHasAnimations(mask) {
             return false
         }
@@ -9707,6 +9873,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return false
         }
         return entry.contentBoundsHash == contentBoundsHash
+    }
+
+    private func subtreeContainsEmitter(_ layer: CALayer) -> Bool {
+        var pending: [CALayer] = [layer]
+        var visited: Set<ObjectIdentifier> = []
+        while let candidate = pending.popLast() {
+            guard visited.insert(ObjectIdentifier(candidate)).inserted else {
+                continue
+            }
+            if candidate is CAEmitterLayer {
+                return true
+            }
+            if let mask = candidate.mask {
+                pending.append(mask)
+            }
+            pending.append(contentsOf: candidate.sublayers ?? [])
+        }
+        return false
     }
 
     private func rasterizationCaptureBounds(for layer: CALayer) -> CGRect? {
@@ -11106,6 +11290,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     ) {
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else { return }
+        let entersDepthSpace = emitterLayer.preservesDepth
+        let beginsIndependentDepthGroup = entersDepthSpace && transformDepthNesting == 0
+        if beginsIndependentDepthGroup {
+            guard let depthClearPipeline else {
+                emitterRenderFailureCount += 1
+                return
+            }
+            renderPass.setPipeline(depthClearPipeline)
+            renderPass.draw(vertexCount: 3)
+        }
+        if entersDepthSpace {
+            transformDepthNesting += 1
+        }
+        defer {
+            if entersDepthSpace {
+                transformDepthNesting -= 1
+            }
+        }
         let emitterCells = emitterLayer.emitterCells ?? []
 
         let layerID = ObjectIdentifier(modelLayer)
