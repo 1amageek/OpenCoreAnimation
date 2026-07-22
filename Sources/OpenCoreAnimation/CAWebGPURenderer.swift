@@ -2960,9 +2960,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         premultipliedTexturedDepthStencilPipeline = makePipeline(stencilCompare: .equal, depthEnabled: true)
     }
 
-    /// R3.5: pick the textured pipeline based on stencil state and the
-    /// `blendEnabled` decision for the layer. Falls back to the alpha-blended
-    /// variant when an opaque pipeline isn't created (test fallback).
+    /// R3.5: picks the textured pipeline without weakening the active stencil
+    /// or depth contract. An unavailable opaque variant may use the matching
+    /// alpha-blended variant, but a stencil variant never falls back to an
+    /// unmasked pipeline.
     private func selectTexturedPipeline(
         for layer: CALayer,
         forceBlending: Bool = false
@@ -2971,14 +2972,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
         if transformDepthNesting > 0 {
             if maskNestingDepth > 0 {
                 if blendOff, let opaque = texturedDepthStencilOpaquePipeline { return opaque }
-                return texturedDepthStencilPipeline ?? texturedDepthPipeline
+                return texturedDepthStencilPipeline
             }
             if blendOff, let opaque = texturedDepthOpaquePipeline { return opaque }
             return texturedDepthPipeline
         }
         if maskNestingDepth > 0 {
             if blendOff, let opaque = texturedStencilOpaquePipeline { return opaque }
-            return texturedStencilPipeline ?? texturedPipeline
+            return texturedStencilPipeline
         }
         if blendOff, let opaque = texturedOpaquePipeline { return opaque }
         return texturedPipeline
