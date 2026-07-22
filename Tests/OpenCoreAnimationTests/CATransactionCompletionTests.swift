@@ -59,6 +59,31 @@ struct CATransactionCompletionTests {
         #expect(completionCount == 1)
     }
 
+    @Test("Completion tracks an animation group as one attached animation")
+    func groupCompletesTransactionOnce() {
+        CATransaction.flush()
+        let layer = CALayer()
+        let child = CABasicAnimation(keyPath: "opacity")
+        child.duration = 1
+        let group = CAAnimationGroup()
+        group.animations = [child]
+        group.duration = 1
+        var completionCount = 0
+
+        CATransaction.begin()
+        CATransaction.setCompletionBlock {
+            completionCount += 1
+        }
+        layer.add(group, forKey: "group")
+        CATransaction.commit()
+
+        #expect(completionCount == 0)
+        setStoredAnimationBeginTime(CACurrentMediaTime() - 2, on: layer, forKey: "group")
+        layer.processAnimationCompletions()
+        layer.processAnimationCompletions()
+        #expect(completionCount == 1)
+    }
+
     @Test("Completion tracks an implicit animation created by a layer action")
     func implicitActionAnimationDelaysCompletion() {
         CATransaction.flush()

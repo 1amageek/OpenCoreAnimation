@@ -431,14 +431,25 @@ open class CALayer: CAMediaTiming, Hashable {
     ) {
         // Handle animation groups
         if let animationGroup = animation as? CAAnimationGroup {
-            applyAnimationGroup(animationGroup, to: layer, at: time, pass: pass)
+            applyAnimationGroup(
+                animationGroup,
+                to: layer,
+                at: time,
+                pass: pass,
+                managesLifecycle: true
+            )
             return
         }
 
         // Handle transitions
         if let transition = animation as? CATransition {
             guard pass == .nonAdditive else { return }
-            applyTransition(transition, to: layer, at: time)
+            applyTransition(
+                transition,
+                to: layer,
+                at: time,
+                managesLifecycle: true
+            )
             return
         }
 
@@ -500,14 +511,15 @@ open class CALayer: CAMediaTiming, Hashable {
         _ transition: CATransition,
         to layer: CALayer,
         at time: CFTimeInterval,
-        effectiveDuration: CFTimeInterval? = nil
+        effectiveDuration: CFTimeInterval? = nil,
+        managesLifecycle: Bool
     ) {
         // Calculate transition progress
         let duration = transition.duration > 0
             ? transition.duration
             : effectiveDuration ?? CATransaction.animationDuration()
         let timing = CAMediaTimingEvaluator.evaluate(transition, parentTime: time, duration: duration)
-        if timing.phase != .before {
+        if managesLifecycle, timing.phase != .before {
             transition.markStarted()
         }
         guard timing.applies(fillMode: transition.fillMode) else { return }
@@ -540,18 +552,18 @@ open class CALayer: CAMediaTiming, Hashable {
         to layer: CALayer,
         at time: CFTimeInterval,
         effectiveDuration: CFTimeInterval? = nil,
-        pass: AnimationApplicationPass
+        pass: AnimationApplicationPass,
+        managesLifecycle: Bool
     ) {
-        guard let animations = group.animations else { return }
-
         let groupBaseDuration = group.duration > 0
             ? group.duration
             : effectiveDuration ?? CATransaction.animationDuration()
         let timing = CAMediaTimingEvaluator.evaluate(group, parentTime: time, duration: groupBaseDuration)
-        if timing.phase != .before {
+        if managesLifecycle, timing.phase != .before {
             group.markStarted()
         }
         guard timing.applies(fillMode: group.fillMode) else { return }
+        guard let animations = group.animations else { return }
         let childTime: CFTimeInterval
         if let timingFunction = group.timingFunction {
             let easedProgress = timingFunction.evaluate(at: Float(timing.progress))
@@ -589,7 +601,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 to: layer,
                 at: time,
                 effectiveDuration: effectiveDuration,
-                pass: pass
+                pass: pass,
+                managesLifecycle: false
             )
             return
         }
@@ -600,7 +613,8 @@ open class CALayer: CAMediaTiming, Hashable {
                 transition,
                 to: layer,
                 at: time,
-                effectiveDuration: effectiveDuration
+                effectiveDuration: effectiveDuration,
+                managesLifecycle: false
             )
             return
         }
@@ -624,9 +638,6 @@ open class CALayer: CAMediaTiming, Hashable {
             parentTime: time,
             duration: singleCycleDuration
         )
-        if timing.phase != .before {
-            animation.markStarted()
-        }
         guard timing.applies(fillMode: animation.fillMode) else { return }
         var progress = timing.progress
 
