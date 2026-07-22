@@ -3126,6 +3126,14 @@ func installHarness() {
                             == .invalidRasterizationScale(0)
                     invalidRasterization.removeFromSuperlayer()
                     engine.renderFrame()
+                    let frameFailuresBeforeInvalidResize = renderer.frameRenderFailureCount
+                    let sizeBeforeInvalidResize = renderer.size
+                    renderer.resize(width: 0, height: 16)
+                    let invalidResizeWasRejected = renderer.size == sizeBeforeInvalidResize
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeInvalidResize + 1
+                        && renderer.lastFrameRenderFailure
+                            == .invalidRenderTarget(.invalidDimensions(width: 0, height: 16))
                     transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
                         + ",transparent=\(transparentPixelsAreCorrect)"
                         + ",isolated=\(independentGroupsAreIsolated)"
@@ -3149,6 +3157,8 @@ func installHarness() {
                         + ",reused=\(unchangedSubtreeWasReused)"
                         + ",rasterFailure=\(hasTypedRasterizationFailure)"
                         + ",depthFailures=\(renderer.transformDepthRenderFailureCount)"
+                        + ",frameFailures=\(frameFailuresBeforeInvalidResize)"
+                        + ",resizeTyped=\(invalidResizeWasRejected)"
                 } catch {
                     crossingGroup.removeFromSuperlayer()
                     directMaskedGroup.removeFromSuperlayer()

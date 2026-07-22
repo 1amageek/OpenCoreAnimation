@@ -9,7 +9,7 @@ import JavaScriptKit
 #endif
 
 /// Errors that can occur during renderer operations.
-public enum CARendererError: Error {
+public enum CARendererError: Error, Equatable, Sendable {
     /// The GPU/graphics device is not available.
     case deviceNotAvailable
     /// Failed to create the render pipeline.
@@ -24,6 +24,8 @@ public enum CARendererError: Error {
     case resourceCreationFailed
     /// The canvas/view is not configured.
     case canvasNotConfigured
+    /// The requested render target cannot be represented by the renderer.
+    case invalidRenderTarget(CARenderTargetConfigurationError)
     /// General rendering error.
     case renderingFailed(String)
 }

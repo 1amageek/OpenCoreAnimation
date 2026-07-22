@@ -965,6 +965,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var lastDynamicRangeRenderFailure: CADynamicRangeRenderFailure?
 
+    /// Number of frames rejected before command encoding could begin.
+    @_spi(RendererDiagnostics)
+    public private(set) var frameRenderFailureCount: Int = 0
+
+    /// The most recent typed frame-start failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastFrameRenderFailure: CAWebGPUFrameRenderFailure?
+
     /// Whether the browser reports configurable canvas tone mapping.
     @_spi(RendererDiagnostics)
     public private(set) var supportsExtendedDynamicRangeOutput: Bool = false
@@ -2086,11 +2094,27 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Get initial canvas size
         let width = canvas.width.number ?? 800
         let height = canvas.height.number ?? 600
-        size = CGSize(width: width, height: height)
+        let renderTarget: CARenderTargetConfiguration
+        do {
+            renderTarget = try CARenderTargetConfiguration(
+                width: width,
+                height: height,
+                maximumTextureDimension: Int(device.limits.maxTextureDimension2D)
+            )
+        } catch {
+            throw CARendererError.invalidRenderTarget(error)
+        }
+        size = CGSize(width: renderTarget.width, height: renderTarget.height)
 
         // Create depth texture
-        createDepthTexture(width: Int(width), height: Int(height))
-        configureRasterizationCache(width: Int(width), height: Int(height))
+        let depthResources = createDepthResources(
+            device: device,
+            width: renderTarget.width,
+            height: renderTarget.height
+        )
+        depthTexture = depthResources.texture
+        depthTextureView = depthResources.view
+        configureRasterizationCache(width: renderTarget.width, height: renderTarget.height)
 
         // Create textured pipeline
         try createTexturedPipeline(device: device)
@@ -3611,17 +3635,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
         ))
     }
 
-    /// Creates or recreates the depth texture for the given size.
-    /// Uses depth24plus-stencil8 format to support both depth testing and stencil-based masking.
-    private func createDepthTexture(width: Int, height: Int) {
-        guard let device = device, width > 0, height > 0 else { return }
-
-        depthTexture = device.createTexture(descriptor: GPUTextureDescriptor(
+    /// Creates a complete depth resource pair for validated target dimensions.
+    private func createDepthResources(
+        device: GPUDevice,
+        width: Int,
+        height: Int
+    ) -> (texture: GPUTexture, view: GPUTextureView) {
+        let texture = device.createTexture(descriptor: GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
             format: .depth24plusStencil8,
             usage: .renderAttachment
         ))
-        depthTextureView = depthTexture?.createView()
+        return (texture, texture.createView())
     }
 
     /// Configures and then reads back the canvas contract. Browsers that do
@@ -3773,23 +3798,52 @@ public final class CAWebGPURenderer: CARendererDelegate {
         lastDynamicRangeRenderFailure = failure
     }
 
+    private func recordFrameRenderFailure(_ failure: CAWebGPUFrameRenderFailure) {
+        frameRenderFailureCount += 1
+        lastFrameRenderFailure = failure
+    }
+
     public func resize(width: Int, height: Int) {
-        size = CGSize(width: width, height: height)
-
-        // Update canvas size
-        canvas.width = .number(Double(width))
-        canvas.height = .number(Double(height))
-
-        // Reconfigure context for new size
-        if device != nil {
-            guard configureCanvas(toneMappingMode: canvasToneMappingMode) else {
-                recordDynamicRangeFailure(.canvasConfigurationFailed)
-                return
-            }
+        let maximumTextureDimension = device.map {
+            Int($0.limits.maxTextureDimension2D)
+        } ?? Int.max
+        let renderTarget: CARenderTargetConfiguration
+        do {
+            renderTarget = try CARenderTargetConfiguration(
+                width: Double(width),
+                height: Double(height),
+                maximumTextureDimension: maximumTextureDimension
+            )
+        } catch {
+            recordFrameRenderFailure(.invalidRenderTarget(error))
+            return
         }
 
+        // Configure first so a rejected context change cannot leave the public
+        // size and canvas dimensions partially committed.
+        if device != nil,
+           !configureCanvas(toneMappingMode: canvasToneMappingMode) {
+            recordDynamicRangeFailure(.canvasConfigurationFailed)
+            recordFrameRenderFailure(.canvasConfigurationFailed)
+            return
+        }
+
+        // Update canvas size
+        size = CGSize(width: renderTarget.width, height: renderTarget.height)
+        canvas.width = .number(Double(renderTarget.width))
+        canvas.height = .number(Double(renderTarget.height))
+
         // Recreate depth texture
-        createDepthTexture(width: width, height: height)
+        if let device {
+            let depthResources = createDepthResources(
+                device: device,
+                width: renderTarget.width,
+                height: renderTarget.height
+            )
+            depthTexture?.destroy()
+            depthTexture = depthResources.texture
+            depthTextureView = depthResources.view
+        }
 
         // Shadow captures are viewport-sized. A resize invalidates every per-layer set.
         for resources in shadowLayerResources.values {
@@ -3810,7 +3864,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Recreating the cache on resize applies the new viewport-derived
         // immutable byte budget. The eviction callback releases every old
         // capture and its dependent texture view before replacement.
-        configureRasterizationCache(width: width, height: height)
+        configureRasterizationCache(width: renderTarget.width, height: renderTarget.height)
         prerasterizedTextures.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
     }
@@ -3842,11 +3896,41 @@ public final class CAWebGPURenderer: CARendererDelegate {
     public func render(layer rootLayer: CALayer) {
         lastContentsConversionError = nil
         lastContentsRenderFailure = nil
-        guard let device = device,
-              let context = context,
-              let pipeline = pipeline,
-              bindGroup != nil,
-              depthTexture != nil else { return }
+        guard let device else {
+            recordFrameRenderFailure(.deviceUnavailable)
+            return
+        }
+        let renderTarget: CARenderTargetConfiguration
+        do {
+            renderTarget = try CARenderTargetConfiguration(
+                width: Double(size.width),
+                height: Double(size.height),
+                maximumTextureDimension: Int(device.limits.maxTextureDimension2D)
+            )
+        } catch {
+            recordFrameRenderFailure(.invalidRenderTarget(error))
+            return
+        }
+        guard let context else {
+            recordFrameRenderFailure(.contextUnavailable)
+            return
+        }
+        guard let pipeline else {
+            recordFrameRenderFailure(.basePipelineUnavailable)
+            return
+        }
+        guard bindGroup != nil else {
+            recordFrameRenderFailure(.baseBindGroupUnavailable)
+            return
+        }
+        guard depthTexture != nil else {
+            recordFrameRenderFailure(.depthTextureUnavailable)
+            return
+        }
+        guard let depthTextureView else {
+            recordFrameRenderFailure(.depthTextureViewUnavailable)
+            return
+        }
 
         guard prepareDynamicRangeOutput(for: rootLayer) else { return }
 
@@ -3949,7 +4033,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // view is cached in `depthTextureView`.
         let currentTexture = context.getCurrentTexture()
         let textureView = currentTexture.createView()
-        guard let depthTextureView = depthTextureView else { return }
 
         // Create command encoder
         let encoder = device.createCommandEncoder()
@@ -3975,9 +4058,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // with game development and standard mathematical coordinate systems.
         let projectionMatrix = Matrix4x4.orthographic(
             left: 0,
-            right: Float(size.width),
+            right: renderTarget.viewportSize.x,
             bottom: 0,
-            top: Float(size.height),
+            top: renderTarget.viewportSize.y,
             near: -1000,
             far: 1000
         )
@@ -4529,6 +4612,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         gradientStopByteOffset = 0
         gradientStopOffsets.removeAll(keepingCapacity: false)
         gradientBindGroup = nil
+        depthTexture?.destroy()
         depthTexture = nil
         pipeline = nil
         depthPipeline = nil
@@ -4579,6 +4663,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         lastContentsConversionError = nil
         dynamicRangeRenderFailureCount = 0
         lastDynamicRangeRenderFailure = nil
+        frameRenderFailureCount = 0
+        lastFrameRenderFailure = nil
         supportsExtendedDynamicRangeOutput = false
         isExtendedDynamicRangeActive = false
         canvasToneMappingMode = .standard
