@@ -498,6 +498,25 @@ func installHarness() {
             }
             return .number(Double(count))
         })
+        h.expose("getLastTransitionFailure", returning: {
+            let result = MainActor.assumeIsolated { () -> String in
+                guard let failure = (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
+                    .lastTransitionRenderFailure else {
+                    return "none"
+                }
+                switch failure {
+                case .unsupportedFilterValue(let typeName):
+                    return "unsupportedFilterValue=\(typeName)"
+                case .unsupportedTransitionType(let value):
+                    return "unsupportedType=\(value)"
+                case .unsupportedTransitionSubtype(let value):
+                    return "unsupportedSubtype=\(value)"
+                default:
+                    return "other"
+                }
+            }
+            return .string(result)
+        })
         h.expose("getFirstUncapturedGPUError", returning: {
             let message = MainActor.assumeIsolated {
                 (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?

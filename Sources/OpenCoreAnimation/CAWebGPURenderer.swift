@@ -716,6 +716,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var transitionRenderFailureCount: Int = 0
 
+    /// The most recent typed transition capture or filter failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastTransitionRenderFailure: CATransitionRenderFailure?
+
     /// Number of requested layer filters rejected before GPU dispatch.
     @_spi(RendererDiagnostics)
     public private(set) var layerFilterFailureCount: Int = 0
@@ -4606,6 +4610,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         transitionFilterDispatchCount = 0
         transitionFilterFailureCount = 0
         transitionRenderFailureCount = 0
+        lastTransitionRenderFailure = nil
         transitionFilterProcessor?.invalidate()
         transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
@@ -5128,6 +5133,43 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     }
 
+    private enum TransitionFailureCategory {
+        case filter
+        case render
+    }
+
+    private func recordTransitionFailure(
+        _ failure: CATransitionRenderFailure,
+        category: TransitionFailureCategory
+    ) {
+        switch category {
+        case .filter:
+            transitionFilterFailureCount += 1
+        case .render:
+            transitionRenderFailureCount += 1
+        }
+        lastTransitionRenderFailure = failure
+    }
+
+    private func builtInTransitionValidationFailure(
+        type: CATransitionType,
+        subtype: CATransitionSubtype?
+    ) -> CATransitionRenderFailure? {
+        switch type {
+        case .fade:
+            return nil
+        case .moveIn, .push, .reveal:
+            switch subtype {
+            case .fromRight, .fromLeft, .fromTop, .fromBottom, nil:
+                return nil
+            default:
+                return .unsupportedTransitionSubtype(subtype?.rawValue ?? "nil")
+            }
+        default:
+            return .unsupportedTransitionType(type.rawValue)
+        }
+    }
+
     private func prerenderTransitions(
         _ rootLayer: CALayer,
         encoder: GPUCommandEncoder
@@ -5154,46 +5196,66 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 activeTransitionSourceIDs.insert(sourceID)
                 if transitionCaptures[sourceID] == nil,
                    !failedTransitionSourceIDs.contains(sourceID) {
-                    let capture: TransitionCapturePair?
+                    let capture: TransitionCapturePair
                     if let filterValue = state.filter {
-                        guard let filter = filterValue as? CIFilter,
-                              let processor = transitionFilterProcessor,
-                              processor.supports(filter) else {
+                        guard let filter = filterValue as? CIFilter else {
                             failedTransitionSourceIDs.insert(sourceID)
-                            transitionFilterFailureCount += 1
+                            recordTransitionFailure(
+                                .unsupportedFilterValue(String(reflecting: type(of: filterValue))),
+                                category: .filter
+                            )
                             return
                         }
-                        capture = createFilteredTransitionCapture(
-                            sourceLayer: state.sourceLayer,
-                            targetLayer: layer,
-                            filter: filter,
-                            processor: processor,
-                            device: device,
-                            pipeline: pipeline,
-                            encoder: encoder
-                        )
-                    } else if supportsBuiltInTransition(
-                        type: state.type,
-                        subtype: state.subtype
-                    ) {
-                        capture = createBuiltInTransitionCapture(
-                            sourceLayer: state.sourceLayer,
-                            targetLayer: layer,
-                            device: device,
-                            pipeline: pipeline,
-                            encoder: encoder
-                        )
-                    } else {
-                        failedTransitionSourceIDs.insert(sourceID)
-                        transitionRenderFailureCount += 1
-                        return
-                    }
-                    guard let capture else {
-                        failedTransitionSourceIDs.insert(sourceID)
-                        if state.filter != nil {
-                            transitionFilterFailureCount += 1
+                        guard let processor = transitionFilterProcessor else {
+                            failedTransitionSourceIDs.insert(sourceID)
+                            recordTransitionFailure(.filterProcessorUnavailable, category: .filter)
+                            return
                         }
-                        return
+                        guard processor.supports(filter) else {
+                            failedTransitionSourceIDs.insert(sourceID)
+                            recordTransitionFailure(
+                                .unsupportedFilter(String(describing: filter)),
+                                category: .filter
+                            )
+                            return
+                        }
+                        do {
+                            capture = try createFilteredTransitionCapture(
+                                sourceLayer: state.sourceLayer,
+                                targetLayer: layer,
+                                filter: filter,
+                                processor: processor,
+                                device: device,
+                                pipeline: pipeline,
+                                encoder: encoder
+                            )
+                        } catch let failure {
+                            failedTransitionSourceIDs.insert(sourceID)
+                            recordTransitionFailure(failure, category: .filter)
+                            return
+                        }
+                    } else {
+                        if let failure = builtInTransitionValidationFailure(
+                            type: state.type,
+                            subtype: state.subtype
+                        ) {
+                            failedTransitionSourceIDs.insert(sourceID)
+                            recordTransitionFailure(failure, category: .render)
+                            return
+                        }
+                        do {
+                            capture = try createBuiltInTransitionCapture(
+                                sourceLayer: state.sourceLayer,
+                                targetLayer: layer,
+                                device: device,
+                                pipeline: pipeline,
+                                encoder: encoder
+                            )
+                        } catch let failure {
+                            failedTransitionSourceIDs.insert(sourceID)
+                            recordTransitionFailure(failure, category: .render)
+                            return
+                        }
                     }
                     transitionCaptures[sourceID] = capture
                     transitionSourceCaptureCount += 1
@@ -5201,6 +5263,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 }
 
                 if let execution = transitionCaptures[sourceID]?.filterExecution {
+                    guard state.progress.isFinite else {
+                        destroyTransitionCapture(for: sourceID)
+                        failedTransitionSourceIDs.insert(sourceID)
+                        recordTransitionFailure(.invalidProgress(state.progress), category: .filter)
+                        return
+                    }
                     do {
                         try execution.encode(
                             progress: Float(state.progress),
@@ -5210,7 +5278,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     } catch {
                         destroyTransitionCapture(for: sourceID)
                         failedTransitionSourceIDs.insert(sourceID)
-                        transitionFilterFailureCount += 1
+                        recordTransitionFailure(
+                            .filterDispatchFailed(String(describing: error)),
+                            category: .filter
+                        )
                     }
                 }
             }
@@ -5227,48 +5298,32 @@ public final class CAWebGPURenderer: CARendererDelegate {
         failedTransitionSourceIDs = failedTransitionSourceIDs.intersection(activeTransitionSourceIDs)
     }
 
-    private func supportsBuiltInTransition(
-        type: CATransitionType,
-        subtype: CATransitionSubtype?
-    ) -> Bool {
-        switch type {
-        case .fade:
-            return true
-        case .moveIn, .push, .reveal:
-            switch subtype {
-            case .fromRight, .fromLeft, .fromTop, .fromBottom, nil:
-                return true
-            default:
-                return false
-            }
-        default:
-            return false
-        }
-    }
-
     private func createBuiltInTransitionCapture(
         sourceLayer: CALayer,
         targetLayer: CALayer,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         encoder: GPUCommandEncoder
-    ) -> TransitionCapturePair? {
-        guard let source = captureTransitionParticipant(
+    ) throws(CATransitionRenderFailure) -> TransitionCapturePair {
+        let source = try captureTransitionParticipant(
             sourceLayer,
+            role: .source,
             device: device,
             pipeline: pipeline,
             encoder: encoder
-        ) else {
-            return nil
-        }
-        guard let target = captureTransitionParticipant(
-            targetLayer,
-            device: device,
-            pipeline: pipeline,
-            encoder: encoder
-        ) else {
+        )
+        let target: TransitionParticipantCapture
+        do {
+            target = try captureTransitionParticipant(
+                targetLayer,
+                role: .target,
+                device: device,
+                pipeline: pipeline,
+                encoder: encoder
+            )
+        } catch let failure {
             source.texture.destroy()
-            return nil
+            throw failure
         }
         return TransitionCapturePair(source: source, target: target, filterExecution: nil)
     }
@@ -5281,25 +5336,28 @@ public final class CAWebGPURenderer: CARendererDelegate {
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         encoder: GPUCommandEncoder
-    ) -> TransitionCapturePair? {
-        guard let target = captureTransitionParticipant(
+    ) throws(CATransitionRenderFailure) -> TransitionCapturePair {
+        let target = try captureTransitionParticipant(
             targetLayer,
+            role: .target,
             device: device,
             pipeline: pipeline,
             encoder: encoder
-        ) else {
-            return nil
-        }
+        )
         let sharedPixelSize = CGSize(width: target.pixelWidth, height: target.pixelHeight)
-        guard let source = captureTransitionParticipant(
-            sourceLayer,
-            pixelSizeOverride: sharedPixelSize,
-            device: device,
-            pipeline: pipeline,
-            encoder: encoder
-        ) else {
+        let source: TransitionParticipantCapture
+        do {
+            source = try captureTransitionParticipant(
+                sourceLayer,
+                role: .source,
+                pixelSizeOverride: sharedPixelSize,
+                device: device,
+                pipeline: pipeline,
+                encoder: encoder
+            )
+        } catch let failure {
             target.texture.destroy()
-            return nil
+            throw failure
         }
 
         do {
@@ -5318,7 +5376,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         } catch {
             source.texture.destroy()
             target.texture.destroy()
-            return nil
+            throw .filterExecutionCreationFailed(String(describing: error))
         }
     }
 
@@ -5338,51 +5396,23 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     private func captureTransitionParticipant(
         _ layer: CALayer,
+        role: CATransitionParticipantRole,
         pixelSizeOverride: CGSize? = nil,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         encoder: GPUCommandEncoder
-    ) -> TransitionParticipantCapture? {
+    ) throws(CATransitionRenderFailure) -> TransitionParticipantCapture {
         let presentation = layer._renderTimePresentation()
         let bounds = presentation.bounds
-        guard bounds.width.isFinite,
-              bounds.height.isFinite,
-              bounds.width > 0,
-              bounds.height > 0 else {
-            return nil
-        }
-
-        let pixelWidth: Int
-        let pixelHeight: Int
-        if let pixelSizeOverride {
-            guard pixelSizeOverride.width.isFinite,
-                  pixelSizeOverride.height.isFinite,
-                  pixelSizeOverride.width > 0,
-                  pixelSizeOverride.height > 0 else {
-                return nil
-            }
-            pixelWidth = Int(pixelSizeOverride.width)
-            pixelHeight = Int(pixelSizeOverride.height)
-        } else {
-            let requestedScale = presentation.contentsScale.isFinite
-                ? max(presentation.contentsScale, 1)
-                : 1
-            let maximumDimension = CGFloat(max(1, Int(device.limits.maxTextureDimension2D)))
-            let requestedWidth = bounds.width * requestedScale
-            let requestedHeight = bounds.height * requestedScale
-            guard requestedWidth.isFinite,
-                  requestedHeight.isFinite,
-                  requestedWidth > 0,
-                  requestedHeight > 0 else {
-                return nil
-            }
-            let fittingScale = min(
-                1,
-                maximumDimension / max(requestedWidth, requestedHeight)
-            )
-            pixelWidth = max(1, Int(ceil(requestedWidth * fittingScale)))
-            pixelHeight = max(1, Int(ceil(requestedHeight * fittingScale)))
-        }
+        let configuration = try CATransitionCaptureConfiguration(
+            bounds: bounds,
+            contentsScale: presentation.contentsScale,
+            pixelSizeOverride: pixelSizeOverride,
+            maximumTextureDimension: Int(device.limits.maxTextureDimension2D),
+            role: role
+        )
+        let pixelWidth = configuration.pixelWidth
+        let pixelHeight = configuration.pixelHeight
         let pixelSize = CGSize(width: pixelWidth, height: pixelHeight)
 
         let texture = device.createTexture(descriptor: GPUTextureDescriptor(
@@ -5434,10 +5464,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
 
         let captureProjection = Matrix4x4.orthographic(
-            left: 0,
-            right: Float(bounds.width),
-            bottom: 0,
-            top: Float(bounds.height),
+            left: configuration.projectionLeft,
+            right: configuration.projectionRight,
+            bottom: configuration.projectionBottom,
+            top: configuration.projectionTop,
             near: -1000,
             far: 1000
         )

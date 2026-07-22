@@ -51,6 +51,7 @@ interface OCA extends Harness {
     getTransitionFilterDispatchCount: () => number;
     getTransitionFilterFailureCount: () => number;
     getTransitionRenderFailureCount: () => number;
+    getLastTransitionFailure: () => string;
     getFirstUncapturedGPUError: () => string;
     getActiveFilterResourceCount: () => number;
     getLayerFilterFailureCount: () => number;
@@ -283,14 +284,17 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.exerciseUnsupportedTransitionFilter();
         await expect.poll(() => h.getTransitionFilterFailureCount()).toBe(1);
+        expect(await h.getLastTransitionFailure()).toBe("unsupportedFilterValue=Swift.String");
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.exerciseUnsupportedBuiltInTransition();
         await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(1);
+        expect(await h.getLastTransitionFailure()).toBe("unsupportedType=unsupported");
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.exerciseUnsupportedTransitionSubtype();
         await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(2);
+        expect(await h.getLastTransitionFailure()).toBe("unsupportedSubtype=unsupported");
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.removeTransition();
