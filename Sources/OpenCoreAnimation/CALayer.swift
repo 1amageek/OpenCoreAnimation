@@ -5274,7 +5274,9 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Converts the point from the specified layer's coordinate system to the receiver's coordinate system.
     open func convert(_ p: CGPoint, from l: CALayer?) -> CGPoint {
-        guard let sourceLayer = l else { return p }
+        guard let sourceLayer = l else {
+            return convertPointFromSuperlayer(p)
+        }
         if sourceLayer === self { return p }
 
         var sourceAncestors = Set<ObjectIdentifier>()
@@ -5315,7 +5317,9 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Converts the point from the receiver's coordinate system to the specified layer's coordinate system.
     open func convert(_ p: CGPoint, to l: CALayer?) -> CGPoint {
-        guard let targetLayer = l else { return p }
+        guard let targetLayer = l else {
+            return PlaneProjectiveTransform(localToSuperlayerTransform()).project(p)
+        }
         if targetLayer === self { return p }
 
         // Use the inverse operation
@@ -5324,8 +5328,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Converts the rectangle from the specified layer's coordinate system to the receiver's coordinate system.
     open func convert(_ r: CGRect, from l: CALayer?) -> CGRect {
-        guard let sourceLayer = l else { return r }
-        if sourceLayer === self { return r }
+        if l === self { return r }
 
         // For rectangles with transforms, we need to convert all four corners
         // and compute the bounding box
@@ -5344,8 +5347,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Converts the rectangle from the receiver's coordinate system to the specified layer's coordinate system.
     open func convert(_ r: CGRect, to l: CALayer?) -> CGRect {
-        guard let targetLayer = l else { return r }
-        if targetLayer === self { return r }
+        if l === self { return r }
 
         // For rectangles with transforms, we need to convert all four corners
         // and compute the bounding box

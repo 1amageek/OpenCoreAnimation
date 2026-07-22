@@ -4,6 +4,49 @@ import Testing
 
 @Suite("CALayer coordinate conversion")
 struct CALayerCoordinateConversionTests {
+    @Test("Nil point conversion uses the superlayer coordinate space")
+    func nilPointConversionUsesSuperlayerCoordinateSpace() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 5, y: 7, width: 100, height: 80)
+        layer.anchorPoint = CGPoint(x: 0.25, y: 0.75)
+        layer.position = CGPoint(x: 80, y: 90)
+        layer.transform = CATransform3DMakeRotation(0.3, 0, 0, 1)
+        layer.isGeometryFlipped = true
+
+        let localPoint = CGPoint(x: 11, y: 13)
+        let superlayerPoint = layer.convert(localPoint, to: nil)
+        let convertedFromSuperlayer = layer.convert(localPoint, from: nil)
+
+        #expect(abs(superlayerPoint.x - 57.7113238134) < 0.0001)
+        #expect(abs(superlayerPoint.y - 97.7598269212) < 0.0001)
+        #expect(abs(convertedFromSuperlayer.x + 58.6732736626) < 0.0001)
+        #expect(abs(convertedFromSuperlayer.y - 80.1700154030) < 0.0001)
+        let roundTrip = layer.convert(superlayerPoint, from: nil)
+        #expect(abs(roundTrip.x - localPoint.x) < 0.0001)
+        #expect(abs(roundTrip.y - localPoint.y) < 0.0001)
+    }
+
+    @Test("Nil rectangle conversion projects every corner")
+    func nilRectangleConversionProjectsEveryCorner() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
+        layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.position = CGPoint(x: 50, y: 60)
+        layer.transform = CATransform3DMakeRotation(.pi / 2, 0, 0, 1)
+
+        let converted = layer.convert(layer.bounds, to: nil)
+        #expect(abs(converted.origin.x - 40) < 0.0001)
+        #expect(abs(converted.origin.y - 40) < 0.0001)
+        #expect(abs(converted.width - 20) < 0.0001)
+        #expect(abs(converted.height - 40) < 0.0001)
+
+        let restored = layer.convert(converted, from: nil)
+        #expect(abs(restored.origin.x) < 0.0001)
+        #expect(abs(restored.origin.y) < 0.0001)
+        #expect(abs(restored.width - 40) < 0.0001)
+        #expect(abs(restored.height - 20) < 0.0001)
+    }
+
     @Test("Geometry flipping matches Core Animation coordinate conversion")
     func geometryFlippingMatchesCoreAnimationCoordinateConversion() {
         let root = CALayer()
