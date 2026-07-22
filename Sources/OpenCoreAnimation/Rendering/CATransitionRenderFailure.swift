@@ -21,4 +21,11 @@ public enum CATransitionRenderFailure: Error, Equatable, Sendable {
     case filterExecutionCreationFailed(String)
     case invalidProgress(CFTimeInterval)
     case filterDispatchFailed(String)
+    case compositeResourcesUnavailable
+    case invalidCompositeBounds(CGRect)
+    case invalidCompositeOffset(CGPoint)
+    case invalidCompositeOpacity(Float)
+    case invalidCompositeTransform
+    case compositeVertexCapacityExceeded(Int)
+    case compositePipelineUnavailable
 }

@@ -213,6 +213,29 @@ private struct TransitionCapturePair {
     let filterExecution: CIWebGPUTransitionExecution?
 }
 
+private struct TransitionCompositeRequest {
+    let participant: TransitionParticipantCapture
+    let cacheKey: TexturedCacheKey
+    let offset: CGPoint
+    let opacityMultiplier: Float
+}
+
+private struct TransitionCompositeResources {
+    let device: GPUDevice
+    let bindGroupLayout: GPUBindGroupLayout
+    let sampler: GPUSampler
+    let vertexBuffer: GPUBuffer
+    let uniformBuffer: GPUBuffer
+    let selectedPipeline: GPURenderPipeline
+    let basePipeline: GPURenderPipeline
+}
+
+private struct PreparedTransitionComposite {
+    let request: TransitionCompositeRequest
+    let configuration: CATransitionCompositeConfiguration
+    let finalMatrix: Matrix4x4
+}
+
 private enum EmitterBirthRemainderKey: Hashable {
     case root(ObjectIdentifier)
     case child(parentBirthSequence: UInt64, cell: ObjectIdentifier)
@@ -5508,6 +5531,108 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
     }
 
+    private func transitionCompositeResources() throws(CATransitionRenderFailure) -> TransitionCompositeResources {
+        guard let device,
+              let texturedBindGroupLayout,
+              let textureSampler,
+              let vertexBuffer,
+              let uniformBuffer,
+              let basePipeline = pipeline else {
+            throw .compositeResourcesUnavailable
+        }
+        guard let selectedPipeline = selectPremultipliedTexturedPipeline() else {
+            throw .compositePipelineUnavailable
+        }
+        return TransitionCompositeResources(
+            device: device,
+            bindGroupLayout: texturedBindGroupLayout,
+            sampler: textureSampler,
+            vertexBuffer: vertexBuffer,
+            uniformBuffer: uniformBuffer,
+            selectedPipeline: selectedPipeline,
+            basePipeline: basePipeline
+        )
+    }
+
+    private func transitionCompositeConfiguration(
+        for request: TransitionCompositeRequest
+    ) throws(CATransitionRenderFailure) -> CATransitionCompositeConfiguration {
+        try CATransitionCompositeConfiguration(
+            bounds: request.participant.compositeLayer.bounds,
+            position: request.participant.compositeLayer.position,
+            offset: request.offset,
+            opacity: currentEffectiveOpacity
+                * request.participant.compositeLayer.opacity
+                * request.opacityMultiplier
+        )
+    }
+
+    private func transitionCompositeMatrixIsFinite(_ matrix: Matrix4x4) -> Bool {
+        func vectorIsFinite(_ vector: SIMD4<Float>) -> Bool {
+            vector.x.isFinite
+                && vector.y.isFinite
+                && vector.z.isFinite
+                && vector.w.isFinite
+        }
+        return vectorIsFinite(matrix.columns.0)
+            && vectorIsFinite(matrix.columns.1)
+            && vectorIsFinite(matrix.columns.2)
+            && vectorIsFinite(matrix.columns.3)
+    }
+
+    private func prepareTransitionComposite(
+        _ request: TransitionCompositeRequest,
+        parentMatrix: Matrix4x4
+    ) throws(CATransitionRenderFailure) -> PreparedTransitionComposite {
+        let configuration = try transitionCompositeConfiguration(for: request)
+        let presentation = request.participant.compositeLayer
+        let originalPosition = presentation.position
+        presentation.position = configuration.translatedPosition
+        let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
+        presentation.position = originalPosition
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(configuration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, configuration.size.y, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = modelMatrix * scaleMatrix
+        guard transitionCompositeMatrixIsFinite(finalMatrix) else {
+            throw .invalidCompositeTransform
+        }
+        return PreparedTransitionComposite(
+            request: request,
+            configuration: configuration,
+            finalMatrix: finalMatrix
+        )
+    }
+
+    private func reserveTransitionCompositeAllocations(
+        drawCount: Int
+    ) throws(CATransitionRenderFailure) -> [(vertexOffset: UInt64, uniformIndex: Int)] {
+        let verticesPerDraw = 6
+        let bytesPerDraw = UInt64(verticesPerDraw * MemoryLayout<CARendererVertex>.stride)
+        let requiredVertexBytes = UInt64(drawCount) * bytesPerDraw
+        guard drawCount > 0,
+              requiredVertexBytes <= Self.maxVertexBufferSize,
+              currentVertexOffset <= Self.maxVertexBufferSize - requiredVertexBytes,
+              drawCount <= Self.maxLayers,
+              currentLayerIndex <= Self.maxLayers - drawCount else {
+            droppedLayerCount += 1
+            throw .compositeVertexCapacityExceeded(drawCount)
+        }
+
+        let allocations = (0..<drawCount).map { index in
+            (
+                vertexOffset: currentVertexOffset + UInt64(index) * bytesPerDraw,
+                uniformIndex: currentLayerIndex + index
+            )
+        }
+        currentVertexOffset += requiredVertexBytes
+        currentLayerIndex += drawCount
+        return allocations
+    }
+
     /// Composites frozen source and target layer trees for a built-in or filtered transition.
     private func renderTransition(
         state: CATransitionRenderState,
@@ -5516,6 +5641,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
     ) {
         let sourceID = ObjectIdentifier(state.sourceLayer)
         guard let capture = transitionCaptures[sourceID] else { return }
+        let failureCategory: TransitionFailureCategory = capture.filterExecution == nil
+            ? .render
+            : .filter
+        guard state.progress.isFinite else {
+            recordTransitionFailure(.invalidProgress(state.progress), category: failureCategory)
+            return
+        }
         let targetLayer = capture.target.compositeLayer
         let progress = CGFloat(max(0, min(1, state.progress)))
         let baseModelMatrix = targetLayer.modelMatrix(parentMatrix: parentMatrix)
@@ -5527,93 +5659,100 @@ public final class CAWebGPURenderer: CARendererDelegate {
             applyScissorRect(renderPass)
         }
 
-        func renderParticipant(
-            _ participant: TransitionParticipantCapture,
-            cacheKey: TexturedCacheKey,
-            offset: CGPoint,
-            opacityMultiplier: Float
-        ) {
-            renderTransitionCapture(
-                participant,
-                cacheKey: cacheKey,
-                offset: offset,
-                opacityMultiplier: opacityMultiplier,
-                renderPass: renderPass,
-                parentMatrix: parentMatrix
-            )
-        }
-
         if let filterExecution = capture.filterExecution {
-            renderParticipant(
-                TransitionParticipantCapture(
-                    texture: filterExecution.outputTexture,
-                    compositeLayer: capture.target.compositeLayer,
-                    pixelWidth: capture.target.pixelWidth,
-                    pixelHeight: capture.target.pixelHeight
-                ),
-                cacheKey: .transitionFilter(sourceID),
-                offset: .zero,
-                opacityMultiplier: 1
-            )
+            do {
+                try renderTransitionCompositeRequests(
+                    [TransitionCompositeRequest(
+                        participant: TransitionParticipantCapture(
+                            texture: filterExecution.outputTexture,
+                            compositeLayer: capture.target.compositeLayer,
+                            pixelWidth: capture.target.pixelWidth,
+                            pixelHeight: capture.target.pixelHeight
+                        ),
+                        cacheKey: .transitionFilter(sourceID),
+                        offset: .zero,
+                        opacityMultiplier: 1
+                    )],
+                    renderPass: renderPass,
+                    parentMatrix: parentMatrix
+                )
+            } catch let failure {
+                recordTransitionFailure(failure, category: .filter)
+            }
             return
         }
 
-        switch state.type {
-        case .fade:
-            renderFadeTransition(
-                capture,
-                sourceID: sourceID,
-                progress: Float(progress),
-                renderPass: renderPass,
-                parentMatrix: parentMatrix
-            )
+        do {
+            switch state.type {
+            case .fade:
+                try renderFadeTransition(
+                    capture,
+                    sourceID: sourceID,
+                    progress: Float(progress),
+                    renderPass: renderPass,
+                    parentMatrix: parentMatrix
+                )
 
-        case .moveIn:
-            guard let direction = transitionDirection(
-                subtype: state.subtype,
-                bounds: targetLayer.bounds
-            ) else { return }
-            renderParticipant(capture.source, cacheKey: .transitionSource(sourceID), offset: .zero, opacityMultiplier: 1)
-            renderParticipant(
-                capture.target,
-                cacheKey: .transitionTarget(sourceID),
-                offset: CGPoint(x: direction.x * (1 - progress), y: direction.y * (1 - progress)),
-                opacityMultiplier: 1
-            )
+            case .moveIn, .push, .reveal:
+                guard let direction = transitionDirection(
+                    subtype: state.subtype,
+                    bounds: targetLayer.bounds
+                ) else {
+                    recordTransitionFailure(
+                        .unsupportedTransitionSubtype(state.subtype?.rawValue ?? "nil"),
+                        category: .render
+                    )
+                    return
+                }
+                let sourceOffset: CGPoint
+                let targetOffset: CGPoint
+                switch state.type {
+                case .moveIn:
+                    sourceOffset = .zero
+                    targetOffset = CGPoint(
+                        x: direction.x * (1 - progress),
+                        y: direction.y * (1 - progress)
+                    )
+                case .push:
+                    sourceOffset = CGPoint(x: -direction.x * progress, y: -direction.y * progress)
+                    targetOffset = CGPoint(
+                        x: direction.x * (1 - progress),
+                        y: direction.y * (1 - progress)
+                    )
+                case .reveal:
+                    sourceOffset = CGPoint(x: -direction.x * progress, y: -direction.y * progress)
+                    targetOffset = .zero
+                default:
+                    sourceOffset = .zero
+                    targetOffset = .zero
+                }
+                let requests: [TransitionCompositeRequest]
+                if state.type == .reveal {
+                    requests = [
+                        TransitionCompositeRequest(participant: capture.target, cacheKey: .transitionTarget(sourceID), offset: targetOffset, opacityMultiplier: 1),
+                        TransitionCompositeRequest(participant: capture.source, cacheKey: .transitionSource(sourceID), offset: sourceOffset, opacityMultiplier: 1),
+                    ]
+                } else {
+                    requests = [
+                        TransitionCompositeRequest(participant: capture.source, cacheKey: .transitionSource(sourceID), offset: sourceOffset, opacityMultiplier: 1),
+                        TransitionCompositeRequest(participant: capture.target, cacheKey: .transitionTarget(sourceID), offset: targetOffset, opacityMultiplier: 1),
+                    ]
+                }
+                try renderTransitionCompositeRequests(
+                    requests,
+                    renderPass: renderPass,
+                    parentMatrix: parentMatrix
+                )
 
-        case .push:
-            guard let direction = transitionDirection(
-                subtype: state.subtype,
-                bounds: targetLayer.bounds
-            ) else { return }
-            renderParticipant(
-                capture.source,
-                cacheKey: .transitionSource(sourceID),
-                offset: CGPoint(x: -direction.x * progress, y: -direction.y * progress),
-                opacityMultiplier: 1
-            )
-            renderParticipant(
-                capture.target,
-                cacheKey: .transitionTarget(sourceID),
-                offset: CGPoint(x: direction.x * (1 - progress), y: direction.y * (1 - progress)),
-                opacityMultiplier: 1
-            )
-
-        case .reveal:
-            guard let direction = transitionDirection(
-                subtype: state.subtype,
-                bounds: targetLayer.bounds
-            ) else { return }
-            renderParticipant(capture.target, cacheKey: .transitionTarget(sourceID), offset: .zero, opacityMultiplier: 1)
-            renderParticipant(
-                capture.source,
-                cacheKey: .transitionSource(sourceID),
-                offset: CGPoint(x: -direction.x * progress, y: -direction.y * progress),
-                opacityMultiplier: 1
-            )
-
-        default:
-            return
+            default:
+                recordTransitionFailure(
+                    .unsupportedTransitionType(state.type.rawValue),
+                    category: .render
+                )
+                return
+            }
+        } catch let failure {
+            recordTransitionFailure(failure, category: .render)
         }
     }
 
@@ -5623,26 +5762,26 @@ public final class CAWebGPURenderer: CARendererDelegate {
         progress: Float,
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
-    ) {
+    ) throws(CATransitionRenderFailure) {
         guard let device,
               let transitionFadeBindGroupLayout,
               let textureSampler,
               let vertexBuffer,
               let uniformBuffer,
-              let selectedPipeline = selectedTransitionFadePipeline() else {
-            return
+              let basePipeline = pipeline else {
+            throw .compositeResourcesUnavailable
+        }
+        guard let selectedPipeline = selectedTransitionFadePipeline() else {
+            throw .compositePipelineUnavailable
         }
 
-        let presentation = capture.target.compositeLayer
-        let bounds = presentation.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return }
+        let prepared = try prepareTransitionComposite(TransitionCompositeRequest(
+            participant: capture.target,
+            cacheKey: .transitionTarget(sourceID),
+            offset: .zero,
+            opacityMultiplier: 1
+        ), parentMatrix: parentMatrix)
 
-        let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(bounds.height), 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
-        ))
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: SIMD4(repeating: 1)),
             CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 1), color: SIMD4(repeating: 1)),
@@ -5651,14 +5790,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: SIMD4(repeating: 1)),
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: SIMD4(repeating: 1)),
         ]
-        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
-            return
-        }
+        let allocation = try reserveTransitionCompositeAllocations(drawCount: 1)[0]
+        let vertexOffset = allocation.vertexOffset
+        let uniformIndex = allocation.uniformIndex
 
         var uniforms = TransitionFadeUniforms(
-            mvpMatrix: presentation.modelMatrix(parentMatrix: parentMatrix) * scaleMatrix,
+            mvpMatrix: prepared.finalMatrix,
             colorMultiplier: currentReplicatorColor,
-            opacity: currentEffectiveOpacity * presentation.opacity,
+            opacity: prepared.configuration.opacity,
             progress: progress
         )
         let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
@@ -5701,9 +5840,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
-        if let pipeline {
-            renderPass.setPipeline(pipeline)
-        }
+        renderPass.setPipeline(basePipeline)
     }
 
     private func selectedTransitionFadePipeline() -> GPURenderPipeline? {
@@ -5729,34 +5866,38 @@ public final class CAWebGPURenderer: CARendererDelegate {
         return view
     }
 
-    private func renderTransitionCapture(
-        _ capture: TransitionParticipantCapture,
-        cacheKey: TexturedCacheKey,
-        offset: CGPoint,
-        opacityMultiplier: Float,
+    private func renderTransitionCompositeRequests(
+        _ requests: [TransitionCompositeRequest],
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
-    ) {
-        guard opacityMultiplier > 0,
-              let device,
-              let texturedBindGroupLayout,
-              let textureSampler,
-              let vertexBuffer,
-              let uniformBuffer else {
-            return
+    ) throws(CATransitionRenderFailure) {
+        let resources = try transitionCompositeResources()
+        var preparedComposites: [PreparedTransitionComposite] = []
+        preparedComposites.reserveCapacity(requests.count)
+        for request in requests {
+            preparedComposites.append(
+                try prepareTransitionComposite(request, parentMatrix: parentMatrix)
+            )
         }
+        let allocations = try reserveTransitionCompositeAllocations(drawCount: requests.count)
+        for index in requests.indices {
+            renderPreparedTransitionComposite(
+                preparedComposites[index],
+                allocation: allocations[index],
+                resources: resources,
+                renderPass: renderPass
+            )
+        }
+        renderPass.setPipeline(resources.basePipeline)
+    }
 
-        let presentation = capture.compositeLayer
-        let bounds = presentation.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return }
-
-        let originalPosition = presentation.position
-        presentation.position = CGPoint(
-            x: originalPosition.x + offset.x,
-            y: originalPosition.y + offset.y
-        )
-        let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
-        presentation.position = originalPosition
+    private func renderPreparedTransitionComposite(
+        _ prepared: PreparedTransitionComposite,
+        allocation: (vertexOffset: UInt64, uniformIndex: Int),
+        resources: TransitionCompositeResources,
+        renderPass: GPURenderPassEncoder
+    ) {
+        let request = prepared.request
 
         let white = currentReplicatorColor
         var vertices: [CARendererVertex] = [
@@ -5767,53 +5908,38 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 0), color: white),
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
         ]
-        guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
-            return
-        }
-
-        let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(bounds.height), 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
-        ))
         var uniforms = TexturedUniforms(
-            mvpMatrix: modelMatrix * scaleMatrix,
-            opacity: currentEffectiveOpacity * presentation.opacity * opacityMultiplier,
+            mvpMatrix: prepared.finalMatrix,
+            opacity: prepared.configuration.opacity,
             cornerRadius: 0,
-            layerSize: SIMD2<Float>(Float(bounds.width), Float(bounds.height)),
+            layerSize: prepared.configuration.size,
             cornerRadii: .zero
         )
-        let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
-        device.queue.writeBuffer(
-            uniformBuffer,
+        let uniformOffset = UInt64(allocation.uniformIndex) * Self.alignedUniformSize
+        resources.device.queue.writeBuffer(
+            resources.uniformBuffer,
             bufferOffset: uniformOffset,
             data: createFloat32Array(from: &uniforms)
         )
-        device.queue.writeBuffer(
-            vertexBuffer,
-            bufferOffset: vertexOffset,
+        resources.device.queue.writeBuffer(
+            resources.vertexBuffer,
+            bufferOffset: allocation.vertexOffset,
             data: createFloat32Array(from: &vertices)
         )
 
         let bindGroup = cachedTexturedBindGroup(
-            cacheKey: cacheKey,
-            gpuTexture: capture.texture,
-            device: device,
-            layout: texturedBindGroupLayout,
-            sampler: textureSampler,
-            uniformBuffer: uniformBuffer,
+            cacheKey: request.cacheKey,
+            gpuTexture: request.participant.texture,
+            device: resources.device,
+            layout: resources.bindGroupLayout,
+            sampler: resources.sampler,
+            uniformBuffer: resources.uniformBuffer,
             uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
         )
-        guard let selectedPipeline = selectPremultipliedTexturedPipeline() else { return }
-        renderPass.setPipeline(selectedPipeline)
+        renderPass.setPipeline(resources.selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+        renderPass.setVertexBuffer(0, buffer: resources.vertexBuffer, offset: allocation.vertexOffset)
         renderPass.draw(vertexCount: 6)
-
-        if let pipeline {
-            renderPass.setPipeline(pipeline)
-        }
     }
 
     private func transitionDirection(
