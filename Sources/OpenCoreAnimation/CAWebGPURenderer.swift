@@ -905,6 +905,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var lastCornerCurveRenderFailure: CACornerCurveRenderFailure?
 
+    /// Number of stencil masks or rounded clips rejected before safe state mutation.
+    @_spi(RendererDiagnostics)
+    public private(set) var maskRenderFailureCount: Int = 0
+
+    /// The most recent typed mask or stencil-state failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastMaskRenderFailure: CAMaskRenderFailure?
+
     /// Number of image-content draws rejected because their geometry, resources, or pixels are invalid.
     @_spi(RendererDiagnostics)
     public private(set) var contentsRenderFailureCount: Int = 0
@@ -4521,6 +4529,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         lastGradientRenderFailure = nil
         cornerCurveRenderFailureCount = 0
         lastCornerCurveRenderFailure = nil
+        maskRenderFailureCount = 0
+        lastMaskRenderFailure = nil
         contentsRenderFailureCount = 0
         lastContentsRenderFailure = nil
         textRenderFailureCount = 0
@@ -5567,7 +5577,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
     }
 
-    private func transitionCompositeMatrixIsFinite(_ matrix: Matrix4x4) -> Bool {
+    private func matrixIsFinite(_ matrix: Matrix4x4) -> Bool {
         func vectorIsFinite(_ vector: SIMD4<Float>) -> Bool {
             vector.x.isFinite
                 && vector.y.isFinite
@@ -5597,7 +5607,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             SIMD4<Float>(0, 0, 0, 1)
         ))
         let finalMatrix = modelMatrix * scaleMatrix
-        guard transitionCompositeMatrixIsFinite(finalMatrix) else {
+        guard matrixIsFinite(finalMatrix) else {
             throw .invalidCompositeTransform
         }
         return PreparedTransitionComposite(
@@ -6022,7 +6032,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Stencil-aware pipeline selection: if a mask or rounded-corner stencil is active,
         // use the stencil-testing variant so the bg respects the mask shape.
-        renderPass.setPipeline(stencilAwarePipeline())
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            recordMaskRenderFailure(.pipelineUnavailable(.activeStencil))
+            return
+        }
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -6091,7 +6105,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
 
         // Stencil-aware pipeline selection so border respects any active mask/rounded clip.
-        renderPass.setPipeline(stencilAwarePipeline())
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            recordMaskRenderFailure(.pipelineUnavailable(.activeStencil))
+            return
+        }
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -6101,7 +6119,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// otherwise the default pipeline with stencil compare == .always.
     /// Used by background and border rendering so solid-colored quads respect CALayer.mask
     /// and rounded-corner masksToBounds clipping.
-    private func stencilAwarePipeline() -> GPURenderPipeline {
+    private func stencilAwarePipeline() -> GPURenderPipeline? {
         if transformDepthNesting > 0 {
             if maskNestingDepth > 0, let depthStencilTestPipeline {
                 return depthStencilTestPipeline
@@ -6113,7 +6131,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         if maskNestingDepth > 0, let stencilTestPipeline = stencilTestPipeline {
             return stencilTestPipeline
         }
-        return pipeline!
+        return pipeline
     }
 
     // MARK: - Mask Rendering (Stencil)
@@ -6123,6 +6141,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
     ) {
         cornerCurveRenderFailureCount += 1
         lastCornerCurveRenderFailure = failure
+    }
+
+    private func recordMaskRenderFailure(_ failure: CAMaskRenderFailure) {
+        maskRenderFailureCount += 1
+        lastMaskRenderFailure = failure
+    }
+
+    private var stencilStateIsValid: Bool {
+        guard let depthReference = UInt32(exactly: maskNestingDepth) else {
+            return false
+        }
+        return depthReference == currentStencilValue
     }
 
     /// Renders a mask layer to the stencil buffer.
@@ -6136,9 +6166,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     ) -> Bool {
         guard let device = device,
               let stencilWritePipeline = stencilWritePipeline,
+              let stencilTestPipeline = stencilTestPipeline,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup else { return false }
+              let bindGroup = bindGroup,
+              pipeline != nil else {
+            recordMaskRenderFailure(.resourcesUnavailable(.contentMask))
+            return false
+        }
 
         // Validate before mutating the stencil state. A failed mask must not clear
         // or decrement an enclosing mask when the caller unwinds.
@@ -6146,11 +6181,55 @@ public final class CAWebGPURenderer: CARendererDelegate {
         if maskPresentationLayer.cornerRadius > 0,
            let error = maskPresentationLayer.cornerCurveRenderError {
             recordCornerCurveRenderFailure(.mask(error))
+            recordMaskRenderFailure(
+                .unsupportedCornerCurve(.contentMask, maskPresentationLayer.cornerCurve.rawValue)
+            )
+            return false
+        }
+
+        let configuration: CAMaskRenderConfiguration
+        do {
+            configuration = try CAMaskRenderConfiguration(
+                bounds: maskPresentationLayer.bounds,
+                cornerRadius: maskPresentationLayer.cornerRadius,
+                cornerCurveExponent: maskPresentationLayer.cornerCurveRenderExponent
+                    ?? Float(CornerCurveRenderConfiguration.circularExponent),
+                cornerRadii: maskPresentationLayer.cornerRadiiComponents,
+                context: .contentMask
+            )
+        } catch let failure {
+            recordMaskRenderFailure(failure)
             return false
         }
 
         // Render the mask layer (this writes to stencil buffer)
         let maskModelMatrix = maskPresentationLayer.modelMatrix(parentMatrix: parentMatrix)
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(configuration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, configuration.size.y, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = maskModelMatrix * scaleMatrix
+        guard matrixIsFinite(finalMatrix) else {
+            recordMaskRenderFailure(.invalidTransform(.contentMask))
+            return false
+        }
+        guard stencilStateIsValid else {
+            recordMaskRenderFailure(
+                .invalidStencilState(
+                    depth: maskNestingDepth,
+                    reference: currentStencilValue
+                )
+            )
+            return false
+        }
+        guard currentStencilValue < UInt32.max,
+              maskNestingDepth < Int.max else {
+            recordMaskRenderFailure(.stencilReferenceOverflow(.contentMask))
+            return false
+        }
 
         // Render mask layer content to stencil - use dynamic vertex allocation
         let maskColor = SIMD4<Float>(1, 1, 1, 1)
@@ -6163,7 +6242,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: maskColor),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return false }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            recordMaskRenderFailure(.vertexCapacityExceeded(.contentMask))
+            return false
+        }
         let (vertexOffset, layerIndex) = allocation
 
         // Mutate stencil state only after every CPU-side prerequisite succeeds.
@@ -6171,22 +6253,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass.setPipeline(stencilWritePipeline)
         renderPass.setStencilReference(currentStencilValue)
 
-        let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(maskPresentationLayer.bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(maskPresentationLayer.bounds.height), 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
-        ))
-
-        let finalMatrix = maskModelMatrix * scaleMatrix
-
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
             opacity: 1.0,  // Full opacity for stencil write
-            cornerRadius: Float(maskPresentationLayer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(maskPresentationLayer.bounds.width), Float(maskPresentationLayer.bounds.height)),
-            cornerCurveExponent: maskPresentationLayer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent),
-            cornerRadii: maskPresentationLayer.cornerRadiiComponents
+            cornerRadius: configuration.cornerRadius,
+            layerSize: configuration.size,
+            cornerCurveExponent: configuration.cornerCurveExponent,
+            cornerRadii: configuration.cornerRadii
         )
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
@@ -6200,9 +6273,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass.draw(vertexCount: 6)
 
         // Switch to stencil test pipeline for subsequent rendering
-        if let stencilTestPipeline = stencilTestPipeline {
-            renderPass.setPipeline(stencilTestPipeline)
-        }
+        renderPass.setPipeline(stencilTestPipeline)
         maskNestingDepth += 1
         return true
     }
@@ -6211,25 +6282,35 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// Supports nesting: if still inside a parent mask, restores the stencil test
     /// pipeline with the parent's stencil reference value instead of fully disabling.
     private func clearStencilMask(renderPass: GPURenderPassEncoder) {
-        // Decrement stencil reference for nested masks
-        if currentStencilValue > 0 {
-            currentStencilValue -= 1
+        guard stencilStateIsValid,
+              maskNestingDepth > 0,
+              currentStencilValue > 0 else {
+            recordMaskRenderFailure(
+                .invalidStencilState(
+                    depth: maskNestingDepth,
+                    reference: currentStencilValue
+                )
+            )
+            return
         }
-        maskNestingDepth = max(0, maskNestingDepth - 1)
 
-        if maskNestingDepth > 0 {
-            // Still inside a parent mask — restore stencil test with parent's reference
-            if let stencilTestPipeline = stencilTestPipeline {
-                renderPass.setPipeline(stencilTestPipeline)
-                renderPass.setStencilReference(currentStencilValue)
-            }
+        let nextDepth = maskNestingDepth - 1
+        let nextReference = currentStencilValue - 1
+        let restorationPipeline: GPURenderPipeline?
+        if nextDepth > 0 {
+            restorationPipeline = stencilTestPipeline
         } else {
-            // No more masks — switch back to main pipeline
-            if let pipeline = pipeline {
-                renderPass.setPipeline(pipeline)
-                renderPass.setStencilReference(0)
-            }
+            restorationPipeline = pipeline
         }
+        guard let restorationPipeline else {
+            recordMaskRenderFailure(.pipelineUnavailable(.restoration))
+            return
+        }
+
+        maskNestingDepth = nextDepth
+        currentStencilValue = nextReference
+        renderPass.setPipeline(restorationPipeline)
+        renderPass.setStencilReference(nextDepth > 0 ? nextReference : 0)
     }
 
     /// Writes a rounded rectangle to the stencil buffer for masksToBounds + cornerRadius clipping.
@@ -6248,20 +6329,60 @@ public final class CAWebGPURenderer: CARendererDelegate {
               let stencilTestPipeline = stencilTestPipeline,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup else { return false }
+              let bindGroup = bindGroup,
+              pipeline != nil else {
+            recordMaskRenderFailure(.resourcesUnavailable(.roundedClip))
+            return false
+        }
         if let error = layer.cornerCurveRenderError {
             recordCornerCurveRenderFailure(.roundedClip(error))
+            recordMaskRenderFailure(
+                .unsupportedCornerCurve(.roundedClip, layer.cornerCurve.rawValue)
+            )
+            return false
+        }
+
+        let configuration: CAMaskRenderConfiguration
+        do {
+            configuration = try CAMaskRenderConfiguration(
+                bounds: layer.bounds,
+                cornerRadius: layer.cornerRadius,
+                cornerCurveExponent: layer.cornerCurveRenderExponent
+                    ?? Float(CornerCurveRenderConfiguration.circularExponent),
+                cornerRadii: layer.cornerRadiiComponents,
+                context: .roundedClip
+            )
+        } catch let failure {
+            recordMaskRenderFailure(failure)
             return false
         }
 
         // Build transform that maps the unit quad to the layer bounds
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(layer.bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(layer.bounds.height), 0, 0),
+            SIMD4<Float>(configuration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, configuration.size.y, 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
         let finalMatrix = modelMatrix * scaleMatrix
+        guard matrixIsFinite(finalMatrix) else {
+            recordMaskRenderFailure(.invalidTransform(.roundedClip))
+            return false
+        }
+        guard stencilStateIsValid else {
+            recordMaskRenderFailure(
+                .invalidStencilState(
+                    depth: maskNestingDepth,
+                    reference: currentStencilValue
+                )
+            )
+            return false
+        }
+        guard currentStencilValue < UInt32.max,
+              maskNestingDepth < Int.max else {
+            recordMaskRenderFailure(.stencilReferenceOverflow(.roundedClip))
+            return false
+        }
 
         // Create vertices for the quad
         let color = SIMD4<Float>(1, 1, 1, 1)
@@ -6274,7 +6395,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return false }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            recordMaskRenderFailure(.vertexCapacityExceeded(.roundedClip))
+            return false
+        }
         let (vertexOffset, layerIndex) = allocation
 
         // Mutate stencil state only after every CPU-side prerequisite succeeds.
@@ -6286,12 +6410,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
             opacity: 1.0,
-            cornerRadius: Float(layer.cornerRadius),
-            layerSize: SIMD2<Float>(Float(layer.bounds.width), Float(layer.bounds.height)),
-            cornerCurveExponent: layer.cornerCurveRenderExponent ?? Float(CornerCurveRenderConfiguration.circularExponent)
+            cornerRadius: configuration.cornerRadius,
+            layerSize: configuration.size,
+            cornerCurveExponent: configuration.cornerCurveExponent
         )
 
-        uniforms.cornerRadii = layer.cornerRadiiComponents
+        uniforms.cornerRadii = configuration.cornerRadii
 
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
         let uniformData = createFloat32Array(from: &uniforms)
@@ -7760,7 +7884,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Renderers for textured, gradient, filter, and emitter layers change
         // the active pipeline. A shape must therefore select its own solid
         // pipeline instead of depending on whichever sibling rendered first.
-        renderPass.setPipeline(stencilAwarePipeline())
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            recordMaskRenderFailure(.pipelineUnavailable(.activeStencil))
+            return
+        }
+        renderPass.setPipeline(selectedPipeline)
 
         // Render the complete fill in one tessellation so subpath winding and
         // even-odd holes are preserved across contour boundaries.
@@ -8058,7 +8186,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Other foreground renderers select textured or additive pipelines.
         // Gradients always return to the solid pipeline before binding uniforms.
-        renderPass.setPipeline(stencilAwarePipeline())
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            recordMaskRenderFailure(.pipelineUnavailable(.activeStencil))
+            return
+        }
+        renderPass.setPipeline(selectedPipeline)
 
         // Create scale matrix for layer bounds
         let scaleMatrix = Matrix4x4(columns: (
@@ -9234,6 +9366,35 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
     }
 
+    private func contentMaskCornerCurveFailure(
+        in layer: CALayer
+    ) -> (error: CornerCurveRenderConfigurationError, rawValue: String)? {
+        var visited: Set<ObjectIdentifier> = []
+        func visit(
+            _ candidate: CALayer
+        ) -> (error: CornerCurveRenderConfigurationError, rawValue: String)? {
+            guard visited.insert(ObjectIdentifier(candidate)).inserted else {
+                return nil
+            }
+            let presentation = renderPresentation(for: candidate)
+            if presentation.cornerRadius > 0,
+               let error = presentation.cornerCurveRenderError {
+                return (error, presentation.cornerCurve.rawValue)
+            }
+            if let nestedMask = presentation.mask,
+               let failure = visit(nestedMask) {
+                return failure
+            }
+            for sublayer in candidate.sublayers ?? [] {
+                if let failure = visit(sublayer) {
+                    return failure
+                }
+            }
+            return nil
+        }
+        return visit(layer)
+    }
+
     private func renderRawCompositionContentMask(
         _ target: LayerPrepassTarget,
         outputView: GPUTextureView,
@@ -9242,6 +9403,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         depthStencilView: GPUTextureView? = nil,
         encoder: GPUCommandEncoder
     ) -> Bool {
+        if let failure = contentMaskCornerCurveFailure(in: target.layer) {
+            recordCornerCurveRenderFailure(.mask(failure.error))
+            recordMaskRenderFailure(
+                .unsupportedCornerCurve(.contentMask, failure.rawValue)
+            )
+            return false
+        }
         guard let pipeline,
               let activeDepthStencilView = depthStencilView ?? depthTextureView,
               compositionContentMaskTreeIsDirectlyRenderable(target.layer) else { return false }

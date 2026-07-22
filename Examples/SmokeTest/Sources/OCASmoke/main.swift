@@ -5283,6 +5283,7 @@ func installHarness() {
                 CATransaction.commit()
 
                 let failureCountBefore = renderer.cornerCurveRenderFailureCount
+                let maskFailureCountBefore = renderer.maskRenderFailureCount
                 CAAnimationEngine.shared.renderFrame()
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
@@ -5310,7 +5311,17 @@ func installHarness() {
                     case nil:
                         typedFailure = "nil"
                     }
-                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta),typed=\(typedFailure)"
+                    let maskFailureDelta = renderer.maskRenderFailureCount - maskFailureCountBefore
+                    let maskTypedFailure: String
+                    switch renderer.lastMaskRenderFailure {
+                    case .unsupportedCornerCurve(let context, let value):
+                        maskTypedFailure = "\(context.rawValue):\(value)"
+                    case .none:
+                        maskTypedFailure = "nil"
+                    default:
+                        maskTypedFailure = "other"
+                    }
+                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta),typed=\(typedFailure),maskFailures=\(maskFailureDelta),maskTyped=\(maskTypedFailure)"
                 } catch {
                     cornerCurveProbeResult = "error: \(error)"
                 }
