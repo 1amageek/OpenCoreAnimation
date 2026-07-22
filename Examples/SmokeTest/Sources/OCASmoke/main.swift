@@ -3148,6 +3148,7 @@ func installHarness() {
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
                         + ",rasterFailure=\(hasTypedRasterizationFailure)"
+                        + ",depthFailures=\(renderer.transformDepthRenderFailureCount)"
                 } catch {
                     crossingGroup.removeFromSuperlayer()
                     directMaskedGroup.removeFromSuperlayer()

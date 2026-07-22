@@ -873,6 +873,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var lastReplicatorRenderFailure: CAReplicatorRenderFailure?
 
+    /// Number of transform-layer depth groups rejected before rendering.
+    @_spi(RendererDiagnostics)
+    public private(set) var transformDepthRenderFailureCount: Int = 0
+
+    /// The most recent typed transform-layer depth failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastTransformDepthRenderFailure: CATransformDepthRenderFailure?
+
     /// Number of visible shadows that could not complete the GPU render path.
     @_spi(RendererDiagnostics)
     public private(set) var shadowRenderFailureCount: Int = 0
@@ -4729,6 +4737,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         lastEmitterRenderFailure = nil
         replicatorRenderFailureCount = 0
         lastReplicatorRenderFailure = nil
+        transformDepthRenderFailureCount = 0
+        lastTransformDepthRenderFailure = nil
 
         // Textured bind group / view caches (release JS-side handles)
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: false)
@@ -12240,6 +12250,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - CATransformLayer Rendering
 
+    private func recordTransformDepthRenderFailure(
+        _ failure: CATransformDepthRenderFailure
+    ) {
+        transformDepthRenderFailureCount += 1
+        lastTransformDepthRenderFailure = failure
+    }
+
     /// Renders a CATransformLayer's sublayers without rendering the layer's own properties.
     ///
     /// CATransformLayer is different from regular layers in that:
@@ -12257,16 +12274,28 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
-        guard layer.sublayers != nil else { return }
+        guard layer.sublayers?.isEmpty == false else { return }
 
-        let beginsIndependentDepthGroup = transformDepthNesting == 0
-        if beginsIndependentDepthGroup {
-            guard let depthClearPipeline else { return }
+        let configuration: CATransformDepthRenderConfiguration
+        do {
+            configuration = try CATransformDepthRenderConfiguration(
+                currentNestingDepth: transformDepthNesting
+            )
+        } catch {
+            recordTransformDepthRenderFailure(error)
+            return
+        }
+        if configuration.requiresDepthClear {
+            guard let depthClearPipeline else {
+                recordTransformDepthRenderFailure(.depthClearPipelineUnavailable)
+                return
+            }
             renderPass.setPipeline(depthClearPipeline)
             renderPass.draw(vertexCount: 3)
         }
-        transformDepthNesting += 1
-        defer { transformDepthNesting -= 1 }
+        let previousNestingDepth = transformDepthNesting
+        transformDepthNesting = configuration.enteredNestingDepth
+        defer { transformDepthNesting = previousNestingDepth }
 
         // `renderLayer` already applied this transform layer's presentation transform.
         // Only the sublayer transform and bounds origin remain before traversing children.
