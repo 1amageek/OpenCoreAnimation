@@ -138,7 +138,7 @@ test.describe("OpenCoreAnimation smoke", () => {
         await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
         expect(await h.getFirstUncapturedGPUError()).toBe("none");
         expect(await h.getPixelReadback()).toBe(
-            "255,0,0,255;0,255,0,255;0,0,255,255;25,25,38,255;255,0,255,255;77,13,83,255;191,255,64,255"
+            "255,0,0,255;0,255,0,255;0,0,255,255;25,25,38,255;255,0,255,255;77,13,83,255;191,255,64,255;invalidTyped=true"
         );
 
         await h.beginContentsGeometryProbe();

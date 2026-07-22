@@ -4926,9 +4926,17 @@ func installHarness() {
                         CGPoint(x: 320, y: 80),
                         CGPoint(x: 80, y: 80),
                     ])
+                    let typedCoordinateFailure: Bool
+                    do {
+                        _ = try await renderer.readbackPixels(at: [CGPoint(x: 80.5, y: 80)])
+                        typedCoordinateFailure = false
+                    } catch {
+                        typedCoordinateFailure = error as? CARendererError
+                            == .invalidReadbackCoordinate(x: 80.5, y: 80, width: 400, height: 300)
+                    }
                     pixelReadbackResult = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
-                        .joined(separator: ";")
+                        .joined(separator: ";") + ";invalidTyped=\(typedCoordinateFailure)"
                 } catch {
                     pixelReadbackResult = "error: \(error)"
                 }

@@ -26,6 +26,10 @@ public enum CARendererError: Error, Equatable, Sendable {
     case canvasNotConfigured
     /// The requested render target cannot be represented by the renderer.
     case invalidRenderTarget(CARenderTargetConfigurationError)
+    /// A pixel readback coordinate was non-integral or outside the texture.
+    case invalidReadbackCoordinate(x: CGFloat, y: CGFloat, width: Int, height: Int)
+    /// A mapped WebGPU readback byte was absent or not representable as UInt8.
+    case invalidReadbackByte(index: Int)
     /// General rendering error.
     case renderingFailed(String)
 }

@@ -4552,11 +4552,22 @@ public final class CAWebGPURenderer: CARendererDelegate {
             throw CARendererError.renderingFailed("No rendered texture is available for readback")
         }
         guard !points.isEmpty else { return [] }
-        guard points.allSatisfy({
-            $0.x >= 0 && $0.y >= 0
-                && $0.x < CGFloat(texture.width) && $0.y < CGFloat(texture.height)
-        }) else {
-            throw CARendererError.renderingFailed("Readback coordinate is outside the render target")
+        for point in points {
+            guard point.x.isFinite,
+                  point.y.isFinite,
+                  point.x.rounded(.towardZero) == point.x,
+                  point.y.rounded(.towardZero) == point.y,
+                  point.x >= 0,
+                  point.y >= 0,
+                  point.x < CGFloat(texture.width),
+                  point.y < CGFloat(texture.height) else {
+                throw CARendererError.invalidReadbackCoordinate(
+                    x: point.x,
+                    y: point.y,
+                    width: Int(texture.width),
+                    height: Int(texture.height)
+                )
+            }
         }
 
         let bytesPerPixel: UInt32
@@ -4607,28 +4618,43 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         let mappedRange = stagingBuffer.getMappedRange()
         let bytes = JSObject.global.Uint8Array.function!.new(mappedRange)
-        let pixels = points.map { point -> [Float] in
+        defer {
+            stagingBuffer.unmap()
+            stagingBuffer.destroy()
+        }
+        let pixels = try points.map { point -> [Float] in
             let offset = Int(point.y) * Int(bytesPerRow)
                 + Int(point.x) * Int(bytesPerPixel)
             if preferredFormat == .rgba16float {
-                return (0..<4).map { component in
+                return try (0..<4).map { component in
                     let componentOffset = offset + component * 2
-                    let low = UInt16(UInt8(bytes[componentOffset].number ?? 0))
-                    let high = UInt16(UInt8(bytes[componentOffset + 1].number ?? 0))
+                    let low = UInt16(try Self.readbackByte(bytes, at: componentOffset))
+                    let high = UInt16(try Self.readbackByte(bytes, at: componentOffset + 1))
                     return Float(Float16(bitPattern: low | (high << 8)))
                 }
             }
-            let first = Float(UInt8(bytes[offset].number ?? 0)) / 255
-            let second = Float(UInt8(bytes[offset + 1].number ?? 0)) / 255
-            let third = Float(UInt8(bytes[offset + 2].number ?? 0)) / 255
-            let alpha = Float(UInt8(bytes[offset + 3].number ?? 0)) / 255
+            let first = Float(try Self.readbackByte(bytes, at: offset)) / 255
+            let second = Float(try Self.readbackByte(bytes, at: offset + 1)) / 255
+            let third = Float(try Self.readbackByte(bytes, at: offset + 2)) / 255
+            let alpha = Float(try Self.readbackByte(bytes, at: offset + 3)) / 255
             return preferredFormat == .bgra8unorm
                 ? [third, second, first, alpha]
                 : [first, second, third, alpha]
         }
-        stagingBuffer.unmap()
-        stagingBuffer.destroy()
         return pixels
+    }
+
+    private static func readbackByte(
+        _ bytes: JSObject,
+        at index: Int
+    ) throws(CARendererError) -> UInt8 {
+        guard let number = bytes[index].number,
+              number.isFinite,
+              let integer = Int(exactly: number),
+              let byte = UInt8(exactly: integer) else {
+            throw .invalidReadbackByte(index: index)
+        }
+        return byte
     }
 
     private static func normalizedUInt8(_ value: Float) -> UInt8 {
