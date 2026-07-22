@@ -13,6 +13,18 @@ internal enum CAFilterOperation: Equatable {
     case colorInvert
 }
 
+internal enum CAFilterConfigurationError: Error, Equatable {
+    case unexpectedParameter(String)
+    case invalidParameterType(String)
+    case nonFiniteParameter(String)
+    case parameterOutOfRange(String, minimum: CGFloat, maximum: CGFloat?)
+}
+
+internal enum CAFilterExecutionPlan: Equatable {
+    case renderer(CAFilterOperation)
+    case coreImage(name: String, parameters: [String: CGFloat])
+}
+
 
 /// A filter effect that can be applied to layer content.
 ///
@@ -206,41 +218,144 @@ public struct CAFilter: Hashable {
     /// Gets the blur radius if this is a blur filter.
     public var blurRadius: CGFloat? {
         guard type == .gaussianBlur else { return nil }
-        return floatValue(forKey: "inputRadius") ?? 0
+        return configuredNumber(forKey: "inputRadius", default: 0)
     }
 
     /// Gets the brightness amount if this is a brightness filter.
     public var brightnessAmount: CGFloat? {
         guard type == .brightness else { return nil }
-        return floatValue(forKey: "inputBrightness") ?? 0
+        return configuredNumber(forKey: "inputBrightness", default: 0)
     }
 
     /// Gets the contrast amount if this is a contrast filter.
     public var contrastAmount: CGFloat? {
         guard type == .contrast else { return nil }
-        return floatValue(forKey: "inputContrast") ?? 1
+        return configuredNumber(forKey: "inputContrast", default: 1)
     }
 
     /// Gets the saturation amount if this is a saturation filter.
     public var saturationAmount: CGFloat? {
         guard type == .saturation else { return nil }
-        return floatValue(forKey: "inputSaturation") ?? 1
+        return configuredNumber(forKey: "inputSaturation", default: 1)
+    }
+
+    internal func executionPlan() throws -> CAFilterExecutionPlan {
+        switch type {
+        case .gaussianBlur:
+            return .renderer(.gaussianBlur(radius: try validatedNumber(
+                forKey: "inputRadius",
+                default: 0,
+                minimum: 0
+            )))
+        case .brightness:
+            return .renderer(.brightness(amount: try validatedNumber(
+                forKey: "inputBrightness",
+                default: 0,
+                minimum: -1,
+                maximum: 1
+            )))
+        case .contrast:
+            return .renderer(.contrast(amount: try validatedNumber(
+                forKey: "inputContrast",
+                default: 1,
+                minimum: 0,
+                maximum: 4
+            )))
+        case .saturation:
+            return .renderer(.saturation(amount: try validatedNumber(
+                forKey: "inputSaturation",
+                default: 1,
+                minimum: 0,
+                maximum: 2
+            )))
+        case .colorInvert:
+            try rejectUnexpectedParameters(allowedKeys: [])
+            return .renderer(.colorInvert)
+        case .sepiaTone:
+            return .coreImage(name: type.rawValue, parameters: [
+                "inputIntensity": try validatedNumber(
+                    forKey: "inputIntensity",
+                    default: 1,
+                    minimum: 0,
+                    maximum: 1
+                )
+            ])
+        case .vignette:
+            try rejectUnexpectedParameters(allowedKeys: ["inputRadius", "inputIntensity"])
+            return .coreImage(name: type.rawValue, parameters: [
+                "inputRadius": try validatedNumber(
+                    forKey: "inputRadius",
+                    default: 1,
+                    minimum: 0,
+                    validateKeys: false
+                ),
+                "inputIntensity": try validatedNumber(
+                    forKey: "inputIntensity",
+                    default: 0,
+                    minimum: 0,
+                    maximum: 1,
+                    validateKeys: false
+                )
+            ])
+        }
     }
 
     internal var operation: CAFilterOperation? {
-        switch type {
-        case .gaussianBlur:
-            return .gaussianBlur(radius: blurRadius ?? 0)
-        case .brightness:
-            return .brightness(amount: brightnessAmount ?? 0)
-        case .contrast:
-            return .contrast(amount: contrastAmount ?? 1)
-        case .saturation:
-            return .saturation(amount: saturationAmount ?? 1)
-        case .colorInvert:
-            return .colorInvert
-        case .sepiaTone, .vignette:
+        do {
+            guard case let .renderer(operation) = try executionPlan() else {
+                return nil
+            }
+            return operation
+        } catch {
             return nil
+        }
+    }
+
+    private func validatedNumber(
+        forKey key: String,
+        default defaultValue: CGFloat,
+        minimum: CGFloat,
+        maximum: CGFloat? = nil,
+        validateKeys: Bool = true
+    ) throws -> CGFloat {
+        if validateKeys {
+            try rejectUnexpectedParameters(allowedKeys: [key])
+        }
+        guard parameters[key] != nil else {
+            return defaultValue
+        }
+        guard let value = floatValue(forKey: key) else {
+            throw CAFilterConfigurationError.invalidParameterType(key)
+        }
+        guard value.isFinite else {
+            throw CAFilterConfigurationError.nonFiniteParameter(key)
+        }
+        guard value >= minimum, maximum.map({ value <= $0 }) ?? true else {
+            throw CAFilterConfigurationError.parameterOutOfRange(
+                key,
+                minimum: minimum,
+                maximum: maximum
+            )
+        }
+        return value
+    }
+
+    private func configuredNumber(forKey key: String, default defaultValue: CGFloat) -> CGFloat? {
+        guard parameters[key] != nil else {
+            return defaultValue
+        }
+        guard let value = floatValue(forKey: key), value.isFinite else {
+            return nil
+        }
+        return value
+    }
+
+    private func rejectUnexpectedParameters(allowedKeys: Set<String>) throws {
+        if let unexpected = parameters.keys
+            .filter({ !allowedKeys.contains($0) })
+            .sorted()
+            .first {
+            throw CAFilterConfigurationError.unexpectedParameter(unexpected)
         }
     }
 }

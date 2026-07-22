@@ -265,6 +265,50 @@ struct CAFilterTests {
         #expect(blur3 != blur4)
         #expect(Set([blur3, blur4]).count == 2)
     }
+
+    @Test("Execution plans validate parameters and materialize Core Image defaults")
+    func filterExecutionPlansAreValidated() throws {
+        #expect(try CAFilter.blur(radius: 6).executionPlan() == .renderer(
+            .gaussianBlur(radius: 6)
+        ))
+        #expect(try CAFilter(type: .sepiaTone).executionPlan() == .coreImage(
+            name: "CISepiaTone",
+            parameters: ["inputIntensity": 1]
+        ))
+        #expect(try CAFilter(type: .vignette).executionPlan() == .coreImage(
+            name: "CIVignette",
+            parameters: ["inputRadius": 1, "inputIntensity": 0]
+        ))
+
+        #expect(throws: CAFilterConfigurationError.invalidParameterType("inputRadius")) {
+            try CAFilter(
+                type: .gaussianBlur,
+                parameters: ["inputRadius": "large"]
+            ).executionPlan()
+        }
+        #expect(throws: CAFilterConfigurationError.nonFiniteParameter("inputBrightness")) {
+            try CAFilter.brightness(.nan).executionPlan()
+        }
+        #expect(throws: CAFilterConfigurationError.parameterOutOfRange(
+            "inputContrast",
+            minimum: 0,
+            maximum: 4
+        )) {
+            try CAFilter.contrast(5).executionPlan()
+        }
+        #expect(throws: CAFilterConfigurationError.unexpectedParameter("inputRaduis")) {
+            try CAFilter(
+                type: .gaussianBlur,
+                parameters: ["inputRaduis": 5]
+            ).executionPlan()
+        }
+        #expect(throws: CAFilterConfigurationError.unexpectedParameter("inputIntensity")) {
+            try CAFilter(
+                type: .colorInvert,
+                parameters: ["inputIntensity": 1]
+            ).executionPlan()
+        }
+    }
 }
 
 @Suite("CALayer Subtree Render-Effect Counters")

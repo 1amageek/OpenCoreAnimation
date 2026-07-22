@@ -8296,17 +8296,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         for value in filters {
             if let filter = value as? CAFilter {
-                if let operation = filter.operation {
-                    stages.append(.renderer(operation))
-                    continue
-                }
-                guard let coreImageFilter = CIFilter(name: filter.name) else {
+                let executionPlan: CAFilterExecutionPlan
+                do {
+                    executionPlan = try filter.executionPlan()
+                } catch {
                     return nil
                 }
-                for (key, parameter) in filter.parameters {
-                    coreImageFilter.setValue(parameter, forKey: key)
+                switch executionPlan {
+                case let .renderer(operation):
+                    stages.append(.renderer(operation))
+                case let .coreImage(name, parameters):
+                    guard let coreImageFilter = CIFilter(name: name) else {
+                        return nil
+                    }
+                    for (key, parameter) in parameters {
+                        coreImageFilter.setValue(parameter, forKey: key)
+                    }
+                    stages.append(.coreImage(coreImageFilter))
                 }
-                stages.append(.coreImage(coreImageFilter))
             } else if let filter = value as? CIFilter {
                 if filter.isEnabled {
                     stages.append(.coreImage(filter))

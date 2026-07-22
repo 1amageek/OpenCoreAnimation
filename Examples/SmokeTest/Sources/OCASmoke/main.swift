@@ -754,6 +754,17 @@ func installHarness() {
                 rejected.filters = [incompatibleFilter]
                 root.addSublayer(rejected)
 
+                let invalidParameters = CALayer()
+                invalidParameters.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                invalidParameters.position = CGPoint(x: 220, y: 140)
+                invalidParameters.zPosition = 100
+                invalidParameters.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                invalidParameters.filters = [CAFilter(
+                    type: .gaussianBlur,
+                    parameters: ["inputRaduis": 8]
+                )]
+                root.addSublayer(invalidParameters)
+
                 let alphaFiltered = CALayer()
                 alphaFiltered.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
                 alphaFiltered.position = CGPoint(x: 300, y: 140)
@@ -773,12 +784,14 @@ func installHarness() {
                         CGPoint(x: 360, y: 260),
                         CGPoint(x: 360, y: 200),
                         CGPoint(x: 140, y: 160),
+                        CGPoint(x: 220, y: 160),
                         CGPoint(x: 300, y: 160),
                     ])
                     let groupedPixel = pixels[4]
                     let translucentGroupedPixel = pixels[5]
                     let rejectedPixel = pixels[6]
-                    let alphaFilteredPixel = pixels[7]
+                    let invalidParametersPixel = pixels[7]
+                    let alphaFilteredPixel = pixels[8]
                     opacityGroup.allowsGroupOpacity = false
                     translucentGroup.allowsGroupOpacity = false
                     engine.renderFrame()
@@ -802,6 +815,7 @@ func installHarness() {
                         && (18...25).contains(translucentUngroupedPixel[2])
                         && translucentUngroupedPixel[3] == 255
                     let rejectedExplicitly = rejectedPixel == [26, 26, 38, 255]
+                    let invalidParametersRejected = invalidParametersPixel == [26, 26, 38, 255]
                     let alphaFilteredCorrectly = alphaFilteredPixel == [13, 141, 147, 255]
                     layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
@@ -810,6 +824,7 @@ func installHarness() {
                         + ",translucentGroup=\(translucentGrouped)"
                         + ",translucentUngrouped=\(translucentUngrouped)"
                         + ",rejected=\(rejectedExplicitly)"
+                        + ",invalid=\(invalidParametersRejected)"
                         + ",alphaFilter=\(alphaFilteredCorrectly)"
                         + ",alphaPixel=\(alphaFilteredPixel.map(String.init).joined(separator: ","))"
                 } catch {
@@ -822,6 +837,7 @@ func installHarness() {
                 opacityGroup.removeFromSuperlayer()
                 translucentGroup.removeFromSuperlayer()
                 rejected.removeFromSuperlayer()
+                invalidParameters.removeFromSuperlayer()
                 alphaFiltered.removeFromSuperlayer()
                 engine.renderFrame()
             }
