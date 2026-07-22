@@ -7099,11 +7099,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
             )
 
             // Set font
-            let escapedFontFamily = configuration.fontFamily.replacingOccurrences(
-                of: "\"",
-                with: "\\\""
+            ctx.font = .string(
+                "\(configuration.fontSize)px \(configuration.cssFontFamily)"
             )
-            ctx.font = .string("\(configuration.fontSize)px \"\(escapedFontFamily)\"")
 
             // Set text color
             let color = configuration.foregroundRGBA

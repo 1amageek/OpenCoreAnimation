@@ -23,6 +23,7 @@ public enum CATextRenderFailure: Error, Equatable, Sendable {
 internal struct CATextRenderConfiguration {
     let text: String
     let fontFamily: String
+    let cssFontFamily: String
     let fontSize: CGFloat
     let contentsScale: CGFloat
     let foregroundRGBA: SIMD4<Float>
@@ -80,6 +81,7 @@ internal struct CATextRenderConfiguration {
 
         self.text = text
         self.fontFamily = fontFamily
+        self.cssFontFamily = Self.cssFontFamily(from: fontFamily)
         self.fontSize = layer.fontSize
         self.contentsScale = layer.contentsScale
         self.foregroundRGBA = SIMD4(
@@ -92,5 +94,20 @@ internal struct CATextRenderConfiguration {
         self.truncationMode = layer.truncationMode
         self.bounds = layer.bounds
         self.isWrapped = layer.isWrapped
+    }
+
+    private static func cssFontFamily(from fontFamily: String) -> String {
+        let genericFamilies: Set<String> = [
+            "serif", "sans-serif", "monospace", "cursive", "fantasy",
+            "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace",
+            "ui-rounded", "math", "emoji", "fangsong",
+        ]
+        if genericFamilies.contains(fontFamily.lowercased()) {
+            return fontFamily.lowercased()
+        }
+        let escaped = fontFamily
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
 }

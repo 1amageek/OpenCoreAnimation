@@ -21,12 +21,27 @@ struct CATextRenderConfigurationTests {
 
         #expect(configuration.text == "Hello")
         #expect(configuration.fontFamily == "Test Sans")
+        #expect(configuration.cssFontFamily == "\"Test Sans\"")
         #expect(configuration.contentsScale == 2)
         #expect(configuration.foregroundRGBA == SIMD4<Float>(0.25, 0.25, 0.25, 0.5))
         #expect(configuration.bounds == layer.bounds)
         #expect(configuration.alignmentMode == .center)
         #expect(configuration.truncationMode == .middle)
         #expect(configuration.isWrapped)
+    }
+
+    @Test("CSS generic families remain generic and concrete names are escaped")
+    func cssFontFamily() throws {
+        let layer = CATextLayer()
+        layer.string = "Text"
+        layer.font = "Monospace"
+        #expect(try CATextRenderConfiguration(layer: layer).cssFontFamily == "monospace")
+
+        layer.font = "Quoted \\\" Font"
+        #expect(
+            try CATextRenderConfiguration(layer: layer).cssFontFamily
+                == "\"Quoted \\\\\\\" Font\""
+        )
     }
 
     @Test("Unsupported text and font values fail instead of becoming descriptions")
