@@ -259,41 +259,6 @@ struct CAFilterTests {
         #expect(saturation.saturationAmount == 0.75)
     }
 
-    @Test("Layer filter helpers aggregate CAFilter entries only")
-    func layerFilterHelpersAggregateCAFilters() {
-        let layer = CALayer()
-        layer.filters = [
-            CAFilter.blur(radius: 3),
-            "ignored",
-            CAFilter.blur(radius: 4),
-            CAFilter.brightness(0.2)
-        ]
-
-        #expect(layer.activeFilters.count == 3)
-        #expect(layer.hasBlurFilter == true)
-        #expect(layer.totalBlurRadius == 7)
-    }
-
-    @Test("Supported filter operations preserve order and skip unsupported entries")
-    func supportedFilterOperationsPreserveOrder() {
-        let layer = CALayer()
-        layer.filters = [
-            CAFilter.blur(radius: 3),
-            "ignored",
-            CAFilter.brightness(0.2),
-            CAFilter.colorInvert(),
-            CAFilter(type: .sepiaTone, parameters: ["inputIntensity": 0.8]),
-            CAFilter.contrast(1.5)
-        ]
-
-        #expect(layer.supportedFilterOperations == [
-            .gaussianBlur(radius: 3),
-            .brightness(amount: 0.2),
-            .colorInvert,
-            .contrast(amount: 1.5),
-        ])
-    }
-
     @Test("Hashable and equality include filter parameters")
     func filterEqualityIncludesParameters() {
         let blur3 = CAFilter.blur(radius: 3)

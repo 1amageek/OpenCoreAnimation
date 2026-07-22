@@ -10,7 +10,7 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 
 | Evidence | Result |
 |---|---|
-| Native package | 540 tests passed |
+| Native package | 538 tests passed |
 | Browser | 3 checks passed, including float16 extended-dynamic-range output and SDR restoration, rasterized/tiled pixels, frozen transition pairs, filters, multiple shadows, shape fill-rule holes, trimmed/dashed strokes, axial/radial/conic and 12-stop gradients, depth-preserving emitters/replicators, and replicated background/border/shape/image/gradient pixels read back from WebGPU |
 | Layer defaults | `CALayer.defaultValue(forKey:)` returns QuartzCore-compatible typed defaults for geometry, contents, appearance, rasterization, and timing keys instead of treating every key as unknown. Shape, gradient, replicator, emitter, text, tiled, and scroll layers override their specialized defaults while inheriting base values. Fresh layers now use opaque-black borders, enabled edge antialiasing, infinite layer duration, and Helvetica text to match QuartzCore; native tests compare stored, zero/unknown, inherited, and instance defaults, while browser readback verifies default edge coverage and black-border rendering |
 | Layer archiving | `CALayer.shouldArchiveValue(forKey:)` compares each supported base property with its QuartzCore archive default instead of returning a fixed success value. Shape, gradient, replicator, emitter, text, tiled, and scroll layers own their specialized decisions and defer unknown keys through the class hierarchy. Fresh and changed values are cross-checked against QuartzCore, including collection, delegate, timing, derived, and unknown-key behavior |

@@ -300,17 +300,6 @@ public struct CAFilter: Hashable {
         }
     }
 
-    internal var operation: CAFilterOperation? {
-        do {
-            guard case let .renderer(operation) = try executionPlan() else {
-                return nil
-            }
-            return operation
-        } catch {
-            return nil
-        }
-    }
-
     private func validatedNumber(
         forKey key: String,
         default defaultValue: CGFloat,
@@ -356,45 +345,6 @@ public struct CAFilter: Hashable {
             .sorted()
             .first {
             throw CAFilterConfigurationError.unexpectedParameter(unexpected)
-        }
-    }
-}
-
-// MARK: - CALayer Filter Extensions
-
-extension CALayer {
-
-    /// Extracts CAFilter objects from the filters array.
-    ///
-    /// This helper method extracts any CAFilter instances from the filters array,
-    /// which may contain mixed types for compatibility with CIFilter on Apple platforms.
-    internal var activeFilters: [CAFilter] {
-        guard let filters = filters else { return [] }
-        return filters.compactMap { $0 as? CAFilter }
-    }
-
-    /// Returns supported GPU filter operations in the order they should be applied.
-    internal var supportedFilterOperations: [CAFilterOperation] {
-        activeFilters.compactMap(\.operation)
-    }
-
-    /// Checks if the layer has any blur filters.
-    internal var hasBlurFilter: Bool {
-        return supportedFilterOperations.contains {
-            if case .gaussianBlur = $0 {
-                return true
-            }
-            return false
-        }
-    }
-
-    /// Gets the total blur radius from all blur filters.
-    internal var totalBlurRadius: CGFloat {
-        supportedFilterOperations.reduce(0) { partialResult, operation in
-            guard case let .gaussianBlur(radius) = operation else {
-                return partialResult
-            }
-            return partialResult + radius
         }
     }
 }
