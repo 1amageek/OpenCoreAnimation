@@ -10,9 +10,8 @@ import simd
 ///
 /// ## Protocol Conformance
 ///
-/// Conforms to both `CARenderer` (public API) and `CARendererDelegate` (internal).
-/// This allows it to be used both directly and through `CAAnimationEngine`.
-public final class CAMetalRenderer: CARenderer, CARendererDelegate {
+/// Conforms to the internal renderer-backend contract used by the animation engine.
+public final class CAMetalRenderer: CARendererDelegate {
 
     // MARK: - Properties
 
@@ -35,14 +34,21 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
     public var size: CGSize = CGSize(width: 0, height: 0)
 
     /// The pixel format for rendering.
-    private let pixelFormat: MTLPixelFormat = .bgra8Unorm
+    private var pixelFormat: MTLPixelFormat = .bgra8Unorm
 
     /// The target texture for offscreen rendering.
     private var targetTexture: MTLTexture?
 
+    /// The most recent submission, retained so native verification can wait for completion.
+    internal private(set) var lastCommandBuffer: MTLCommandBuffer?
+
     // MARK: - Initialization
 
     public init() {}
+
+    internal init(destination texture: any MTLTexture) throws {
+        try configure(device: texture.device, destination: texture)
+    }
 
     // MARK: - CARenderer
 
@@ -51,22 +57,11 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw CARendererError.deviceNotAvailable
         }
-        self.device = device
+        try configure(device: device, destination: nil)
+    }
 
-        // Create command queue
-        guard let commandQueue = device.makeCommandQueue() else {
-            throw CARendererError.deviceNotAvailable
-        }
-        self.commandQueue = commandQueue
-
-        // Create render pipeline
-        try createPipeline()
-
-        // Create vertex buffer for a quad (two triangles)
-        createVertexBuffer()
-
-        // Create uniform buffer
-        createUniformBuffer()
+    internal func setDestination(_ texture: any MTLTexture) throws {
+        try configure(device: texture.device, destination: texture)
     }
 
     public func resize(width: Int, height: Int) {
@@ -128,6 +123,7 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         renderLayer(rootLayer, encoder: encoder, parentMatrix: projectionMatrix)
 
         encoder.endEncoding()
+        lastCommandBuffer = commandBuffer
         commandBuffer.commit()
 
         // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
@@ -143,6 +139,7 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         targetTexture = nil
         commandQueue = nil
         device = nil
+        lastCommandBuffer = nil
     }
 
     // MARK: - Private Methods
@@ -223,7 +220,7 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         vertexDescriptor.attributes[2].offset = MemoryLayout<SIMD2<Float>>.stride * 2
         vertexDescriptor.attributes[2].bufferIndex = 0
 
-        vertexDescriptor.layouts[0].stride = MemoryLayout<CARendererVertex>.stride
+        vertexDescriptor.layouts[0].stride = MemoryLayout<CAMetalRendererVertex>.stride
 
         // Create pipeline descriptor
         let pipelineDescriptor = MTLRenderPipelineDescriptor()
@@ -246,24 +243,43 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         }
     }
 
+    private func configure(
+        device: any MTLDevice,
+        destination: (any MTLTexture)?
+    ) throws {
+        guard let commandQueue = device.makeCommandQueue() else {
+            throw CARendererError.deviceNotAvailable
+        }
+        self.device = device
+        self.commandQueue = commandQueue
+        targetTexture = destination
+        if let destination {
+            pixelFormat = destination.pixelFormat
+            size = CGSize(width: destination.width, height: destination.height)
+        }
+        try createPipeline()
+        createVertexBuffer()
+        createUniformBuffer()
+    }
+
     private func createVertexBuffer() {
         guard let device = device else { return }
 
         // Quad vertices (two triangles)
-        let vertices: [CARendererVertex] = [
+        let vertices: [CAMetalRendererVertex] = [
             // Triangle 1
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: SIMD4(1, 1, 1, 1)),
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: SIMD4(1, 1, 1, 1)),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: SIMD4(1, 1, 1, 1)),
+            CAMetalRendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: SIMD4(1, 1, 1, 1)),
+            CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: SIMD4(1, 1, 1, 1)),
+            CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: SIMD4(1, 1, 1, 1)),
             // Triangle 2
-            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: SIMD4(1, 1, 1, 1)),
-            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: SIMD4(1, 1, 1, 1)),
-            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: SIMD4(1, 1, 1, 1)),
+            CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: SIMD4(1, 1, 1, 1)),
+            CAMetalRendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: SIMD4(1, 1, 1, 1)),
+            CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: SIMD4(1, 1, 1, 1)),
         ]
 
         vertexBuffer = device.makeBuffer(
             bytes: vertices,
-            length: MemoryLayout<CARendererVertex>.stride * vertices.count,
+            length: MemoryLayout<CAMetalRendererVertex>.stride * vertices.count,
             options: .storageModeShared
         )
     }
@@ -272,7 +288,7 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         guard let device = device else { return }
 
         uniformBuffer = device.makeBuffer(
-            length: MemoryLayout<CARendererUniforms>.stride,
+            length: MemoryLayout<CAMetalRendererUniforms>.stride,
             options: .storageModeShared
         )
     }
@@ -282,14 +298,16 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         encoder: MTLRenderCommandEncoder,
         parentMatrix: simd_float4x4
     ) {
+        let presentationLayer = layer._renderTimePresentation()
+
         // Skip hidden layers
-        guard !layer.isHidden && layer.opacity > 0 else { return }
+        guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
 
         // Calculate model matrix
-        let modelMatrix = layer.modelMatrix(parentMatrix: parentMatrix)
+        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
 
         // Create scale matrix for layer bounds (column-major order)
-        let boundsSize = layer.bounds.size
+        let boundsSize = presentationLayer.bounds.size
         let w = Float(boundsSize.width)
         let h = Float(boundsSize.height)
         let col0 = SIMD4<Float>(w, 0, 0, 0)
@@ -301,34 +319,34 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         let finalMatrix = modelMatrix * scaleMatrix
 
         // Update uniforms
-        var uniforms = CARendererUniforms(
+        var uniforms = CAMetalRendererUniforms(
             mvpMatrix: finalMatrix,
-            opacity: layer.opacity,
-            cornerRadius: Float(layer.cornerRadius)
+            opacity: presentationLayer.opacity,
+            cornerRadius: Float(presentationLayer.cornerRadius)
         )
 
         uniformBuffer?.contents().copyMemory(
             from: &uniforms,
-            byteCount: MemoryLayout<CARendererUniforms>.stride
+            byteCount: MemoryLayout<CAMetalRendererUniforms>.stride
         )
 
         // Render background color if set
-        if layer.backgroundColor != nil {
+        if presentationLayer.backgroundColor != nil {
             // Update vertex colors with background color
-            let color = layer.backgroundColorComponents
+            let color = presentationLayer.backgroundColorComponents
 
-            var vertices: [CARendererVertex] = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+            var vertices: [CAMetalRendererVertex] = [
+                CAMetalRendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
+                CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+                CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
+                CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
+                CAMetalRendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: color),
+                CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
             ]
 
             vertexBuffer?.contents().copyMemory(
                 from: &vertices,
-                byteCount: MemoryLayout<CARendererVertex>.stride * vertices.count
+                byteCount: MemoryLayout<CAMetalRendererVertex>.stride * vertices.count
             )
 
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -339,7 +357,7 @@ public final class CAMetalRenderer: CARenderer, CARendererDelegate {
         // Render sublayers
         if let sublayers = layer.sublayers {
             // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
-            let sublayerMatrix = layer.sublayerMatrix(modelMatrix: modelMatrix)
+            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
 
             for sublayer in sublayers {
                 renderLayer(sublayer, encoder: encoder, parentMatrix: sublayerMatrix)

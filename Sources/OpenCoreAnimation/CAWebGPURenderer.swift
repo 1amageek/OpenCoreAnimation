@@ -606,8 +606,8 @@ private final class EmitterLayerState {
 /// A renderer that uses WebGPU to render layer trees in WASM/Web environments.
 ///
 /// This is the primary renderer for OpenCoreAnimation in production.
-/// It conforms to both `CARenderer` (public API) and `CARendererDelegate` (internal).
-public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
+/// It conforms to the internal renderer-backend contract used by the animation engine.
+public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Constants
 
@@ -11693,7 +11693,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let frameToken = CALayer._currentFrameToken
         if state.lastUpdatedFrame != frameToken {
-            let currentTime = CACurrentMediaTime()
+            let currentTime = CARenderTimeContext.currentMediaTime
             let deltaTime = state.lastUpdateTime > 0
                 ? min(max(Float(currentTime - state.lastUpdateTime), 0), 0.1)
                 : 1.0 / 60.0
@@ -12337,7 +12337,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
         let tilesX = Int(tileCountX)
         let tilesY = Int(tileCountY)
-        let tileMediaTime = CACurrentMediaTime()
+        let tileMediaTime = CARenderTimeContext.currentMediaTime
 
         // Render tiles
         for ty in 0..<tilesY {

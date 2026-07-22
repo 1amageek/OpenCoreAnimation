@@ -57,12 +57,10 @@ import JavaScriptKit
     /// The renderer is created automatically during initialization.
     internal var rendererDelegate: CARendererDelegate?
 
-    /// Public accessor for the renderer (read-only).
-    ///
-    /// This provides access to the renderer for advanced use cases
-    /// while maintaining internal ownership.
-    public var renderer: CARenderer? {
-        return rendererDelegate as? CARenderer
+    /// Exposes the concrete backend only to renderer diagnostics and browser proofs.
+    @_spi(RendererDiagnostics)
+    public var rendererBackend: AnyObject? {
+        rendererDelegate
     }
 
     /// The display link driving the animation loop.

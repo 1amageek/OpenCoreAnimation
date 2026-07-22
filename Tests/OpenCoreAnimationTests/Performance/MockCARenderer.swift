@@ -1,4 +1,4 @@
-// Phase 3 — A native-only `CARenderer` implementation that records the
+// Phase 3 — A native-only renderer-backend implementation that records the
 // command stream a production WebGPU renderer would issue. Phase 3 / 4
 // tests assert against this stream rather than against pixels.
 //
@@ -81,10 +81,10 @@ internal final class RecordingCommandSink: RenderCommandSink {
 
 // MARK: - MockCARenderer
 
-/// Native-only `CARenderer` that drives the same Phase 3 decision logic
+/// Native-only renderer backend that drives the same Phase 3 decision logic
 /// as `CAWebGPURenderer` but records commands into a `RecordingCommandSink`
 /// instead of issuing real WebGPU calls.
-internal final class MockCARenderer: CARenderer {
+internal final class MockCARenderer: CARendererDelegate {
 
     internal var size: CGSize = CGSize(width: 0, height: 0)
 
@@ -115,7 +115,7 @@ internal final class MockCARenderer: CARenderer {
         self.rasterizationCache = RasterizationCache(maxBytes: rasterizationCacheMaxBytes)
     }
 
-    // MARK: CARenderer
+    // MARK: CARendererDelegate
 
     internal func initialize() async throws {
         // Nothing to do — no real device/queue/pipeline behind this mock.

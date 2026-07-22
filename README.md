@@ -10,11 +10,12 @@ OpenCoreAnimation enables CoreAnimation-style code to run in the browser via Web
 
 | Evidence | Result |
 |---|---|
-| Native package | 533 tests passed |
+| Native package | 537 tests passed |
 | Browser | 3 checks passed, including float16 extended-dynamic-range output and SDR restoration, rasterized/tiled pixels, frozen transition pairs, filters, multiple shadows, shape fill-rule holes, trimmed/dashed strokes, axial/radial/conic and 12-stop gradients, depth-preserving emitters/replicators, and replicated background/border/shape/image/gradient pixels read back from WebGPU |
 | Layer defaults | `CALayer.defaultValue(forKey:)` returns QuartzCore-compatible typed defaults for geometry, contents, appearance, rasterization, and timing keys instead of treating every key as unknown. Shape, gradient, replicator, emitter, text, tiled, and scroll layers override their specialized defaults while inheriting base values. Fresh layers now use opaque-black borders, enabled edge antialiasing, infinite layer duration, and Helvetica text to match QuartzCore; native tests compare stored, zero/unknown, inherited, and instance defaults, while browser readback verifies default edge coverage and black-border rendering |
 | Layer archiving | `CALayer.shouldArchiveValue(forKey:)` compares each supported base property with its QuartzCore archive default instead of returning a fixed success value. Shape, gradient, replicator, emitter, text, tiled, and scroll layers own their specialized decisions and defer unknown keys through the class hierarchy. Fresh and changed values are cross-checked against QuartzCore, including collection, delegate, timing, derived, and unknown-key behavior |
 | Display invalidation | `CALayer.needsDisplay(forKey:)` preserves the QuartzCore base and non-text `false` contract while `CATextLayer` identifies its ten text/style/scale redraw keys. Text mutations set the public display-invalid state only when a stored value changes, and copy/presentation initialization transfers backing values without manufacturing redraw work |
+| Explicit renderer | `CARenderer` is a QuartzCore-compatible class rather than the former backend protocol. `beginFrame`, automatic and explicit update regions, supplied media-time presentation evaluation, `nextFrameTime`, `render`, and `endFrame` execute over the same internal WebGPU/Metal backend contract used by the animation engine. Automatic regions include overflowing descendants plus both old and new extents so moved or removed content cannot leave stale pixels; active animations and effects conservatively invalidate the destination bounds. Native tests compare lifecycle decisions with QuartzCore, verify future/active/paused scheduling and descendant removal, and read an actual submitted Metal texture pixel; the release WASM build includes the canvas-backed initializer and Core Video timestamp stand-ins |
 | Animation and emitter-cell defaults | `CAAnimation`, every concrete animation subclass, and `CAEmitterCell` expose QuartzCore-compatible defaults and `shouldArchiveValue(forKey:)` decisions for persistent state. Runtime-only frame-rate hints and spring initial velocity remain intentionally unarchived, while unknown keys fail closed. `CAEmitterCell` includes `style`, defaults to white, enabled, and infinite duration, and distinguishes positive infinity from invalid non-finite timing. Native tests cover typed values, subclass inheritance, every archive key, canonical/unknown keys, style storage, indefinite emission, infinite repeats, and typed timing failure; browser emitter diagnostics exercise the default infinite duration with zero spawn failures |
 | Shape fills | `CAShapeLayer` tessellates all path contours as one fill, preserving `.nonZero` winding and `.evenOdd` parity for nested, overlapping, coincident, curved, open, and self-intersecting subpaths. Unknown rules and non-finite paths fail through renderer diagnostics instead of producing fallback geometry. Shape draws select their own solid/stencil/depth pipeline so output does not depend on the preceding sibling type. Native geometry tests and browser pixel readback cover both fill rules, holes, and submitted draw/vertex counts |
 | Shape strokes | `strokeStart` and `strokeEnd` trim against total length across all subpaths, then the shared OpenCoreGraphics geometry path applies `lineDashPattern`, phase continuity, line caps, line joins, and miter limits before the outline enters the same WebGPU tessellator as fills. Raw animation values remain unclamped in the model and clamp only at rendering. Invalid geometry, dash patterns, and unknown styles report explicit failures. Native tests cover trim, multi-subpath ranges, dash/phase, cap styles, and failure contracts; browser pixels prove trimmed alternating dash segments reach WebGPU |
@@ -364,7 +365,7 @@ cd Tests/e2e && npm test
 | Platform | Rendering | Timing | Usage |
 |----------|-----------|--------|-------|
 | WASM/Web | WebGPU | `requestAnimationFrame` | **Production** |
-| macOS/iOS | Metal (stub) | `Timer` | Testing only |
+| macOS/iOS | Metal offscreen verification | `Timer` | Testing only |
 
 On native Apple platforms, use Apple's QuartzCore directly for production. OpenCoreAnimation's native implementations are for testing purposes only.
 
@@ -373,7 +374,7 @@ On native Apple platforms, use Apple's QuartzCore directly for production. OpenC
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                  OpenCoreAnimation API                       │
-│     (CALayer, CAAnimation, CADisplayLink - QuartzCore API)   │
+│ (CALayer, CAAnimation, CADisplayLink, CARenderer - API)     │
 ├─────────────────────────────────────────────────────────────┤
 │                  WebGPU Rendering Layer                      │
 │  ┌─────────────────┐  ┌──────────────────┐                  │

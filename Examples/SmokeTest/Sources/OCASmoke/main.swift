@@ -436,91 +436,91 @@ func installHarness() {
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .transitionSourceCaptureCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getTransitionTargetCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .transitionTargetCaptureCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getActiveTransitionTextureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .activeTransitionTextureCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getTransitionFilterDispatchCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .transitionFilterDispatchCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getTransitionFilterFailureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .transitionFilterFailureCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getTransitionRenderFailureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .transitionRenderFailureCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getFirstUncapturedGPUError", returning: {
             let message = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .firstUncapturedGPUError ?? "none"
             }
             return .string(message)
         })
         h.expose("getActiveFilterResourceCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .activeFilterResourceCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getLayerFilterFailureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .layerFilterFailureCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getCompositionFilterFailureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .compositionFilterFailureCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getActiveCompositionResourceCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .activeCompositionResourceCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getActiveShadowResourceCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .activeShadowResourceCount ?? -1
             }
             return .number(Double(count))
         })
         h.expose("getShadowRenderFailureCount", returning: {
             let count = MainActor.assumeIsolated {
-                (CAAnimationEngine.shared.renderer as? CAWebGPURenderer)?
+                (CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer)?
                     .shadowRenderFailureCount ?? -1
             }
             return .number(Double(count))
@@ -598,7 +598,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let layer = filteredTransitioningLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     transitionFilterProbeResult = "error: probe layer or renderer unavailable"
                     return
                 }
@@ -691,7 +691,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     layerFilterProbeResult = "error: root layer or renderer unavailable"
                     return
                 }
@@ -877,7 +877,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     textProbeResult = "error: text dependencies unavailable"
                     return
                 }
@@ -1011,7 +1011,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     edgeAntialiasingProbeResult = "error: edge antialiasing dependencies unavailable"
                     return
                 }
@@ -1144,7 +1144,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     booleanAnimationProbeResult = "error: Boolean animation dependencies unavailable"
                     return
                 }
@@ -1253,7 +1253,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     contentsAnimationProbeResult = "error: contents animation dependencies unavailable"
                     return
                 }
@@ -1379,7 +1379,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     rasterizationScaleProbeResult = "error: rasterization scale dependencies unavailable"
                     return
                 }
@@ -1445,7 +1445,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     shadowPathKeyframeProbeResult = "error: shadow path keyframe dependencies unavailable"
                     return
                 }
@@ -1538,7 +1538,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     transformComponentProbeResult = "error: transform component dependencies unavailable"
                     return
                 }
@@ -1697,7 +1697,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     constraintLayoutProbeResult = "error: constraint layout dependencies unavailable"
                     return
                 }
@@ -1818,7 +1818,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     aggregateByValueProbeResult = "error: aggregate byValue dependencies unavailable"
                     return
                 }
@@ -1938,7 +1938,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     additiveKeyframeProbeResult = "error: additive keyframe dependencies unavailable"
                     return
                 }
@@ -2053,7 +2053,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     delegateDrawProbeResult = "error: delegate draw dependencies unavailable"
                     return
                 }
@@ -2205,7 +2205,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     geometryFlipProbeResult = "error: geometry flip dependencies unavailable"
                     return
                 }
@@ -2275,7 +2275,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     transformDepthProbeResult = "error: transform depth dependencies unavailable"
                     return
                 }
@@ -2778,7 +2778,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer,
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer,
                       let multiply = CIFilter(name: "CIMultiplyCompositing"),
                       let screen = CIFilter(name: "CIScreenCompositing"),
                       let sourceOver = CIFilter(name: "CISourceOverCompositing"),
@@ -3238,7 +3238,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     shadowProbeResult = "error: root layer or renderer unavailable"
                     return
                 }
@@ -3522,7 +3522,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     replicatorProbeResult = "error: root layer or renderer unavailable"
                     return
                 }
@@ -3836,7 +3836,7 @@ func installHarness() {
                 let engine = CAAnimationEngine.shared
                 engine.pause()
                 guard let root = rootLayerRef,
-                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     emitterProbeResult = "error: root layer or renderer unavailable"
                     return
                 }
@@ -4364,7 +4364,7 @@ func installHarness() {
                 engine.pause()
                 engine.renderFrame()
 
-                guard let renderer = engine.renderer as? CAWebGPURenderer else {
+                guard let renderer = engine.rendererBackend as? CAWebGPURenderer else {
                     pixelReadbackResult = "error: renderer unavailable"
                     return
                 }
@@ -4390,7 +4390,7 @@ func installHarness() {
         h.expose("beginDynamicRangeProbe", action: {
             Task { @MainActor in
                 guard let root = rootLayerRef,
-                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                      let renderer = CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer else {
                     dynamicRangeProbeResult = "error: renderer unavailable"
                     return
                 }
@@ -4507,7 +4507,7 @@ func installHarness() {
         h.expose("beginShapeFillRuleProbe", action: {
             Task { @MainActor in
                 guard let root = rootLayerRef,
-                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                      let renderer = CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer else {
                     shapeFillRuleProbeResult = "error: renderer unavailable"
                     return
                 }
@@ -4618,7 +4618,7 @@ func installHarness() {
         h.expose("beginGradientTypeProbe", action: {
             Task { @MainActor in
                 guard let root = rootLayerRef,
-                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                      let renderer = CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer else {
                     gradientTypeProbeResult = "error: renderer unavailable"
                     return
                 }
@@ -4721,7 +4721,7 @@ func installHarness() {
         h.expose("beginCornerCurveProbe", action: {
             Task { @MainActor in
                 guard let root = rootLayerRef,
-                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                      let renderer = CAAnimationEngine.shared.rendererBackend as? CAWebGPURenderer else {
                     cornerCurveProbeResult = "error: renderer unavailable"
                     return
                 }

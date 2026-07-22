@@ -251,7 +251,7 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._presentationCacheIsValid = false
 
         // Update with animations at the offset time
-        let evaluationTime = CACurrentMediaTime() - timeOffset
+        let evaluationTime = CARenderTimeContext.currentMediaTime - timeOffset
         updatePresentationLayer(presentation, at: evaluationTime)
 
         return presentation
@@ -261,7 +261,7 @@ open class CALayer: CAMediaTiming, Hashable {
     private func updatePresentationLayer() {
         guard let presentation = _presentationLayer else { return }
 
-        updatePresentationLayer(presentation, at: CACurrentMediaTime())
+        updatePresentationLayer(presentation, at: CARenderTimeContext.currentMediaTime)
     }
 
     /// Updates a presentation layer with animated values at a specific time.
@@ -5168,7 +5168,7 @@ open class CALayer: CAMediaTiming, Hashable {
     /// You typically don't need to call this method directly. Instead, use
     /// `CAAnimationEngine.shared` to manage the animation loop.
     public func processAnimationCompletions() {
-        let currentTime = convertTime(CACurrentMediaTime(), from: nil)
+        let currentTime = convertTime(CARenderTimeContext.currentMediaTime, from: nil)
         var keysToRemove: [String] = []
 
         for (key, animation) in _animations {
