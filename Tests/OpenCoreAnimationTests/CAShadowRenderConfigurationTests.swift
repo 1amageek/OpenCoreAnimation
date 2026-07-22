@@ -30,6 +30,17 @@ struct CAShadowRenderConfigurationTests {
         #expect(throws: CAShadowRenderFailure.nonFiniteGeometry) {
             try CAShadowRenderConfiguration(layer: layer)
         }
+
+        layer.shadowRadius = CGFloat.greatestFiniteMagnitude
+        #expect(throws: CAShadowRenderFailure.nonFiniteGeometry) {
+            try CAShadowRenderConfiguration(layer: layer)
+        }
+
+        layer.shadowRadius = 1
+        layer.shadowOffset = CGSize(width: CGFloat.greatestFiniteMagnitude, height: 0)
+        #expect(throws: CAShadowRenderFailure.nonFiniteGeometry) {
+            try CAShadowRenderConfiguration(layer: layer)
+        }
     }
 
     @Test("Missing and non-finite colors fail explicitly")

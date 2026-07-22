@@ -1522,6 +1522,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// Shadow paths rejected during the current pre-render pass.
     private var failedShadowRenderKeys: Set<LayerRenderKey> = []
 
+    /// Active pre-render failures already counted for diagnostics.
+    private var reportedShadowRenderFailureKeys: Set<LayerRenderKey> = []
+
+    /// Pre-rendered shadows whose final display composite is currently unavailable.
+    private var failedShadowDisplayKeys: Set<LayerRenderKey> = []
+
     // MARK: - Filter Rendering (CAFilter)
 
     /// Filter composite pipeline for blending filtered result with optional tint.
@@ -4541,6 +4547,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         shadowLayerResources.removeAll(keepingCapacity: false)
         prerenderedShadows.removeAll(keepingCapacity: false)
         failedShadowRenderKeys.removeAll(keepingCapacity: false)
+        reportedShadowRenderFailureKeys.removeAll(keepingCapacity: false)
+        failedShadowDisplayKeys.removeAll(keepingCapacity: false)
         shadowRenderFailureCount = 0
         lastShadowRenderFailure = nil
         shapeRenderFailureCount = 0
@@ -8425,7 +8433,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
     ) {
         lastShadowRenderFailure = failure
         prerenderedShadows.removeValue(forKey: renderKey)
-        if failedShadowRenderKeys.insert(renderKey).inserted {
+        failedShadowRenderKeys.insert(renderKey)
+        if reportedShadowRenderFailureKeys.insert(renderKey).inserted {
+            shadowRenderFailureCount += 1
+        }
+    }
+
+    private func recordShadowDisplayFailure(
+        _ failure: CAShadowRenderFailure,
+        for renderKey: LayerRenderKey
+    ) {
+        lastShadowRenderFailure = failure
+        if failedShadowDisplayKeys.insert(renderKey).inserted {
             shadowRenderFailureCount += 1
         }
     }
@@ -8440,9 +8459,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
         collectShadowLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
 
         guard !targets.isEmpty else {
+            reportedShadowRenderFailureKeys.removeAll(keepingCapacity: true)
+            failedShadowDisplayKeys.removeAll(keepingCapacity: true)
             evictShadowResources(except: [])
             return
         }
+
+        let targetRenderKeys = Set(targets.lazy.map(\.renderKey))
+        reportedShadowRenderFailureKeys.formIntersection(targetRenderKeys)
+        failedShadowDisplayKeys.formIntersection(targetRenderKeys)
 
         guard let device = device,
               let pipeline = pipeline,
@@ -8714,6 +8739,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             resources.hasRenderedContent = true
             resources.captureState = captureState
             failedShadowRenderKeys.remove(shadowRenderKey)
+            reportedShadowRenderFailureKeys.remove(shadowRenderKey)
             prerenderedShadows[shadowRenderKey] = PrerenderedShadow(resources: resources)
         }
 
@@ -11875,52 +11901,109 @@ public final class CAWebGPURenderer: CARendererDelegate {
         do {
             configuration = try CAShadowRenderConfiguration(layer: layer)
         } catch {
-            recordShadowRenderFailure(error, for: shadowRenderKey)
+            recordShadowDisplayFailure(error, for: shadowRenderKey)
             return
         }
-        guard let vertexBuffer = vertexBuffer,
-              let shadowCompositePipeline = shadowCompositePipeline,
-              let blurSampler = blurSampler else {
-            recordShadowRenderFailure(.rendererResourcesUnavailable, for: shadowRenderKey)
+        let compositeConfiguration: CAShadowCompositeConfiguration
+        do {
+            compositeConfiguration = try CAShadowCompositeConfiguration(
+                shadow: configuration,
+                effectiveOpacity: currentEffectiveOpacity,
+                replicatorColor: currentReplicatorColor,
+                viewportSize: size
+            )
+        } catch {
+            recordShadowDisplayFailure(error, for: shadowRenderKey)
             return
         }
         guard let prerendered = prerenderedShadows[shadowRenderKey] else {
-            recordShadowRenderFailure(.prerenderedShadowUnavailable, for: shadowRenderKey)
+            recordShadowDisplayFailure(.prerenderedShadowUnavailable, for: shadowRenderKey)
+            return
+        }
+        guard let vertexBuffer,
+              let blurSampler else {
+            recordShadowDisplayFailure(.rendererResourcesUnavailable, for: shadowRenderKey)
+            return
+        }
+        let selectedPipeline: GPURenderPipeline
+        if maskNestingDepth > 0 {
+            guard let shadowCompositeStencilPipeline else {
+                recordShadowDisplayFailure(
+                    .compositeStencilPipelineUnavailable,
+                    for: shadowRenderKey
+                )
+                return
+            }
+            selectedPipeline = shadowCompositeStencilPipeline
+        } else {
+            guard let shadowCompositePipeline else {
+                recordShadowDisplayFailure(.rendererResourcesUnavailable, for: shadowRenderKey)
+                return
+            }
+            selectedPipeline = shadowCompositePipeline
+        }
+        guard let restorationPipeline = pipeline else {
+            recordShadowDisplayFailure(
+                .compositeRestorationPipelineUnavailable,
+                for: shadowRenderKey
+            )
             return
         }
 
-        let shadowOffset = configuration.offset
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(
+                position: SIMD2(0, 0),
+                texCoord: SIMD2(0, 1),
+                color: compositeConfiguration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(compositeConfiguration.viewportSize.x, 0),
+                texCoord: SIMD2(1, 1),
+                color: compositeConfiguration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(0, compositeConfiguration.viewportSize.y),
+                texCoord: SIMD2(0, 0),
+                color: compositeConfiguration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(compositeConfiguration.viewportSize.x, 0),
+                texCoord: SIMD2(1, 1),
+                color: compositeConfiguration.color
+            ),
+            CARendererVertex(
+                position: compositeConfiguration.viewportSize,
+                texCoord: SIMD2(1, 0),
+                color: compositeConfiguration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(0, compositeConfiguration.viewportSize.y),
+                texCoord: SIMD2(0, 0),
+                color: compositeConfiguration.color
+            ),
+        ]
 
-        let effectiveOpacity = currentEffectiveOpacity
-        let colorComponents = replicatedColor(SIMD4<Float>(
-            configuration.color.x,
-            configuration.color.y,
-            configuration.color.z,
-            configuration.color.w * configuration.opacity * effectiveOpacity
-        ))
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            recordShadowDisplayFailure(.vertexCapacityExceeded, for: shadowRenderKey)
+            return
+        }
+        let vertexOffset = allocation.vertexOffset
 
         var shadowUniforms = ShadowUniforms(
             mvpMatrix: Matrix4x4.orthographic(
                 left: 0,
-                right: Float(size.width),
+                right: compositeConfiguration.viewportSize.x,
                 bottom: 0,
-                top: Float(size.height),
+                top: compositeConfiguration.viewportSize.y,
                 near: -1000,
                 far: 1000
             ),
-            shadowColor: colorComponents,
-            shadowOffset: SIMD2<Float>(Float(shadowOffset.width), Float(shadowOffset.height)),
-            layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
+            shadowColor: compositeConfiguration.color,
+            shadowOffset: compositeConfiguration.offset,
+            layerSize: compositeConfiguration.viewportSize
         )
-        let shadowUniformData = createFloat32Array(from: &shadowUniforms)
-        device.queue.writeBuffer(
-            prerendered.resources.compositeUniformBuffer,
-            bufferOffset: 0,
-            data: shadowUniformData
-        )
-
         let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: shadowCompositePipeline.getBindGroupLayout(index: 0),
+            layout: selectedPipeline.getBindGroupLayout(index: 0),
             entries: [
                 GPUBindGroupEntry(binding: 0, resource: .buffer(
                     prerendered.resources.compositeUniformBuffer,
@@ -11931,33 +12014,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler))
             ]
         ))
-
-        var vertices: [CARendererVertex] = [
-            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), 0), texCoord: SIMD2(1, 1), color: colorComponents),
-            CARendererVertex(position: SIMD2(Float(size.width), Float(size.height)), texCoord: SIMD2(1, 0), color: colorComponents),
-            CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 0), color: colorComponents),
-        ]
-
-        guard let allocation = allocateVertices(count: vertices.count) else {
-            recordShadowRenderFailure(.vertexCapacityExceeded, for: shadowRenderKey)
-            return
-        }
-        let vertexOffset = allocation.vertexOffset
-
+        device.queue.writeBuffer(
+            prerendered.resources.compositeUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &shadowUniforms)
+        )
         let vertexData = createFloat32Array(from: &vertices)
         device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
-        renderPass.setPipeline(
-            maskNestingDepth > 0
-                ? (shadowCompositeStencilPipeline ?? shadowCompositePipeline)
-                : shadowCompositePipeline
-        )
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
+        renderPass.setPipeline(restorationPipeline)
+        failedShadowDisplayKeys.remove(shadowRenderKey)
     }
 
     /// Renders a filtered layer by compositing the pre-rendered filter texture.

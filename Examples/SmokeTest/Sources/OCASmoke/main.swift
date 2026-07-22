@@ -3929,6 +3929,36 @@ func installHarness() {
                 result += ";typed=\(renderer.lastShadowRenderFailure == .nonFiniteGeometry)"
                 invalidShadow.removeFromSuperlayer()
                 engine.renderFrame()
+
+                let invalidCompositeShadow = CALayer()
+                invalidCompositeShadow.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                invalidCompositeShadow.position = CGPoint(x: 20, y: 20)
+                invalidCompositeShadow.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 1
+                )
+                invalidCompositeShadow.shadowColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                invalidCompositeShadow.shadowOpacity = 1
+                invalidCompositeShadow.shadowRadius = 2
+                invalidCompositeShadow.opacity = .infinity
+                let failuresBeforeInvalidComposite = renderer.shadowRenderFailureCount
+                root.addSublayer(invalidCompositeShadow)
+                engine.renderFrame()
+                let invalidCompositeWasCountedOnce = renderer.shadowRenderFailureCount
+                    == failuresBeforeInvalidComposite + 1
+                let invalidCompositeWasRejected = invalidCompositeWasCountedOnce
+                    && renderer.lastShadowRenderFailure
+                        == .invalidCompositeOpacity(.infinity)
+                result += ";displayTyped=\(invalidCompositeWasRejected)"
+                invalidCompositeShadow.removeFromSuperlayer()
+                engine.renderFrame()
                 shadowProbeResult = result
             }
         })
