@@ -3833,6 +3833,18 @@ func installHarness() {
                 imageContent.removeFromSuperlayer()
                 maskedShadow.removeFromSuperlayer()
                 engine.renderFrame()
+                let invalidShadow = CALayer()
+                invalidShadow.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                invalidShadow.position = CGPoint(x: 20, y: 20)
+                invalidShadow.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                invalidShadow.shadowColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                invalidShadow.shadowOpacity = 1
+                invalidShadow.shadowRadius = .nan
+                root.addSublayer(invalidShadow)
+                engine.renderFrame()
+                result += ";typed=\(renderer.lastShadowRenderFailure == .nonFiniteGeometry)"
+                invalidShadow.removeFromSuperlayer()
+                engine.renderFrame()
                 shadowProbeResult = result
             }
         })

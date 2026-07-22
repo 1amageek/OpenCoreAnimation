@@ -850,6 +850,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var shadowRenderFailureCount: Int = 0
 
+    /// The most recent typed shadow-rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastShadowRenderFailure: CAShadowRenderFailure?
+
     /// Number of shape fills rejected because their path or fill rule was invalid.
     @_spi(RendererDiagnostics)
     public private(set) var shapeRenderFailureCount: Int = 0
@@ -1443,6 +1447,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     /// Shadow outputs available to the main pass this frame.
     private var prerenderedShadows: [LayerRenderKey: PrerenderedShadow] = [:]
+
+    /// Shadow paths rejected during the current pre-render pass.
+    private var failedShadowRenderKeys: Set<LayerRenderKey> = []
 
     // MARK: - Filter Rendering (CAFilter)
 
@@ -4457,7 +4464,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
         shadowLayerResources.removeAll(keepingCapacity: false)
         prerenderedShadows.removeAll(keepingCapacity: false)
+        failedShadowRenderKeys.removeAll(keepingCapacity: false)
         shadowRenderFailureCount = 0
+        lastShadowRenderFailure = nil
         shapeRenderFailureCount = 0
         gradientRenderFailureCount = 0
         cornerCurveRenderFailureCount = 0
@@ -7886,11 +7895,23 @@ public final class CAWebGPURenderer: CARendererDelegate {
     }
 
     /// Pre-renders every visible shadow with independently-owned GPU resources.
+    private func recordShadowRenderFailure(
+        _ failure: CAShadowRenderFailure,
+        for renderKey: LayerRenderKey
+    ) {
+        lastShadowRenderFailure = failure
+        prerenderedShadows.removeValue(forKey: renderKey)
+        if failedShadowRenderKeys.insert(renderKey).inserted {
+            shadowRenderFailureCount += 1
+        }
+    }
+
     private func prerenderShadows(
         _ rootLayer: CALayer,
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
+        failedShadowRenderKeys.removeAll(keepingCapacity: true)
         var targets: [LayerPrepassTarget] = []
         collectShadowLayers(rootLayer, parentMatrix: projectionMatrix, into: &targets)
 
@@ -7909,7 +7930,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
               let shadowBlurVerticalPipeline = shadowBlurVerticalPipeline,
               let shadowBindGroupLayout = shadowBindGroupLayout,
               let blurSampler = blurSampler else {
-            shadowRenderFailureCount += targets.count
+            for target in targets {
+                recordShadowRenderFailure(
+                    .rendererResourcesUnavailable,
+                    for: target.renderKey
+                )
+            }
             return
         }
 
@@ -7919,8 +7945,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
         for target in targets {
             let shadowLayer = target.layer
             let shadowRenderKey = target.renderKey
-            activeRenderKeys.insert(shadowRenderKey)
             let presentationLayer = target.presentationLayer
+            let shadowConfiguration: CAShadowRenderConfiguration
+            do {
+                shadowConfiguration = try CAShadowRenderConfiguration(layer: presentationLayer)
+            } catch {
+                recordShadowRenderFailure(error, for: shadowRenderKey)
+                continue
+            }
+            activeRenderKeys.insert(shadowRenderKey)
             guard presentationLayer.cornerRadius <= 0
                     || presentationLayer.cornerCurveRenderExponent != nil else {
                 // The main traversal records the diagnostic exactly once and
@@ -7954,7 +7987,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             let cornerRadii = presentationLayer.cornerRadiiComponents
             let cornerCurveExponent = presentationLayer.cornerCurveRenderExponent
                 ?? Float(CornerCurveRenderConfiguration.circularExponent)
-            let blurRadius = max(0, Float(presentationLayer.shadowRadius)) * 0.5
+            let blurRadius = shadowConfiguration.radius * 0.5
             let captureState = ShadowCaptureState(
                 matrix: finalMatrix,
                 layerSize: layerSize,
@@ -8038,8 +8071,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         )
                     }
                 } catch {
-                    shadowRenderFailureCount += 1
-                    maskVertices = []
+                    recordShadowRenderFailure(
+                        .shadowPathTessellationFailed,
+                        for: shadowRenderKey
+                    )
+                    continue
                 }
 
                 let maskVertexBuffer = resources.ensureMaskVertexCapacity(
@@ -8153,6 +8189,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
             resources.hasRenderedContent = true
             resources.captureState = captureState
+            failedShadowRenderKeys.remove(shadowRenderKey)
             prerenderedShadows[shadowRenderKey] = PrerenderedShadow(resources: resources)
         }
 
@@ -10137,18 +10174,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         if hasVisibleShadow(presentationLayer) {
             transientRasterizationTextures.append(cachedTexture)
-            guard let shadowedTexture = executeRasterizedShadow(
-                layer: presentationLayer,
-                contentTexture: cachedTexture,
-                captureBounds: captureBounds,
-                width: pixelWidth,
-                height: pixelHeight,
-                encoder: encoder
-            ) else {
-                shadowRenderFailureCount += 1
+            do {
+                cachedTexture = try executeRasterizedShadow(
+                    layer: presentationLayer,
+                    contentTexture: cachedTexture,
+                    captureBounds: captureBounds,
+                    width: pixelWidth,
+                    height: pixelHeight,
+                    encoder: encoder
+                )
+            } catch {
+                recordShadowRenderFailure(error, for: layerRenderKey)
                 return
             }
-            cachedTexture = shadowedTexture
         }
 
         // Insert the entry. The cache enforces the byte budget only
@@ -10538,7 +10576,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         width: Int,
         height: Int,
         encoder: GPUCommandEncoder
-    ) -> GPUTexture? {
+    ) throws(CAShadowRenderFailure) -> GPUTexture {
         guard let device,
               let bindGroupLayout,
               let dummyGradientStopBuffer,
@@ -10547,7 +10585,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
               let shadowBlurVerticalPipeline,
               let shadowBindGroupLayout,
               let rasterizedShadowCompositePipeline,
-              let blurSampler else { return nil }
+              let blurSampler else {
+            throw .rasterizedShadowResourcesUnavailable
+        }
+        let configuration = try CAShadowRenderConfiguration(layer: layer)
 
         let resources = ShadowLayerResources(
             device: device,
@@ -10611,8 +10652,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     )
                 }
             } catch {
-                shadowRenderFailureCount += 1
-                return nil
+                throw .shadowPathTessellationFailed
             }
             let vertexBuffer = resources.ensureMaskVertexCapacity(vertices.count, device: device)
             if !vertices.isEmpty {
@@ -10646,7 +10686,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         var blurUniforms = BlurUniforms(
             texelSize: SIMD2<Float>(1 / Float(width), 1 / Float(height)),
-            blurRadius: max(0, Float(layer.shadowRadius)) * 0.5
+            blurRadius: configuration.radius * 0.5
         )
         device.queue.writeBuffer(
             resources.blurUniformBuffer,
@@ -10707,18 +10747,17 @@ public final class CAWebGPURenderer: CARendererDelegate {
         verticalPass.draw(vertexCount: 6)
         verticalPass.end()
 
-        let colorComponents = layer.shadowColor?.components ?? []
         let color = SIMD4<Float>(
-            colorComponents.count > 0 ? Float(colorComponents[0]) : 0,
-            colorComponents.count > 1 ? Float(colorComponents[1]) : 0,
-            colorComponents.count > 2 ? Float(colorComponents[2]) : 0,
-            (colorComponents.count > 3 ? Float(colorComponents[3]) : 1) * layer.shadowOpacity
+            configuration.color.x,
+            configuration.color.y,
+            configuration.color.z,
+            configuration.color.w * configuration.opacity
         )
         var compositeUniforms = RasterShadowCompositeUniforms(
             shadowColor: color,
             shadowOffsetUV: SIMD2<Float>(
-                Float(layer.shadowOffset.width / captureBounds.width),
-                Float(-layer.shadowOffset.height / captureBounds.height)
+                Float(configuration.offset.width / captureBounds.width),
+                Float(-configuration.offset.height / captureBounds.height)
             )
         )
         device.queue.writeBuffer(
@@ -10882,7 +10921,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else {
-            shadowRenderFailureCount += 1
+            rasterizationFailureCount += 1
             return
         }
         let (vertexOffset, layerIndex) = allocation
@@ -11250,32 +11289,35 @@ public final class CAWebGPURenderer: CARendererDelegate {
         device: GPUDevice,
         renderPass: GPURenderPassEncoder
     ) {
-        guard let shadowColor = layer.shadowColor,
-              let vertexBuffer = vertexBuffer,
-              let prerendered = prerenderedShadows[renderKey(for: modelLayer)],
+        let shadowRenderKey = renderKey(for: modelLayer)
+        guard !failedShadowRenderKeys.contains(shadowRenderKey) else { return }
+        let configuration: CAShadowRenderConfiguration
+        do {
+            configuration = try CAShadowRenderConfiguration(layer: layer)
+        } catch {
+            recordShadowRenderFailure(error, for: shadowRenderKey)
+            return
+        }
+        guard let vertexBuffer = vertexBuffer,
               let shadowCompositePipeline = shadowCompositePipeline,
               let blurSampler = blurSampler else {
-            shadowRenderFailureCount += 1
+            recordShadowRenderFailure(.rendererResourcesUnavailable, for: shadowRenderKey)
+            return
+        }
+        guard let prerendered = prerenderedShadows[shadowRenderKey] else {
+            recordShadowRenderFailure(.prerenderedShadowUnavailable, for: shadowRenderKey)
             return
         }
 
-        let shadowOpacity = layer.shadowOpacity
-        let shadowOffset = layer.shadowOffset
+        let shadowOffset = configuration.offset
 
         let effectiveOpacity = currentEffectiveOpacity
-        let colorComponents: SIMD4<Float>
-        if let components = shadowColor.components, components.count >= 3 {
-            colorComponents = replicatedColor(SIMD4<Float>(
-                Float(components[0]),
-                Float(components[1]),
-                Float(components[2]),
-                (components.count > 3 ? Float(components[3]) * shadowOpacity : shadowOpacity) * effectiveOpacity
-            ))
-        } else {
-            colorComponents = replicatedColor(
-                SIMD4<Float>(0, 0, 0, shadowOpacity * effectiveOpacity)
-            )
-        }
+        let colorComponents = replicatedColor(SIMD4<Float>(
+            configuration.color.x,
+            configuration.color.y,
+            configuration.color.z,
+            configuration.color.w * configuration.opacity * effectiveOpacity
+        ))
 
         var shadowUniforms = ShadowUniforms(
             mvpMatrix: Matrix4x4.orthographic(
@@ -11319,7 +11361,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(0, Float(size.height)), texCoord: SIMD2(0, 0), color: colorComponents),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            recordShadowRenderFailure(.vertexCapacityExceeded, for: shadowRenderKey)
+            return
+        }
         let vertexOffset = allocation.vertexOffset
 
         let vertexData = createFloat32Array(from: &vertices)
