@@ -48,6 +48,7 @@ nonisolated(unsafe) var constraintLayoutProbeResult: String = "pending"
 nonisolated(unsafe) var aggregateByValueProbeResult: String = "pending"
 nonisolated(unsafe) var additiveKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
+nonisolated(unsafe) var geometryFlipProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
@@ -172,6 +173,7 @@ public func setup() {
             aggregateByValueProbeResult = "pending"
             additiveKeyframeProbeResult = "pending"
             delegateDrawProbeResult = "pending"
+            geometryFlipProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
             emitterProbeResult = "pending"
@@ -380,6 +382,9 @@ func installHarness() {
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
+        })
+        h.expose("getGeometryFlipProbeResult", returning: {
+            .string(geometryFlipProbeResult)
         })
         h.expose("getShadowProbeResult", returning: {
             .string(shadowProbeResult)
@@ -2162,6 +2167,76 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     delegateDrawProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginGeometryFlipProbe", action: {
+            Task { @MainActor in
+                geometryFlipProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    geometryFlipProbeResult = "error: geometry flip dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                let parent = CALayer()
+                parent.bounds = CGRect(x: 0, y: 0, width: 80, height: 80)
+                parent.position = CGPoint(x: 200, y: 150)
+                parent.zPosition = 100
+
+                let red = CALayer()
+                red.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                red.position = CGPoint(x: 20, y: 20)
+                red.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                parent.addSublayer(red)
+
+                let blue = CALayer()
+                blue.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                blue.position = CGPoint(x: 20, y: 60)
+                blue.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                parent.addSublayer(blue)
+                root.addSublayer(parent)
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    parent.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (existingLayer, wasHidden) in existingLayerStates {
+                        existingLayer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                let samplePoints = [
+                    CGPoint(x: 180, y: 130),
+                    CGPoint(x: 180, y: 170),
+                ]
+                engine.renderFrame()
+                do {
+                    let normalPixels = try await renderer.readbackPixels(at: samplePoints)
+                    parent.isGeometryFlipped = true
+                    engine.renderFrame()
+                    let flippedPixels = try await renderer.readbackPixels(at: samplePoints)
+                    restoreScene()
+                    geometryFlipProbeResult = "normal="
+                        + normalPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                        + ",flipped="
+                        + flippedPixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")
+                } catch {
+                    restoreScene()
+                    geometryFlipProbeResult = "error: \(error)"
                 }
             }
         })

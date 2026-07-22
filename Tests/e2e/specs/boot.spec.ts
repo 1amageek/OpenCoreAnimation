@@ -167,6 +167,11 @@ test.describe("OpenCoreAnimation smoke", () => {
             "initial=255,0,0,255;0,255,0,255,updated=0,0,255,255;255,255,0,255,normalVertical=255,0,0,255;255,255,255,255,flippedVertical=255,255,255,255;0,0,255,255,callbacks=true,display=true,retained=true,replaced=true,released=true,rejected=true,failures=1"
         );
 
+        await h.beginGeometryFlipProbe();
+        await expect.poll(() => h.getGeometryFlipProbeResult(), { timeout: 10_000 }).toBe(
+            "normal=0,0,255,255;255,0,0,255,flipped=255,0,0,255;0,0,255,255"
+        );
+
         await h.beginEdgeAntialiasingProbe();
         await expect.poll(() => h.getEdgeAntialiasingProbeResult(), { timeout: 10_000 }).toBe(
             "defaultEnabled=true,initial=40,40,40,255;40,40,40,255;255,255,255,255;255,255,255,255;215,215,215,255;40,40,40,255,defaultBorder=0,0,0,255;255,255,255,255,mutated=255,255,255,255;215,215,215,255,bottom=40,40,40,255;255,255,255,255,top=255,255,255,255;215,215,215,255"

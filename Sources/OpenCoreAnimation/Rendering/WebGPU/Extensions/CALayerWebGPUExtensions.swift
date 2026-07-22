@@ -112,18 +112,32 @@ extension CALayer {
             result = result * sublayerTransform.matrix4x4
         }
 
-        // Apply bounds.origin offset
-        // In CoreAnimation, bounds.origin defines where the coordinate system origin is
-        // within the layer. A sublayer at position (0,0) with parent's bounds.origin = (50, 50)
-        // should appear at (-50, -50) relative to the parent's visible top-left.
-        // This is the scrolling behavior used by CAScrollLayer.
-        if bounds.origin.x != 0 || bounds.origin.y != 0 {
-            let boundsOriginOffset = Matrix4x4(translation: SIMD3<Float>(
+        // Convert the layer's bounds coordinate space into its drawable plane.
+        // A geometry-flipped layer reflects descendant geometry around the
+        // horizontal midpoint of its bounds without changing its own contents.
+        if isGeometryFlipped {
+            let flippedBoundsTransform = Matrix4x4(translation: SIMD3<Float>(
+                0,
+                Float(bounds.height),
+                0
+            )) * Matrix4x4(columns: (
+                SIMD4<Float>(1, 0, 0, 0),
+                SIMD4<Float>(0, -1, 0, 0),
+                SIMD4<Float>(0, 0, 1, 0),
+                SIMD4<Float>(0, 0, 0, 1)
+            ))
+                * Matrix4x4(translation: SIMD3<Float>(
+                    Float(-bounds.origin.x),
+                    Float(-bounds.origin.y),
+                    0
+                ))
+            result = result * flippedBoundsTransform
+        } else if bounds.origin.x != 0 || bounds.origin.y != 0 {
+            result = result * Matrix4x4(translation: SIMD3<Float>(
                 Float(-bounds.origin.x),
                 Float(-bounds.origin.y),
                 0
             ))
-            result = result * boundsOriginOffset
         }
 
         return result

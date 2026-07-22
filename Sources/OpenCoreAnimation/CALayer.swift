@@ -5112,10 +5112,26 @@ open class CALayer: CAMediaTiming, Hashable {
     // MARK: - Mapping Between Coordinate and Time Spaces
 
     private func localToSuperlayerTransform() -> CATransform3D {
-        var result = CATransform3DMakeTranslation(
-            -_bounds.origin.x - _bounds.size.width * _anchorPoint.x,
-            -_bounds.origin.y - _bounds.size.height * _anchorPoint.y,
-            -_anchorPointZ
+        let anchorOffsetY: CGFloat
+        let geometryScaleY: CGFloat
+        if isGeometryFlipped {
+            anchorOffsetY = _bounds.origin.y
+                + _bounds.size.height * (1 - _anchorPoint.y)
+            geometryScaleY = -1
+        } else {
+            anchorOffsetY = -_bounds.origin.y
+                - _bounds.size.height * _anchorPoint.y
+            geometryScaleY = 1
+        }
+
+        var result = CATransform3DMakeScale(1, geometryScaleY, 1)
+        result = CATransform3DConcat(
+            result,
+            CATransform3DMakeTranslation(
+                -_bounds.origin.x - _bounds.size.width * _anchorPoint.x,
+                anchorOffsetY,
+                -_anchorPointZ
+            )
         )
         result = CATransform3DConcat(result, _transform)
         result = CATransform3DConcat(

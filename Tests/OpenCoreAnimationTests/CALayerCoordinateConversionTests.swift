@@ -4,6 +4,64 @@ import Testing
 
 @Suite("CALayer coordinate conversion")
 struct CALayerCoordinateConversionTests {
+    @Test("Geometry flipping matches Core Animation coordinate conversion")
+    func geometryFlippingMatchesCoreAnimationCoordinateConversion() {
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 200, height: 200)
+        root.anchorPoint = .zero
+        root.position = .zero
+
+        let parent = CALayer()
+        parent.bounds = CGRect(x: 5, y: 7, width: 100, height: 80)
+        parent.anchorPoint = .zero
+        parent.position = CGPoint(x: 20, y: 30)
+        parent.isGeometryFlipped = true
+        root.addSublayer(parent)
+
+        let child = CALayer()
+        child.bounds = CGRect(x: 0, y: 0, width: 10, height: 10)
+        child.anchorPoint = .zero
+        child.position = CGPoint(x: 15, y: 17)
+        parent.addSublayer(child)
+
+        let childOrigin = child.convert(CGPoint.zero, to: root)
+        let childTop = child.convert(CGPoint(x: 0, y: 10), to: root)
+        let parentBoundsOrigin = parent.convert(parent.bounds.origin, to: root)
+
+        #expect(childOrigin == CGPoint(x: 30, y: 100))
+        #expect(childTop == CGPoint(x: 30, y: 90))
+        #expect(parentBoundsOrigin == CGPoint(x: 20, y: 110))
+        #expect(child.convert(childOrigin, from: root) == CGPoint.zero)
+        #expect(root.hitTest(CGPoint(x: 35, y: 95)) === child)
+    }
+
+    @Test("Geometry flipping preserves anchor-relative transforms")
+    func geometryFlippingPreservesAnchorRelativeTransforms() {
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 300, height: 300)
+        root.anchorPoint = .zero
+        root.position = .zero
+
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 5, y: 7, width: 100, height: 80)
+        layer.anchorPoint = CGPoint(x: 0.25, y: 0.75)
+        layer.position = CGPoint(x: 80, y: 90)
+        layer.transform = CATransform3DMakeRotation(0.3, 0, 0, 1)
+        layer.isGeometryFlipped = true
+        root.addSublayer(layer)
+
+        let boundsOrigin = layer.convert(CGPoint(x: 5, y: 7), to: root)
+        let lowerRight = layer.convert(CGPoint(x: 105, y: 7), to: root)
+        let upperLeft = layer.convert(CGPoint(x: 5, y: 87), to: root)
+
+        #expect(abs(boundsOrigin.x - 50.2061836386) < 0.0001)
+        #expect(abs(boundsOrigin.y - 101.718724616) < 0.0001)
+        #expect(abs(lowerRight.x - 145.739832551) < 0.0001)
+        #expect(abs(lowerRight.y - 131.270745282) < 0.0001)
+        #expect(abs(upperLeft.x - 73.8478001715) < 0.0001)
+        #expect(abs(upperLeft.y - 25.2918054859) < 0.0001)
+    }
+
     @Test("Sublayer transforms affect conversion and hit testing")
     func sublayerTransformAffectsConversionAndHitTesting() {
         let parent = CALayer()
