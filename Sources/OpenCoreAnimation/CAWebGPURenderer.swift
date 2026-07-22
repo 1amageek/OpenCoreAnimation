@@ -6970,275 +6970,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
     // MARK: - Shape Layer Rendering
 
-    /// Flattens a CGPath into an array of polylines (arrays of points).
-    /// Each subpath becomes a separate polyline.
-    private func flattenPath(_ path: CGPath, flatness: CGFloat = 0.5) -> [[CGPoint]] {
-        var polylines: [[CGPoint]] = []
-        var currentPolyline: [CGPoint] = []
-        var currentPoint = CGPoint.zero
-        var subpathStart = CGPoint.zero
-
-        path.applyWithBlock { elementPtr in
-            let element = elementPtr.pointee
-            switch element.type {
-            case .moveToPoint:
-                if !currentPolyline.isEmpty {
-                    polylines.append(currentPolyline)
-                }
-                currentPolyline = []
-                let point = element.points![0]
-                currentPolyline.append(point)
-                currentPoint = point
-                subpathStart = point
-
-            case .addLineToPoint:
-                let point = element.points![0]
-                currentPolyline.append(point)
-                currentPoint = point
-
-            case .addQuadCurveToPoint:
-                let control = element.points![0]
-                let end = element.points![1]
-                // Flatten quadratic bezier
-                self.flattenQuadBezier(from: currentPoint, control: control, to: end,
-                                       flatness: flatness, into: &currentPolyline)
-                currentPoint = end
-
-            case .addCurveToPoint:
-                let control1 = element.points![0]
-                let control2 = element.points![1]
-                let end = element.points![2]
-                // Flatten cubic bezier
-                self.flattenCubicBezier(from: currentPoint, control1: control1,
-                                        control2: control2, to: end,
-                                        flatness: flatness, into: &currentPolyline)
-                currentPoint = end
-
-            case .closeSubpath:
-                if !currentPolyline.isEmpty && currentPolyline.first != currentPolyline.last {
-                    currentPolyline.append(subpathStart)
-                }
-                currentPoint = subpathStart
-
-            @unknown default:
-                break
-            }
-        }
-
-        if !currentPolyline.isEmpty {
-            polylines.append(currentPolyline)
-        }
-
-        return polylines
-    }
-
-    /// Flattens a quadratic bezier curve into line segments.
-    private func flattenQuadBezier(from p0: CGPoint, control p1: CGPoint, to p2: CGPoint,
-                                   flatness: CGFloat, into polyline: inout [CGPoint]) {
-        // Simple recursive subdivision
-        let midX = (p0.x + 2 * p1.x + p2.x) / 4
-        let midY = (p0.y + 2 * p1.y + p2.y) / 4
-        let dx = (p0.x + p2.x) / 2 - midX
-        let dy = (p0.y + p2.y) / 2 - midY
-
-        if dx * dx + dy * dy <= flatness * flatness {
-            polyline.append(p2)
-        } else {
-            let p01 = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
-            let p12 = CGPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
-            let mid = CGPoint(x: (p01.x + p12.x) / 2, y: (p01.y + p12.y) / 2)
-            flattenQuadBezier(from: p0, control: p01, to: mid, flatness: flatness, into: &polyline)
-            flattenQuadBezier(from: mid, control: p12, to: p2, flatness: flatness, into: &polyline)
-        }
-    }
-
-    /// Flattens a cubic bezier curve into line segments.
-    private func flattenCubicBezier(from p0: CGPoint, control1 p1: CGPoint,
-                                    control2 p2: CGPoint, to p3: CGPoint,
-                                    flatness: CGFloat, into polyline: inout [CGPoint]) {
-        // Check if curve is flat enough
-        let dx1 = p1.x - p0.x
-        let dy1 = p1.y - p0.y
-        let dx2 = p2.x - p3.x
-        let dy2 = p2.y - p3.y
-
-        let d = sqrt(max(dx1 * dx1 + dy1 * dy1, dx2 * dx2 + dy2 * dy2))
-
-        if d <= flatness {
-            polyline.append(p3)
-        } else {
-            // Subdivide
-            let p01 = CGPoint(x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2)
-            let p12 = CGPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
-            let p23 = CGPoint(x: (p2.x + p3.x) / 2, y: (p2.y + p3.y) / 2)
-            let p012 = CGPoint(x: (p01.x + p12.x) / 2, y: (p01.y + p12.y) / 2)
-            let p123 = CGPoint(x: (p12.x + p23.x) / 2, y: (p12.y + p23.y) / 2)
-            let mid = CGPoint(x: (p012.x + p123.x) / 2, y: (p012.y + p123.y) / 2)
-
-            flattenCubicBezier(from: p0, control1: p01, control2: p012, to: mid,
-                               flatness: flatness, into: &polyline)
-            flattenCubicBezier(from: mid, control1: p123, control2: p23, to: p3,
-                               flatness: flatness, into: &polyline)
-        }
-    }
-
-    /// Generates stroke geometry for a polyline.
-    /// Returns vertices forming triangle strips along the path.
-    private func generateStrokeGeometry(polyline: [CGPoint], lineWidth: CGFloat,
-                                        lineCap: CAShapeLayerLineCap,
-                                        lineJoin: CAShapeLayerLineJoin) -> [CGPoint] {
-        guard polyline.count >= 2 else { return [] }
-
-        let halfWidth = lineWidth / 2
-        var leftPoints: [CGPoint] = []
-        var rightPoints: [CGPoint] = []
-
-        for i in 0..<polyline.count {
-            let curr = polyline[i]
-
-            // Calculate tangent
-            var tangent: CGPoint
-            if i == 0 {
-                let next = polyline[i + 1]
-                tangent = CGPoint(x: next.x - curr.x, y: next.y - curr.y)
-            } else if i == polyline.count - 1 {
-                let prev = polyline[i - 1]
-                tangent = CGPoint(x: curr.x - prev.x, y: curr.y - prev.y)
-            } else {
-                let prev = polyline[i - 1]
-                let next = polyline[i + 1]
-                tangent = CGPoint(x: next.x - prev.x, y: next.y - prev.y)
-            }
-
-            // Normalize tangent
-            let len = sqrt(tangent.x * tangent.x + tangent.y * tangent.y)
-            if len > 0.0001 {
-                tangent.x /= len
-                tangent.y /= len
-            }
-
-            // Calculate normal (perpendicular)
-            let normal = CGPoint(x: -tangent.y, y: tangent.x)
-
-            // Offset points
-            leftPoints.append(CGPoint(x: curr.x + normal.x * halfWidth,
-                                      y: curr.y + normal.y * halfWidth))
-            rightPoints.append(CGPoint(x: curr.x - normal.x * halfWidth,
-                                       y: curr.y - normal.y * halfWidth))
-        }
-
-        // Build triangle strip as triangles
-        var vertices: [CGPoint] = []
-        for i in 0..<(leftPoints.count - 1) {
-            // Triangle 1
-            vertices.append(leftPoints[i])
-            vertices.append(rightPoints[i])
-            vertices.append(leftPoints[i + 1])
-
-            // Triangle 2
-            vertices.append(rightPoints[i])
-            vertices.append(rightPoints[i + 1])
-            vertices.append(leftPoints[i + 1])
-        }
-
-        // Add end caps
-        if lineCap == .round {
-            // Round cap at start
-            let startCenter = polyline[0]
-            let startTangent = CGPoint(x: polyline[1].x - polyline[0].x,
-                                       y: polyline[1].y - polyline[0].y)
-            addRoundCap(center: startCenter, tangent: startTangent, halfWidth: halfWidth,
-                        isStart: true, into: &vertices)
-
-            // Round cap at end
-            let endCenter = polyline[polyline.count - 1]
-            let endTangent = CGPoint(x: polyline[polyline.count - 1].x - polyline[polyline.count - 2].x,
-                                     y: polyline[polyline.count - 1].y - polyline[polyline.count - 2].y)
-            addRoundCap(center: endCenter, tangent: endTangent, halfWidth: halfWidth,
-                        isStart: false, into: &vertices)
-        } else if lineCap == .square {
-            // Square caps extend by halfWidth
-            let startCenter = polyline[0]
-            let startDir = CGPoint(x: polyline[0].x - polyline[1].x,
-                                   y: polyline[0].y - polyline[1].y)
-            let startLen = sqrt(startDir.x * startDir.x + startDir.y * startDir.y)
-            if startLen > 0 {
-                let startNorm = CGPoint(x: startDir.x / startLen, y: startDir.y / startLen)
-                let extendedStart = CGPoint(x: startCenter.x + startNorm.x * halfWidth,
-                                            y: startCenter.y + startNorm.y * halfWidth)
-                let perpStart = CGPoint(x: -startNorm.y, y: startNorm.x)
-
-                vertices.append(leftPoints[0])
-                vertices.append(CGPoint(x: extendedStart.x + perpStart.x * halfWidth,
-                                        y: extendedStart.y + perpStart.y * halfWidth))
-                vertices.append(rightPoints[0])
-
-                vertices.append(rightPoints[0])
-                vertices.append(CGPoint(x: extendedStart.x + perpStart.x * halfWidth,
-                                        y: extendedStart.y + perpStart.y * halfWidth))
-                vertices.append(CGPoint(x: extendedStart.x - perpStart.x * halfWidth,
-                                        y: extendedStart.y - perpStart.y * halfWidth))
-            }
-
-            let endCenter = polyline[polyline.count - 1]
-            let endDir = CGPoint(x: polyline[polyline.count - 1].x - polyline[polyline.count - 2].x,
-                                 y: polyline[polyline.count - 1].y - polyline[polyline.count - 2].y)
-            let endLen = sqrt(endDir.x * endDir.x + endDir.y * endDir.y)
-            if endLen > 0 {
-                let endNorm = CGPoint(x: endDir.x / endLen, y: endDir.y / endLen)
-                let extendedEnd = CGPoint(x: endCenter.x + endNorm.x * halfWidth,
-                                          y: endCenter.y + endNorm.y * halfWidth)
-                let perpEnd = CGPoint(x: -endNorm.y, y: endNorm.x)
-
-                vertices.append(leftPoints[leftPoints.count - 1])
-                vertices.append(CGPoint(x: extendedEnd.x + perpEnd.x * halfWidth,
-                                        y: extendedEnd.y + perpEnd.y * halfWidth))
-                vertices.append(rightPoints[rightPoints.count - 1])
-
-                vertices.append(rightPoints[rightPoints.count - 1])
-                vertices.append(CGPoint(x: extendedEnd.x + perpEnd.x * halfWidth,
-                                        y: extendedEnd.y + perpEnd.y * halfWidth))
-                vertices.append(CGPoint(x: extendedEnd.x - perpEnd.x * halfWidth,
-                                        y: extendedEnd.y - perpEnd.y * halfWidth))
-            }
-        }
-
-        return vertices
-    }
-
-    /// Adds a round cap to the stroke geometry.
-    private func addRoundCap(center: CGPoint, tangent: CGPoint, halfWidth: CGFloat,
-                             isStart: Bool, into vertices: inout [CGPoint]) {
-        let len = sqrt(tangent.x * tangent.x + tangent.y * tangent.y)
-        guard len > 0 else { return }
-
-        let dir = CGPoint(x: tangent.x / len, y: tangent.y / len)
-        let normal = CGPoint(x: -dir.y, y: dir.x)
-
-        // Create semicircle with 8 segments
-        let segments = 8
-        let startAngle: CGFloat = isStart ? CGFloat.pi / 2 : -CGFloat.pi / 2
-        let endAngle: CGFloat = isStart ? 3 * CGFloat.pi / 2 : CGFloat.pi / 2
-
-        for i in 0..<segments {
-            let angle1 = startAngle + CGFloat(i) * (endAngle - startAngle) / CGFloat(segments)
-            let angle2 = startAngle + CGFloat(i + 1) * (endAngle - startAngle) / CGFloat(segments)
-
-            let p1 = CGPoint(
-                x: center.x + halfWidth * (cos(angle1) * normal.x - sin(angle1) * dir.x),
-                y: center.y + halfWidth * (cos(angle1) * normal.y - sin(angle1) * dir.y)
-            )
-            let p2 = CGPoint(
-                x: center.x + halfWidth * (cos(angle2) * normal.x - sin(angle2) * dir.x),
-                y: center.y + halfWidth * (cos(angle2) * normal.y - sin(angle2) * dir.y)
-            )
-
-            vertices.append(center)
-            vertices.append(p1)
-            vertices.append(p2)
-        }
-    }
-
     /// Renders a CAShapeLayer with its path.
     private func renderShapeLayer(
         _ shapeLayer: CAShapeLayer,
@@ -7326,46 +7057,47 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
 
         // Render stroke if strokeColor is set
-        if let strokeColor = shapeLayer.strokeColor, shapeLayer.lineWidth > 0 {
-            let polylines = flattenPath(path)
-            for polyline in polylines {
-                guard polyline.count >= 2 else { continue }
-
-                // Generate stroke geometry
-                let strokeVertices = generateStrokeGeometry(
-                    polyline: polyline,
+        if let strokeColor = shapeLayer.strokeColor {
+            guard shapeLayer.lineWidth.isFinite else {
+                shapeRenderFailureCount += 1
+                return
+            }
+            guard shapeLayer.lineWidth > 0 else { return }
+            let strokePoints: [CGPoint]
+            do {
+                strokePoints = try ShapeStrokeTessellator.triangles(
+                    for: path,
                     lineWidth: shapeLayer.lineWidth,
                     lineCap: shapeLayer.lineCap,
-                    lineJoin: shapeLayer.lineJoin
+                    lineJoin: shapeLayer.lineJoin,
+                    miterLimit: shapeLayer.miterLimit,
+                    dashPattern: shapeLayer.lineDashPattern,
+                    dashPhase: shapeLayer.lineDashPhase,
+                    strokeStart: shapeLayer.strokeStart,
+                    strokeEnd: shapeLayer.strokeEnd
                 )
-                guard !strokeVertices.isEmpty else { continue }
+            } catch {
+                shapeRenderFailureCount += 1
+                strokePoints = []
+            }
 
-                // Create vertices
-                var vertices: [CARendererVertex] = []
-                let colorComponents = cgColorToSIMD4(strokeColor)
-                let bounds = shapeLayer.bounds
-                let hasValidBounds = bounds.width > 0 && bounds.height > 0
-
-                for point in strokeVertices {
-                    let layerCoordinate = hasValidBounds
+            let bounds = shapeLayer.bounds
+            let hasValidBounds = bounds.width > 0 && bounds.height > 0
+            let colorComponents = cgColorToSIMD4(strokeColor)
+            var vertices = strokePoints.map { point in
+                CARendererVertex(
+                    position: SIMD2(Float(point.x), Float(point.y)),
+                    texCoord: hasValidBounds
                         ? SIMD2(
                             Float((point.x - bounds.minX) / bounds.width),
                             Float((point.y - bounds.minY) / bounds.height)
                         )
-                        : .zero
-                    vertices.append(CARendererVertex(
-                        position: SIMD2(Float(point.x), Float(point.y)),
-                        texCoord: layerCoordinate,
-                        color: colorComponents
-                    ))
-                }
-
-                // Allocate vertices dynamically
-                guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
-                    continue  // Buffer full, skip this polyline
-                }
-
-                // Update uniforms
+                        : .zero,
+                    color: colorComponents
+                )
+            }
+            if !vertices.isEmpty,
+               let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) {
                 var uniforms = CARendererUniforms(
                     mvpMatrix: modelMatrix,
                     opacity: currentEffectiveOpacity,
@@ -7373,24 +7105,17 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
                     edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
                 )
-
                 let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
-                let uniformData = createFloat32Array(from: &uniforms)
                 device.queue.writeBuffer(
                     uniformBuffer,
                     bufferOffset: uniformOffset,
-                    data: uniformData
+                    data: createFloat32Array(from: &uniforms)
                 )
-
-                // Write vertices at dynamically allocated offset
-                let vertexData = createFloat32Array(from: &vertices)
                 device.queue.writeBuffer(
                     vertexBuffer,
                     bufferOffset: vertexOffset,
-                    data: vertexData
+                    data: createFloat32Array(from: &vertices)
                 )
-
-                // Draw
                 renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
                 renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
                 renderPass.draw(vertexCount: UInt32(vertices.count))

@@ -130,7 +130,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginShapeFillRuleProbe();
         await expect.poll(() => h.getShapeFillRuleProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;26,26,38,255;0,255,0,255;26,26,38,255;0,0,255,255;26,26,38,255,failures=1,draws=2,vertices=42"
+            "255,0,0,255;26,26,38,255;0,255,0,255;26,26,38,255;0,0,255,255;26,26,38,255;255,0,0,255;26,26,38,255;255,0,0,255;26,26,38,255,failures=1,draws=2,vertices=42"
         );
 
         await h.beginTransitionFilterProbes();

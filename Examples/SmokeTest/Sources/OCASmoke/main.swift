@@ -4230,6 +4230,22 @@ func installHarness() {
                 shadow.shadowOffset = .zero
                 shadow.shadowRadius = 0
                 root.addSublayer(shadow)
+
+                let strokePath = CGMutablePath()
+                strokePath.move(to: CGPoint(x: 0, y: 20))
+                strokePath.addLine(to: CGPoint(x: 40, y: 20))
+                let stroke = CAShapeLayer()
+                stroke.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                stroke.position = CGPoint(x: 300, y: 150)
+                stroke.zPosition = 100
+                stroke.path = strokePath
+                stroke.fillColor = nil
+                stroke.strokeColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                stroke.lineWidth = 6
+                stroke.lineDashPattern = [5, 5]
+                stroke.strokeStart = 0.25
+                stroke.strokeEnd = 0.75
+                root.addSublayer(stroke)
                 CATransaction.commit()
 
                 CAAnimationEngine.shared.renderFrame()
@@ -4241,6 +4257,10 @@ func installHarness() {
                         CGPoint(x: 160, y: 150),
                         CGPoint(x: 205, y: 150),
                         CGPoint(x: 220, y: 150),
+                        CGPoint(x: 292, y: 150),
+                        CGPoint(x: 297, y: 150),
+                        CGPoint(x: 302, y: 150),
+                        CGPoint(x: 308, y: 150),
                     ])
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
@@ -4253,6 +4273,7 @@ func installHarness() {
                 nonZero.removeFromSuperlayer()
                 unsupported.removeFromSuperlayer()
                 shadow.removeFromSuperlayer()
+                stroke.removeFromSuperlayer()
                 CAAnimationEngine.shared.renderFrame()
             }
         })
