@@ -858,6 +858,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var lastTextRenderFailure: CATextRenderFailure?
 
+    /// Number of tiled-layer draws rejected by validation or renderer resources.
+    @_spi(RendererDiagnostics)
+    public private(set) var tiledLayerRenderFailureCount: Int = 0
+
+    /// The most recent typed tiled-layer rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastTiledLayerRenderFailure: CATiledLayerRenderFailure?
+
     /// The most recent typed image-conversion failure in the current frame.
     @_spi(RendererDiagnostics)
     public private(set) var lastContentsConversionError: CAImageContentsConversionError?
@@ -4420,6 +4428,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         contentsRenderFailureCount = 0
         textRenderFailureCount = 0
         lastTextRenderFailure = nil
+        tiledLayerRenderFailureCount = 0
+        lastTiledLayerRenderFailure = nil
         lastContentsConversionError = nil
         dynamicRangeRenderFailureCount = 0
         lastDynamicRangeRenderFailure = nil
@@ -12144,6 +12154,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
     }
 
     /// Renders a CATiledLayer with tile-based rendering and LOD support.
+    private func recordTiledLayerRenderFailure(_ failure: CATiledLayerRenderFailure) {
+        tiledLayerRenderFailureCount += 1
+        lastTiledLayerRenderFailure = failure
+    }
+
     private func renderTiledLayer(
         _ tiledLayer: CATiledLayer,
         presentation: CATiledLayer,
@@ -12160,42 +12175,62 @@ public final class CAWebGPURenderer: CARendererDelegate {
             }
         }
 
+        let configuration: CATiledLayerRenderConfiguration
+        do {
+            configuration = try CATiledLayerRenderConfiguration(layer: presentation)
+        } catch {
+            recordTiledLayerRenderFailure(error)
+            return
+        }
+
+        let bounds = configuration.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return }
+
         // Calculate current LOD level
         let lodLevel = calculateLODLevel(tiledLayer: presentation, modelMatrix: modelMatrix)
 
         // Adjust tile size based on LOD level
         // Higher LOD = larger tiles (covering more area with less detail)
         let lodScale = pow(2.0, CGFloat(lodLevel))
-        let pixelScale = presentation.contentsScale / lodScale
-        guard pixelScale.isFinite, pixelScale > 0 else { return }
+        let pixelScale = configuration.contentsScale / lodScale
+        guard pixelScale.isFinite, pixelScale > 0 else {
+            recordTiledLayerRenderFailure(.invalidContentsScale(configuration.contentsScale))
+            return
+        }
         let maximumTextureDimension = max(1, Int(device.limits.maxTextureDimension2D))
         let maximumLogicalTileDimension = CGFloat(maximumTextureDimension) / pixelScale
         let adjustedTileSize = CGSize(
-            width: min(presentation.tileSize.width * lodScale, maximumLogicalTileDimension),
-            height: min(presentation.tileSize.height * lodScale, maximumLogicalTileDimension)
+            width: min(configuration.tileSize.width * lodScale, maximumLogicalTileDimension),
+            height: min(configuration.tileSize.height * lodScale, maximumLogicalTileDimension)
         )
 
-        let bounds = presentation.bounds
-        guard bounds.width > 0,
-              bounds.height > 0,
-              bounds.width.isFinite,
-              bounds.height.isFinite,
-              adjustedTileSize.width.isFinite,
+        guard adjustedTileSize.width.isFinite,
               adjustedTileSize.height.isFinite,
               adjustedTileSize.width > 0,
               adjustedTileSize.height > 0 else {
+            recordTiledLayerRenderFailure(.invalidTileSize(configuration.tileSize))
             return
         }
         let tileCountX = ceil(bounds.width / adjustedTileSize.width)
         let tileCountY = ceil(bounds.height / adjustedTileSize.height)
         guard tileCountX.isFinite,
               tileCountY.isFinite,
-              tileCountX <= CGFloat(Int.max),
-              tileCountY <= CGFloat(Int.max) else {
+              tileCountX > 0,
+              tileCountY > 0,
+              tileCountX <= CGFloat(Self.maxLayers),
+              tileCountY <= CGFloat(Self.maxLayers) else {
+            recordTiledLayerRenderFailure(.tileCountExceedsRendererCapacity(Int.max))
             return
         }
         let tilesX = Int(tileCountX)
         let tilesY = Int(tileCountY)
+        guard tilesY == 0 || tilesX <= Self.maxLayers / tilesY else {
+            let reportedCount = tilesX > Int.max / max(tilesY, 1)
+                ? Int.max
+                : tilesX * tilesY
+            recordTiledLayerRenderFailure(.tileCountExceedsRendererCapacity(reportedCount))
+            return
+        }
         let tileMediaTime = CARenderTimeContext.currentMediaTime
 
         // Render tiles
@@ -12283,7 +12318,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     ) {
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
-              let textureSampler = textureSampler else { return }
+              let textureSampler = textureSampler else {
+            recordTiledLayerRenderFailure(.rendererResourcesUnavailable)
+            return
+        }
 
         // Get or create texture for image using the texture manager.
         // The manager retains `image` for the cached lifetime; passing
@@ -12316,7 +12354,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     device: device
                 )
             }
-        ) else { return }
+        ) else {
+            recordTiledLayerRenderFailure(.rendererResourcesUnavailable)
+            return
+        }
 
         // Create vertices with white color (texture provides color)
         // V-flip: in Y-up system, bottom vertices (y=0) get V=1, top vertices (y=1) get V=0
@@ -12330,7 +12371,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 0), color: white),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            recordTiledLayerRenderFailure(.rendererResourcesUnavailable)
+            return
+        }
         let (vertexOffset, layerIndex) = allocation
 
         // Create uniforms
@@ -12349,7 +12393,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
         device.queue.writeBuffer(vertexBuffer, bufferOffset: vertexOffset, data: vertexData)
 
         // Create bind group for textured rendering
-        guard let texturedBindGroupLayout = texturedBindGroupLayout else { return }
+        guard let texturedBindGroupLayout = texturedBindGroupLayout,
+              let selectedPipeline = selectTexturedPipeline(for: layer) else {
+            recordTiledLayerRenderFailure(.rendererResourcesUnavailable)
+            return
+        }
         let texturedBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
             layout: texturedBindGroupLayout,
             entries: [
@@ -12365,9 +12413,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             ]
         ))
 
-        if let selected = selectTexturedPipeline(for: layer) {
-            renderPass.setPipeline(selected)
-        }
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
@@ -12408,7 +12454,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         let requests = pendingTileDraws
         pendingTileDraws.removeAll(keepingCapacity: true)
         for request in requests {
-            Self.beginTileDraw(
+            beginTileDraw(
                 tiledLayer: request.tiledLayer,
                 delegate: request.delegate,
                 tileKey: request.tileKey,
@@ -12421,7 +12467,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
     }
 
-    private static func beginTileDraw(
+    private func beginTileDraw(
         tiledLayer: CATiledLayer,
         delegate: any CALayerDelegate,
         tileKey: CATiledLayer.TileKey,
@@ -12440,6 +12486,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 space: .deviceRGB,
                 bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
               ) else {
+            recordTiledLayerRenderFailure(.drawingContextCreationFailed)
             if tiledLayer.loadingTileGenerations[tileKey] == cacheGeneration {
                 tiledLayer.loadingTiles.remove(tileKey)
                 tiledLayer.loadingTileGenerations.removeValue(forKey: tileKey)
@@ -12451,8 +12498,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         context.translateBy(x: -tileRect.minX, y: -tileRect.minY)
         delegate.draw(tiledLayer, in: context)
 
-        Task { @MainActor in
+        Task { @MainActor [weak self, weak tiledLayer] in
+            guard let tiledLayer else { return }
             guard let image = await context.makeImageAsync() else {
+                self?.recordTiledLayerRenderFailure(.imageCreationFailed)
                 if tiledLayer.loadingTileGenerations[tileKey] == cacheGeneration {
                     tiledLayer.loadingTiles.remove(tileKey)
                     tiledLayer.loadingTileGenerations.removeValue(forKey: tileKey)
