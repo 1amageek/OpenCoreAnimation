@@ -10854,16 +10854,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
             cachedTexture = captureTexture
         } else {
             transientRasterizationTextures.append(captureTexture)
-            guard let filteredTexture = executeRasterizedFilterStages(
-                filterStages,
-                inputTexture: captureTexture,
-                width: pixelWidth,
-                height: pixelHeight,
-                encoder: encoder
-            ) else {
-                if failedLayerFilterKeys.insert(layerRenderKey).inserted {
-                    layerFilterFailureCount += 1
-                }
+            let filteredTexture: GPUTexture
+            do {
+                filteredTexture = try executeRasterizedFilterStages(
+                    filterStages,
+                    inputTexture: captureTexture,
+                    width: pixelWidth,
+                    height: pixelHeight,
+                    device: device,
+                    processor: layerFilterProcessor,
+                    encoder: encoder
+                )
+            } catch {
+                recordLayerFilterFailure(error, for: layerRenderKey)
                 return
             }
             failedLayerFilterKeys.remove(layerRenderKey)
@@ -10871,19 +10874,22 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
 
         if let maskLayer = presentationLayer.mask {
-            guard let maskedTexture = executeRasterizedContentMask(
-                maskLayer,
-                contentTexture: cachedTexture,
-                projectionMatrix: captureProjection,
-                renderSize: captureSize,
-                depthStencilView: captureDepthView,
-                width: pixelWidth,
-                height: pixelHeight,
-                encoder: encoder
-            ) else {
-                if failedLayerFilterKeys.insert(layerRenderKey).inserted {
-                    layerFilterFailureCount += 1
-                }
+            let maskedTexture: GPUTexture
+            do {
+                maskedTexture = try executeRasterizedContentMask(
+                    maskLayer,
+                    contentTexture: cachedTexture,
+                    projectionMatrix: captureProjection,
+                    renderSize: captureSize,
+                    depthStencilView: captureDepthView,
+                    width: pixelWidth,
+                    height: pixelHeight,
+                    device: device,
+                    processor: layerFilterProcessor,
+                    encoder: encoder
+                )
+            } catch {
+                recordLayerFilterFailure(error, for: layerRenderKey)
                 return
             }
             failedLayerFilterKeys.remove(layerRenderKey)
@@ -11087,10 +11093,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         inputTexture: GPUTexture,
         width: Int,
         height: Int,
+        device: GPUDevice,
+        processor: CIWebGPUFilterProcessor?,
         encoder: GPUCommandEncoder
-    ) -> GPUTexture? {
-        guard let device else { return nil }
-
+    ) throws(CALayerFilterRenderFailure) -> GPUTexture {
         let resources = FilterLayerResources(
             device: device,
             width: width,
@@ -11103,8 +11109,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         var currentAlphaMode = FilterTextureAlphaMode.premultiplied
         var conversionIndex = 0
 
-        func convert(to targetMode: FilterTextureAlphaMode) -> Bool {
-            guard currentAlphaMode != targetMode else { return true }
+        func convert(to targetMode: FilterTextureAlphaMode) throws(CALayerFilterRenderFailure) {
+            guard currentAlphaMode != targetMode else { return }
             let outputTexture = currentTexture === resources.resultTexture
                 ? resources.sourceTexture
                 : resources.resultTexture
@@ -11120,10 +11126,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 uniformBuffer: uniformBuffer,
                 resources: resources,
                 encoder: encoder
-            ) else { return false }
+            ) else {
+                throw .alphaConversionFailed
+            }
             currentTexture = outputTexture
             currentAlphaMode = targetMode
-            return true
         }
 
         for (stageIndex, stage) in stages.enumerated() {
@@ -11134,7 +11141,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
             switch stage {
             case let .renderer(operation):
-                guard convert(to: .premultiplied) else { return nil }
+                try convert(to: .premultiplied)
                 let outputTexture = currentTexture === resources.resultTexture
                     ? resources.sourceTexture
                     : resources.resultTexture
@@ -11161,12 +11168,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         encoder: encoder
                     )
                 }
-                guard applied else { return nil }
+                guard applied else {
+                    throw .rendererOperationFailed
+                }
                 currentTexture = outputTexture
 
             case let .coreImage(filter):
-                guard convert(to: .straight), let processor = layerFilterProcessor else {
-                    return nil
+                try convert(to: .straight)
+                guard let processor else {
+                    throw .coreImageProcessorUnavailable
                 }
                 do {
                     let execution = try processor.makeExecution(
@@ -11181,12 +11191,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     currentTexture = execution.outputTexture
                     currentAlphaMode = .straight
                 } catch {
-                    return nil
+                    throw .coreImageExecutionFailed
                 }
             }
         }
 
-        guard convert(to: .premultiplied) else { return nil }
+        try convert(to: .premultiplied)
 
         let finalTexture = device.createTexture(descriptor: GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
@@ -11201,7 +11211,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             encoder: encoder
         ) else {
             transientRasterizationTextures.append(finalTexture)
-            return nil
+            throw .rendererOperationFailed
         }
         return finalTexture
     }
@@ -11214,19 +11224,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
         depthStencilView: GPUTextureView,
         width: Int,
         height: Int,
+        device: GPUDevice,
+        processor: CIWebGPUFilterProcessor?,
         encoder: GPUCommandEncoder
-    ) -> GPUTexture? {
-        guard let device,
-              let compositionMaskApplyPipeline else { return nil }
-        let maskStages: [LayerFilterStage]
-        do {
-            maskStages = try layerFilterStages(
-                from: renderPresentation(for: maskLayer).filters ?? []
-            )
-        } catch {
-            recordLayerFilterFailure(error, for: renderKey(for: maskLayer))
-            return nil
+    ) throws(CALayerFilterRenderFailure) -> GPUTexture {
+        guard let compositionMaskApplyPipeline else {
+            throw .contentMaskUnavailable
         }
+        let maskStages = try layerFilterStages(
+            from: renderPresentation(for: maskLayer).filters ?? []
+        )
 
         let resources = FilterLayerResources(
             device: device,
@@ -11251,19 +11258,23 @@ public final class CAWebGPURenderer: CARendererDelegate {
             renderSize: renderSize,
             depthStencilView: depthStencilView,
             encoder: encoder
-        ) else { return nil }
+        ) else {
+            throw .contentMaskCaptureFailed
+        }
 
         let maskTexture: GPUTexture
         if !executesRootMaskStages {
             maskTexture = resources.sourceTexture
         } else {
-            guard let filteredMask = executeRasterizedFilterStages(
+            let filteredMask = try executeRasterizedFilterStages(
                 maskStages,
                 inputTexture: resources.sourceTexture,
                 width: width,
                 height: height,
+                device: device,
+                processor: processor,
                 encoder: encoder
-            ) else { return nil }
+            )
             transientRasterizationTextures.append(filteredMask)
             maskTexture = filteredMask
         }
@@ -11281,7 +11292,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             encoder: encoder
         ) else {
             outputTexture.destroy()
-            return nil
+            throw .contentMaskCompositeFailed
         }
         transientRasterizationTextures.append(contentTexture)
         return outputTexture

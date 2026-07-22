@@ -914,6 +914,29 @@ func installHarness() {
                             == .invalidCompositeOpacity(.infinity)
                     invalidComposite.removeFromSuperlayer()
 
+                    rejected.removeFromSuperlayer()
+                    invalidParameters.removeFromSuperlayer()
+                    engine.renderFrame()
+                    let rasterizedRejected = CALayer()
+                    rasterizedRejected.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    rasterizedRejected.position = CGPoint(x: 140, y: 140)
+                    rasterizedRejected.zPosition = 100
+                    rasterizedRejected.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    rasterizedRejected.shouldRasterize = true
+                    rasterizedRejected.filters = [incompatibleFilter]
+                    let failuresBeforeRasterizedRejection = renderer.layerFilterFailureCount
+                    root.addSublayer(rasterizedRejected)
+                    engine.renderFrame()
+                    let rasterizedFailureTyped = renderer.layerFilterFailureCount
+                            == failuresBeforeRasterizedRejection + 1
+                        && renderer.lastLayerFilterFailure == .coreImageExecutionFailed
+                    rasterizedRejected.removeFromSuperlayer()
+
                     layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
@@ -926,6 +949,7 @@ func installHarness() {
                         + ",alphaFilter=\(alphaFilteredCorrectly)"
                         + ",alphaPixel=\(alphaFilteredPixel.map(String.init).joined(separator: ","))"
                         + ",displayTyped=\(invalidCompositeTyped)"
+                        + ",rasterTyped=\(rasterizedFailureTyped)"
                 } catch {
                     layerFilterProbeResult = "error: \(error)"
                 }
