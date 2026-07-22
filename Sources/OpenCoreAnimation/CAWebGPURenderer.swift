@@ -1575,6 +1575,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// Requested layer-filter paths whose configuration is currently not executable.
     private var failedLayerFilterKeys: Set<LayerRenderKey> = []
 
+    /// Prepared layer-filter textures whose final display composite is currently unavailable.
+    private var failedLayerFilterDisplayKeys: Set<LayerRenderKey> = []
+
     // MARK: - Backdrop Composition
 
     private var compositionLayerResources: [LayerRenderKey: CompositionLayerResources] = [:]
@@ -4604,6 +4607,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         activeLayerFilterExecutions.removeAll(keepingCapacity: false)
         retiringLayerFilterExecutions.removeAll(keepingCapacity: false)
         failedLayerFilterKeys.removeAll(keepingCapacity: false)
+        failedLayerFilterDisplayKeys.removeAll(keepingCapacity: false)
         layerFilterFailureCount = 0
         lastLayerFilterFailure = nil
         layerFilterProcessor?.invalidate()
@@ -5010,13 +5014,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
            (hasRequestedFilters || shouldCompositeAsGroup || hasPreparedContentMask) {
             if let prerendered = preparedFilter {
                 // Composite the pre-rendered filtered texture.
-                renderFilteredLayerComposite(
-                    layer,
-                    prerendered: prerendered,
-                    device: device,
-                    renderPass: renderPass,
-                    modelMatrix: modelMatrix
-                )
+                do {
+                    try renderFilteredLayerComposite(
+                        prerendered,
+                        device: device,
+                        renderPass: renderPass
+                    )
+                    failedLayerFilterDisplayKeys.remove(currentRenderKey)
+                } catch let failure {
+                    lastLayerFilterFailure = failure
+                    if failedLayerFilterDisplayKeys.insert(currentRenderKey).inserted {
+                        layerFilterFailureCount += 1
+                    }
+                }
                 return
             }
             // A requested filter path must not silently fall back to unfiltered rendering.
@@ -9092,6 +9102,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
 
         failedLayerFilterKeys.formIntersection(failedRenderKeys)
+        failedLayerFilterDisplayKeys.formIntersection(activeRenderKeys)
         evictFilterResources(except: activeRenderKeys)
     }
 
@@ -11954,19 +11965,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// This method draws a full-screen quad textured with the filtered layer content
     /// from the filter pre-rendering pass.
     private func renderFilteredLayerComposite(
-        _ layer: CALayer,
-        prerendered: PrerenderedFilter,
+        _ prerendered: PrerenderedFilter,
         device: GPUDevice,
-        renderPass: GPURenderPassEncoder,
-        modelMatrix: Matrix4x4
-    ) {
-        renderPremultipliedFullScreenTexture(
+        renderPass: GPURenderPassEncoder
+    ) throws(CALayerFilterRenderFailure) {
+        let configuration = try CALayerFilterCompositeConfiguration(
+            opacity: currentEffectiveOpacity,
+            colorMultiplier: currentReplicatorColor
+        )
+        try renderPremultipliedFullScreenTexture(
             prerendered.outputView,
             uniformBuffer: prerendered.resources.compositeUniformBuffer,
-            uniforms: FilterCompositeUniforms(
-                opacity: currentEffectiveOpacity,
-                colorMultiplier: currentReplicatorColor
-            ),
+            configuration: configuration,
             device: device,
             renderPass: renderPass
         )
@@ -12106,14 +12116,33 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private func renderPremultipliedFullScreenTexture(
         _ textureView: GPUTextureView,
         uniformBuffer: GPUBuffer,
-        uniforms initialUniforms: FilterCompositeUniforms,
+        configuration: CALayerFilterCompositeConfiguration,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder
-    ) {
-        guard let filterCompositePipeline = filterCompositePipeline,
-              let blurSampler = blurSampler else { return }
+    ) throws(CALayerFilterRenderFailure) {
+        guard let blurSampler else {
+            throw .compositeResourcesUnavailable
+        }
+        let selectedPipeline: GPURenderPipeline
+        if maskNestingDepth > 0 {
+            guard let filterCompositeStencilPipeline else {
+                throw .compositeStencilPipelineUnavailable
+            }
+            selectedPipeline = filterCompositeStencilPipeline
+        } else {
+            guard let filterCompositePipeline else {
+                throw .compositeResourcesUnavailable
+            }
+            selectedPipeline = filterCompositePipeline
+        }
+        guard let restorationPipeline = pipeline else {
+            throw .compositeRestorationPipelineUnavailable
+        }
 
-        var filterUniforms = initialUniforms
+        var filterUniforms = FilterCompositeUniforms(
+            opacity: configuration.opacity,
+            colorMultiplier: configuration.colorMultiplier
+        )
         let filterUniformData = createFloat32Array(from: &filterUniforms)
         device.queue.writeBuffer(
             uniformBuffer,
@@ -12123,7 +12152,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Create composite bind group with the filtered texture.
         let compositeBindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
-            layout: filterCompositePipeline.getBindGroupLayout(index: 0),
+            layout: selectedPipeline.getBindGroupLayout(index: 0),
             entries: [
                 GPUBindGroupEntry(binding: 0, resource: .buffer(uniformBuffer, offset: 0, size: UInt64(MemoryLayout<FilterCompositeUniforms>.stride))),
                 GPUBindGroupEntry(binding: 1, resource: .textureView(textureView)),
@@ -12131,14 +12160,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
             ]
         ))
 
-        renderPass.setPipeline(maskNestingDepth > 0 ? (filterCompositeStencilPipeline ?? filterCompositePipeline) : filterCompositePipeline)
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
         renderPass.draw(vertexCount: 6)
 
         // Switch back to regular pipeline
-        if let pipeline = pipeline {
-            renderPass.setPipeline(pipeline)
-        }
+        renderPass.setPipeline(restorationPipeline)
     }
 
     // MARK: - CATransformLayer Rendering

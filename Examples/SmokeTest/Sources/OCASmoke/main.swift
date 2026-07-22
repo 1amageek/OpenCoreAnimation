@@ -889,6 +889,31 @@ func installHarness() {
                     let invalidParametersTyped = renderer.lastLayerFilterFailure
                         == .invalidConfiguration(.unexpectedParameter("inputRaduis"))
                     let alphaFilteredCorrectly = alphaFilteredPixel == [13, 141, 147, 255]
+
+                    let invalidComposite = CALayer()
+                    invalidComposite.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    invalidComposite.position = CGPoint(x: 360, y: 140)
+                    invalidComposite.zPosition = 100
+                    invalidComposite.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    invalidComposite.filters = [CAFilter.colorInvert()]
+                    invalidComposite.opacity = .infinity
+                    let failureCountBeforeInvalidComposite = renderer.layerFilterFailureCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    root.addSublayer(invalidComposite)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let invalidCompositeTyped = renderer.layerFilterFailureCount
+                            - failureCountBeforeInvalidComposite == 1
+                        && renderer.lastLayerFilterFailure
+                            == .invalidCompositeOpacity(.infinity)
+                    invalidComposite.removeFromSuperlayer()
+
                     layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
@@ -900,6 +925,7 @@ func installHarness() {
                         + ",typed=\(invalidParametersTyped)"
                         + ",alphaFilter=\(alphaFilteredCorrectly)"
                         + ",alphaPixel=\(alphaFilteredPixel.map(String.init).joined(separator: ","))"
+                        + ",displayTyped=\(invalidCompositeTyped)"
                 } catch {
                     layerFilterProbeResult = "error: \(error)"
                 }

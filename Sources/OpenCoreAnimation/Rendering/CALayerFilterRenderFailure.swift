@@ -14,4 +14,9 @@ public enum CALayerFilterRenderFailure: Error, Equatable, Sendable {
     case contentMaskUnavailable
     case contentMaskCaptureFailed
     case contentMaskCompositeFailed
+    case invalidCompositeOpacity(Float)
+    case invalidCompositeColor(SIMD4<Float>)
+    case compositeResourcesUnavailable
+    case compositeStencilPipelineUnavailable
+    case compositeRestorationPipelineUnavailable
 }
