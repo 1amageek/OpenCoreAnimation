@@ -8,6 +8,12 @@ import OpenCoreGraphics
 
 @Suite("CALayer Bounds Behavior Tests")
 struct CALayerBoundsBehaviorTests {
+    private final class ReinvalidatingDelegate: CALayerDelegate {
+        func display(_ layer: CALayer) {
+            layer.setNeedsDisplay(CGRect(x: 3, y: 4, width: 5, height: 6))
+        }
+    }
+
     @Test("Changing bounds marks layer dirty when needsDisplayOnBoundsChange is enabled")
     func boundsChangeMarksNeedsDisplay() {
         let layer = CALayer()
@@ -34,6 +40,37 @@ struct CALayerBoundsBehaviorTests {
         #expect(layer.contentsAreFlipped() == false)
         layer.isGeometryFlipped = true
         #expect(layer.contentsAreFlipped() == true)
+    }
+
+    @Test("Partial display invalidations union until display")
+    func partialDisplayInvalidationsUnionUntilDisplay() {
+        let layer = CALayer()
+        layer.setNeedsDisplay(CGRect(x: 1, y: 2, width: 4, height: 5))
+        layer.setNeedsDisplay(CGRect(x: 3, y: 4, width: 6, height: 7))
+
+        #expect(layer.pendingDisplayInvalidation == .partial(
+            CGRect(x: 1, y: 2, width: 8, height: 9)
+        ))
+
+        layer.setNeedsDisplay()
+        #expect(layer.pendingDisplayInvalidation == .full)
+        layer.displayIfNeeded()
+        #expect(layer.pendingDisplayInvalidation == nil)
+    }
+
+    @Test("Display reentrancy retains the new invalidation")
+    func displayReentrancyRetainsNewInvalidation() {
+        let layer = CALayer()
+        let delegate = ReinvalidatingDelegate()
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
+        layer.displayIfNeeded()
+
+        #expect(layer.needsDisplay())
+        #expect(layer.pendingDisplayInvalidation == .partial(
+            CGRect(x: 3, y: 4, width: 5, height: 6)
+        ))
     }
 }
 

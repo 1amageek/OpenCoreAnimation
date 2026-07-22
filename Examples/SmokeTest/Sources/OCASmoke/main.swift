@@ -2124,7 +2124,12 @@ func installHarness() {
                     let displayPixel = initialReadback[4]
                     let invalidPixel = initialReadback[5]
                     delegate.usesSwappedColors = true
-                    layer.setNeedsDisplay()
+                    layer.setNeedsDisplay(CGRect(
+                        x: layer.bounds.minX,
+                        y: layer.bounds.minY,
+                        width: layer.bounds.width / 2,
+                        height: layer.bounds.height
+                    ))
                     displayLayer.setNeedsDisplay()
                     engine.renderFrame()
                     let updatedPixels = try await renderer.readbackPixels(at: samplePoints)

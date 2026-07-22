@@ -164,7 +164,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginDelegateDrawProbe();
         await expect.poll(() => h.getDelegateDrawProbeResult(), { timeout: 10_000 }).toBe(
-            "initial=255,0,0,255;0,255,0,255,updated=0,0,255,255;255,255,0,255,normalVertical=255,0,0,255;255,255,255,255,flippedVertical=255,255,255,255;0,0,255,255,callbacks=true,display=true,retained=true,replaced=true,released=true,rejected=true,failures=1"
+            "initial=255,0,0,255;0,255,0,255,updated=0,0,255,255;0,255,0,255,normalVertical=255,0,0,255;255,255,255,255,flippedVertical=255,255,255,255;0,0,255,255,callbacks=true,display=true,retained=true,replaced=true,released=true,rejected=true,failures=1"
         );
 
         await h.beginGeometryFlipProbe();

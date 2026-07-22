@@ -3832,6 +3832,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         identifier: ObjectIdentifier,
         maximumTextureDimension: Int
     ) {
+        guard let displayInvalidation = layer.pendingDisplayInvalidation else { return }
         let revisionBeforeDisplay = layer._contentRevision
         layer.displayIfNeeded()
         if layer._contentRevision != revisionBeforeDisplay {
@@ -3883,18 +3884,57 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             return
         }
 
-        context.scaleBy(x: scale, y: scale)
-        if layer.contentsAreFlipped() {
-            context.translateBy(x: -bounds.minX, y: -bounds.minY)
-        } else {
-            // CGImage row zero is the top row, while OpenCoreAnimation's
-            // default layer geometry is Y-up. Write logical Y=0 into the
-            // final bitmap row so textured display preserves that contract.
-            context.translateBy(x: -bounds.minX, y: bounds.maxY)
-            context.scaleBy(x: 1, y: -1)
+        let invalidationRect: CGRect
+        switch displayInvalidation {
+        case .full:
+            invalidationRect = bounds
+        case .partial(let requestedRect):
+            invalidationRect = requestedRect.intersection(bounds)
+            if let previousImage = delegateBackingStores[identifier],
+               previousImage.width == pixelWidth,
+               previousImage.height == pixelHeight,
+               previousImage.bitsPerComponent == 8,
+               previousImage.bitsPerPixel == 32,
+               previousImage.bytesPerRow == context.bytesPerRow,
+               let previousData = previousImage.data,
+               previousData.count >= context.bytesPerRow * pixelHeight,
+               let destination = CGBitmapContextGetData(context) {
+                // Partial redraw must preserve untouched pixels. The copy is
+                // required because CGImage snapshots are immutable while the
+                // new CGContext needs independent mutable storage.
+                previousData.withUnsafeBytes { source in
+                    if let sourceAddress = source.baseAddress {
+                        destination.copyMemory(
+                            from: sourceAddress,
+                            byteCount: context.bytesPerRow * pixelHeight
+                        )
+                    }
+                }
+            }
         }
-        delegate.layerWillDraw(layer)
-        layer.draw(in: context)
+
+        let hasDrawableInvalidation = invalidationRect.origin.x.isFinite
+            && invalidationRect.origin.y.isFinite
+            && invalidationRect.width.isFinite
+            && invalidationRect.height.isFinite
+            && invalidationRect.width > 0
+            && invalidationRect.height > 0
+        if hasDrawableInvalidation {
+            context.scaleBy(x: scale, y: scale)
+            if layer.contentsAreFlipped() {
+                context.translateBy(x: -bounds.minX, y: -bounds.minY)
+            } else {
+                // CGImage row zero is the top row, while OpenCoreAnimation's
+                // default layer geometry is Y-up. Write logical Y=0 into the
+                // final bitmap row so textured display preserves that contract.
+                context.translateBy(x: -bounds.minX, y: bounds.maxY)
+                context.scaleBy(x: 1, y: -1)
+            }
+            context.clip(to: invalidationRect)
+            context.clear(invalidationRect)
+            delegate.layerWillDraw(layer)
+            layer.draw(in: context)
+        }
         guard let image = context.makeImage() else {
             delegateBackingStores.removeValue(forKey: identifier)
             delegateDrawFailureCount += 1

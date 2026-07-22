@@ -4758,17 +4758,41 @@ open class CALayer: CAMediaTiming, Hashable {
 
     // MARK: - Updating Layer Display
 
+    internal enum DisplayInvalidation: Equatable {
+        case full
+        case partial(CGRect)
+    }
+
     private var _needsDisplay: Bool = false
+    private var _needsFullDisplay: Bool = false
+    private var _displayInvalidationRect: CGRect?
+
+    internal var pendingDisplayInvalidation: DisplayInvalidation? {
+        guard _needsDisplay else { return nil }
+        if _needsFullDisplay {
+            return .full
+        }
+        return .partial(_displayInvalidationRect ?? .null)
+    }
 
     /// Marks the layer's contents as needing to be updated.
     open func setNeedsDisplay() {
         _needsDisplay = true
+        _needsFullDisplay = true
+        _displayInvalidationRect = nil
         markDirty(.contentsRedraw)
     }
 
     /// Marks the region within the specified rectangle as needing to be updated.
     open func setNeedsDisplay(_ r: CGRect) {
         _needsDisplay = true
+        if !_needsFullDisplay {
+            if let existing = _displayInvalidationRect {
+                _displayInvalidationRect = existing.union(r)
+            } else {
+                _displayInvalidationRect = r
+            }
+        }
         markDirty(.contentsRedraw)
     }
 
@@ -4777,10 +4801,11 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Initiates the update process for a layer if it is currently marked as needing an update.
     open func displayIfNeeded() {
-        if _needsDisplay {
-            display()
-            _needsDisplay = false
-        }
+        guard _needsDisplay else { return }
+        _needsDisplay = false
+        _needsFullDisplay = false
+        _displayInvalidationRect = nil
+        display()
     }
 
     /// Returns a Boolean indicating whether the layer has been marked as needing an update.
