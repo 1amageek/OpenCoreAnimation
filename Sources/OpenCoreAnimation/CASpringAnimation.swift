@@ -11,6 +11,9 @@ import Foundation
 /// An animation that applies a spring-like force to a layer's properties.
 open class CASpringAnimation: CABasicAnimation {
 
+    private static let restDisplacement: CGFloat = 0.001
+    private static let settlingSampleInterval: CFTimeInterval = 0.1
+
     /// The mass of the object attached to the end of the spring.
     /// Must be greater than 0. Default is 1.
     private var _mass: CGFloat = 1
@@ -47,8 +50,57 @@ open class CASpringAnimation: CABasicAnimation {
     /// The initial velocity of the object attached to the spring.
     open var initialVelocity: CGFloat = 0
 
+    /// Controls whether damping ratios greater than one use an overdamped response.
+    ///
+    /// When this is `false`, damping above the critical value is evaluated as a
+    /// critically damped spring. The physical coefficient remains available through
+    /// `damping`, matching QuartzCore's separation between stored parameters and the
+    /// response policy.
+    open var allowsOverdamping: Bool = false
+
+    /// The duration of one cycle of the corresponding undamped oscillator.
+    open var perceptualDuration: CFTimeInterval {
+        2 * .pi * sqrt(CFTimeInterval(mass / stiffness))
+    }
+
+    /// A normalized description of the spring's overshoot.
+    ///
+    /// Positive values describe underdamping, zero is critical damping, and
+    /// negative values describe overdamping.
+    open var bounce: CGFloat {
+        let ratio = physicalDampingRatio
+        if ratio <= 1 {
+            return 1 - ratio
+        }
+        return (1 / ratio) - 1
+    }
+
     public required init() {
         super.init()
+    }
+
+    /// Creates a spring from perceptual duration and bounce parameters.
+    public convenience init(perceptualDuration: CFTimeInterval, bounce: CGFloat) {
+        self.init()
+
+        guard perceptualDuration.isFinite, perceptualDuration > 0, bounce.isFinite else {
+            return
+        }
+
+        let angularFrequency = 2 * Double.pi / perceptualDuration
+        stiffness = CGFloat(angularFrequency * angularFrequency)
+        allowsOverdamping = true
+
+        let dampingRatio: CGFloat
+        if bounce >= 0 {
+            dampingRatio = 1 - bounce
+        } else if bounce > -1 {
+            dampingRatio = 1 / (1 + bounce)
+        } else {
+            dampingRatio = .infinity
+        }
+        damping = 2 * dampingRatio * sqrt(mass * stiffness)
+        duration = settlingDuration
     }
 
     public required init(animation: CAAnimation) {
@@ -58,6 +110,7 @@ open class CASpringAnimation: CABasicAnimation {
             self.stiffness = source.stiffness
             self.damping = source.damping
             self.initialVelocity = source.initialVelocity
+            self.allowsOverdamping = source.allowsOverdamping
         }
     }
 
@@ -70,6 +123,8 @@ open class CASpringAnimation: CABasicAnimation {
             return CGFloat(100)
         case "damping":
             return CGFloat(10)
+        case "allowsOverdamping":
+            return false
         default:
             return super.defaultValue(forKey: key)
         }
@@ -83,31 +138,38 @@ open class CASpringAnimation: CABasicAnimation {
         if damping == 0 {
             return CFTimeInterval(Float.greatestFiniteMagnitude)
         }
-        // Ensure valid parameters to prevent division by zero
-        let safeMass = mass
-        let safeStiffness = stiffness
-        let safeDamping = damping
-
-        // Calculate damping ratio: ζ = c / (2 * sqrt(k * m))
-        let dampingRatio = safeDamping / (2 * sqrt(safeStiffness * safeMass))
-
-        // Use tolerance for damping regime classification to avoid
-        // floating-point boundary issues (e.g., dampingRatio = 0.9999999).
-        let criticalDampingTolerance = 1e-6
-        let naturalFrequency = sqrt(safeStiffness / safeMass)
-
-        if abs(dampingRatio - 1) < criticalDampingTolerance {
-            // Critically damped: settling time ≈ 4 / ω_n
-            return 4 / naturalFrequency
-        } else if dampingRatio > 1 {
-            // Overdamped: settling time ≈ 4 / (ω_n * (ζ - sqrt(ζ² - 1)))
-            // Uses the slower eigenvalue for accurate settling
-            let slowEigenvalue = naturalFrequency * (dampingRatio - sqrt(dampingRatio * dampingRatio - 1))
-            return 4 / slowEigenvalue
-        } else {
-            // Underdamped: settling time ≈ 4 / (ζ * ω_n)
-            return 4 / (dampingRatio * naturalFrequency)
+        if damping == .infinity, allowsOverdamping {
+            return 0
         }
+
+        let dampingRatio = effectiveDampingRatio
+        let naturalFrequency = sqrt(stiffness / mass)
+        if dampingRatio < 1 {
+            let dampedFrequency = naturalFrequency * sqrt(1 - dampingRatio * dampingRatio)
+            let decayRate = dampingRatio * naturalFrequency
+            let sineCoefficient = (decayRate - initialVelocity) / dampedFrequency
+            let envelope = sqrt(1 + sineCoefficient * sineCoefficient)
+            let envelopeDuration = log(envelope / Self.restDisplacement) / decayRate
+
+            // QuartzCore leaves a phase-dependent fraction of the natural response
+            // after the exponential envelope reaches the rest threshold. This term
+            // keeps the estimate aligned with the actual oscillator instead of the
+            // former four-time-constant approximation.
+            let phaseAllowance = sqrt(1 - dampingRatio) / naturalFrequency
+            return max(0, CFTimeInterval(envelopeDuration + phaseAllowance))
+        }
+
+        if dampingRatio == 1 {
+            return sampledCriticalSettlingDuration(naturalFrequency: naturalFrequency)
+        }
+
+        // The perceptual overdamping policy intentionally avoids the arbitrarily
+        // long tail of the slow physical eigenvalue. QuartzCore quantizes this
+        // estimate to tenths of a second.
+        let dimensionlessDuration = 9.3 * (1 + log(dampingRatio))
+        let estimatedDuration = CFTimeInterval(dimensionlessDuration / naturalFrequency)
+        return ceil(estimatedDuration / Self.settlingSampleInterval)
+            * Self.settlingSampleInterval
     }
 
     /// Override to use settlingDuration when duration is not explicitly set.
@@ -128,15 +190,18 @@ open class CASpringAnimation: CABasicAnimation {
     /// - Parameter time: The elapsed time in seconds since animation start.
     /// - Returns: The interpolated value from 0 to 1, may overshoot for underdamped springs.
     internal func springValue(at time: CFTimeInterval) -> CGFloat {
-        let safeMass = max(0.001, mass)
-        let safeStiffness = max(0.001, stiffness)
-        let safeDamping = max(0.001, damping)
+        if damping == .infinity, allowsOverdamping {
+            return time <= 0 ? 0 : 1
+        }
+
+        let safeMass = mass
+        let safeStiffness = stiffness
 
         // Natural frequency: ω_n = sqrt(k / m)
         let omega_n = sqrt(safeStiffness / safeMass)
 
         // Damping ratio: ζ = c / (2 * sqrt(k * m))
-        let zeta = safeDamping / (2 * sqrt(safeStiffness * safeMass))
+        let zeta = effectiveDampingRatio
 
         // Initial conditions: starting at 0, moving towards 1
         // x(0) = 0 (start position)
@@ -179,5 +244,31 @@ open class CASpringAnimation: CABasicAnimation {
 
             return 1 - A * exp(r1 * t) - B * exp(r2 * t)
         }
+    }
+
+    private var physicalDampingRatio: CGFloat {
+        damping / (2 * sqrt(stiffness * mass))
+    }
+
+    private var effectiveDampingRatio: CGFloat {
+        allowsOverdamping ? physicalDampingRatio : min(physicalDampingRatio, 1)
+    }
+
+    private func sampledCriticalSettlingDuration(
+        naturalFrequency: CGFloat
+    ) -> CFTimeInterval {
+        let linearCoefficient = naturalFrequency - initialVelocity
+        var time = Self.settlingSampleInterval
+
+        while time < CFTimeInterval(Float.greatestFiniteMagnitude) {
+            let scalarTime = CGFloat(time)
+            let displacement = exp(-naturalFrequency * scalarTime)
+                * (1 + linearCoefficient * scalarTime)
+            if abs(displacement) < Self.restDisplacement {
+                return time
+            }
+            time += Self.settlingSampleInterval
+        }
+        return CFTimeInterval(Float.greatestFiniteMagnitude)
     }
 }
