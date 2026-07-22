@@ -44,6 +44,7 @@ nonisolated(unsafe) var contentsAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var rasterizationScaleProbeResult: String = "pending"
 nonisolated(unsafe) var shadowPathKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var transformComponentProbeResult: String = "pending"
+nonisolated(unsafe) var constraintLayoutProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -163,6 +164,7 @@ public func setup() {
             rasterizationScaleProbeResult = "pending"
             shadowPathKeyframeProbeResult = "pending"
             transformComponentProbeResult = "pending"
+            constraintLayoutProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -358,6 +360,9 @@ func installHarness() {
         })
         h.expose("getTransformComponentProbeResult", returning: {
             .string(transformComponentProbeResult)
+        })
+        h.expose("getConstraintLayoutProbeResult", returning: {
+            .string(constraintLayoutProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1608,6 +1613,127 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     transformComponentProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginConstraintLayoutProbe", action: {
+            Task { @MainActor in
+                constraintLayoutProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    constraintLayoutProbeResult = "error: constraint layout dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                let container = CALayer()
+                container.bounds = CGRect(x: 0, y: 0, width: 200, height: 100)
+                container.position = CGPoint(x: 200, y: 150)
+                container.zPosition = 100
+                container.layoutManager = CAConstraintLayoutManager()
+
+                func makeLayer(
+                    name: String,
+                    frame: CGRect,
+                    color: CGColor
+                ) -> CALayer {
+                    let layer = CALayer()
+                    layer.name = name
+                    layer.frame = frame
+                    layer.backgroundColor = color
+                    return layer
+                }
+
+                func constraint(
+                    _ attribute: CAConstraintAttribute,
+                    relativeTo sourceName: String,
+                    _ sourceAttribute: CAConstraintAttribute,
+                    offset: CGFloat = 0
+                ) -> CAConstraint {
+                    CAConstraint(
+                        attribute: attribute,
+                        relativeTo: sourceName,
+                        attribute: sourceAttribute,
+                        scale: 1,
+                        offset: offset
+                    )
+                }
+
+                let first = makeLayer(
+                    name: "first",
+                    frame: CGRect(x: 80, y: 40, width: 20, height: 20),
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                )
+                first.constraints = [
+                    constraint(.minX, relativeTo: "superlayer", .minX, offset: 10),
+                    constraint(.minY, relativeTo: "superlayer", .minY, offset: 10),
+                ]
+
+                let second = makeLayer(
+                    name: "second",
+                    frame: CGRect(x: 3, y: 4, width: 30, height: 20),
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                )
+                second.constraints = [
+                    constraint(.minX, relativeTo: "first", .maxX, offset: 5),
+                    constraint(.minY, relativeTo: "first", .minY),
+                ]
+
+                let third = makeLayer(
+                    name: "third",
+                    frame: CGRect(x: 6, y: 7, width: 40, height: 20),
+                    color: CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                )
+                third.constraints = [
+                    constraint(.minX, relativeTo: "second", .maxX, offset: 7),
+                    constraint(.minY, relativeTo: "second", .minY),
+                ]
+
+                container.addSublayer(third)
+                container.addSublayer(second)
+                container.addSublayer(first)
+                root.addSublayer(container)
+                CATransaction.commit()
+
+                engine.renderFrame()
+                let framesMatch = first.frame == CGRect(x: 10, y: 10, width: 20, height: 20)
+                    && second.frame == CGRect(x: 35, y: 10, width: 30, height: 20)
+                    && third.frame == CGRect(x: 72, y: 10, width: 40, height: 20)
+
+                @MainActor
+                func restoreScene() {
+                    container.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 120, y: 180),
+                        CGPoint(x: 150, y: 180),
+                        CGPoint(x: 192, y: 180),
+                    ])
+                    restoreScene()
+                    constraintLayoutProbeResult = "frames=\(framesMatch),pixels="
+                        + pixels
+                            .map { $0.map(String.init).joined(separator: ",") }
+                            .joined(separator: ";")
+                } catch {
+                    restoreScene()
+                    constraintLayoutProbeResult = "error: \(error)"
                 }
             }
         })

@@ -4288,6 +4288,8 @@ open class CALayer: CAMediaTiming, Hashable {
             let oldValue = _bounds
             guard oldValue != newValue else { return }
             _bounds = newValue
+            setNeedsLayout()
+            _superlayer?.setNeedsLayout()
             if oldValue.size != newValue.size {
                 resizeSublayers(withOldSize: oldValue.size)
             }
@@ -4452,6 +4454,7 @@ open class CALayer: CAMediaTiming, Hashable {
                 CALayer.propagateDirtyDeltaPublic(dirtyDelta, startingAt: self)
             }
             markDirty(.sublayerHierarchy)
+            invalidateLayoutAfterSublayerHierarchyChange()
         }
     }
 
@@ -4564,6 +4567,7 @@ open class CALayer: CAMediaTiming, Hashable {
         // and a fresh `.sublayerHierarchy` bit. Mirrors propagateShadowDelta.
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
+        invalidateLayoutAfterSublayerHierarchyChange()
     }
 
     /// Detaches the layer from its parent layer.
@@ -4577,6 +4581,7 @@ open class CALayer: CAMediaTiming, Hashable {
         CALayer.propagateDirtyDeltaPublic(-_subtreeDirtyCount, startingAt: superlayer)
         superlayer.markDirty(.sublayerHierarchy)
         superlayer._sublayers?.removeAll { $0 === self }
+        superlayer.invalidateLayoutAfterSublayerHierarchyChange()
         _superlayer = nil
     }
 
@@ -4593,6 +4598,7 @@ open class CALayer: CAMediaTiming, Hashable {
         CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
+        invalidateLayoutAfterSublayerHierarchyChange()
     }
 
     /// Inserts the specified sublayer below a different sublayer that already belongs to the receiver.
@@ -4611,6 +4617,7 @@ open class CALayer: CAMediaTiming, Hashable {
         CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
+        invalidateLayoutAfterSublayerHierarchyChange()
     }
 
     /// Inserts the specified sublayer above a different sublayer that already belongs to the receiver.
@@ -4629,6 +4636,7 @@ open class CALayer: CAMediaTiming, Hashable {
         CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
+        invalidateLayoutAfterSublayerHierarchyChange()
     }
 
     /// Replaces the specified sublayer with a different layer object.
@@ -4645,6 +4653,13 @@ open class CALayer: CAMediaTiming, Hashable {
         CALayer.propagateFilterDelta(newLayer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+newLayer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
+        invalidateLayoutAfterSublayerHierarchyChange()
+    }
+
+    private func invalidateLayoutAfterSublayerHierarchyChange() {
+        if layoutManager != nil || delegate != nil {
+            setNeedsLayout()
+        }
     }
 
     // MARK: - Updating Layer Display
@@ -4857,7 +4872,15 @@ open class CALayer: CAMediaTiming, Hashable {
     // MARK: - Managing Layer Resizing and Layout
 
     /// The object responsible for laying out the layer's sublayers.
-    open var layoutManager: (any CALayoutManager)?
+    open var layoutManager: (any CALayoutManager)? {
+        didSet {
+            let oldIdentifier = oldValue.map { ObjectIdentifier($0) }
+            let newIdentifier = layoutManager.map { ObjectIdentifier($0) }
+            if oldIdentifier != newIdentifier {
+                setNeedsLayout()
+            }
+        }
+    }
 
     private var _needsLayout: Bool = false
 
@@ -4950,7 +4973,11 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Constraints define geometric relationships between this layer and other layers in the same
     /// sibling group. The constraint's `sourceName` property identifies the reference layer by name,
     /// or "superlayer" to reference the parent layer.
-    open var constraints: [CAConstraint]?
+    open var constraints: [CAConstraint]? {
+        didSet {
+            _superlayer?.setNeedsLayout()
+        }
+    }
 
     /// Adds the specified constraint to the layer.
     ///

@@ -165,6 +165,7 @@ import JavaScriptKit
     public func displayLinkDidFire(_ displayLink: CADisplayLink) {
         // Render the layer tree first using internal delegate
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
+            layoutRecursively(rootLayer)
             delegate.render(layer: rootLayer)
         }
 
@@ -191,6 +192,15 @@ import JavaScriptKit
         }
     }
 
+    /// Resolves pending layout from parent to child before presentation values
+    /// are captured by the renderer.
+    private func layoutRecursively(_ layer: CALayer) {
+        layer.layoutIfNeeded()
+        for sublayer in layer.sublayers ?? [] {
+            layoutRecursively(sublayer)
+        }
+    }
+
     // MARK: - Manual Rendering
 
     /// Manually triggers a single render frame.
@@ -199,6 +209,7 @@ import JavaScriptKit
     /// for example, after making changes that should be immediately visible.
     public func renderFrame() {
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
+            layoutRecursively(rootLayer)
             delegate.render(layer: rootLayer)
         }
         processAnimationsRecursively(rootLayer)

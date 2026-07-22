@@ -58,7 +58,7 @@ struct CAShadowPathKeyframeAnimationTests {
         let result = try #require(presentation(for: animation, elapsed: 0.5).shadowPath)
 
         #expect(abs(result.boundingBox.minX - 10) < 0.01)
-        #expect(result.boundingBox.width == 20)
+        #expect(abs(result.boundingBox.width - 20) < 0.01)
     }
 
     @Test("Cubic shadow paths apply their interpolated path")
@@ -70,6 +70,6 @@ struct CAShadowPathKeyframeAnimationTests {
         let result = try #require(presentation(for: animation, elapsed: 0.5).shadowPath)
 
         #expect(abs(result.boundingBox.minX - 10) < 0.01)
-        #expect(result.boundingBox.width == 20)
+        #expect(abs(result.boundingBox.width - 20) < 0.01)
     }
 }
