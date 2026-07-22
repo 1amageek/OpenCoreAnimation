@@ -720,6 +720,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var layerFilterFailureCount: Int = 0
 
+    /// The most recent typed layer-filter failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastLayerFilterFailure: CALayerFilterRenderFailure?
+
     /// Number of frozen source and target textures currently retained by the renderer.
     @_spi(RendererDiagnostics)
     public var activeTransitionTextureCount: Int {
@@ -4506,6 +4510,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         retiringLayerFilterExecutions.removeAll(keepingCapacity: false)
         failedLayerFilterKeys.removeAll(keepingCapacity: false)
         layerFilterFailureCount = 0
+        lastLayerFilterFailure = nil
         layerFilterProcessor?.invalidate()
         layerFilterProcessor = nil
         for resources in compositionLayerResources.values {
@@ -8283,11 +8288,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     || requiresContentMask else { continue }
 
             let filteredRenderKey = target.renderKey
-            guard let stages = layerFilterStages(from: requestedFilters) else {
+            let stages: [LayerFilterStage]
+            do {
+                stages = try layerFilterStages(from: requestedFilters)
+            } catch {
                 failedRenderKeys.insert(filteredRenderKey)
-                if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
-                    layerFilterFailureCount += 1
-                }
+                recordLayerFilterFailure(error, for: filteredRenderKey)
                 continue
             }
             activeRenderKeys.insert(filteredRenderKey)
@@ -8354,7 +8360,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             var currentView = resources.sourceView
             var currentAlphaMode = FilterTextureAlphaMode.premultiplied
             var conversionIndex = 0
-            var didFail = false
+            var executionFailure: CALayerFilterRenderFailure?
 
             func convert(to targetMode: FilterTextureAlphaMode) -> Bool {
                 guard currentAlphaMode != targetMode else { return true }
@@ -8385,14 +8391,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 switch stage {
                 case let .renderer(operation):
                     guard convert(to: .premultiplied) else {
-                        didFail = true
+                        executionFailure = .alphaConversionFailed
                         break
                     }
                     let outputTexture = currentTexture === resources.resultTexture
                         ? resources.sourceTexture
                         : resources.resultTexture
                     guard let outputView = resources.view(for: outputTexture) else {
-                        didFail = true
+                        executionFailure = .rendererResourcesUnavailable
                         break
                     }
                     let operationUniformBuffer = resources.uniformBuffer(
@@ -8425,7 +8431,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     }
 
                     guard applied else {
-                        didFail = true
+                        executionFailure = .rendererOperationFailed
                         break
                     }
                     currentTexture = outputTexture
@@ -8433,11 +8439,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
                 case let .coreImage(filter):
                     guard convert(to: .straight) else {
-                        didFail = true
+                        executionFailure = .alphaConversionFailed
                         break
                     }
                     guard let processor = layerFilterProcessor else {
-                        didFail = true
+                        executionFailure = .coreImageProcessorUnavailable
                         break
                     }
                     do {
@@ -8454,28 +8460,24 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         currentView = execution.outputTexture.createView()
                         currentAlphaMode = .straight
                     } catch {
-                        didFail = true
+                        executionFailure = .coreImageExecutionFailed
                     }
                 }
 
-                if didFail {
+                if executionFailure != nil {
                     break
                 }
             }
 
-            if didFail {
+            if let executionFailure {
                 failedRenderKeys.insert(filteredRenderKey)
-                if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
-                    layerFilterFailureCount += 1
-                }
+                recordLayerFilterFailure(executionFailure, for: filteredRenderKey)
                 continue
             }
 
             guard convert(to: .premultiplied) else {
                 failedRenderKeys.insert(filteredRenderKey)
-                if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
-                    layerFilterFailureCount += 1
-                }
+                recordLayerFilterFailure(.alphaConversionFailed, for: filteredRenderKey)
                 continue
             }
 
@@ -8483,9 +8485,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 guard let maskLayer = target.presentationLayer.mask,
                       let compositionMaskApplyPipeline else {
                     failedRenderKeys.insert(filteredRenderKey)
-                    if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
-                        layerFilterFailureCount += 1
-                    }
+                    recordLayerFilterFailure(.contentMaskUnavailable, for: filteredRenderKey)
                     continue
                 }
                 let maskTarget = LayerPrepassTarget(
@@ -8504,9 +8504,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     encoder: encoder
                 ) else {
                     failedRenderKeys.insert(filteredRenderKey)
-                    if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
-                        layerFilterFailureCount += 1
-                    }
+                    recordLayerFilterFailure(.contentMaskCaptureFailed, for: filteredRenderKey)
                     continue
                 }
                 let maskedTexture = currentTexture === resources.resultTexture
@@ -8521,9 +8519,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         encoder: encoder
                       ) else {
                     failedRenderKeys.insert(filteredRenderKey)
-                    if failedLayerFilterKeys.insert(filteredRenderKey).inserted {
-                        layerFilterFailureCount += 1
-                    }
+                    recordLayerFilterFailure(.contentMaskCompositeFailed, for: filteredRenderKey)
                     continue
                 }
                 currentTexture = maskedTexture
@@ -8560,7 +8556,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
         return (layer.sublayers ?? []).contains(where: visit)
     }
 
-    private func layerFilterStages(from filters: [Any]) -> [LayerFilterStage]? {
+    private func recordLayerFilterFailure(
+        _ failure: CALayerFilterRenderFailure,
+        for renderKey: LayerRenderKey
+    ) {
+        lastLayerFilterFailure = failure
+        if failedLayerFilterKeys.insert(renderKey).inserted {
+            layerFilterFailureCount += 1
+        }
+    }
+
+    private func layerFilterStages(
+        from filters: [Any]
+    ) throws(CALayerFilterRenderFailure) -> [LayerFilterStage] {
         var stages: [LayerFilterStage] = []
         stages.reserveCapacity(filters.count)
 
@@ -8570,14 +8578,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 do {
                     executionPlan = try filter.executionPlan()
                 } catch {
-                    return nil
+                    throw .invalidConfiguration(error)
                 }
                 switch executionPlan {
                 case let .renderer(operation):
                     stages.append(.renderer(operation))
                 case let .coreImage(name, parameters):
                     guard let coreImageFilter = CIFilter(name: name) else {
-                        return nil
+                        throw .unavailableCoreImageFilter(name)
                     }
                     for (key, parameter) in parameters {
                         coreImageFilter.setValue(parameter, forKey: key)
@@ -8589,7 +8597,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     stages.append(.coreImage(filter))
                 }
             } else {
-                return nil
+                throw .unsupportedFilterValue(String(reflecting: type(of: value)))
             }
         }
 
@@ -8996,8 +9004,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
         contentMaskIndex: Int,
         encoder: GPUCommandEncoder
     ) -> Bool {
-        guard let device,
-              let stages = layerFilterStages(from: target.presentationLayer.filters ?? []) else {
+        guard let device else {
+            return false
+        }
+        let stages: [LayerFilterStage]
+        do {
+            stages = try layerFilterStages(from: target.presentationLayer.filters ?? [])
+        } catch {
+            recordLayerFilterFailure(error, for: target.renderKey)
             return false
         }
         guard !stages.isEmpty else {
@@ -9307,7 +9321,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 let key = target.renderKey
                 let presentation = target.presentationLayer
                 let requestedBackgroundFilters = presentation.backgroundFilters ?? []
-                guard let backgroundStages = layerFilterStages(from: requestedBackgroundFilters) else {
+                let backgroundStages: [LayerFilterStage]
+                do {
+                    backgroundStages = try layerFilterStages(from: requestedBackgroundFilters)
+                } catch {
                     recordFailure(key)
                     continue
                 }
@@ -9944,10 +9961,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         if requestedFilters.isEmpty {
             filterStages = []
         } else {
-            guard let stages = layerFilterStages(from: requestedFilters) else {
+            do {
+                filterStages = try layerFilterStages(from: requestedFilters)
+            } catch {
+                recordLayerFilterFailure(error, for: layerRenderKey)
                 return
             }
-            filterStages = stages
         }
 
         let captureTexture = device.createTexture(descriptor: GPUTextureDescriptor(
@@ -10413,10 +10432,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
         encoder: GPUCommandEncoder
     ) -> GPUTexture? {
         guard let device,
-              let compositionMaskApplyPipeline,
-              let maskStages = layerFilterStages(
+              let compositionMaskApplyPipeline else { return nil }
+        let maskStages: [LayerFilterStage]
+        do {
+            maskStages = try layerFilterStages(
                 from: renderPresentation(for: maskLayer).filters ?? []
-              ) else { return nil }
+            )
+        } catch {
+            recordLayerFilterFailure(error, for: renderKey(for: maskLayer))
+            return nil
+        }
 
         let resources = FilterLayerResources(
             device: device,

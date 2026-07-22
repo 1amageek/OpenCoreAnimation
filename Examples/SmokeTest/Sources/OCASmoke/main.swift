@@ -867,6 +867,8 @@ func installHarness() {
                         && translucentUngroupedPixel[3] == 255
                     let rejectedExplicitly = rejectedPixel == [25, 25, 38, 255]
                     let invalidParametersRejected = invalidParametersPixel == [25, 25, 38, 255]
+                    let invalidParametersTyped = renderer.lastLayerFilterFailure
+                        == .invalidConfiguration(.unexpectedParameter("inputRaduis"))
                     let alphaFilteredCorrectly = alphaFilteredPixel == [13, 141, 147, 255]
                     layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
@@ -876,6 +878,7 @@ func installHarness() {
                         + ",translucentUngrouped=\(translucentUngrouped)"
                         + ",rejected=\(rejectedExplicitly)"
                         + ",invalid=\(invalidParametersRejected)"
+                        + ",typed=\(invalidParametersTyped)"
                         + ",alphaFilter=\(alphaFilteredCorrectly)"
                         + ",alphaPixel=\(alphaFilteredPixel.map(String.init).joined(separator: ","))"
                 } catch {

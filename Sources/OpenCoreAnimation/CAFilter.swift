@@ -13,7 +13,8 @@ internal enum CAFilterOperation: Equatable {
     case colorInvert
 }
 
-internal enum CAFilterConfigurationError: Error, Equatable {
+@_spi(RendererDiagnostics)
+public enum CAFilterConfigurationError: Error, Equatable, Sendable {
     case unexpectedParameter(String)
     case invalidParameterType(String)
     case nonFiniteParameter(String)
@@ -239,7 +240,7 @@ public struct CAFilter: Hashable {
         return configuredNumber(forKey: "inputSaturation", default: 1)
     }
 
-    internal func executionPlan() throws -> CAFilterExecutionPlan {
+    internal func executionPlan() throws(CAFilterConfigurationError) -> CAFilterExecutionPlan {
         switch type {
         case .gaussianBlur:
             return .renderer(.gaussianBlur(radius: try validatedNumber(
@@ -306,7 +307,7 @@ public struct CAFilter: Hashable {
         minimum: CGFloat,
         maximum: CGFloat? = nil,
         validateKeys: Bool = true
-    ) throws -> CGFloat {
+    ) throws(CAFilterConfigurationError) -> CGFloat {
         if validateKeys {
             try rejectUnexpectedParameters(allowedKeys: [key])
         }
@@ -339,7 +340,9 @@ public struct CAFilter: Hashable {
         return value
     }
 
-    private func rejectUnexpectedParameters(allowedKeys: Set<String>) throws {
+    private func rejectUnexpectedParameters(
+        allowedKeys: Set<String>
+    ) throws(CAFilterConfigurationError) {
         if let unexpected = parameters.keys
             .filter({ !allowedKeys.contains($0) })
             .sorted()

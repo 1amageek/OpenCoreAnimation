@@ -4,7 +4,7 @@ import CoreGraphics
 #else
 import OpenCoreGraphics
 #endif
-@testable import OpenCoreAnimation
+@_spi(RendererDiagnostics) @testable import OpenCoreAnimation
 
 @Suite("CALayer Bounds Behavior Tests")
 struct CALayerBoundsBehaviorTests {
