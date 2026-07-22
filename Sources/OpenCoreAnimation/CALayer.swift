@@ -3945,6 +3945,10 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
+    /// The most recent context-rendering failure from `render(in:)`.
+    @_spi(RendererDiagnostics)
+    public internal(set) var lastContextRenderError: CALayerContextRenderError?
+
     /// Renders the layer and its sublayers into the specified context.
     ///
     /// This method renders the layer's contents, including its visual appearance
@@ -3952,27 +3956,39 @@ open class CALayer: CAMediaTiming, Hashable {
     ///
     /// - Parameter ctx: The graphics context in which to render.
     open func render(in ctx: CGContext) {
-        // Save the graphics state
         ctx.saveGState()
         defer { ctx.restoreGState() }
+        renderLayerTree(in: ctx)
+    }
 
-        // Skip hidden layers
+    private func renderLayerTree(in ctx: CGContext) {
+        lastContextRenderError = nil
         guard !isHidden && opacity > 0 else { return }
 
-        // Apply transform
-        if !CATransform3DIsIdentity(_transform) {
-            let affine = CATransform3DGetAffineTransform(_transform)
-            ctx.concatenate(affine)
+        let effectiveOpacity = min(1, max(0, CGFloat(opacity)))
+        let usesOpacityGroup = effectiveOpacity < 1
+        if usesOpacityGroup {
+            ctx.setAlpha(ctx.alpha * effectiveOpacity)
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+            ctx.setAlpha(1)
         }
-
-        // Apply opacity
-        ctx.setAlpha(CGFloat(opacity))
+        defer {
+            if usesOpacityGroup {
+                ctx.endTransparencyLayer()
+            }
+        }
 
         // Set up clipping if masksToBounds is true
         if masksToBounds {
-            let clipPath = layerShapePath(in: bounds)
-            ctx.addPath(clipPath)
-            ctx.clip()
+            do {
+                let clipPath = try layerShapePath(in: bounds)
+                ctx.addPath(clipPath)
+                ctx.clip()
+            } catch {
+                lastContextRenderError = error
+                ctx.addPath(CGPath(rect: .zero, transform: nil))
+                ctx.clip()
+            }
         }
 
         // Draw shadow (before content)
@@ -3993,9 +4009,13 @@ open class CALayer: CAMediaTiming, Hashable {
         if let bgColor = backgroundColor {
             ctx.setFillColor(bgColor)
             if cornerRadius > 0 {
-                let path = layerShapePath(in: bounds)
-                ctx.addPath(path)
-                ctx.fillPath()
+                do {
+                    let path = try layerShapePath(in: bounds)
+                    ctx.addPath(path)
+                    ctx.fillPath()
+                } catch {
+                    lastContextRenderError = error
+                }
             } else {
                 ctx.fill(bounds)
             }
@@ -4009,40 +4029,56 @@ open class CALayer: CAMediaTiming, Hashable {
         // Let delegate draw if needed
         delegate?.draw(self, in: ctx)
 
+        if let specializedLayer = self as? CALayerContextRenderable {
+            do {
+                try specializedLayer.renderSpecializedContent(in: ctx)
+            } catch {
+                lastContextRenderError = error
+            }
+        }
+
         // Draw border
         if borderWidth > 0, let borderColor = borderColor {
             ctx.setStrokeColor(borderColor)
             ctx.setLineWidth(borderWidth)
             if cornerRadius > 0 {
-                let path = layerShapePath(in: bounds.insetBy(dx: borderWidth / 2, dy: borderWidth / 2))
-                ctx.addPath(path)
-                ctx.strokePath()
+                do {
+                    let path = try layerShapePath(
+                        in: bounds.insetBy(dx: borderWidth / 2, dy: borderWidth / 2)
+                    )
+                    ctx.addPath(path)
+                    ctx.strokePath()
+                } catch {
+                    lastContextRenderError = error
+                }
             } else {
                 ctx.stroke(bounds.insetBy(dx: borderWidth / 2, dy: borderWidth / 2))
             }
         }
 
         // Render sublayers
-        if let sublayers = sublayers {
-            for sublayer in sublayers {
-                ctx.saveGState()
-
-                // Translate to sublayer position
-                let sublayerOrigin = CGPoint(
-                    x: sublayer.position.x - sublayer.bounds.width * sublayer.anchorPoint.x,
-                    y: sublayer.position.y - sublayer.bounds.height * sublayer.anchorPoint.y
+        if sublayers?.isEmpty == false {
+            ctx.saveGState()
+            if !CATransform3DIsIdentity(sublayerTransform) {
+                let transformAnchor = CGPoint(
+                    x: bounds.minX + bounds.width * anchorPoint.x,
+                    y: bounds.minY + bounds.height * anchorPoint.y
                 )
-                ctx.translateBy(x: sublayerOrigin.x, y: sublayerOrigin.y)
-
-                // Apply sublayer transform
-                if !CATransform3DIsIdentity(sublayerTransform) {
-                    let affine = CATransform3DGetAffineTransform(sublayerTransform)
-                    ctx.concatenate(affine)
-                }
-
-                sublayer.render(in: ctx)
+                ctx.translateBy(x: transformAnchor.x, y: transformAnchor.y)
+                ctx.concatenate(CATransform3DGetAffineTransform(sublayerTransform))
+                ctx.translateBy(x: -transformAnchor.x, y: -transformAnchor.y)
+            }
+            if isGeometryFlipped {
+                ctx.translateBy(x: 0, y: bounds.minY + bounds.maxY)
+                ctx.scaleBy(x: 1, y: -1)
+            }
+            for sublayer in sortedSublayers() {
+                ctx.saveGState()
+                concatenateGeometry(of: sublayer, in: ctx)
+                sublayer.renderLayerTree(in: ctx)
                 ctx.restoreGState()
             }
+            ctx.restoreGState()
         }
 
         if let maskLayer {
@@ -4051,7 +4087,20 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    private func layerShapePath(in rect: CGRect) -> CGPath {
+    private func concatenateGeometry(of layer: CALayer, in context: CGContext) {
+        context.translateBy(x: layer.position.x, y: layer.position.y)
+        if !CATransform3DIsIdentity(layer.transform) {
+            context.concatenate(CATransform3DGetAffineTransform(layer.transform))
+        }
+        context.translateBy(
+            x: -layer.bounds.width * layer.anchorPoint.x - layer.bounds.origin.x,
+            y: -layer.bounds.height * layer.anchorPoint.y - layer.bounds.origin.y
+        )
+    }
+
+    private func layerShapePath(
+        in rect: CGRect
+    ) throws(CALayerContextRenderError) -> CGPath {
         guard rect.width > 0, rect.height > 0 else {
             return CGPath(rect: .zero, transform: nil)
         }
@@ -4090,7 +4139,7 @@ open class CALayer: CAMediaTiming, Hashable {
                 )
             }
         default:
-            return CGMutablePath()
+            throw .unsupportedCornerCurve(cornerCurve.rawValue)
         }
 
         let path = CGMutablePath()
@@ -4147,6 +4196,10 @@ open class CALayer: CAMediaTiming, Hashable {
 
         path.closeSubpath()
         return path
+    }
+
+    internal func contextRenderShapePath() throws(CALayerContextRenderError) -> CGPath {
+        try layerShapePath(in: bounds)
     }
 
     private func continuousCornerPath(
@@ -4267,14 +4320,12 @@ open class CALayer: CAMediaTiming, Hashable {
     private func applyMask(_ maskLayer: CALayer, in ctx: CGContext) {
         ctx.saveGState()
         defer { ctx.restoreGState() }
-
-        let maskOrigin = CGPoint(
-            x: maskLayer.position.x - maskLayer.bounds.width * maskLayer.anchorPoint.x,
-            y: maskLayer.position.y - maskLayer.bounds.height * maskLayer.anchorPoint.y
-        )
-        ctx.translateBy(x: maskOrigin.x, y: maskOrigin.y)
+        concatenateGeometry(of: maskLayer, in: ctx)
         ctx.setBlendMode(.destinationIn)
-        maskLayer.render(in: ctx)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        ctx.setBlendMode(.normal)
+        maskLayer.renderLayerTree(in: ctx)
+        ctx.endTransparencyLayer()
     }
 
     /// Draws the contents image into the context.

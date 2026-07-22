@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import OpenCoreAnimation
+@_spi(RendererDiagnostics) @testable import OpenCoreAnimation
 @testable import OpenCoreGraphics
 
 private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unchecked Sendable {
@@ -15,12 +15,16 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
         let path: CGPath
         let color: CGColor
         let clipPaths: [CGClipPath]
+        let transform: CGAffineTransform
+        let alpha: CGFloat
     }
 
     var imageDrawCalls: [ImageDrawCall] = []
     var fillCalls: [FillCall] = []
     var transparencyLayerBeginCount = 0
     var transparencyLayerEndCount = 0
+    var transparencyLayerEndAlphas: [CGFloat] = []
+    var transparencyLayerEndBlendModes: [CGBlendMode] = []
 
     func fill(
         path: CGPath,
@@ -59,7 +63,13 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
         rule: CGPathFillRule,
         state: CGDrawingState
     ) {
-        fillCalls.append(FillCall(path: path, color: color, clipPaths: state.clipPaths))
+        fillCalls.append(FillCall(
+            path: path,
+            color: color,
+            clipPaths: state.clipPaths,
+            transform: state.ctm,
+            alpha: alpha
+        ))
     }
 
     func draw(
@@ -79,6 +89,8 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
 
     func endTransparencyLayer(alpha: CGFloat, blendMode: CGBlendMode, state: CGDrawingState) {
         transparencyLayerEndCount += 1
+        transparencyLayerEndAlphas.append(alpha)
+        transparencyLayerEndBlendModes.append(blendMode)
     }
 }
 
@@ -99,6 +111,25 @@ struct CALayerRenderingTests {
         }
         context.rendererDelegate = renderer
         return context
+    }
+
+    private func makeSoftwareContext(width: Int, height: Int) throws -> CGContext {
+        try #require(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: .deviceRGB,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        ))
+    }
+
+    private func pixel(in context: CGContext, x: Int, y: Int) throws -> [UInt8] {
+        let image = try #require(context.makeImage())
+        let data = try #require(image.data ?? image.dataProvider?.data)
+        let offset = y * image.bytesPerRow + x * 4
+        return Array(data[offset..<(offset + 4)])
     }
 
     private func makeImage(width: Int, height: Int) -> CGImage {
@@ -320,6 +351,7 @@ struct CALayerRenderingTests {
         layer.render(in: context)
 
         #expect(renderer.fillCalls.isEmpty)
+        #expect(layer.lastContextRenderError == .unsupportedCornerCurve("future-curve"))
     }
 
     @Test("mask renders through a transparency layer using destinationIn blending")
@@ -338,9 +370,264 @@ struct CALayerRenderingTests {
 
         layer.render(in: context)
 
+        #expect(renderer.transparencyLayerBeginCount == 2)
+        #expect(renderer.transparencyLayerEndCount == 2)
+        #expect(renderer.imageDrawCalls.count == 2)
+        #expect(renderer.imageDrawCalls.last?.blendMode == .normal)
+        #expect(renderer.transparencyLayerEndBlendModes.first == .destinationIn)
+    }
+
+    @Test("render ignores the root layer transform in its own coordinate space")
+    func rootTransformIsIgnored() throws {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 4, height: 4)
+        layer.position = CGPoint(x: 20, y: 20)
+        layer.transform = CATransform3DMakeTranslation(10, 12, 0)
+        layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+
+        layer.render(in: context)
+
+        let call = try #require(renderer.fillCalls.first)
+        #expect(call.path.boundingBox.applying(call.transform) == layer.bounds)
+    }
+
+    @Test("sublayer geometry applies position transform anchor and bounds origin in order")
+    func sublayerGeometryComposition() throws {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+        let parent = CALayer()
+        parent.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+
+        let child = CALayer()
+        child.bounds = CGRect(x: 3, y: 4, width: 4, height: 4)
+        child.position = CGPoint(x: 10, y: 10)
+        child.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        child.transform = CATransform3DMakeRotation(.pi / 2, 0, 0, 1)
+        child.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        parent.addSublayer(child)
+
+        parent.render(in: context)
+
+        let call = try #require(renderer.fillCalls.first)
+        let renderedBounds = call.path.boundingBox
+        #expect(abs(renderedBounds.minX - 8) < 0.001)
+        #expect(abs(renderedBounds.minY - 8) < 0.001)
+        #expect(abs(renderedBounds.width - 4) < 0.001)
+        #expect(abs(renderedBounds.height - 4) < 0.001)
+    }
+
+    @Test("sublayer geometry reaches the expected software pixels")
+    func sublayerGeometrySoftwarePixels() throws {
+        let context = try makeSoftwareContext(width: 30, height: 30)
+        let parent = CALayer()
+        parent.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+
+        let child = CALayer()
+        child.bounds = CGRect(x: 3, y: 4, width: 4, height: 4)
+        child.position = CGPoint(x: 10, y: 10)
+        child.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        child.transform = CATransform3DMakeRotation(.pi / 2, 0, 0, 1)
+        child.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        parent.addSublayer(child)
+
+        parent.render(in: context)
+
+        #expect(try pixel(in: context, x: 9, y: 9) == [255, 0, 0, 255])
+        #expect(try pixel(in: context, x: 13, y: 13) == [0, 0, 0, 0])
+    }
+
+    @Test("sublayerTransform rotates descendants around the parent anchor")
+    func sublayerTransformUsesParentAnchor() throws {
+        let context = try makeSoftwareContext(width: 40, height: 40)
+        let parent = CALayer()
+        parent.bounds = CGRect(x: 0, y: 0, width: 30, height: 30)
+        parent.sublayerTransform = CATransform3DMakeRotation(.pi / 2, 0, 0, 1)
+
+        let child = CALayer()
+        child.bounds = CGRect(x: 0, y: 0, width: 4, height: 4)
+        child.position = CGPoint(x: 10, y: 10)
+        child.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        child.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        parent.addSublayer(child)
+
+        parent.render(in: context)
+
+        #expect(try pixel(in: context, x: 19, y: 9) == [255, 0, 0, 255])
+        #expect(try pixel(in: context, x: 9, y: 9) == [0, 0, 0, 0])
+    }
+
+    @Test("layer opacity composites the complete subtree as one group")
+    func opacityUsesTransparencyGroup() throws {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+        let parent = CALayer()
+        parent.bounds = CGRect(x: 0, y: 0, width: 10, height: 10)
+        parent.opacity = 0.5
+
+        let child = CALayer()
+        child.frame = parent.bounds
+        child.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        parent.addSublayer(child)
+
+        parent.render(in: context)
+
         #expect(renderer.transparencyLayerBeginCount == 1)
         #expect(renderer.transparencyLayerEndCount == 1)
-        #expect(renderer.imageDrawCalls.count == 2)
-        #expect(renderer.imageDrawCalls.last?.blendMode == .destinationIn)
+        #expect(try #require(renderer.transparencyLayerEndAlphas.first) == 0.5)
+        #expect(try #require(renderer.fillCalls.first).alpha == 1)
+    }
+
+    @Test("CAShapeLayer render draws fill and trimmed stroke content")
+    func shapeLayerRendersSpecializedContent() {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+        let shape = CAShapeLayer()
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 2, y: 8))
+        path.addLine(to: CGPoint(x: 18, y: 8))
+        shape.path = path
+        shape.fillColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+        shape.strokeColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        shape.lineWidth = 4
+        shape.strokeStart = 0.5
+        shape.strokeEnd = 1
+
+        shape.render(in: context)
+
+        #expect(renderer.fillCalls.count == 2)
+        #expect(renderer.fillCalls.last?.path.boundingBox.minX ?? 0 >= 9.9)
+        #expect(shape.lastContextRenderError == nil)
+    }
+
+    @Test("CAShapeLayer render reports unknown stroke styles")
+    func shapeLayerReportsUnknownStrokeStyle() {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+        let shape = CAShapeLayer()
+        shape.path = CGPath(rect: CGRect(x: 0, y: 0, width: 10, height: 10), transform: nil)
+        shape.fillColor = nil
+        shape.strokeColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        shape.lineCap = CAShapeLayerLineCap(rawValue: "future-cap")
+
+        shape.render(in: context)
+
+        #expect(shape.lastContextRenderError == .unsupportedShapeLineCap("future-cap"))
+        #expect(renderer.fillCalls.isEmpty)
+    }
+
+    @Test("CAShapeLayer render writes specialized content to software pixels")
+    func shapeLayerSoftwarePixels() throws {
+        let context = try makeSoftwareContext(width: 16, height: 16)
+        let shape = CAShapeLayer()
+        shape.path = CGPath(
+            rect: CGRect(x: 2, y: 3, width: 8, height: 6),
+            transform: nil
+        )
+        shape.fillColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+        shape.strokeColor = nil
+
+        shape.render(in: context)
+
+        #expect(try pixel(in: context, x: 5, y: 5) == [0, 255, 0, 255])
+        #expect(try pixel(in: context, x: 12, y: 5) == [0, 0, 0, 0])
+    }
+
+    @Test("layer mask clears pixels outside the rendered mask buffer")
+    func layerMaskSoftwarePixels() throws {
+        let context = try makeSoftwareContext(width: 10, height: 10)
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 10, height: 10)
+        layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+
+        let maskLayer = CALayer()
+        maskLayer.frame = CGRect(x: 0, y: 0, width: 5, height: 10)
+        maskLayer.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        layer.mask = maskLayer
+
+        layer.render(in: context)
+
+        #expect(try pixel(in: context, x: 2, y: 5) == [255, 0, 0, 255])
+        #expect(try pixel(in: context, x: 7, y: 5) == [0, 0, 0, 0])
+    }
+
+    @Test("CAGradientLayer render draws an axial gradient in unit coordinates")
+    func axialGradientSoftwarePixels() throws {
+        let context = try makeSoftwareContext(width: 4, height: 1)
+        let gradient = CAGradientLayer()
+        gradient.bounds = CGRect(x: 0, y: 0, width: 4, height: 1)
+        gradient.colors = [
+            CGColor(red: 0, green: 0, blue: 0, alpha: 1),
+            CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+        ]
+        gradient.startPoint = CGPoint(x: 0, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 0.5)
+
+        gradient.render(in: context)
+
+        #expect(try pixel(in: context, x: 0, y: 0) == [32, 32, 32, 255])
+        #expect(try pixel(in: context, x: 3, y: 0) == [223, 223, 223, 255])
+        #expect(gradient.lastContextRenderError == nil)
+    }
+
+    @Test("CAGradientLayer render draws elliptical radial bands")
+    func radialGradientSoftwarePixels() throws {
+        let context = try makeSoftwareContext(width: 9, height: 9)
+        let gradient = CAGradientLayer()
+        gradient.bounds = CGRect(x: 0, y: 0, width: 9, height: 9)
+        gradient.colors = [
+            CGColor(red: 0, green: 0, blue: 0, alpha: 1),
+            CGColor(red: 1, green: 1, blue: 1, alpha: 1),
+        ]
+        gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 1)
+        gradient.type = .radial
+
+        gradient.render(in: context)
+
+        let center = try pixel(in: context, x: 4, y: 4)
+        let edge = try pixel(in: context, x: 4, y: 0)
+        #expect(center[0] < 8)
+        #expect(edge[0] > 180)
+        #expect(gradient.lastContextRenderError == nil)
+    }
+
+    @Test("CAGradientLayer render draws conic angle progression")
+    func conicGradientSoftwarePixels() throws {
+        let context = try makeSoftwareContext(width: 9, height: 9)
+        let gradient = CAGradientLayer()
+        gradient.bounds = CGRect(x: 0, y: 0, width: 9, height: 9)
+        gradient.colors = [
+            CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+            CGColor(red: 0, green: 0, blue: 1, alpha: 1),
+        ]
+        gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
+        gradient.endPoint = CGPoint(x: 1, y: 0.5)
+        gradient.type = .conic
+
+        gradient.render(in: context)
+
+        let right = try pixel(in: context, x: 8, y: 4)
+        let top = try pixel(in: context, x: 4, y: 0)
+        #expect(right[0] > right[2])
+        #expect(top[2] > top[0])
+        #expect(gradient.lastContextRenderError == nil)
+    }
+
+    @Test("CAGradientLayer render reports invalid public configuration")
+    func gradientReportsInvalidConfiguration() {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+        let gradient = CAGradientLayer()
+        gradient.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+        gradient.colors = [
+            CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+            "not-a-color",
+        ]
+
+        gradient.render(in: context)
+
+        #expect(gradient.lastContextRenderError == .invalidGradientColor(index: 1))
     }
 }
