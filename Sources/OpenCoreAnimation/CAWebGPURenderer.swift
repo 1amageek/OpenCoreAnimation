@@ -822,9 +822,17 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var emitterSpawnFailureCount: Int = 0
 
-    /// Number of emitter frames rejected because their render mode was unsupported.
+    /// The most recent typed emitter simulation or spawn failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastEmitterSpawnFailure: CAEmitterFailure?
+
+    /// Number of emitter draws rejected by configuration or renderer resources.
     @_spi(RendererDiagnostics)
     public private(set) var emitterRenderFailureCount: Int = 0
+
+    /// The most recent typed emitter rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastEmitterRenderFailure: CAEmitterFailure?
 
     /// Number of replicator draws rejected by validation or renderer resources.
     @_spi(RendererDiagnostics)
@@ -4601,7 +4609,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         emitterLayerStates.removeAll(keepingCapacity: false)
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
         emitterSpawnFailureCount = 0
+        lastEmitterSpawnFailure = nil
         emitterRenderFailureCount = 0
+        lastEmitterRenderFailure = nil
         replicatorRenderFailureCount = 0
         lastReplicatorRenderFailure = nil
 
@@ -4913,7 +4923,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             if transformDepthNesting > 0,
                !emitterPresentation.preservesDepth,
                rasterizePrerenderRootLayer !== layer {
-                emitterRenderFailureCount += 1
+                recordEmitterRenderFailure(.flatteningCaptureUnavailable)
                 return
             }
             renderEmitterLayer(
@@ -11540,6 +11550,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - CAEmitterLayer Rendering
 
+    private func recordEmitterSpawnFailure(_ failure: CAEmitterFailure) {
+        emitterSpawnFailureCount += 1
+        lastEmitterSpawnFailure = failure
+    }
+
+    private func recordEmitterRenderFailure(_ failure: CAEmitterFailure) {
+        emitterRenderFailureCount += 1
+        lastEmitterRenderFailure = failure
+    }
+
     /// Rotates a 2D point around the center (0.5, 0.5) by the given angle in radians.
     private func rotatePoint(_ point: SIMD2<Float>, angle: Float) -> SIMD2<Float> {
         let center = SIMD2<Float>(0.5, 0.5)
@@ -11561,13 +11581,32 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
+        let layerID = ObjectIdentifier(modelLayer)
+        if let existing = emitterLayerStates[layerID], existing.owner === modelLayer {
+            existing.lastRenderedBirthSequences.removeAll(keepingCapacity: true)
+            existing.lastRenderUsedAdditiveBlending = false
+        }
+        let configuration: CAEmitterRenderConfiguration
+        do {
+            configuration = try CAEmitterRenderConfiguration(layer: emitterLayer)
+        } catch {
+            if case .unsupportedRenderMode(_) = error {
+                recordEmitterRenderFailure(error)
+            } else {
+                recordEmitterSpawnFailure(error)
+            }
+            return
+        }
         guard let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
-        let entersDepthSpace = emitterLayer.preservesDepth
+              let uniformBuffer = uniformBuffer else {
+            recordEmitterRenderFailure(.rendererResourcesUnavailable)
+            return
+        }
+        let entersDepthSpace = configuration.preservesDepth
         let beginsIndependentDepthGroup = entersDepthSpace && transformDepthNesting == 0
         if beginsIndependentDepthGroup {
             guard let depthClearPipeline else {
-                emitterRenderFailureCount += 1
+                recordEmitterRenderFailure(.depthResourcesUnavailable)
                 return
             }
             renderPass.setPipeline(depthClearPipeline)
@@ -11581,20 +11620,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 transformDepthNesting -= 1
             }
         }
-        let emitterCells = emitterLayer.emitterCells ?? []
+        let emitterCells = configuration.emitterCells
 
-        let layerID = ObjectIdentifier(modelLayer)
         activeEmitterLayerIDs.insert(layerID)
         let state: EmitterLayerState
         if let existing = emitterLayerStates[layerID], existing.owner === modelLayer {
             state = existing
         } else {
-            state = EmitterLayerState(owner: modelLayer, seed: emitterLayer.seed)
+            state = EmitterLayerState(owner: modelLayer, seed: configuration.seed)
             emitterLayerStates[layerID] = state
         }
-        if state.configuredSeed != emitterLayer.seed {
-            state.randomSource.reset(seed: emitterLayer.seed)
-            state.configuredSeed = emitterLayer.seed
+        if state.configuredSeed != configuration.seed {
+            state.randomSource.reset(seed: configuration.seed)
+            state.configuredSeed = configuration.seed
         }
         let currentCellIDs = Set(emitterCells.map(ObjectIdentifier.init))
         state.birthRemainders = state.birthRemainders.filter { key, _ in
@@ -11618,6 +11656,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
             for index in state.particles.indices {
                 state.particles[index].update(deltaTime: deltaTime)
+                if !particleStateIsFinite(state.particles[index]) {
+                    state.particles[index].isAlive = false
+                    recordEmitterSpawnFailure(.nonFiniteParticleState)
+                }
             }
             var projectedLiveParticleCount = state.particles.reduce(into: 0) { count, particle in
                 if particle.isAlive { count += 1 }
@@ -11633,45 +11675,56 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         to: state.simulationTime
                     )
                 } catch {
-                    emitterSpawnFailureCount += 1
+                    recordEmitterSpawnFailure(.invalidCellTiming)
                     continue
                 }
-                guard let particlesToSpawn = emitterParticleBirthCount(
-                    cell: cell,
-                    activeDelta: activeDelta,
-                    rateMultiplier: emitterLayer.birthRate,
-                    remainderKey: .root(cellID),
-                    state: state
-                ) else {
-                    emitterSpawnFailureCount += 1
+                let particlesToSpawn: Int
+                do {
+                    particlesToSpawn = try emitterParticleBirthCount(
+                        cell: cell,
+                        activeDelta: activeDelta,
+                        rateMultiplier: configuration.birthRate,
+                        remainderKey: .root(cellID),
+                        state: state
+                    )
+                } catch {
+                    recordEmitterSpawnFailure(error)
                     continue
                 }
 
                 for _ in 0..<particlesToSpawn {
-                    guard projectedLiveParticleCount < Self.maxParticles else { break }
+                    guard projectedLiveParticleCount < Self.maxParticles else {
+                        recordEmitterSpawnFailure(
+                            .particleCapacityExceeded(maximum: Self.maxParticles)
+                        )
+                        break
+                    }
                     guard let position = EmitterGeometry.position(
-                        shape: emitterLayer.emitterShape,
-                        mode: emitterLayer.emitterMode,
-                        position: emitterLayer.emitterPosition,
-                        zPosition: emitterLayer.emitterZPosition,
-                        size: emitterLayer.emitterSize,
-                        depth: emitterLayer.emitterDepth,
+                        shape: configuration.emitterShape,
+                        mode: configuration.emitterMode,
+                        position: configuration.emitterPosition,
+                        zPosition: configuration.emitterZPosition,
+                        size: configuration.emitterSize,
+                        depth: configuration.emitterDepth,
                         random: &state.randomSource
                     ) else {
-                        emitterSpawnFailureCount += 1
+                        recordEmitterSpawnFailure(.nonFiniteLayerGeometry)
                         continue
                     }
-                    guard var particle = makeEmitterParticle(
-                        cell: cell,
-                        position: position,
-                        parentDirection: nil,
-                        inheritedColor: SIMD4(1, 1, 1, 1),
-                        inheritedScale: 1,
-                        generation: 0,
-                        emitterLayer: emitterLayer,
-                        state: state
-                    ) else {
-                        emitterSpawnFailureCount += 1
+                    var particle: EmitterParticle
+                    do {
+                        particle = try makeEmitterParticle(
+                            cell: cell,
+                            position: position,
+                            parentDirection: nil,
+                            inheritedColor: SIMD4(1, 1, 1, 1),
+                            inheritedScale: 1,
+                            generation: 0,
+                            configuration: configuration,
+                            state: state
+                        )
+                    } catch {
+                        recordEmitterSpawnFailure(error)
                         continue
                     }
                     guard particle.isAlive else { continue }
@@ -11701,25 +11754,31 @@ public final class CAWebGPURenderer: CARendererDelegate {
                             to: parentEndTime
                         )
                     } catch {
-                        emitterSpawnFailureCount += 1
+                        recordEmitterSpawnFailure(.invalidCellTiming)
                         continue
                     }
-                    guard let particlesToSpawn = emitterParticleBirthCount(
-                        cell: childCell,
-                        activeDelta: activeDelta,
-                        rateMultiplier: emitterLayer.birthRate,
-                        remainderKey: .child(
-                            parentBirthSequence: parent.birthSequence,
-                            cell: ObjectIdentifier(childCell)
-                        ),
-                        state: state
-                    ) else {
-                        emitterSpawnFailureCount += 1
+                    let particlesToSpawn: Int
+                    do {
+                        particlesToSpawn = try emitterParticleBirthCount(
+                            cell: childCell,
+                            activeDelta: activeDelta,
+                            rateMultiplier: configuration.birthRate,
+                            remainderKey: .child(
+                                parentBirthSequence: parent.birthSequence,
+                                cell: ObjectIdentifier(childCell)
+                            ),
+                            state: state
+                        )
+                    } catch {
+                        recordEmitterSpawnFailure(error)
                         continue
                     }
 
                     for childIndex in 0..<particlesToSpawn {
                         guard projectedLiveParticleCount < Self.maxParticles else {
+                            recordEmitterSpawnFailure(
+                                .particleCapacityExceeded(maximum: Self.maxParticles)
+                            )
                             break
                         }
                         let fraction = Float(childIndex + 1) / Float(particlesToSpawn + 1)
@@ -11729,17 +11788,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
                             + (parent.color - parent.previousColor) * fraction
                         let inheritedScale = parent.previousScale
                             + (parent.scale - parent.previousScale) * fraction
-                        guard var child = makeEmitterParticle(
-                            cell: childCell,
-                            position: position,
-                            parentDirection: parent.emissionDirection,
-                            inheritedColor: inheritedColor,
-                            inheritedScale: inheritedScale,
-                            generation: parent.generation + 1,
-                            emitterLayer: emitterLayer,
-                            state: state
-                        ) else {
-                            emitterSpawnFailureCount += 1
+                        var child: EmitterParticle
+                        do {
+                            child = try makeEmitterParticle(
+                                cell: childCell,
+                                position: position,
+                                parentDirection: parent.emissionDirection,
+                                inheritedColor: inheritedColor,
+                                inheritedScale: inheritedScale,
+                                generation: parent.generation + 1,
+                                configuration: configuration,
+                                state: state
+                            )
+                        } catch {
+                            recordEmitterSpawnFailure(error)
                             continue
                         }
                         guard child.isAlive else { continue }
@@ -11760,25 +11822,26 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 }
             }
         }
-        state.lastRenderedBirthSequences.removeAll(keepingCapacity: true)
-        state.lastRenderUsedAdditiveBlending = false
-
         func draw(_ particle: EmitterParticle, additive: Bool = false) {
             guard particle.isAlive else { return }
-            if renderEmitterParticle(
-                particle,
-                device: device,
-                renderPass: renderPass,
-                modelMatrix: modelMatrix,
-                vertexBuffer: vertexBuffer,
-                uniformBuffer: uniformBuffer,
-                additive: additive
-            ) {
-                state.lastRenderedBirthSequences.append(particle.birthSequence)
+            do {
+                if try renderEmitterParticle(
+                    particle,
+                    device: device,
+                    renderPass: renderPass,
+                    modelMatrix: modelMatrix,
+                    vertexBuffer: vertexBuffer,
+                    uniformBuffer: uniformBuffer,
+                    additive: additive
+                ) {
+                    state.lastRenderedBirthSequences.append(particle.birthSequence)
+                }
+            } catch {
+                recordEmitterRenderFailure(error)
             }
         }
 
-        switch emitterLayer.renderMode {
+        switch configuration.renderMode {
         case .unordered, .oldestFirst:
             for particle in state.particles {
                 draw(particle)
@@ -11811,7 +11874,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     : emitterTexturedAdditivePipeline
             }
             guard additivePipeline != nil else {
-                emitterRenderFailureCount += 1
+                recordEmitterRenderFailure(.additivePipelineUnavailable)
                 return
             }
             state.lastRenderUsedAdditiveBlending = true
@@ -11819,7 +11882,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 draw(particle, additive: true)
             }
         default:
-            emitterRenderFailureCount += 1
+            recordEmitterRenderFailure(
+                .unsupportedRenderMode(configuration.renderMode.rawValue)
+            )
         }
     }
 
@@ -11829,12 +11894,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         rateMultiplier: Float,
         remainderKey: EmitterBirthRemainderKey,
         state: EmitterLayerState
-    ) -> Int? {
+    ) throws(CAEmitterFailure) -> Int {
         let configuredBirthRate = cell.birthRate * rateMultiplier
         guard activeDelta.isFinite,
               activeDelta >= 0,
               configuredBirthRate.isFinite else {
-            return nil
+            throw .invalidCellBirthRate
         }
         let birthRate = max(0, configuredBirthRate)
         let accumulated = birthRate * activeDelta
@@ -11842,7 +11907,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         guard accumulated.isFinite,
               accumulated >= 0,
               accumulated <= Float(Int.max) else {
-            return nil
+            throw .invalidCellBirthRate
         }
         let particlesToSpawn = Int(accumulated.rounded(.down))
         state.birthRemainders[remainderKey] = accumulated - Float(particlesToSpawn)
@@ -11864,9 +11929,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         inheritedColor: SIMD4<Float>,
         inheritedScale: Float,
         generation: Int,
-        emitterLayer: CAEmitterLayer,
+        configuration: CAEmitterRenderConfiguration,
         state: EmitterLayerState
-    ) -> EmitterParticle? {
+    ) throws(CAEmitterFailure) -> EmitterParticle {
         var particle = EmitterParticle()
         if let configuredContents = cell.contents {
             guard let image = configuredContents as? CGImage,
@@ -11885,7 +11950,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     magnificationFilter: cell.magnificationFilter,
                     minificationFilter: cell.minificationFilter
                   ) != nil else {
-                return nil
+                throw .invalidCellContents
             }
             particle.contents = image
             particle.contentsRect = cell.contentsRect
@@ -11901,7 +11966,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             range: cell.emissionRange,
             random: &state.randomSource
         ) else {
-            return nil
+            throw .nonFiniteEmissionDirection
         }
         let direction: SIMD3<Float>
         if let parentDirection {
@@ -11911,14 +11976,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     parentDirection: parentDirection
                 )
             } catch {
-                return nil
+                throw .invalidChildDirection
             }
         } else {
             direction = localDirection
         }
         let velocityVariation = CGFloat(state.randomSource.signedFloat()) * cell.velocityRange
-        let velocity = Float(cell.velocity + velocityVariation) * emitterLayer.velocity
-        guard velocity.isFinite else { return nil }
+        let velocity = Float(cell.velocity + velocityVariation) * configuration.velocity
+        guard velocity.isFinite else { throw .nonFiniteParticleState }
 
         particle.generation = generation
         particle.emitterCells = cell.emitterCells ?? []
@@ -11934,19 +11999,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         particle.lifetime = (
             cell.lifetime + state.randomSource.signedFloat() * cell.lifetimeRange
-        ) * emitterLayer.lifetime
+        ) * configuration.lifetime
         particle.previousLifetime = particle.lifetime
         particle.maxLifetime = particle.lifetime
         particle.scale = Float(
             cell.scale + CGFloat(state.randomSource.signedFloat()) * cell.scaleRange
-        ) * emitterLayer.scale * inheritedScale
+        ) * configuration.scale * inheritedScale
         particle.previousScale = particle.scale
-        particle.scaleSpeed = Float(cell.scaleSpeed) * emitterLayer.scale * inheritedScale
+        particle.scaleSpeed = Float(cell.scaleSpeed) * configuration.scale * inheritedScale
         particle.rotationSpeed = Float(
             cell.spin + CGFloat(state.randomSource.signedFloat()) * cell.spinRange
-        ) * emitterLayer.spin
+        ) * configuration.spin
 
-        let baseColor = emitterCellColor(cell, random: &state.randomSource)
+        let baseColor = try emitterCellColor(cell, random: &state.randomSource)
         particle.color = baseColor * inheritedColor
         particle.previousColor = particle.color
         particle.colorSpeed = SIMD4(
@@ -11955,7 +12020,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             cell.blueSpeed,
             cell.alphaSpeed
         ) * inheritedColor
-        guard particleStateIsFinite(particle) else { return nil }
+        guard particleStateIsFinite(particle) else { throw .nonFiniteParticleState }
         particle.isAlive = particle.lifetime > 0
         return particle
     }
@@ -11963,39 +12028,40 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private func emitterCellColor(
         _ cell: CAEmitterCell,
         random: inout EmitterRandomSource
-    ) -> SIMD4<Float> {
-        let components = cell.color?.components ?? []
+    ) throws(CAEmitterFailure) -> SIMD4<Float> {
         let base: SIMD4<Float>
-        switch components.count {
-        case 4...:
+        if let color = cell.color {
+            guard let converted = color.converted(
+                to: .deviceRGB,
+                intent: .defaultIntent,
+                options: nil
+            ), let components = converted.components,
+               components.count == 4,
+               components.allSatisfy(\.isFinite) else {
+                throw .invalidCellColor
+            }
             base = SIMD4(
                 Float(components[0]),
                 Float(components[1]),
                 Float(components[2]),
                 Float(components[3])
             )
-        case 3:
-            base = SIMD4(
-                Float(components[0]),
-                Float(components[1]),
-                Float(components[2]),
-                1
-            )
-        case 2:
-            let gray = Float(components[0])
-            base = SIMD4(gray, gray, gray, Float(components[1]))
-        case 1:
-            let gray = Float(components[0])
-            base = SIMD4(gray, gray, gray, 1)
-        default:
+        } else {
             base = SIMD4(1, 1, 1, 1)
         }
-        return SIMD4(
+        let color = SIMD4(
             base.x + random.signedFloat() * cell.redRange,
             base.y + random.signedFloat() * cell.greenRange,
             base.z + random.signedFloat() * cell.blueRange,
             base.w + random.signedFloat() * cell.alphaRange
         )
+        guard color.x.isFinite,
+              color.y.isFinite,
+              color.z.isFinite,
+              color.w.isFinite else {
+            throw .invalidCellColor
+        }
+        return color
     }
 
     private func renderEmitterParticle(
@@ -12006,7 +12072,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         vertexBuffer: GPUBuffer,
         uniformBuffer: GPUBuffer,
         additive: Bool
-    ) -> Bool {
+    ) throws(CAEmitterFailure) -> Bool {
         guard let image = particle.contents else { return false }
         let textureFormat = CGImageTexturePixelFormat.recommended(for: image)
         let memorySizeBytes: UInt64
@@ -12019,29 +12085,36 @@ public final class CAWebGPURenderer: CARendererDelegate {
             )
         } catch {
             recordContentsConversionFailure(error)
-            return false
+            throw .imageConversionFailed(error)
         }
         guard let sampling = EmitterTextureSampling(
-                magnificationFilter: particle.magnificationFilter,
-                minificationFilter: particle.minificationFilter
-              ),
-              let sampler = emitterTextureSamplers[sampling],
+            magnificationFilter: particle.magnificationFilter,
+            minificationFilter: particle.minificationFilter
+        ) else {
+            throw .invalidCellContents
+        }
+        guard let sampler = emitterTextureSamplers[sampling],
               let texturedBindGroupLayout,
-              let selectedPipeline = selectedEmitterPipeline(additive: additive),
-              let texture = textureManager?.getOrCreateTexture(
-                for: image,
-                width: image.width,
-                height: image.height,
-                memorySizeBytes: memorySizeBytes,
-                factory: { [weak self] in
-                    self?.createGPUTexture(
-                        from: image,
-                        format: textureFormat,
-                        device: device
-                    )
-                }
-              ) else {
-            return false
+              let selectedPipeline = selectedEmitterPipeline(additive: additive) else {
+            throw .rendererResourcesUnavailable
+        }
+        guard let textureManager else {
+            throw .textureResourcesUnavailable
+        }
+        guard let texture = textureManager.getOrCreateTexture(
+            for: image,
+            width: image.width,
+            height: image.height,
+            memorySizeBytes: memorySizeBytes,
+            factory: { [weak self] in
+                self?.createGPUTexture(
+                    from: image,
+                    format: textureFormat,
+                    device: device
+                )
+            }
+        ) else {
+            throw .textureResourcesUnavailable
         }
 
         let width = Float(image.width) / particle.contentsScale * particle.scale
@@ -12068,7 +12141,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: p2, texCoord: SIMD2(uvMinX, uvMinY), color: replicatedParticleColor),
         ]
         guard let (vertexOffset, layerIndex) = allocateVertices(count: vertices.count) else {
-            return false
+            throw .vertexCapacityExceeded
         }
 
         let scaleMatrix = Matrix4x4(columns: (

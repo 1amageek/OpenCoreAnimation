@@ -4284,6 +4284,8 @@ func installHarness() {
                     engine.renderFrame()
                     let unknownRejected = renderer.lastRenderedParticleSequences(for: first).isEmpty
                         && renderer.emitterRenderFailureCount == 1
+                        && renderer.lastEmitterRenderFailure
+                            == .unsupportedRenderMode("unsupported")
                     result += ";orders=\(oldestFirst && oldestLast && backToFront),additive=\(additive),unknown=\(unknownRejected)"
 
                     first.removeFromSuperlayer()
@@ -4481,6 +4483,7 @@ func installHarness() {
                         && renderer.lastRenderedParticleSequences(for: invisibleEmitter.layer).isEmpty
                     let unsupportedRejected = renderer.activeParticleCount(for: unsupportedEmitter.layer) == 0
                         && renderer.emitterSpawnFailureCount == 1
+                        && renderer.lastEmitterSpawnFailure == .invalidCellContents
                     for layer in transientEmitterLayers {
                         layer.removeFromSuperlayer()
                     }
