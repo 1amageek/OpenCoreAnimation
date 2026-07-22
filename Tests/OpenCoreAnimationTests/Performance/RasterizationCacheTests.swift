@@ -153,6 +153,21 @@ struct RasterizationCacheTests {
         #expect(cache.bytes == expectedBytes)
     }
 
+    @Test func bytesAccountedUsingConfiguredPixelFormatWidth() {
+        let cache = RasterizationCache<StubTexture>(
+            maxBytes: 1_000_000,
+            bytesPerPixel: 8
+        )
+        cache.insert(
+            makeKey(1),
+            texture: StubTexture(id: 1),
+            pixelSize: CGSize(width: 8, height: 8),
+            contentBoundsHash: 0,
+            atFrame: 0
+        )
+        #expect(cache.bytes == 8 * 8 * 8)
+    }
+
     // C.4 — `lookup(... atFrame:)` updates `lastUsedFrame`. This is what
     // protects an entry from idle-eviction the next frame.
     @Test func lookupTouchesLastUsedFrame() {

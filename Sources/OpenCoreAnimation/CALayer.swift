@@ -59,6 +59,9 @@ open class CALayer: CAMediaTiming, Hashable {
             self._contentsCenter = otherLayer._contentsCenter
             self.contentsGravity = otherLayer.contentsGravity
             self.contentsFormat = otherLayer.contentsFormat
+            self.toneMapMode = otherLayer.toneMapMode
+            self.preferredDynamicRange = otherLayer.preferredDynamicRange
+            self.contentsHeadroom = otherLayer.contentsHeadroom
 
             // Copy rendering properties — backing storage as above.
             self._isOpaque = otherLayer._isOpaque
@@ -297,6 +300,9 @@ open class CALayer: CAMediaTiming, Hashable {
         presentation._contentsCenter = _contentsCenter
         presentation.contentsGravity = contentsGravity
         presentation.contentsFormat = contentsFormat
+        presentation.toneMapMode = toneMapMode
+        presentation.preferredDynamicRange = preferredDynamicRange
+        presentation.contentsHeadroom = contentsHeadroom
 
         // Copy render configuration that may change after the presentation
         // object was first allocated.
@@ -3921,6 +3927,30 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
+    /// Controls when the receiving layer's contents are tone mapped.
+    open var toneMapMode: ToneMapMode = .automatic {
+        didSet {
+            guard oldValue != toneMapMode else { return }
+            markDirty(.contents)
+        }
+    }
+
+    /// Controls the dynamic range used for the receiving layer's colors and contents.
+    open var preferredDynamicRange: DynamicRange = .standard {
+        didSet {
+            guard oldValue != preferredDynamicRange else { return }
+            markDirty(.contents)
+        }
+    }
+
+    /// The amount of extended-range headroom used by untagged layer contents.
+    open var contentsHeadroom: CGFloat = 0 {
+        didSet {
+            guard oldValue != contentsHeadroom else { return }
+            markDirty(.contents)
+        }
+    }
+
     /// Renders the layer and its sublayers into the specified context.
     ///
     /// This method renders the layer's contents, including its visual appearance
@@ -5730,6 +5760,12 @@ open class CALayer: CAMediaTiming, Hashable {
             return CGFloat(1)
         case "contentsFormat":
             return CALayerContentsFormat.RGBA8Uint
+        case "toneMapMode":
+            return ToneMapMode.automatic
+        case "preferredDynamicRange":
+            return DynamicRange.standard
+        case "contentsHeadroom":
+            return CGFloat(0)
         case "minificationFilter", "magnificationFilter":
             return CALayerContentsFilter.linear
         case "opacity":

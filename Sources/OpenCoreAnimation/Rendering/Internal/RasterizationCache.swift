@@ -96,7 +96,7 @@ internal struct RasterizedEntry<TextureRef> {
     /// Frame at which this entry was last looked up or inserted; used by
     /// idle-eviction and byte-budget eviction.
     internal var lastUsedFrame: UInt64
-    /// Approximate GPU byte cost (`width × height × 4` for RGBA8). Used
+    /// Approximate GPU byte cost (`width × height × bytesPerPixel`). Used
     /// only for eviction accounting; not for actual allocation.
     internal var byteCost: Int
 }
@@ -125,6 +125,8 @@ internal final class RasterizationCache<TextureRef> {
     /// allowed (so a single oversize entry can still land before an
     /// eviction pass runs).
     internal let maxBytes: Int
+    /// Storage cost of one captured pixel in the renderer's target format.
+    internal let bytesPerPixel: Int
 
     // MARK: Counters (test/observability only)
 
@@ -133,8 +135,9 @@ internal final class RasterizationCache<TextureRef> {
 
     // MARK: Init
 
-    internal init(maxBytes: Int) {
+    internal init(maxBytes: Int, bytesPerPixel: Int = 4) {
         self.maxBytes = maxBytes
+        self.bytesPerPixel = max(1, bytesPerPixel)
     }
 
     // MARK: Public surface
@@ -240,12 +243,10 @@ internal final class RasterizationCache<TextureRef> {
 
     // MARK: Internal helpers
 
-    /// 4 bytes per pixel for RGBA8. Phase 3 only stores RGBA8 captures —
-    /// the BGRA / sRGB question is decided by the renderer's pipeline,
-    /// not by the cache.
+    /// The renderer supplies the byte width of its capture texture format.
     private func byteCostOf(pixelSize: CGSize) -> Int {
         let w = max(0, Int(pixelSize.width.rounded(.up)))
         let h = max(0, Int(pixelSize.height.rounded(.up)))
-        return w * h * 4
+        return w * h * bytesPerPixel
     }
 }

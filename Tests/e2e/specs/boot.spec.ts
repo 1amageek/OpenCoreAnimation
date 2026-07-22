@@ -41,6 +41,7 @@ interface OCA extends Harness {
     getShapeFillRuleProbeResult: () => string;
     getGradientTypeProbeResult: () => string;
     getCornerCurveProbeResult: () => string;
+    getDynamicRangeProbeResult: () => string;
     getTransitionSourceCaptureCount: () => number;
     getTransitionTargetCaptureCount: () => number;
     getActiveTransitionTextureCount: () => number;
@@ -75,6 +76,7 @@ interface OCA extends Harness {
     beginShapeFillRuleProbe: () => void;
     beginGradientTypeProbe: () => void;
     beginCornerCurveProbe: () => void;
+    beginDynamicRangeProbe: () => void;
     beginShadowProbe: () => void;
     beginDisplayLinkProbe: () => void;
     beginEmitterProbe: () => void;
@@ -129,17 +131,22 @@ test.describe("OpenCoreAnimation smoke", () => {
         await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
         expect(await h.getFirstUncapturedGPUError()).toBe("none");
         expect(await h.getPixelReadback()).toBe(
-            "255,0,0,255;0,255,0,255;0,0,255,255;26,26,38,255;255,0,255,255;77,13,83,255;191,255,64,255"
+            "255,0,0,255;0,255,0,255;0,0,255,255;25,25,38,255;255,0,255,255;77,13,83,255;191,255,64,255"
+        );
+
+        await h.beginDynamicRangeProbe();
+        await expect.poll(() => h.getDynamicRangeProbeResult(), { timeout: 10_000 }).toBe(
+            "capability=true,extended=true,preserved=true,extendedPixel=2.0:0.5:0.25:1.0,invalid=true,unknownTone=true,unknownRange=true,standardPolicy=true,automatic=true,standard=true,standardPixel=true,failures=true"
         );
 
         await h.beginShapeFillRuleProbe();
         await expect.poll(() => h.getShapeFillRuleProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;26,26,38,255;0,255,0,255;26,26,38,255;0,0,255,255;26,26,38,255;255,0,0,255;26,26,38,255;255,0,0,255;26,26,38,255,failures=1,draws=2,vertices=42"
+            "255,0,0,255;25,25,38,255;0,255,0,255;25,25,38,255;0,0,255,255;25,25,38,255;255,0,0,255;25,25,38,255;255,0,0,255;25,25,38,255,failures=1,draws=2,vertices=42"
         );
 
         await h.beginGradientTypeProbe();
         await expect.poll(() => h.getGradientTypeProbeResult(), { timeout: 10_000 }).toBe(
-            "242,13,0,255;0,242,13,255;0,0,255,255;232,23,0,255;0,239,16,255;0,0,255,255;253,2,0,255;130,125,0,255;0,252,3,255;0,125,130,255;26,26,38,255;0,0,255,255,failures=1"
+            "242,13,0,255;0,242,13,255;0,0,255,255;232,23,0,255;0,239,16,255;0,0,255,255;253,2,0,255;130,125,0,255;0,252,3,255;0,125,130,255;25,25,38,255;0,0,255,255,failures=1"
         );
 
         await h.beginCornerCurveProbe();
@@ -159,7 +166,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginLayerFilterProbe();
         await expect.poll(() => h.getLayerFilterProbeResult(), { timeout: 10_000 }).toBe(
-            "127,255,255,255;191,191,0,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true,rejected=true,invalid=true,alphaFilter=true,alphaPixel=13,141,147,255"
+            "128,255,255,255;191,191,0,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true,rejected=true,invalid=true,alphaFilter=true,alphaPixel=13,141,147,255"
         );
         expect(await h.getActiveFilterResourceCount()).toBe(0);
         expect(await h.getLayerFilterFailureCount()).toBe(2);
@@ -231,14 +238,14 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginCompositionProbe();
         await expect.poll(() => h.getCompositionProbeResult(), { timeout: 10_000 }).toBe(
-            "ordered=true,unbounded=true,maskBackdrop=true,pixels=0,0,0,255;255,255,0,255;127,0,0,255;0,0,255,255;0,255,255,255;255,0,0,255;7,135,10,192;127,0,0,255;255,255,0,255;255,0,0,255;255,0,0,255;255,128,0,255;127,0,0,255;128,128,0,255;255,0,255,255;255,255,0,255;255,0,0,255;255,0,0,255;255,0,0,255;0,255,255,255;255,0,0,255;255,0,0,255;255,128,0,255;255,0,0,255;0,255,255,255;255,0,0,255;0,255,255,255;0,255,255,255;10,10,78,160;54,11,16,149,failures=0,after=0"
+            "ordered=true,unbounded=true,maskBackdrop=true,pixels=0,0,0,255;255,255,0,255;128,0,0,255;0,0,255,255;0,255,255,255;255,0,0,255;6,133,10,191;128,0,0,255;255,255,0,255;255,0,0,255;255,0,0,255;255,128,0,255;128,0,0,255;128,128,0,255;255,0,255,255;255,255,0,255;255,0,0,255;255,0,0,255;255,0,0,255;0,255,255,255;255,0,0,255;255,0,0,255;255,128,0,255;255,0,0,255;0,255,255,255;255,0,0,255;0,255,255,255;0,255,255,255;9,9,78,160;53,10,16,149,failures=0,after=0"
         );
         expect(await h.getCompositionFilterFailureCount()).toBe(0);
         expect(await h.getActiveCompositionResourceCount()).toBe(0);
 
         await h.beginShadowProbe();
         await expect.poll(() => h.getShadowProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;13,140,19,255;13,13,146,255;26,26,38,255;255,0,0,255;255,0,0,255;emptyRegion=true;emptyLayer=true;imageEdges=true;imageCenter=true;maskTransition=true;animatedSilhouette=true"
+            "255,0,0,255;13,140,19,255;13,13,147,255;25,25,38,255;255,0,0,255;255,0,0,255;emptyRegion=true;emptyLayer=true;imageEdges=true;imageCenter=true;maskTransition=true;animatedSilhouette=true"
         );
         expect(await h.getActiveShadowResourceCount()).toBe(0);
         expect(await h.getShadowRenderFailureCount()).toBe(0);

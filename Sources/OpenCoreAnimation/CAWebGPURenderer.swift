@@ -67,6 +67,16 @@ private let caRendererAlignedUniformSize: UInt64 = {
 
 // MARK: - WebGPU Renderer
 
+/// A dynamic-range request that cannot be represented by the active WebGPU output.
+@_spi(RendererDiagnostics)
+public enum CADynamicRangeRenderFailure: Error, Equatable, Sendable {
+    case invalidToneMapMode(String)
+    case invalidPreferredDynamicRange(String)
+    case invalidContentsHeadroom(CGFloat)
+    case canvasConfigurationFailed
+    case extendedCanvasUnavailable
+}
+
 /// Typed cache key for the renderer's textured-content view / bind group caches.
 ///
 /// `ObjectIdentifier` alone is just a heap address. The same renderer caches
@@ -835,6 +845,22 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var cornerCurveRenderFailureCount: Int = 0
 
+    /// Number of frames rejected because their dynamic-range contract could not be honored.
+    @_spi(RendererDiagnostics)
+    public private(set) var dynamicRangeRenderFailureCount: Int = 0
+
+    /// The most recent dynamic-range failure, retained for typed diagnostics.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastDynamicRangeRenderFailure: CADynamicRangeRenderFailure?
+
+    /// Whether the browser reports configurable canvas tone mapping.
+    @_spi(RendererDiagnostics)
+    public private(set) var supportsExtendedDynamicRangeOutput: Bool = false
+
+    /// Whether the canvas is currently configured for extended-range presentation.
+    @_spi(RendererDiagnostics)
+    public private(set) var isExtendedDynamicRangeActive: Bool = false
+
     /// Number of shape-fill draw calls encoded in the latest frame.
     @_spi(RendererDiagnostics)
     public private(set) var shapeFillDrawCount: Int = 0
@@ -858,7 +884,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     }
 
     /// The preferred texture format.
-    private var preferredFormat: GPUTextureFormat = .bgra8unorm
+    private var preferredFormat: GPUTextureFormat = .rgba16float
+
+    /// Tone-mapping mode confirmed by `GPUCanvasContext.getConfiguration()`.
+    private var canvasToneMappingMode: GPUCanvasToneMappingMode = .standard
 
     /// The swap-chain texture most recently submitted for presentation.
     private var lastRenderedTexture: GPUTexture?
@@ -1647,8 +1676,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         transitionFilterProcessor = CIWebGPUTransitionProcessor(device: device)
         layerFilterProcessor = CIWebGPUFilterProcessor(device: device)
 
-        // Get preferred format
-        preferredFormat = gpu.preferredCanvasFormat
+        // Float16 storage is required to preserve values above SDR white until
+        // browser presentation. An 8-bit normalized canvas would clamp them
+        // before its tone-mapping stage.
+        preferredFormat = .rgba16float
 
         // Configure canvas context
         let ctx = canvas.getContext!("webgpu")
@@ -1657,11 +1688,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
         context = GPUCanvasContext(jsObject: ctxObject)
 
-        context?.configure(GPUCanvasConfiguration(
-            device: device,
-            format: preferredFormat,
-            usage: [.renderAttachment, .copySrc]
-        ))
+        guard configureCanvas(toneMappingMode: .standard) else {
+            throw CARendererError.canvasNotConfigured
+        }
 
         // Create shader module
         let shaderModule = device.createShaderModule(descriptor: GPUShaderModuleDescriptor(
@@ -3429,6 +3458,155 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         depthTextureView = depthTexture?.createView()
     }
 
+    /// Configures and then reads back the canvas contract. Browsers that do
+    /// not implement configurable tone mapping omit the member from
+    /// `getConfiguration()`; an extended request must not be treated as
+    /// successful in that case.
+    private func configureCanvas(toneMappingMode: GPUCanvasToneMappingMode) -> Bool {
+        guard let device, let context else { return false }
+        context.configure(GPUCanvasConfiguration(
+            device: device,
+            format: preferredFormat,
+            usage: [.renderAttachment, .copySrc],
+            toneMapping: GPUCanvasToneMapping(mode: toneMappingMode)
+        ))
+
+        let reportedMode = context.getConfiguration()?.toneMapping?.mode
+        supportsExtendedDynamicRangeOutput = reportedMode != nil
+        if toneMappingMode == .extended, reportedMode != .extended {
+            return false
+        }
+        canvasToneMappingMode = reportedMode ?? .standard
+        isExtendedDynamicRangeActive = canvasToneMappingMode == .extended
+        return true
+    }
+
+    private struct DynamicRangeRequest {
+        var requiresExtendedOutput = false
+        var prefersExtendedOutput = false
+
+        mutating func merge(_ other: DynamicRangeRequest) {
+            requiresExtendedOutput = requiresExtendedOutput || other.requiresExtendedOutput
+            prefersExtendedOutput = prefersExtendedOutput || other.prefersExtendedOutput
+        }
+    }
+
+    /// Resolves the complete visible tree before acquiring a canvas texture.
+    /// Explicit high-range requests fail the frame if the browser cannot
+    /// represent them; automatic requests may select standard output.
+    private func prepareDynamicRangeOutput(for rootLayer: CALayer) -> Bool {
+        let request: DynamicRangeRequest
+        do {
+            request = try dynamicRangeRequest(for: rootLayer)
+        } catch {
+            let failure = error
+            recordDynamicRangeFailure(failure)
+            return false
+        }
+
+        let wantsExtended = request.requiresExtendedOutput
+            || (request.prefersExtendedOutput && supportsExtendedDynamicRangeOutput)
+        let requestedMode: GPUCanvasToneMappingMode = wantsExtended ? .extended : .standard
+        if requestedMode != canvasToneMappingMode {
+            guard configureCanvas(toneMappingMode: requestedMode) else {
+                if requestedMode == .extended {
+                    recordDynamicRangeFailure(.extendedCanvasUnavailable)
+                } else {
+                    recordDynamicRangeFailure(.canvasConfigurationFailed)
+                }
+                return false
+            }
+        }
+        if request.requiresExtendedOutput && !isExtendedDynamicRangeActive {
+            recordDynamicRangeFailure(.extendedCanvasUnavailable)
+            return false
+        }
+
+        lastDynamicRangeRenderFailure = nil
+        return true
+    }
+
+    private func dynamicRangeRequest(
+        for layer: CALayer
+    ) throws(CADynamicRangeRenderFailure) -> DynamicRangeRequest {
+        guard !layer.isHidden, layer.opacity > 0 else {
+            return DynamicRangeRequest()
+        }
+        guard layer.toneMapMode == .automatic
+                || layer.toneMapMode == .never
+                || layer.toneMapMode == .ifSupported else {
+            throw CADynamicRangeRenderFailure.invalidToneMapMode(layer.toneMapMode.rawValue)
+        }
+        guard layer.preferredDynamicRange == .automatic
+                || layer.preferredDynamicRange == .standard
+                || layer.preferredDynamicRange == .constrainedHigh
+                || layer.preferredDynamicRange == .high else {
+            throw CADynamicRangeRenderFailure.invalidPreferredDynamicRange(
+                layer.preferredDynamicRange.rawValue
+            )
+        }
+        guard layer.contentsHeadroom.isFinite,
+              layer.contentsHeadroom == 0 || layer.contentsHeadroom >= 1 else {
+            throw CADynamicRangeRenderFailure.invalidContentsHeadroom(layer.contentsHeadroom)
+        }
+
+        let containsExtendedContent = layerContainsExtendedContent(layer)
+        let explicitlyRequestsHighRange = layer.preferredDynamicRange == .high
+            || layer.preferredDynamicRange == .constrainedHigh
+        var request = DynamicRangeRequest(
+            requiresExtendedOutput: explicitlyRequestsHighRange
+                || (containsExtendedContent && layer.toneMapMode == .never),
+            prefersExtendedOutput: containsExtendedContent
+                && layer.preferredDynamicRange == .automatic
+        )
+        for sublayer in layer.sublayers ?? [] {
+            request.merge(try dynamicRangeRequest(for: sublayer))
+        }
+        return request
+    }
+
+    private func layerContainsExtendedContent(_ layer: CALayer) -> Bool {
+        if layer.contentsHeadroom > 1 { return true }
+        if let image = layer.contents as? CGImage,
+           image.contentHeadroom > 1 || image.colorSpace?.isHDR() == true {
+            return true
+        }
+        if colorContainsExtendedComponents(layer.backgroundColor)
+            || colorContainsExtendedComponents(layer.borderColor)
+            || colorContainsExtendedComponents(layer.shadowColor) {
+            return true
+        }
+        if let shape = layer as? CAShapeLayer,
+           colorContainsExtendedComponents(shape.fillColor)
+            || colorContainsExtendedComponents(shape.strokeColor) {
+            return true
+        }
+        if let gradient = layer as? CAGradientLayer,
+           gradient.colors?.contains(where: { value in
+               colorContainsExtendedComponents(value as? CGColor)
+           }) == true {
+            return true
+        }
+        if let text = layer as? CATextLayer,
+           colorContainsExtendedComponents(text.foregroundColor) {
+            return true
+        }
+        return false
+    }
+
+    private func colorContainsExtendedComponents(_ color: CGColor?) -> Bool {
+        guard let color else { return false }
+        if color.colorSpace?.isHDR() == true { return true }
+        guard let components = color.components else { return false }
+        let colorComponentCount = max(0, components.count - 1)
+        return components.prefix(colorComponentCount).contains { $0 < 0 || $0 > 1 }
+    }
+
+    private func recordDynamicRangeFailure(_ failure: CADynamicRangeRenderFailure) {
+        dynamicRangeRenderFailureCount += 1
+        lastDynamicRangeRenderFailure = failure
+    }
+
     public func resize(width: Int, height: Int) {
         size = CGSize(width: width, height: height)
 
@@ -3437,12 +3615,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         canvas.height = .number(Double(height))
 
         // Reconfigure context for new size
-        if let device = device {
-            context?.configure(GPUCanvasConfiguration(
-                device: device,
-                format: preferredFormat,
-                usage: [.renderAttachment, .copySrc]
-            ))
+        if device != nil {
+            guard configureCanvas(toneMappingMode: canvasToneMappingMode) else {
+                recordDynamicRangeFailure(.canvasConfigurationFailed)
+                return
+            }
         }
 
         // Recreate depth texture
@@ -3473,9 +3650,15 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     }
 
     private func configureRasterizationCache(width: Int, height: Int) {
-        let budget = max(0, Int((Double(width) * Double(height) * 4.0 * 2.5).rounded()))
+        let bytesPerPixel = preferredFormat == .rgba16float ? 8 : 4
+        let budget = max(0, Int((
+            Double(width) * Double(height) * Double(bytesPerPixel) * 2.5
+        ).rounded()))
         rasterizationCache?.removeAll()
-        let cache = RasterizationCache<GPUTexture>(maxBytes: budget)
+        let cache = RasterizationCache<GPUTexture>(
+            maxBytes: budget,
+            bytesPerPixel: bytesPerPixel
+        )
         cache.onEvict = { [weak self] key, texture in
             if let identity = key.layerIdentity, let self = self {
                 let cacheKey = TexturedCacheKey.rasterizedLayer(
@@ -3496,6 +3679,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let pipeline = pipeline,
               bindGroup != nil,
               depthTexture != nil else { return }
+
+        guard prepareDynamicRangeOutput(for: rootLayer) else { return }
 
         processPendingTileDraws()
 
@@ -3972,12 +4157,28 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         try await readbackPixels(at: [CGPoint(x: x, y: y)])[0]
     }
 
+    /// Reads one pixel without reducing extended-range components to UInt8.
+    @_spi(RendererDiagnostics)
+    @MainActor
+    public func readbackFloatPixel(x: Int, y: Int) async throws -> [Float] {
+        try await readbackFloatPixels(at: [CGPoint(x: x, y: y)])[0]
+    }
+
     /// Reads pixels from the most recently submitted canvas texture in one copy.
     ///
     /// A browser canvas texture is presentation-scoped. Copying the complete
     /// texture once keeps multi-point diagnostics deterministic after present.
     @MainActor
     public func readbackPixels(at points: [CGPoint]) async throws -> [[UInt8]] {
+        try await readbackFloatPixels(at: points).map { components in
+            components.map(Self.normalizedUInt8)
+        }
+    }
+
+    /// Reads raw normalized or extended-range floating-point components.
+    @_spi(RendererDiagnostics)
+    @MainActor
+    public func readbackFloatPixels(at points: [CGPoint]) async throws -> [[Float]] {
         guard let device, let texture = lastRenderedTexture else {
             throw CARendererError.renderingFailed("No rendered texture is available for readback")
         }
@@ -3989,7 +4190,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             throw CARendererError.renderingFailed("Readback coordinate is outside the render target")
         }
 
-        let unalignedBytesPerRow = UInt32(texture.width) * 4
+        let bytesPerPixel: UInt32
+        switch preferredFormat {
+        case .rgba16float:
+            bytesPerPixel = 8
+        case .bgra8unorm, .rgba8unorm:
+            bytesPerPixel = 4
+        default:
+            throw CARendererError.renderingFailed(
+                "Unsupported canvas readback format: \(preferredFormat.rawValue)"
+            )
+        }
+        let unalignedBytesPerRow = UInt32(texture.width) * bytesPerPixel
         let bytesPerRow = ((unalignedBytesPerRow + 255) / 256) * 256
         let bufferSize = UInt64(bytesPerRow) * UInt64(texture.height)
         let stagingBuffer = device.createBuffer(descriptor: GPUBufferDescriptor(
@@ -4026,20 +4238,36 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
 
         let mappedRange = stagingBuffer.getMappedRange()
         let bytes = JSObject.global.Uint8Array.function!.new(mappedRange)
-        let pixels = points.map { point -> [UInt8] in
-            let offset = Int(point.y) * Int(bytesPerRow) + Int(point.x) * 4
-            let first = UInt8(bytes[offset].number ?? 0)
-            let second = UInt8(bytes[offset + 1].number ?? 0)
-            let third = UInt8(bytes[offset + 2].number ?? 0)
-            let alpha = UInt8(bytes[offset + 3].number ?? 0)
-            if preferredFormat == .bgra8unorm {
-                return [third, second, first, alpha]
+        let pixels = points.map { point -> [Float] in
+            let offset = Int(point.y) * Int(bytesPerRow)
+                + Int(point.x) * Int(bytesPerPixel)
+            if preferredFormat == .rgba16float {
+                return (0..<4).map { component in
+                    let componentOffset = offset + component * 2
+                    let low = UInt16(UInt8(bytes[componentOffset].number ?? 0))
+                    let high = UInt16(UInt8(bytes[componentOffset + 1].number ?? 0))
+                    return Float(Float16(bitPattern: low | (high << 8)))
+                }
             }
-            return [first, second, third, alpha]
+            let first = Float(UInt8(bytes[offset].number ?? 0)) / 255
+            let second = Float(UInt8(bytes[offset + 1].number ?? 0)) / 255
+            let third = Float(UInt8(bytes[offset + 2].number ?? 0)) / 255
+            let alpha = Float(UInt8(bytes[offset + 3].number ?? 0)) / 255
+            return preferredFormat == .bgra8unorm
+                ? [third, second, first, alpha]
+                : [first, second, third, alpha]
         }
         stagingBuffer.unmap()
         stagingBuffer.destroy()
         return pixels
+    }
+
+    private static func normalizedUInt8(_ value: Float) -> UInt8 {
+        if value.isNaN { return 0 }
+        if value == .infinity { return 255 }
+        if value == -Float.infinity { return 0 }
+        let scaled = (max(0, min(1, value)) * 255).rounded()
+        return UInt8(scaled)
     }
 
     public func invalidate() {
@@ -4101,6 +4329,11 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         shapeRenderFailureCount = 0
         gradientRenderFailureCount = 0
         cornerCurveRenderFailureCount = 0
+        dynamicRangeRenderFailureCount = 0
+        lastDynamicRangeRenderFailure = nil
+        supportsExtendedDynamicRangeOutput = false
+        isExtendedDynamicRangeActive = false
+        canvasToneMappingMode = .standard
         shapeFillDrawCount = 0
         shapeFillVertexCount = 0
         rasterizationFailureCount = 0
@@ -4248,6 +4481,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         // Persistent JS Float32Array staging pool (release JS handles)
         float32StagingPool.removeAll(keepingCapacity: false)
 
+        context?.unconfigure()
         context = nil
         device = nil
     }

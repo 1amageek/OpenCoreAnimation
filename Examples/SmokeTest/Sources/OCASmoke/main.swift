@@ -58,6 +58,7 @@ nonisolated(unsafe) var transformDepthProbeResult: String = "pending"
 nonisolated(unsafe) var shapeFillRuleProbeResult: String = "pending"
 nonisolated(unsafe) var gradientTypeProbeResult: String = "pending"
 nonisolated(unsafe) var cornerCurveProbeResult: String = "pending"
+nonisolated(unsafe) var dynamicRangeProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -184,6 +185,7 @@ public func setup() {
             shapeFillRuleProbeResult = "pending"
             gradientTypeProbeResult = "pending"
             cornerCurveProbeResult = "pending"
+            dynamicRangeProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -414,6 +416,9 @@ func installHarness() {
         })
         h.expose("getCornerCurveProbeResult", returning: {
             .string(cornerCurveProbeResult)
+        })
+        h.expose("getDynamicRangeProbeResult", returning: {
+            .string(dynamicRangeProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -824,8 +829,8 @@ func installHarness() {
                         && (12...18).contains(translucentUngroupedPixel[1])
                         && (18...25).contains(translucentUngroupedPixel[2])
                         && translucentUngroupedPixel[3] == 255
-                    let rejectedExplicitly = rejectedPixel == [26, 26, 38, 255]
-                    let invalidParametersRejected = invalidParametersPixel == [26, 26, 38, 255]
+                    let rejectedExplicitly = rejectedPixel == [25, 25, 38, 255]
+                    let invalidParametersRejected = invalidParametersPixel == [25, 25, 38, 255]
                     let alphaFilteredCorrectly = alphaFilteredPixel == [13, 141, 147, 255]
                     layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
@@ -3144,17 +3149,17 @@ func installHarness() {
                     ])
                     let composited = pixels[0] == [0, 0, 0, 255]
                         && pixels[1] == [255, 255, 0, 255]
-                        && pixels[2] == [127, 0, 0, 255]
+                        && pixels[2] == [128, 0, 0, 255]
                         && pixels[3] == [0, 0, 255, 255]
                         && pixels[4] == [0, 255, 255, 255]
                         && pixels[5] == [255, 0, 0, 255]
-                        && pixels[6] == [7, 135, 10, 192]
-                        && pixels[7] == [127, 0, 0, 255]
+                        && pixels[6] == [6, 133, 10, 191]
+                        && pixels[7] == [128, 0, 0, 255]
                         && pixels[8] == [255, 255, 0, 255]
                         && pixels[9] == [255, 0, 0, 255]
                         && pixels[10] == [255, 0, 0, 255]
                         && pixels[11] == [255, 128, 0, 255]
-                        && pixels[12] == [127, 0, 0, 255]
+                        && pixels[12] == [128, 0, 0, 255]
                         && pixels[13] == [128, 128, 0, 255]
                         && pixels[14] == [255, 0, 255, 255]
                         && pixels[15] == [255, 255, 0, 255]
@@ -3170,8 +3175,8 @@ func installHarness() {
                         && pixels[25] == [255, 0, 0, 255]
                     let unboundedBackgroundFilterUsesSuperlayerExtent = pixels[26] == [0, 255, 255, 255]
                         && pixels[27] == [0, 255, 255, 255]
-                    let maskBackdropEffectsAreRendered = pixels[28] == [10, 10, 78, 160]
-                        && pixels[29] == [54, 11, 16, 149]
+                    let maskBackdropEffectsAreRendered = pixels[28] == [9, 9, 78, 160]
+                        && pixels[29] == [53, 10, 16, 149]
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -3621,7 +3626,7 @@ func installHarness() {
                         CGPoint(x: 350, y: 160),
                     ])
                     let zeroCountMatches = emptyPixels.allSatisfy { pixel in
-                        pixel == [26, 26, 38, 255]
+                        pixel == [25, 25, 38, 255]
                     }
 
                     replicator.removeFromSuperlayer()
@@ -4350,6 +4355,123 @@ func installHarness() {
                         .joined(separator: ";")
                 } catch {
                     pixelReadbackResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginDynamicRangeProbe", action: {
+            Task { @MainActor in
+                guard let root = rootLayerRef,
+                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                    dynamicRangeProbeResult = "error: renderer unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let probe = CALayer()
+                probe.bounds = CGRect(x: 0, y: 0, width: 400, height: 300)
+                probe.position = CGPoint(x: 200, y: 150)
+                probe.zPosition = 100
+                probe.backgroundColor = CGColor(red: 2, green: 0.5, blue: 0.25, alpha: 1)
+                probe.contentsHeadroom = 2
+                probe.preferredDynamicRange = .high
+                probe.toneMapMode = .never
+                root.addSublayer(probe)
+                CATransaction.commit()
+
+                let failureCountBefore = renderer.dynamicRangeRenderFailureCount
+                CAAnimationEngine.shared.renderFrame()
+                do {
+                    let extendedPixel = try await renderer.readbackFloatPixel(x: 200, y: 150)
+                    let extendedWasActive = renderer.isExtendedDynamicRangeActive
+                    let capabilityWasReported = renderer.supportsExtendedDynamicRangeOutput
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.contentsHeadroom = 0.5
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let rejectedInvalidHeadroom: Bool
+                    if case .invalidContentsHeadroom(0.5)? = renderer.lastDynamicRangeRenderFailure {
+                        rejectedInvalidHeadroom = true
+                    } else {
+                        rejectedInvalidHeadroom = false
+                    }
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.contentsHeadroom = 2
+                    probe.toneMapMode = CALayer.ToneMapMode(rawValue: "future-tone-map")
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let rejectedUnknownToneMapMode: Bool
+                    if case .invalidToneMapMode("future-tone-map")? = renderer.lastDynamicRangeRenderFailure {
+                        rejectedUnknownToneMapMode = true
+                    } else {
+                        rejectedUnknownToneMapMode = false
+                    }
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.toneMapMode = .automatic
+                    probe.preferredDynamicRange = CALayer.DynamicRange(
+                        rawValue: "future-dynamic-range"
+                    )
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let rejectedUnknownDynamicRange: Bool
+                    if case .invalidPreferredDynamicRange("future-dynamic-range")? = renderer.lastDynamicRangeRenderFailure {
+                        rejectedUnknownDynamicRange = true
+                    } else {
+                        rejectedUnknownDynamicRange = false
+                    }
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.preferredDynamicRange = .standard
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let standardPolicyWasActive = !renderer.isExtendedDynamicRangeActive
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.preferredDynamicRange = .automatic
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let automaticPolicyWasExtended = renderer.isExtendedDynamicRangeActive
+                    let automaticPixel = try await renderer.readbackFloatPixel(x: 200, y: 150)
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let standardPixel = try await renderer.readbackFloatPixel(x: 200, y: 150)
+                    let returnedToStandard = !renderer.isExtendedDynamicRangeActive
+                    let noUnexpectedFailures = renderer.dynamicRangeRenderFailureCount
+                        == failureCountBefore + 3
+
+                    dynamicRangeProbeResult = [
+                        "capability=\(capabilityWasReported)",
+                        "extended=\(extendedWasActive)",
+                        "preserved=\(extendedPixel[0] > 1)",
+                        "extendedPixel=\(extendedPixel.map { String($0) }.joined(separator: ":"))",
+                        "invalid=\(rejectedInvalidHeadroom)",
+                        "unknownTone=\(rejectedUnknownToneMapMode)",
+                        "unknownRange=\(rejectedUnknownDynamicRange)",
+                        "standardPolicy=\(standardPolicyWasActive)",
+                        "automatic=\(automaticPolicyWasExtended && automaticPixel[0] > 1)",
+                        "standard=\(returnedToStandard)",
+                        "standardPixel=\(standardPixel.allSatisfy { $0 >= 0 && $0 <= 1 })",
+                        "failures=\(noUnexpectedFailures)",
+                    ].joined(separator: ",")
+                } catch {
+                    dynamicRangeProbeResult = "error: \(error)"
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
                 }
             }
         })
