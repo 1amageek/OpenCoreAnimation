@@ -826,9 +826,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var emitterRenderFailureCount: Int = 0
 
-    /// Number of depth-preserving replicator frames rejected before GPU submission.
+    /// Number of replicator draws rejected by validation or renderer resources.
     @_spi(RendererDiagnostics)
     public private(set) var replicatorRenderFailureCount: Int = 0
+
+    /// The most recent typed replicator rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastReplicatorRenderFailure: CAReplicatorRenderFailure?
 
     /// Number of visible shadows that could not complete the GPU render path.
     @_spi(RendererDiagnostics)
@@ -1170,24 +1174,34 @@ public final class CAWebGPURenderer: CARendererDelegate {
             return
         }
 
-        let instanceCount = max(0, replicatorPresentation.instanceCount)
-        let baseColor = replicatorPresentation.instanceColor.map(rgbaComponents)
-            ?? SIMD4<Float>(repeating: 1)
+        let configuration: CAReplicatorRenderConfiguration
+        do {
+            configuration = try CAReplicatorRenderConfiguration(
+                layer: replicatorPresentation,
+                maximumInstanceCount: Self.maxLayers
+            )
+        } catch {
+            return
+        }
         var cumulativeTransform = CATransform3DIdentity
-        for instanceIndex in 0..<instanceCount {
+        for instanceIndex in 0..<configuration.instanceCount {
+            guard CAReplicatorRenderConfiguration.isFinite(cumulativeTransform) else {
+                return
+            }
             let inheritedTimeOffset = currentReplicatorTimeOffset
             let inheritedColor = currentReplicatorColor
-            let instanceColor = SIMD4<Float>(
-                clamp(baseColor.x + Float(instanceIndex) * replicatorPresentation.instanceRedOffset, 0, 1),
-                clamp(baseColor.y + Float(instanceIndex) * replicatorPresentation.instanceGreenOffset, 0, 1),
-                clamp(baseColor.z + Float(instanceIndex) * replicatorPresentation.instanceBlueOffset, 0, 1),
-                clamp(baseColor.w + Float(instanceIndex) * replicatorPresentation.instanceAlphaOffset, 0, 1)
-            )
+            let instanceColor: SIMD4<Float>
+            let instanceTimeOffset: CFTimeInterval
+            do {
+                instanceColor = try configuration.color(at: instanceIndex)
+                instanceTimeOffset = try configuration.timeOffset(at: instanceIndex)
+            } catch {
+                return
+            }
+            let combinedTimeOffset = inheritedTimeOffset + instanceTimeOffset
+            guard combinedTimeOffset.isFinite else { return }
             replicatorColorStack.append(inheritedColor * instanceColor)
-            replicatorTimeOffsetStack.append(
-                inheritedTimeOffset
-                    + CFTimeInterval(instanceIndex) * replicatorPresentation.instanceDelay
-            )
+            replicatorTimeOffsetStack.append(combinedTimeOffset)
             replicatorInstancePath.append(ReplicatorInstancePathComponent(
                 replicator: ObjectIdentifier(replicatorModel),
                 instanceIndex: instanceIndex
@@ -1201,10 +1215,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
             _ = replicatorInstancePath.popLast()
             _ = replicatorTimeOffsetStack.popLast()
             _ = replicatorColorStack.popLast()
-            cumulativeTransform = CATransform3DConcat(
-                cumulativeTransform,
-                replicatorPresentation.instanceTransform
-            )
+            if instanceIndex + 1 < configuration.instanceCount {
+                do {
+                    cumulativeTransform = try configuration.nextTransform(
+                        after: cumulativeTransform,
+                        nextInstanceIndex: instanceIndex + 1
+                    )
+                } catch {
+                    return
+                }
+            }
         }
     }
 
@@ -4583,6 +4603,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         emitterSpawnFailureCount = 0
         emitterRenderFailureCount = 0
         replicatorRenderFailureCount = 0
+        lastReplicatorRenderFailure = nil
 
         // Textured bind group / view caches (release JS-side handles)
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: false)
@@ -6074,6 +6095,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Replicator Layer Rendering
 
+    private func recordReplicatorRenderFailure(_ failure: CAReplicatorRenderFailure) {
+        replicatorRenderFailureCount += 1
+        lastReplicatorRenderFailure = failure
+    }
+
     /// Renders the sublayers of a CAReplicatorLayer with instance transformations.
     ///
     /// Supports the following CAReplicatorLayer features:
@@ -6088,54 +6114,64 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
     ) {
-        let instanceCount = max(0, replicatorLayer.instanceCount)
-        guard instanceCount > 0 else { return }
-        let instanceTransform = replicatorLayer.instanceTransform
-        let instanceDelay = replicatorLayer.instanceDelay
+        let configuration: CAReplicatorRenderConfiguration
+        do {
+            configuration = try CAReplicatorRenderConfiguration(
+                layer: replicatorLayer,
+                maximumInstanceCount: Self.maxLayers
+            )
+        } catch {
+            recordReplicatorRenderFailure(error)
+            return
+        }
+        guard configuration.instanceCount > 0 else { return }
 
-        let baseColor = replicatorLayer.instanceColor.map(rgbaComponents)
-            ?? SIMD4<Float>(1, 1, 1, 1)
-
-        // Color offsets per instance
-        let redOffset = replicatorLayer.instanceRedOffset
-        let greenOffset = replicatorLayer.instanceGreenOffset
-        let blueOffset = replicatorLayer.instanceBlueOffset
-        let alphaOffset = replicatorLayer.instanceAlphaOffset
-
-        if replicatorLayer.preservesDepth {
+        if configuration.preservesDepth {
             renderDepthPreservingReplicatorSublayers(
                 replicatorModelLayer: replicatorModelLayer,
-                replicatorLayer: replicatorLayer,
+                configuration: configuration,
                 sublayers: sublayers,
                 renderPass: renderPass,
-                parentMatrix: parentMatrix,
-                baseColor: baseColor
+                parentMatrix: parentMatrix
             )
             return
         }
 
         // Render each flattened instance.
         var cumulativeTransform = CATransform3DIdentity
-        for instanceIndex in 0..<instanceCount {
-            // Calculate color multiplier for this instance
-            let instanceColor = SIMD4<Float>(
-                clamp(baseColor.x + Float(instanceIndex) * redOffset, 0, 1),
-                clamp(baseColor.y + Float(instanceIndex) * greenOffset, 0, 1),
-                clamp(baseColor.z + Float(instanceIndex) * blueOffset, 0, 1),
-                clamp(baseColor.w + Float(instanceIndex) * alphaOffset, 0, 1)
-            )
+        for instanceIndex in 0..<configuration.instanceCount {
+            guard CAReplicatorRenderConfiguration.isFinite(cumulativeTransform) else {
+                recordReplicatorRenderFailure(
+                    .cumulativeTransformOverflow(instanceIndex: instanceIndex)
+                )
+                return
+            }
+            let instanceColor: SIMD4<Float>
+            let timeOffset: CFTimeInterval
+            do {
+                instanceColor = try configuration.color(at: instanceIndex)
+                timeOffset = try configuration.timeOffset(at: instanceIndex)
+            } catch {
+                recordReplicatorRenderFailure(error)
+                return
+            }
             // Calculate instance matrix
             let instanceMatrix = parentMatrix * cumulativeTransform.matrix4x4
 
             // Calculate time offset for this instance
             // Positive instanceDelay means later instances start their animations later
             // So instance N's animations are evaluated at (currentTime - N * instanceDelay)
-            let timeOffset = CFTimeInterval(instanceIndex) * instanceDelay
-
             let inheritedColor = currentReplicatorColor
             let inheritedTimeOffset = currentReplicatorTimeOffset
+            let combinedTimeOffset = inheritedTimeOffset + timeOffset
+            guard combinedTimeOffset.isFinite else {
+                recordReplicatorRenderFailure(
+                    .instanceTimeOffsetOverflow(instanceIndex: instanceIndex)
+                )
+                return
+            }
             replicatorColorStack.append(inheritedColor * instanceColor)
-            replicatorTimeOffsetStack.append(inheritedTimeOffset + timeOffset)
+            replicatorTimeOffsetStack.append(combinedTimeOffset)
             replicatorInstancePath.append(ReplicatorInstancePathComponent(
                 replicator: ObjectIdentifier(replicatorModelLayer),
                 instanceIndex: instanceIndex
@@ -6159,17 +6195,26 @@ public final class CAWebGPURenderer: CARendererDelegate {
             _ = replicatorColorStack.popLast()
 
             // Apply instance transform for next iteration
-            cumulativeTransform = CATransform3DConcat(cumulativeTransform, instanceTransform)
+            if instanceIndex + 1 < configuration.instanceCount {
+                do {
+                    cumulativeTransform = try configuration.nextTransform(
+                        after: cumulativeTransform,
+                        nextInstanceIndex: instanceIndex + 1
+                    )
+                } catch {
+                    recordReplicatorRenderFailure(error)
+                    return
+                }
+            }
         }
     }
 
     private func renderDepthPreservingReplicatorSublayers(
         replicatorModelLayer: CAReplicatorLayer,
-        replicatorLayer: CAReplicatorLayer,
+        configuration: CAReplicatorRenderConfiguration,
         sublayers: [CALayer],
         renderPass: GPURenderPassEncoder,
-        parentMatrix: Matrix4x4,
-        baseColor: SIMD4<Float>
+        parentMatrix: Matrix4x4
     ) {
         struct DrawItem {
             let layer: CALayer
@@ -6184,7 +6229,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         let beginsIndependentDepthGroup = transformDepthNesting == 0
         if beginsIndependentDepthGroup {
             guard let depthClearPipeline else {
-                replicatorRenderFailureCount += 1
+                recordReplicatorRenderFailure(.depthResourcesUnavailable)
                 return
             }
             renderPass.setPipeline(depthClearPipeline)
@@ -6196,20 +6241,33 @@ public final class CAWebGPURenderer: CARendererDelegate {
         let inheritedColor = currentReplicatorColor
         let inheritedTimeOffset = currentReplicatorTimeOffset
         var items: [DrawItem] = []
-        items.reserveCapacity(max(0, replicatorLayer.instanceCount) * sublayers.count)
         var cumulativeTransform = CATransform3DIdentity
         var insertionOrder = 0
 
-        for instanceIndex in 0..<max(0, replicatorLayer.instanceCount) {
-            let instanceColor = SIMD4<Float>(
-                clamp(baseColor.x + Float(instanceIndex) * replicatorLayer.instanceRedOffset, 0, 1),
-                clamp(baseColor.y + Float(instanceIndex) * replicatorLayer.instanceGreenOffset, 0, 1),
-                clamp(baseColor.z + Float(instanceIndex) * replicatorLayer.instanceBlueOffset, 0, 1),
-                clamp(baseColor.w + Float(instanceIndex) * replicatorLayer.instanceAlphaOffset, 0, 1)
-            )
+        for instanceIndex in 0..<configuration.instanceCount {
+            guard CAReplicatorRenderConfiguration.isFinite(cumulativeTransform) else {
+                recordReplicatorRenderFailure(
+                    .cumulativeTransformOverflow(instanceIndex: instanceIndex)
+                )
+                return
+            }
+            let instanceColor: SIMD4<Float>
+            let instanceTimeOffset: CFTimeInterval
+            do {
+                instanceColor = try configuration.color(at: instanceIndex)
+                instanceTimeOffset = try configuration.timeOffset(at: instanceIndex)
+            } catch {
+                recordReplicatorRenderFailure(error)
+                return
+            }
             let instanceMatrix = parentMatrix * cumulativeTransform.matrix4x4
-            let timeOffset = inheritedTimeOffset
-                + CFTimeInterval(instanceIndex) * replicatorLayer.instanceDelay
+            let timeOffset = inheritedTimeOffset + instanceTimeOffset
+            guard timeOffset.isFinite else {
+                recordReplicatorRenderFailure(
+                    .instanceTimeOffsetOverflow(instanceIndex: instanceIndex)
+                )
+                return
+            }
 
             for sublayer in sublayers {
                 items.append(DrawItem(
@@ -6227,10 +6285,17 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 ))
                 insertionOrder += 1
             }
-            cumulativeTransform = CATransform3DConcat(
-                cumulativeTransform,
-                replicatorLayer.instanceTransform
-            )
+            if instanceIndex + 1 < configuration.instanceCount {
+                do {
+                    cumulativeTransform = try configuration.nextTransform(
+                        after: cumulativeTransform,
+                        nextInstanceIndex: instanceIndex + 1
+                    )
+                } catch {
+                    recordReplicatorRenderFailure(error)
+                    return
+                }
+            }
         }
 
         // Depth testing resolves opaque intersections. Far-to-near submission
@@ -6257,11 +6322,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
             _ = replicatorTimeOffsetStack.popLast()
             _ = replicatorColorStack.popLast()
         }
-    }
-
-    /// Clamps a float value between min and max.
-    private func clamp(_ value: Float, _ minVal: Float, _ maxVal: Float) -> Float {
-        return min(max(value, minVal), maxVal)
     }
 
     private func rgbaComponents(_ color: CGColor) -> SIMD4<Float> {
