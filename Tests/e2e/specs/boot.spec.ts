@@ -145,7 +145,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginDynamicRangeProbe();
         await expect.poll(() => h.getDynamicRangeProbeResult(), { timeout: 10_000 }).toBe(
-            "capability=true,extended=true,preserved=true,extendedPixel=2.0:0.5:0.25:1.0,invalid=true,unknownTone=true,unknownRange=true,standardPolicy=true,automatic=true,standard=true,standardPixel=true,failures=true"
+            "capability=true,extended=true,preserved=true,extendedPixel=2.0:0.5:0.25:1.0,imagePreserved=true,imagePixel=2.0:0.5:0.25:1.0,invalid=true,unknownTone=true,unknownRange=true,standardPolicy=true,automatic=true,standard=true,standardPixel=true,failures=true"
         );
 
         await h.beginShapeFillRuleProbe();

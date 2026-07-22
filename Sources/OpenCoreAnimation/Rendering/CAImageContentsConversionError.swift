@@ -9,5 +9,9 @@ public enum CAImageContentsConversionError: Error, Equatable, Sendable {
     case pixelStorageOverflow
     case missingPixelData
     case insufficientPixelData(required: Int, actual: Int)
+    case missingColorSpace
+    case unsupportedColorSpace
+    case nonFinitePixelComponent(pixelIndex: Int, componentIndex: Int)
+    case invalidAlphaComponent(pixelIndex: Int)
     case conversionFailed
 }

@@ -6385,11 +6385,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // dependent view / bind group caches keyed by the same identity.
         let imageWidth = contents.width
         let imageHeight = contents.height
+        let textureFormat = CGImageTexturePixelFormat.recommended(for: contents)
         let memorySizeBytes: UInt64
         do {
             memorySizeBytes = try mipmappedRGBAByteCount(
                 width: imageWidth,
                 height: imageHeight,
+                format: textureFormat,
                 device: device
             )
         } catch {
@@ -6402,7 +6404,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
             height: imageHeight,
             memorySizeBytes: memorySizeBytes,
             factory: { [weak self] in
-                self?.createGPUTexture(from: contents, device: device)
+                self?.createGPUTexture(
+                    from: contents,
+                    format: textureFormat,
+                    device: device
+                )
             }
         ) else { return }
 
@@ -6623,14 +6629,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
     }
 
     /// Creates a GPU texture from a CGImage.
-    private func createGPUTexture(from cgImage: CGImage, device: GPUDevice) -> GPUTexture? {
+    private func createGPUTexture(
+        from cgImage: CGImage,
+        format: CGImageTexturePixelFormat,
+        device: GPUDevice
+    ) -> GPUTexture? {
         let width = cgImage.width
         let height = cgImage.height
         guard width > 0 && height > 0 else { return nil }
 
-        let rgbaData: Data
+        let baseLevel: CGImageTextureStorage
         do {
-            rgbaData = try CGImageRGBA8Converter.convert(cgImage)
+            baseLevel = try CGImageTextureStorageConverter.convert(cgImage, to: format)
         } catch {
             recordContentsConversionFailure(error)
             return nil
@@ -6647,37 +6657,42 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Every cached image receives a complete mip chain. Linear samplers clamp
         // to level zero, while CAEmitterCell.trilinear selects between these levels.
+        let gpuTextureFormat: GPUTextureFormat
+        switch format {
+        case .rgba8Unorm: gpuTextureFormat = .rgba8unorm
+        case .rgba16Float: gpuTextureFormat = .rgba16float
+        }
         let textureDescriptor = GPUTextureDescriptor(
             size: GPUExtent3D(width: UInt32(width), height: UInt32(height)),
             mipLevelCount: mipLevelCount,
-            format: .rgba8unorm,
+            format: gpuTextureFormat,
             usage: [.textureBinding, .copyDst, .renderAttachment]
         )
 
         let texture = device.createTexture(descriptor: textureDescriptor)
 
-        var levelData = rgbaData
-        mipWidth = width
-        mipHeight = height
+        var levelStorage = baseLevel
         for level in 0..<mipLevelCount {
             device.queue.writeTexture(
                 destination: GPUImageCopyTexture(texture: texture, mipLevel: level),
-                data: createUint8Array(from: levelData),
+                data: createUint8Array(from: levelStorage.data),
                 dataLayout: GPUImageDataLayout(
                     offset: 0,
-                    bytesPerRow: UInt32(mipWidth * 4),
-                    rowsPerImage: UInt32(mipHeight)
+                    bytesPerRow: UInt32(levelStorage.bytesPerRow),
+                    rowsPerImage: UInt32(levelStorage.height)
                 ),
-                size: GPUExtent3D(width: UInt32(mipWidth), height: UInt32(mipHeight))
+                size: GPUExtent3D(
+                    width: UInt32(levelStorage.width),
+                    height: UInt32(levelStorage.height)
+                )
             )
             guard level + 1 < mipLevelCount else { continue }
-            levelData = downsampleRGBA8(
-                levelData,
-                width: mipWidth,
-                height: mipHeight
-            )
-            mipWidth = max(1, mipWidth / 2)
-            mipHeight = max(1, mipHeight / 2)
+            do {
+                levelStorage = try CGImageTextureMipGenerator.nextLevel(from: levelStorage)
+            } catch {
+                recordContentsConversionFailure(error)
+                return nil
+            }
         }
 
         return texture
@@ -6686,6 +6701,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private func mipmappedRGBAByteCount(
         width: Int,
         height: Int,
+        format: CGImageTexturePixelFormat,
         device: GPUDevice
     ) throws(CAImageContentsConversionError) -> UInt64 {
         guard width > 0, height > 0 else {
@@ -6700,78 +6716,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
             )
         }
 
-        var levelWidth = UInt64(width)
-        var levelHeight = UInt64(height)
-        var byteCount: UInt64 = 0
-        while true {
-            let (pixelCount, pixelCountOverflow) = levelWidth.multipliedReportingOverflow(
-                by: levelHeight
-            )
-            let (levelByteCount, levelByteCountOverflow) = pixelCount.multipliedReportingOverflow(
-                by: 4
-            )
-            let (newByteCount, totalOverflow) = byteCount.addingReportingOverflow(levelByteCount)
-            guard !pixelCountOverflow, !levelByteCountOverflow, !totalOverflow else {
-                throw .pixelStorageOverflow
-            }
-            byteCount = newByteCount
-            guard levelWidth > 1 || levelHeight > 1 else { return byteCount }
-            levelWidth = max(1, levelWidth / 2)
-            levelHeight = max(1, levelHeight / 2)
-        }
+        return try CGImageTextureStorage.mipmappedByteCount(
+            width: width,
+            height: height,
+            format: format
+        )
     }
 
     private func recordContentsConversionFailure(_ error: CAImageContentsConversionError) {
         contentsRenderFailureCount += 1
         lastContentsConversionError = error
-    }
-
-    /// Builds the next RGBA8 mip level with a box filter.
-    private func downsampleRGBA8(_ source: Data, width: Int, height: Int) -> Data {
-        let destinationWidth = max(1, width / 2)
-        let destinationHeight = max(1, height / 2)
-        var destination = Data(count: destinationWidth * destinationHeight * 4)
-        source.withUnsafeBytes { sourceBytes in
-            destination.withUnsafeMutableBytes { destinationBytes in
-                guard let sourceBase = sourceBytes.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                      let destinationBase = destinationBytes.baseAddress?.assumingMemoryBound(
-                        to: UInt8.self
-                      ) else {
-                    return
-                }
-                for destinationY in 0..<destinationHeight {
-                    for destinationX in 0..<destinationWidth {
-                        let sourceMinX = destinationX * width / destinationWidth
-                        let sourceMinY = destinationY * height / destinationHeight
-                        let sourceMaxX = max(
-                            sourceMinX + 1,
-                            (destinationX + 1) * width / destinationWidth
-                        )
-                        let sourceMaxY = max(
-                            sourceMinY + 1,
-                            (destinationY + 1) * height / destinationHeight
-                        )
-                        let destinationOffset = (destinationY * destinationWidth + destinationX) * 4
-                        for component in 0..<4 {
-                            var sum: UInt32 = 0
-                            var sampleCount: UInt32 = 0
-                            for sourceY in sourceMinY..<sourceMaxY {
-                                for sourceX in sourceMinX..<sourceMaxX {
-                                    sum += UInt32(
-                                        sourceBase[(sourceY * width + sourceX) * 4 + component]
-                                    )
-                                    sampleCount += 1
-                                }
-                            }
-                            destinationBase[destinationOffset + component] = UInt8(
-                                (sum + sampleCount / 2) / sampleCount
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        return destination
     }
 
     /// Creates a JavaScript Uint8Array from Data.
@@ -11929,11 +11883,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         additive: Bool
     ) -> Bool {
         guard let image = particle.contents else { return false }
+        let textureFormat = CGImageTexturePixelFormat.recommended(for: image)
         let memorySizeBytes: UInt64
         do {
             memorySizeBytes = try mipmappedRGBAByteCount(
                 width: image.width,
                 height: image.height,
+                format: textureFormat,
                 device: device
             )
         } catch {
@@ -11953,7 +11909,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 height: image.height,
                 memorySizeBytes: memorySizeBytes,
                 factory: { [weak self] in
-                    self?.createGPUTexture(from: image, device: device)
+                    self?.createGPUTexture(
+                        from: image,
+                        format: textureFormat,
+                        device: device
+                    )
                 }
               ) else {
             return false
@@ -12274,11 +12234,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // the cache key on the same identity that downstream caches use.
         let imageWidth = image.width
         let imageHeight = image.height
+        let textureFormat = CGImageTexturePixelFormat.recommended(for: image)
         let memorySizeBytes: UInt64
         do {
             memorySizeBytes = try mipmappedRGBAByteCount(
                 width: imageWidth,
                 height: imageHeight,
+                format: textureFormat,
                 device: device
             )
         } catch {
@@ -12291,7 +12253,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
             height: imageHeight,
             memorySizeBytes: memorySizeBytes,
             factory: { [weak self] in
-                self?.createGPUTexture(from: image, device: device)
+                self?.createGPUTexture(
+                    from: image,
+                    format: textureFormat,
+                    device: device
+                )
             }
         ) else { return }
 

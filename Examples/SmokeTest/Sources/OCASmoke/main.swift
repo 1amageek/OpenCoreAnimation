@@ -4600,6 +4600,46 @@ func installHarness() {
                     let extendedWasActive = renderer.isExtendedDynamicRangeActive
                     let capabilityWasReported = renderer.supportsExtendedDynamicRangeOutput
 
+                    guard let extendedColorSpace = CGColorSpace(
+                        name: CGColorSpace.extendedLinearSRGB
+                    ) else {
+                        dynamicRangeProbeResult = "error: extended color space unavailable"
+                        return
+                    }
+                    var imageData = Data()
+                    for component in [Float16(2), Float16(0.5), Float16(0.25), Float16(1)] {
+                        var bits = component.bitPattern.littleEndian
+                        withUnsafeBytes(of: &bits) { imageData.append(contentsOf: $0) }
+                    }
+                    guard let extendedImage = CGImage(
+                        headroom: 2,
+                        width: 1,
+                        height: 1,
+                        bitsPerComponent: 16,
+                        bitsPerPixel: 64,
+                        bytesPerRow: 8,
+                        space: extendedColorSpace,
+                        bitmapInfo: CGBitmapInfo(
+                            alpha: .premultipliedLast,
+                            component: .float,
+                            byteOrder: .order16Little
+                        ),
+                        provider: CGDataProvider(data: imageData),
+                        decode: nil,
+                        shouldInterpolate: false,
+                        intent: .defaultIntent
+                    ) else {
+                        dynamicRangeProbeResult = "error: extended image unavailable"
+                        return
+                    }
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    probe.backgroundColor = nil
+                    probe.contents = extendedImage
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let extendedImagePixel = try await renderer.readbackFloatPixel(x: 200, y: 150)
+
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
                     probe.contentsHeadroom = 0.5
@@ -4670,6 +4710,8 @@ func installHarness() {
                         "extended=\(extendedWasActive)",
                         "preserved=\(extendedPixel[0] > 1)",
                         "extendedPixel=\(extendedPixel.map { String($0) }.joined(separator: ":"))",
+                        "imagePreserved=\(extendedImagePixel[0] > 1)",
+                        "imagePixel=\(extendedImagePixel.map { String($0) }.joined(separator: ":"))",
                         "invalid=\(rejectedInvalidHeadroom)",
                         "unknownTone=\(rejectedUnknownToneMapMode)",
                         "unknownRange=\(rejectedUnknownDynamicRange)",
