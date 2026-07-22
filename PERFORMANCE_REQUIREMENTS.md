@@ -79,7 +79,7 @@ server only ever sees committed snapshots — never half-mutated trees.
 | `CATransaction.begin/commit/flush` | `CATransaction.swift:102,128,182` | Implicit-animation context only |
 | `setNeedsDisplay()` flag | `CALayer.swift:3127` | Bool flipped, never read by renderer |
 | `setNeedsLayout()` flag | `CALayer.swift:3285` | Bool flipped, never read by renderer |
-| `_subtreeShadowCount` / `_subtreeFilterCount` | `CALayer.swift` (Task #5) | Subtree counter for prerender skip |
+| `_dirtyMask` / `_subtreeDirtyCount` | `CALayer.swift`, `CALayer+Dirty.swift` | Unified subtree invalidation for geometry, effects, contents, timing, and hierarchy |
 | Texture LRU cache | `Rendering/WebGPU/Internal/TextureManager.swift` | CGImage → GPUTexture |
 | Triple-buffered uniform/vertex pool | `Rendering/WebGPU/Internal/BufferPool.swift` | `advanceFrame()` based |
 | Geometry tessellation cache | `Rendering/WebGPU/Internal/GeometryCache.swift` | path → vertex |
@@ -114,7 +114,7 @@ later phases are only effective once dirty propagation exists.
 |---|---|---|
 | **R1.1** | `CALayer` has a `_dirtyMask: CALayerDirtyFlags` (OptionSet). Setters for animatable properties (`bounds`, `position`, `transform`, `opacity`, `contents`, `backgroundColor`, `cornerRadius`, `shadowOpacity`, `shadowRadius`, `shadowOffset`, `shadowPath`, …) set the corresponding bit. | Implicit in render-tree commit model. |
 | **R1.2** | Adding/removing/reordering a sublayer marks the parent's `.sublayerHierarchy` bit. Changing a sublayer's `zPosition` marks parent's `.sublayerOrdering` bit. | Required for R3.2. |
-| **R1.3** | Dirty bits propagate to the root via a `_subtreeDirty` counter (analogous to existing `_subtreeShadowCount`). The renderer can early-return on a clean subtree. | Mirror of Task #5 design. |
+| **R1.3** | Dirty bits propagate to the root via `_subtreeDirtyCount`. The renderer can early-return on a clean subtree without separate model-only effect counters. | Unified invalidation contract. |
 | **R1.4** | `setNeedsDisplay()` sets `.contentsRedraw`. The renderer consults this flag to decide whether to re-run `display()` for delegate-backed contents. | `CALayer.setNeedsDisplay()` Discussion. |
 | **R1.5** | `needsDisplay(forKey:)` class method is consulted on property change for custom `CALayer` subclasses. Return value triggers `setNeedsDisplay()`. | `class func needsDisplay(forKey:)`. |
 | **R1.6** | All dirty bits cleared at the end of a successful `render()` pass, *after* the GPU command buffer has been submitted. | Standard double-buffered commit. |

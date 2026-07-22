@@ -89,6 +89,24 @@ struct DirtyPropagationTests {
         #expect(layer._dirtyMask.contains(.shadow))
     }
 
+    @Test func effectsPropagateThroughUnifiedDirtyCounter() {
+        let root = CALayer()
+        let leaf = CALayer()
+        root.addSublayer(leaf)
+        root._testClearDirty()
+
+        leaf.shadowOpacity = 0.8
+        #expect(leaf._dirtyMask.contains(.shadow))
+        #expect(leaf._subtreeDirtyCount == 1)
+        #expect(root._subtreeDirtyCount == 1)
+
+        root._testClearDirty()
+        leaf.filters = [CAFilter.blur(radius: 4)]
+        #expect(leaf._dirtyMask.contains(.filters))
+        #expect(leaf._subtreeDirtyCount == 1)
+        #expect(root._subtreeDirtyCount == 1)
+    }
+
     @Test func rasterizationPropertiesMarkRasterizationBit() {
         let layer = CALayer()
         layer._testClearDirty()
@@ -190,6 +208,58 @@ struct DirtyPropagationTests {
         #expect(parentB._dirtyMask.contains(.sublayerHierarchy))
         #expect(leaf._subtreeDirtyCount == 1)
         #expect(leaf._superlayerForDirty === parentB)
+    }
+
+    @Test func everyHierarchyMutatorUsesUnifiedDirtyCounter() {
+        func dirtyLayer() -> CALayer {
+            let layer = CALayer()
+            layer._testClearDirty()
+            layer.opacity = 0.5
+            return layer
+        }
+
+        func expectInsertion(
+            _ insert: (CALayer, CALayer, CALayer) -> Void
+        ) {
+            let parent = CALayer()
+            let anchor = CALayer()
+            parent.addSublayer(anchor)
+            parent._testClearDirty()
+            let incoming = dirtyLayer()
+
+            insert(parent, incoming, anchor)
+
+            #expect(parent._subtreeDirtyCount == 2)
+            #expect(parent._dirtyMask.contains(.sublayerHierarchy))
+            #expect(incoming.superlayer === parent)
+        }
+
+        expectInsertion { parent, incoming, _ in
+            parent.insertSublayer(incoming, at: 0)
+        }
+        expectInsertion { parent, incoming, anchor in
+            parent.insertSublayer(incoming, below: anchor)
+        }
+        expectInsertion { parent, incoming, anchor in
+            parent.insertSublayer(incoming, above: anchor)
+        }
+
+        let replacementParent = CALayer()
+        let oldChild = CALayer()
+        replacementParent.addSublayer(oldChild)
+        replacementParent._testClearDirty()
+        let replacement = dirtyLayer()
+        replacementParent.replaceSublayer(oldChild, with: replacement)
+        #expect(replacementParent._subtreeDirtyCount == 2)
+        #expect(oldChild.superlayer == nil)
+        #expect(replacement.superlayer === replacementParent)
+
+        replacementParent._testClearDirty()
+        let arrayChild = dirtyLayer()
+        replacementParent.sublayers = [arrayChild]
+        #expect(replacementParent._subtreeDirtyCount == 2)
+        #expect(replacement.superlayer == nil)
+        #expect(arrayChild.superlayer === replacementParent)
     }
 
     // 1.10 — markDirty is a no-op on a presentation layer.

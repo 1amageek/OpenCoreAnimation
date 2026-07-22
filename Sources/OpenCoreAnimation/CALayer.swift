@@ -108,13 +108,6 @@ open class CALayer: CAMediaTiming, Hashable {
             // - layoutManager (typically shared)
             // - actions (typically defined at class level)
             // - animations (presentation layer specific)
-
-            // Seed subtree counters from copied state. Shadow fields above are
-            // assigned via direct backing-store writes (to mirror the original
-            // values without re-clamping); `filters` goes through its setter
-            // and updates `_subtreeFilterCount` as a side effect, but the
-            // shadow contribution must be seeded explicitly.
-            self._subtreeShadowCount = self.selfShadowContribution
         }
     }
 
@@ -3711,9 +3704,7 @@ open class CALayer: CAMediaTiming, Hashable {
         set {
             let oldValue = _shadowOpacity
             guard oldValue != newValue else { return }
-            let oldContribution = selfShadowContribution
             _shadowOpacity = newValue
-            CALayer.propagateShadowDelta(selfShadowContribution - oldContribution, startingAt: self)
             markDirty(.shadow)
             if Self.needsDisplay(forKey: "shadowOpacity") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "shadowOpacity", oldValue: oldValue, newValue: newValue)
@@ -3753,9 +3744,7 @@ open class CALayer: CAMediaTiming, Hashable {
         get { return _shadowColor }
         set {
             let oldValue = _shadowColor
-            let oldContribution = selfShadowContribution
             _shadowColor = newValue
-            CALayer.propagateShadowDelta(selfShadowContribution - oldContribution, startingAt: self)
             markDirty(.shadow)
             CATransaction.registerChange(layer: self, keyPath: "shadowColor", oldValue: oldValue, newValue: newValue)
         }
@@ -3804,9 +3793,7 @@ open class CALayer: CAMediaTiming, Hashable {
     open var filters: [Any]? {
         get { return _filters }
         set {
-            let oldContribution = selfFilterContribution
             _filters = newValue
-            CALayer.propagateFilterDelta(selfFilterContribution - oldContribution, startingAt: self)
             markDirty(.filters)
         }
     }
@@ -4680,19 +4667,13 @@ open class CALayer: CAMediaTiming, Hashable {
     open var sublayers: [CALayer]? {
         get { return _sublayers }
         set {
-            // Remove old sublayers (propagate -counts up from self before detaching)
+            // Remove old sublayers before attaching the replacement hierarchy.
             if let old = _sublayers {
-                var shadowDelta = 0
-                var filterDelta = 0
                 var dirtyDelta = 0
                 for child in old {
-                    shadowDelta += child._subtreeShadowCount
-                    filterDelta += child._subtreeFilterCount
                     dirtyDelta += child._subtreeDirtyCount
                     child._superlayer = nil
                 }
-                CALayer.propagateShadowDelta(-shadowDelta, startingAt: self)
-                CALayer.propagateFilterDelta(-filterDelta, startingAt: self)
                 CALayer.propagateDirtyDeltaPublic(-dirtyDelta, startingAt: self)
             }
             newValue?.forEach { child in
@@ -4700,20 +4681,14 @@ open class CALayer: CAMediaTiming, Hashable {
                     child.removeFromSuperlayer()
                 }
             }
-            // Set new sublayers (propagate +counts up from self after attaching)
+            // Attach the new sublayers and propagate their dirty contribution.
             _sublayers = newValue
             if let new = newValue {
-                var shadowDelta = 0
-                var filterDelta = 0
                 var dirtyDelta = 0
                 for child in new {
                     child._superlayer = self
-                    shadowDelta += child._subtreeShadowCount
-                    filterDelta += child._subtreeFilterCount
                     dirtyDelta += child._subtreeDirtyCount
                 }
-                CALayer.propagateShadowDelta(shadowDelta, startingAt: self)
-                CALayer.propagateFilterDelta(filterDelta, startingAt: self)
                 CALayer.propagateDirtyDeltaPublic(dirtyDelta, startingAt: self)
             }
             markDirty(.sublayerHierarchy)
@@ -4726,23 +4701,6 @@ open class CALayer: CAMediaTiming, Hashable {
     open var superlayer: CALayer? {
         return _superlayer
     }
-
-    // MARK: - Subtree Render-Effect Counters
-    //
-    // `_subtreeShadowCount` / `_subtreeFilterCount` track how many descendants
-    // (including self) have a shadow or supported filter contribution. The
-    // renderer uses these counters to skip the recursive `findFirstShadowLayer`
-    // / `findFirstFilteredLayer` walks when no descendant could possibly need
-    // pre-rendering.
-    //
-    // Limitation: counters reflect MODEL state only. Animations that drive
-    // `shadowOpacity` from a model value of 0 (so the model contribution is 0
-    // but the presentation value is > 0 mid-animation) are not detected.
-    // SpriteKit-style users typically set static shadow values, so the model
-    // count is accurate for them.
-
-    internal fileprivate(set) var _subtreeShadowCount: Int = 0
-    internal fileprivate(set) var _subtreeFilterCount: Int = 0
 
     // MARK: - Phase 1 dirty propagation (PERFORMANCE_DESIGN.md §3)
     //
@@ -4790,32 +4748,6 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Test-only accessor for the `_needsDisplay` boolean axis (B7).
     internal var _needsDisplayForTest: Bool { _needsDisplay }
 
-    fileprivate var selfShadowContribution: Int {
-        (_shadowOpacity > 0 && _shadowColor != nil) ? 1 : 0
-    }
-
-    fileprivate var selfFilterContribution: Int {
-        (_filters?.isEmpty == false) ? 1 : 0
-    }
-
-    fileprivate static func propagateShadowDelta(_ delta: Int, startingAt layer: CALayer?) {
-        guard delta != 0 else { return }
-        var node = layer
-        while let n = node {
-            n._subtreeShadowCount += delta
-            node = n._superlayer
-        }
-    }
-
-    fileprivate static func propagateFilterDelta(_ delta: Int, startingAt layer: CALayer?) {
-        guard delta != 0 else { return }
-        var node = layer
-        while let n = node {
-            n._subtreeFilterCount += delta
-            node = n._superlayer
-        }
-    }
-
     /// Appends the layer to the layer's list of sublayers.
     open func addSublayer(_ layer: CALayer) {
         layer.removeFromSuperlayer()
@@ -4824,10 +4756,8 @@ open class CALayer: CAMediaTiming, Hashable {
         }
         _sublayers?.append(layer)
         layer._superlayer = self
-        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
-        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
         // Phase 1: parent receives the moving subtree's dirty contribution
-        // and a fresh `.sublayerHierarchy` bit. Mirrors propagateShadowDelta.
+        // and a fresh `.sublayerHierarchy` bit.
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
         invalidateLayoutAfterSublayerHierarchyChange()
@@ -4836,8 +4766,6 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Detaches the layer from its parent layer.
     open func removeFromSuperlayer() {
         guard let superlayer = _superlayer else { return }
-        CALayer.propagateShadowDelta(-_subtreeShadowCount, startingAt: superlayer)
-        CALayer.propagateFilterDelta(-_subtreeFilterCount, startingAt: superlayer)
         // Phase 1: subtract the leaving subtree's dirty contribution from
         // the OLD ancestor chain BEFORE clearing _superlayer. The parent
         // also receives `.sublayerHierarchy` (its child set just changed).
@@ -4857,8 +4785,6 @@ open class CALayer: CAMediaTiming, Hashable {
         let index = min(Int(idx), _sublayers?.count ?? 0)
         _sublayers?.insert(layer, at: index)
         layer._superlayer = self
-        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
-        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
         invalidateLayoutAfterSublayerHierarchyChange()
@@ -4876,8 +4802,6 @@ open class CALayer: CAMediaTiming, Hashable {
             _sublayers?.insert(layer, at: 0)
         }
         layer._superlayer = self
-        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
-        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
         invalidateLayoutAfterSublayerHierarchyChange()
@@ -4895,8 +4819,6 @@ open class CALayer: CAMediaTiming, Hashable {
             _sublayers?.append(layer)
         }
         layer._superlayer = self
-        CALayer.propagateShadowDelta(layer._subtreeShadowCount, startingAt: self)
-        CALayer.propagateFilterDelta(layer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+layer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
         invalidateLayoutAfterSublayerHierarchyChange()
@@ -4906,14 +4828,10 @@ open class CALayer: CAMediaTiming, Hashable {
     open func replaceSublayer(_ oldLayer: CALayer, with newLayer: CALayer) {
         guard let index = _sublayers?.firstIndex(where: { $0 === oldLayer }) else { return }
         newLayer.removeFromSuperlayer()
-        CALayer.propagateShadowDelta(-oldLayer._subtreeShadowCount, startingAt: self)
-        CALayer.propagateFilterDelta(-oldLayer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(-oldLayer._subtreeDirtyCount, startingAt: self)
         oldLayer._superlayer = nil
         _sublayers?[index] = newLayer
         newLayer._superlayer = self
-        CALayer.propagateShadowDelta(newLayer._subtreeShadowCount, startingAt: self)
-        CALayer.propagateFilterDelta(newLayer._subtreeFilterCount, startingAt: self)
         CALayer.propagateDirtyDeltaPublic(+newLayer._subtreeDirtyCount, startingAt: self)
         markDirty(.sublayerHierarchy)
         invalidateLayoutAfterSublayerHierarchyChange()

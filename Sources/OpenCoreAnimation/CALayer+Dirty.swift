@@ -3,10 +3,8 @@
 //
 // This extension adds the dirty-bit infrastructure used by the renderer
 // (and Phase 2/3 caches) to skip work for sub-trees that haven't changed
-// since the last commit. The pattern mirrors the existing
-// `_subtreeShadowCount` / `propagateShadowDelta` machinery in CALayer.swift
-// — a single propagation primitive plus per-property setter wrappers that
-// call into it.
+// since the last commit. One propagation primitive accounts for every dirty
+// category, including shadows and filters, without model-only effect counters.
 
 import Foundation
 import Synchronization
@@ -109,9 +107,8 @@ extension CALayer {
 
     // MARK: - Subtree counter propagation
 
-    /// Mirrors `propagateShadowDelta` exactly so the two counters stay
-    /// behaviorally aligned. Internal because the sublayer mutators in
-    /// CALayer.swift's body need to call it across extensions.
+    /// Internal because the sublayer mutators in CALayer.swift's body need to
+    /// call it across extensions.
     internal static func propagateDirtyDeltaPublic(_ delta: Int, startingAt layer: CALayer?) {
         guard delta != 0 else { return }
         var node = layer

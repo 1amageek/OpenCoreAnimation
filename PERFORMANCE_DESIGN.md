@@ -74,7 +74,7 @@ If any is "no", the design is updated, not the code.
 | 9 | Does a mid-frame model mutation never leak into the in-flight render? | Yes — section 6.2 (snapshot). |
 | 10 | Does `CADisplayLink` continue to drive frames when no commit happens (live animations)? | Yes — section 6.3. |
 | 11 | Does the JS Float32Array pool survive `invalidate()` correctly? | Yes — section 7.1. |
-| 12 | Are subtree counters (`_subtreeDirtyCount`) consistent with the existing `_subtreeShadowCount` pattern, so we don't introduce two divergent traversal models? | Yes — section 3.3 mirrors it. |
+| 12 | Does one subtree counter (`_subtreeDirtyCount`) cover every render-affecting category without a divergent model-only effect path? | Yes — section 3.3 defines the unified path. |
 | 13 | Does the design allow Phase 5 to land in parallel with Phase 1 without merge conflicts? | Yes — section 8 sequencing. |
 
 Each item is re-asserted in the relevant section below.
@@ -135,7 +135,7 @@ extension CALayer {
     internal var _dirtyMask: DirtyFlags { get set }
 
     /// Number of descendants (incl. self) with `_dirtyMask != []`.
-    /// Mirrors `_subtreeShadowCount`; renderer can early-return on 0.
+    /// Unified render-invalidity count; renderer can early-return on 0.
     internal var _subtreeDirtyCount: Int { get }
 }
 ```
@@ -179,9 +179,8 @@ Every animatable property becomes a setter that:
 1. Compares old vs. new (early-return if equal — preserves idempotence).
 2. Writes the new value to `_<name>`.
 3. Calls `markDirty(.<bit>)` (defined below).
-4. Where applicable, recomputes its subtree contribution and propagates a
-   delta (e.g., `propagateShadowDelta` continues to run for the existing
-   shadow counter).
+4. Relies on the dirty category to contribute through the single
+   `_subtreeDirtyCount` propagation path.
 
 | Property | Bit | Notes |
 |---|---|---|
@@ -189,8 +188,8 @@ Every animatable property becomes a setter that:
 | `opacity`, `isHidden`, `backgroundColor`, `borderColor`, `borderWidth`, `cornerRadius`, `masksToBounds`, `maskedCorners`, `cornerCurve` | `.appearance` | |
 | `contents`, `contentsRect`, `contentsCenter`, `contentsGravity`, `contentsScale`, `contentsFormat` | `.contents` | |
 | `setNeedsDisplay()` | `.contentsRedraw` | Flag separate from `.contents` so a property change without explicit redraw does not trigger `display()`. |
-| `shadowOpacity`, `shadowRadius`, `shadowOffset`, `shadowColor`, `shadowPath` | `.shadow` | Continues to propagate the existing `_subtreeShadowCount`. |
-| `filters`, `compositingFilter`, `backgroundFilters` | `.filters` | Continues to propagate the existing `_subtreeFilterCount`. |
+| `shadowOpacity`, `shadowRadius`, `shadowOffset`, `shadowColor`, `shadowPath` | `.shadow` | Presentation values are evaluated by the renderer; no model-only effect counter is maintained. |
+| `filters`, `compositingFilter`, `backgroundFilters` | `.filters` | Uses the same dirty propagation as every other render-affecting category. |
 | `mask` | `.mask` | Setter must dirty mask *and* propagate the mask layer's full subtree dirty count up through the parent (mask is rendered into a stencil pass). |
 | `add/insert/replace/removeSublayer*`, `sublayers=` | `.sublayerHierarchy` | All hierarchy mutators get the bit; the parent's bit, not the moving child's. |
 | Any sublayer's `zPosition` change | `.sublayerOrdering` | Set on *parent*, not on the changed child. Implemented by `zPosition`'s setter calling `_superlayer?.markDirty(.sublayerOrdering)`. |
@@ -208,7 +207,7 @@ Every animatable property becomes a setter that:
 
 ### 3.3 The propagation primitive
 
-Mirror the existing `propagateShadowDelta` pattern verbatim:
+Use one propagation primitive for every dirty category:
 
 ```swift
 fileprivate static func propagateDirtyDelta(_ delta: Int, startingAt layer: CALayer?) {
@@ -240,9 +239,7 @@ row contributes only one to the counter.
 ### 3.4 Sublayer mutating APIs (R1.2 enumeration)
 
 These methods (already present, see `CALayer.swift:2963–3120`) must perform
-**three** updates per mutation, mirroring the existing
-`_subtreeShadowCount` pattern exactly (`propagateShadowDelta` at
-CALayer.swift:3025) so we don't introduce a divergent traversal model:
+**three** updates per mutation through the unified dirty-count path:
 
 1. **Subtract the moving child's `_subtreeDirtyCount`** from the *old*
    ancestor chain (if any) — done **before** mutating `_superlayer`.
@@ -250,8 +247,7 @@ CALayer.swift:3025) so we don't introduce a divergent traversal model:
 3. **Add the moving child's `_subtreeDirtyCount`** to the *new* ancestor
    chain — done **after** assigning `_superlayer = self`.
 
-Per-mutator delta plan (matches the existing shadow-counter handling in
-the same methods, lines 3043–3120):
+Per-mutator delta plan:
 
 | Mutator | Sub-step ordering |
 |---|---|
@@ -272,8 +268,8 @@ the count tracks dirtiness, not order.
 **Why subtract on detach is a delta, not a clear-and-rebuild.** A moving
 subtree's internal dirty bits stay valid — they describe the subtree's own
 state, not its relationship to the parent. Reattaching restores the
-contribution to the new ancestors. This matches `_subtreeShadowCount` /
-`_subtreeFilterCount` semantics 1:1.
+contribution to the new ancestors. Hierarchy invalidation remains independent
+from the particular effects in the moving subtree.
 
 ### 3.5 Presentation layer is a *consumer*, never a *producer*
 
@@ -775,9 +771,8 @@ This is a localized change in `prerenderShadows` — no architecture impact.
 
 ### 5.5 Filter / shadow prerender skip (R3.7)
 
-Existing Task #5 fast-path already uses `_subtreeShadowCount` /
-`_subtreeFilterCount` to skip the recursive walk when no contributor exists.
-R3.7 layers on top: even when a contributor exists, if neither the
+Effect discovery reads the current presentation tree so animated shadows and
+filters cannot be hidden by model-only counters. If neither the
 contributing layer nor any ancestor is dirty (`_subtreeDirtyCount == 0` at the
 contributor) AND the prerendered texture is cached, reuse the cache.
 
@@ -1209,7 +1204,7 @@ Each PR ships with its phase's full TDD test set green.
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Subtree counter drifts under aggressive re-parenting | Low | High (silent stale renders) | Mirror existing `_subtreeShadowCount` exactly; extend `subtreeCounterIdempotent` test to cover re-parenting. |
+| Subtree counter drifts under aggressive re-parenting | Low | High (silent stale renders) | Keep one `_subtreeDirtyCount` path and cover every hierarchy mutator with dirty-propagation tests. |
 | R2.2 `self`-return breaks identity-sensitive code | Medium | Medium (subtle bugs) | Audit all `presentation() ===` checks (currently 0 in repo). Keep the renderer's `?? layer` fallback. |
 | Rasterization cache pixel-diff vs. uncached | Medium | High (visual regressions) | Golden-image test in Phase 3.4 / 3.7. |
 | Snapshot capture cost dominates the savings for small trees | Low | Medium | Capture only dirty subtrees from the previous snapshot; leaf reuse keeps cost O(dirty). |
