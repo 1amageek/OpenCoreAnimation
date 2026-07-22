@@ -22,7 +22,6 @@ import JavaScriptKit
 /// The renderer delegate is configured internally based on the target architecture:
 /// - **WASM**: `CAWebGPURenderer` using WebGPU
 /// - **Native (Apple)**: `CAMetalRenderer` using Metal
-/// - **Native (Other)**: `CAMetalRendererDelegate` stub for testing
 ///
 /// ## Key Design Principles
 ///
@@ -108,11 +107,7 @@ internal enum CARendererDelegateFactory {
     /// ## Platform-Specific Behavior
     ///
     /// - **WASM**: Returns `CAWebGPURenderer` (async, requires canvas)
-    /// - **Native**: Returns `CAMetalRendererDelegate` stub (sync, for testing)
-    ///
-    /// Native platforms use a synchronous stub renderer because:
-    /// 1. Production apps on Apple platforms should use QuartzCore directly
-    /// 2. This library's native builds are for testing only
+    /// - **Native**: Returns a lazily configured offscreen `CAMetalRenderer`
     ///
     /// - Parameter canvas: HTML canvas element (WASM only).
     /// - Returns: A renderer delegate appropriate for the current platform.
@@ -124,41 +119,8 @@ internal enum CARendererDelegateFactory {
         return renderer
     }
     #else
-    static func createRenderer() -> CARendererDelegate {
-        // Native: use stub renderer for testing
-        // Production apps on Apple platforms should use QuartzCore directly
-        return CAMetalRendererDelegate()
+    @MainActor static func createRenderer() -> CARendererDelegate {
+        CAMetalRenderer()
     }
     #endif
 }
-
-// MARK: - Native Testing Implementation
-
-#if !arch(wasm32)
-
-/// Metal-based renderer delegate for native testing.
-///
-/// This is a minimal implementation for testing on macOS/iOS.
-/// Production use on Apple platforms should use QuartzCore directly.
-internal final class CAMetalRendererDelegate: CARendererDelegate {
-
-    var size: CGSize = .zero
-
-    @MainActor func initialize() async throws {
-        // No-op for testing
-    }
-
-    func invalidate() {
-        // No-op for testing
-    }
-
-    func render(layer rootLayer: CALayer) {
-        // No-op for testing - actual rendering would use Metal
-    }
-
-    func resize(width: Int, height: Int) {
-        size = CGSize(width: width, height: height)
-    }
-}
-
-#endif

@@ -37,10 +37,16 @@ public final class CAMetalRenderer: CARendererDelegate {
     private var pixelFormat: MTLPixelFormat = .bgra8Unorm
 
     /// The target texture for offscreen rendering.
-    private var targetTexture: MTLTexture?
+    internal private(set) var targetTexture: MTLTexture?
+
+    /// Whether the destination size is inferred from the root layer bounds.
+    private var sizesTargetFromRootBounds = true
 
     /// The most recent submission, retained so native verification can wait for completion.
     internal private(set) var lastCommandBuffer: MTLCommandBuffer?
+
+    /// The latest synchronous renderer failure, cleared after a successful submission.
+    public private(set) var lastRenderError: CARendererError?
 
     // MARK: - Initialization
 
@@ -48,6 +54,7 @@ public final class CAMetalRenderer: CARendererDelegate {
 
     internal init(destination texture: any MTLTexture) throws {
         try configure(device: texture.device, destination: texture)
+        sizesTargetFromRootBounds = false
     }
 
     // MARK: - CARenderer
@@ -58,40 +65,51 @@ public final class CAMetalRenderer: CARendererDelegate {
             throw CARendererError.deviceNotAvailable
         }
         try configure(device: device, destination: nil)
+        lastRenderError = nil
     }
 
     internal func setDestination(_ texture: any MTLTexture) throws {
         try configure(device: texture.device, destination: texture)
+        sizesTargetFromRootBounds = false
+        lastRenderError = nil
     }
 
     public func resize(width: Int, height: Int) {
-        size = CGSize(width: width, height: height)
-
-        // Recreate target texture with new size
-        guard let device = device, width > 0, height > 0 else { return }
-
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat,
-            width: width,
-            height: height,
-            mipmapped: false
-        )
-        descriptor.usage = [.renderTarget, .shaderRead]
-        targetTexture = device.makeTexture(descriptor: descriptor)
+        do {
+            try resizeTarget(width: width, height: height)
+            sizesTargetFromRootBounds = false
+            lastRenderError = nil
+        } catch let error as CARendererError {
+            lastRenderError = error
+        } catch {
+            lastRenderError = .renderingFailed(error.localizedDescription)
+        }
     }
 
     public func render(layer rootLayer: CALayer) {
-        guard let _ = device,
-              let commandQueue = commandQueue,
-              let pipelineState = pipelineState,
-              let targetTexture = targetTexture else { return }
+        do {
+            try prepareForRendering(rootLayer)
+        } catch let error as CARendererError {
+            lastRenderError = error
+            return
+        } catch {
+            lastRenderError = .renderingFailed(error.localizedDescription)
+            return
+        }
+        guard let commandQueue, let pipelineState, let targetTexture else {
+            lastRenderError = .renderingFailed("Metal renderer configuration is incomplete")
+            return
+        }
 
         // Phase 1 (PERFORMANCE_DESIGN.md §3.6): mirror CAWebGPURenderer
         // and bump the per-frame token before any presentation cache lookup.
         CALayer.advanceFrameToken()
 
         // Create command buffer
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            lastRenderError = .renderingFailed("Unable to create a Metal command buffer")
+            return
+        }
 
         // Create render pass descriptor
         let renderPassDescriptor = MTLRenderPassDescriptor()
@@ -102,6 +120,7 @@ public final class CAMetalRenderer: CARendererDelegate {
 
         // Create render encoder
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
+            lastRenderError = .renderingFailed("Unable to create a Metal render encoder")
             return
         }
 
@@ -125,6 +144,7 @@ public final class CAMetalRenderer: CARendererDelegate {
         encoder.endEncoding()
         lastCommandBuffer = commandBuffer
         commandBuffer.commit()
+        lastRenderError = nil
 
         // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
         // Mirror CAWebGPURenderer: clear after submit so any setter that
@@ -140,6 +160,7 @@ public final class CAMetalRenderer: CARendererDelegate {
         commandQueue = nil
         device = nil
         lastCommandBuffer = nil
+        lastRenderError = nil
     }
 
     // MARK: - Private Methods
@@ -260,6 +281,62 @@ public final class CAMetalRenderer: CARendererDelegate {
         try createPipeline()
         createVertexBuffer()
         createUniformBuffer()
+    }
+
+    private func prepareForRendering(_ rootLayer: CALayer) throws {
+        if device == nil {
+            guard let defaultDevice = MTLCreateSystemDefaultDevice() else {
+                throw CARendererError.deviceNotAvailable
+            }
+            try configure(device: defaultDevice, destination: nil)
+        }
+        guard sizesTargetFromRootBounds else {
+            guard targetTexture != nil else {
+                throw CARendererError.textureCreationFailed
+            }
+            return
+        }
+
+        let scale = max(rootLayer.contentsScale, 1)
+        let widthValue = rootLayer.bounds.size.width * scale
+        let heightValue = rootLayer.bounds.size.height * scale
+        guard widthValue.isFinite, heightValue.isFinite,
+              widthValue > 0, heightValue > 0,
+              widthValue <= CGFloat(Int.max),
+              heightValue <= CGFloat(Int.max) else {
+            throw CARendererError.renderingFailed(
+                "The root layer must have finite, positive bounds"
+            )
+        }
+        let width = Int(ceil(widthValue))
+        let height = Int(ceil(heightValue))
+        if targetTexture?.width != width || targetTexture?.height != height {
+            try resizeTarget(width: width, height: height)
+        }
+    }
+
+    private func resizeTarget(width: Int, height: Int) throws {
+        guard width > 0, height > 0 else {
+            throw CARendererError.renderingFailed(
+                "The Metal destination must have positive dimensions"
+            )
+        }
+        guard let device else {
+            throw CARendererError.deviceNotAvailable
+        }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            throw CARendererError.textureCreationFailed
+        }
+        size = CGSize(width: width, height: height)
+        targetTexture = texture
     }
 
     private func createVertexBuffer() {

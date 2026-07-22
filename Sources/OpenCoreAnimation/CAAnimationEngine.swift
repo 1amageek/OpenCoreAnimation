@@ -25,7 +25,7 @@ import JavaScriptKit
 ///
 /// The renderer is configured automatically based on the target architecture:
 /// - **WASM**: Uses `CAWebGPURenderer` (configured via `setCanvas(_:)`)
-/// - **Native**: Uses `CAMetalRendererDelegate` stub (for testing)
+/// - **Native**: Uses an offscreen `CAMetalRenderer` (for testing)
 ///
 /// The renderer delegate is:
 /// - **Internal**: Not exposed to external users
@@ -51,7 +51,7 @@ import JavaScriptKit
     /// Internal renderer delegate - configured automatically based on architecture.
     ///
     /// - WASM: `CAWebGPURenderer`
-    /// - Native: `CAMetalRendererDelegate` stub (for testing)
+    /// - Native: offscreen `CAMetalRenderer` (for testing)
     ///
     /// This is a strong reference because the engine owns the renderer.
     /// The renderer is created automatically during initialization.
