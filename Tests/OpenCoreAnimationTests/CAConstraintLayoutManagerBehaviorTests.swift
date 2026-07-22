@@ -175,6 +175,19 @@ struct CAConstraintLayoutManagerBehaviorTests {
         #expect(!container.needsLayout())
     }
 
+    @Test("Layout repeats when invalidated during an active pass")
+    func repeatsInvalidatedLayoutPass() {
+        let manager = InvalidatingLayoutManager()
+        let layer = CALayer()
+        layer.layoutManager = manager
+
+        layer.layoutIfNeeded()
+
+        #expect(manager.layoutCount == 2)
+        #expect(manager.invalidationCount == 2)
+        #expect(!layer.needsLayout())
+    }
+
     private func makeContainer(width: CGFloat, height: CGFloat) -> CALayer {
         let container = CALayer()
         container.bounds = CGRect(x: 0, y: 0, width: width, height: height)
@@ -208,5 +221,26 @@ struct CAConstraintLayoutManagerBehaviorTests {
             scale: scale,
             offset: offset
         )
+    }
+
+    private final class InvalidatingLayoutManager: CALayoutManager {
+        private(set) var layoutCount = 0
+        private(set) var invalidationCount = 0
+
+        func invalidateLayout(of layer: CALayer) {
+            invalidationCount += 1
+            layer.setNeedsLayout()
+        }
+
+        func layoutSublayers(of layer: CALayer) {
+            layoutCount += 1
+            if layoutCount == 1 {
+                layer.setNeedsLayout()
+            }
+        }
+
+        func preferredSize(of layer: CALayer) -> CGSize {
+            layer.bounds.size
+        }
     }
 }

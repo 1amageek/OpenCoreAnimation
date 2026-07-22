@@ -4886,7 +4886,9 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Invalidates the layer's layout and marks it as needing an update.
     open func setNeedsLayout() {
+        guard !_needsLayout else { return }
         _needsLayout = true
+        layoutManager?.invalidateLayout(of: self)
     }
 
     /// Tells the layer to update its layout.
@@ -4897,9 +4899,9 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Recalculate the receiver's layout, if required.
     open func layoutIfNeeded() {
-        if _needsLayout {
-            layoutSublayers()
+        while _needsLayout {
             _needsLayout = false
+            layoutSublayers()
         }
     }
 
