@@ -3045,6 +3045,26 @@ func installHarness() {
                     let unchangedSubtreeWasReused = reusedFlattenedPixel == [0, 0, 255, 255]
                         && flatteningReuseCaptureCount == 1
                         && flatteningReuseCompositeCount == 10
+                    let invalidRasterization = CALayer()
+                    invalidRasterization.bounds = CGRect(x: 0, y: 0, width: 10, height: 10)
+                    invalidRasterization.position = CGPoint(x: 10, y: 10)
+                    invalidRasterization.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    invalidRasterization.shouldRasterize = true
+                    invalidRasterization.rasterizationScale = 0
+                    root.addSublayer(invalidRasterization)
+                    let rasterizationFailuresBeforeInvalid = renderer.rasterizationFailureCount
+                    engine.renderFrame()
+                    let hasTypedRasterizationFailure = renderer.rasterizationFailureCount
+                            - rasterizationFailuresBeforeInvalid == 1
+                        && renderer.lastRasterizationRenderFailure
+                            == .invalidRasterizationScale(0)
+                    invalidRasterization.removeFromSuperlayer()
+                    engine.renderFrame()
                     transformDepthProbeResult = "crossing=\(crossingIsDepthCorrect)"
                         + ",transparent=\(transparentPixelsAreCorrect)"
                         + ",isolated=\(independentGroupsAreIsolated)"
@@ -3066,6 +3086,7 @@ func installHarness() {
                         + ",overflow=\(overflowRespectsClipping)"
                         + ",updated=\(changedSubtreeWasRecaptured)"
                         + ",reused=\(unchangedSubtreeWasReused)"
+                        + ",rasterFailure=\(hasTypedRasterizationFailure)"
                 } catch {
                     crossingGroup.removeFromSuperlayer()
                     directMaskedGroup.removeFromSuperlayer()

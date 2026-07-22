@@ -934,6 +934,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var rasterizationFailureCount: Int = 0
 
+    /// The most recent typed rasterization capture or composite failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastRasterizationRenderFailure: CARasterizationRenderFailure?
+
     /// Number of requested delegate backing-store draws that could not produce an image.
     @_spi(RendererDiagnostics)
     public private(set) var delegateDrawFailureCount: Int = 0
@@ -4505,6 +4509,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         shapeFillDrawCount = 0
         shapeFillVertexCount = 0
         rasterizationFailureCount = 0
+        lastRasterizationRenderFailure = nil
         delegateBackingStores.removeAll(keepingCapacity: false)
         delegateDrawFailureCount = 0
         depthTextureView = nil
@@ -10087,6 +10092,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// composite time. `renderLayer` recognises the capture root via
     /// `rasterizePrerenderRootLayer` and skips its `modelMatrix`
     /// computation accordingly.
+    private func recordRasterizationFailure(
+        _ failure: CARasterizationRenderFailure
+    ) {
+        rasterizationFailureCount += 1
+        lastRasterizationRenderFailure = failure
+    }
+
     private func captureRasterizedLayer(
         _ layer: CALayer,
         purpose: RasterizationCachePurpose,
@@ -10100,7 +10112,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         let key = RasterizationCacheKey(layerRenderKey, purpose: purpose)
         let presentationLayer = renderPresentation(for: layer)
         guard let captureBounds = rasterizationCaptureBounds(for: layer) else {
-            rasterizationFailureCount += 1
+            recordRasterizationFailure(.invalidCaptureBounds)
             return
         }
         let contentBoundsHash = rasterizationContentBoundsHash(
@@ -10129,24 +10141,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Miss — allocate a visible-subtree texture (`captureBounds × scale`)
         // and render the subtree into it under a bounds-local projection.
-        let requestedScale = CGFloat(presentationLayer.rasterizationScale)
-        guard requestedScale.isFinite, requestedScale > 0 else {
-            rasterizationFailureCount += 1
+        let captureConfiguration: CARasterizationCaptureConfiguration
+        do {
+            captureConfiguration = try CARasterizationCaptureConfiguration(
+                captureBounds: captureBounds,
+                rasterizationScale: presentationLayer.rasterizationScale,
+                maximumTextureDimension: Int(device.limits.maxTextureDimension2D)
+            )
+        } catch let failure {
+            recordRasterizationFailure(failure)
             return
         }
-        let scaledWidth = captureBounds.width * requestedScale
-        let scaledHeight = captureBounds.height * requestedScale
-        guard scaledWidth.isFinite,
-              scaledHeight.isFinite,
-              scaledWidth > 0,
-              scaledHeight > 0 else {
-            rasterizationFailureCount += 1
-            return
-        }
-        let maximumDimension = CGFloat(max(1, Int(device.limits.maxTextureDimension2D)))
-        let fittingScale = min(1, maximumDimension / max(scaledWidth, scaledHeight))
-        let pixelWidth = max(1, Int((scaledWidth * fittingScale).rounded(.up)))
-        let pixelHeight = max(1, Int((scaledHeight * fittingScale).rounded(.up)))
+        let pixelWidth = captureConfiguration.pixelWidth
+        let pixelHeight = captureConfiguration.pixelHeight
 
         let requestedFilters = presentationLayer.filters ?? []
         let filterStages: [LayerFilterStage]
@@ -10221,10 +10228,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // this places the layer's bounds-local content directly into the
         // texture's pixel grid.
         let captureProjection = Matrix4x4.orthographic(
-            left: Float(captureBounds.minX),
-            right: Float(captureBounds.maxX),
-            bottom: Float(captureBounds.minY),
-            top: Float(captureBounds.maxY),
+            left: captureConfiguration.projectionLeft,
+            right: captureConfiguration.projectionRight,
+            bottom: captureConfiguration.projectionBottom,
+            top: captureConfiguration.projectionTop,
             near: -1000,
             far: 1000
         )
@@ -11023,10 +11030,30 @@ public final class CAWebGPURenderer: CARendererDelegate {
         guard let texturedBindGroupLayout = texturedBindGroupLayout,
               let textureSampler = textureSampler,
               let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer else { return }
+              let uniformBuffer = uniformBuffer,
+              let basePipeline = pipeline else {
+            recordRasterizationFailure(.compositeResourcesUnavailable)
+            return
+        }
+        guard let selectedPipeline = selectPremultipliedTexturedPipeline() else {
+            recordRasterizationFailure(.compositePipelineUnavailable)
+            return
+        }
 
         let captureBounds = prerasterized.captureBounds
-        guard captureBounds.width > 0, captureBounds.height > 0 else { return }
+        let captureMinX = Float(captureBounds.minX)
+        let captureMinY = Float(captureBounds.minY)
+        let captureWidth = Float(captureBounds.width)
+        let captureHeight = Float(captureBounds.height)
+        guard captureMinX.isFinite,
+              captureMinY.isFinite,
+              captureWidth.isFinite,
+              captureHeight.isFinite,
+              captureWidth > 0,
+              captureHeight > 0 else {
+            recordRasterizationFailure(.invalidCompositeBounds(captureBounds))
+            return
+        }
 
         // The opacity stack already contains parent opacity × this layer's current
         // opacity. Capture baked the root at 1.0, so applying the stack once here
@@ -11047,7 +11074,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else {
-            rasterizationFailureCount += 1
+            recordRasterizationFailure(.compositeVertexCapacityExceeded)
             return
         }
         let (vertexOffset, layerIndex) = allocation
@@ -11055,13 +11082,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Scale the [0, 1] quad to bounds.size, then apply the layer's
         // own modelMatrix to position/rotate/scale it into the world.
         let originMatrix = Matrix4x4(translation: SIMD3<Float>(
-            Float(captureBounds.minX),
-            Float(captureBounds.minY),
+            captureMinX,
+            captureMinY,
             0
         ))
         let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(captureBounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(captureBounds.height), 0, 0),
+            SIMD4<Float>(captureWidth, 0, 0, 0),
+            SIMD4<Float>(0, captureHeight, 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(0, 0, 0, 1)
         ))
@@ -11073,7 +11100,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             mvpMatrix: finalMatrix,
             opacity: composite,
             cornerRadius: 0,
-            layerSize: SIMD2<Float>(Float(captureBounds.width), Float(captureBounds.height)),
+            layerSize: SIMD2<Float>(captureWidth, captureHeight),
             cornerRadii: .zero
         )
 
@@ -11109,18 +11136,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Captured render-target textures are premultiplied. Using the regular
         // contents pipeline here would multiply RGB by alpha a second time.
-        if let selected = selectPremultipliedTexturedPipeline() {
-            renderPass.setPipeline(selected)
-        }
+        renderPass.setPipeline(selectedPipeline)
         renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
 
         // Restore the regular pipeline so subsequent per-layer draws in
         // the main pass continue with the right state.
-        if let pipeline = pipeline {
-            renderPass.setPipeline(pipeline)
-        }
+        renderPass.setPipeline(basePipeline)
     }
 
     private func applyBlurFilter(
