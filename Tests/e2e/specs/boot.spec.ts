@@ -30,6 +30,7 @@ interface OCA extends Harness {
     getShadowPathKeyframeProbeResult: () => string;
     getTransformComponentProbeResult: () => string;
     getConstraintLayoutProbeResult: () => string;
+    getAggregateByValueProbeResult: () => string;
     getShadowProbeResult: () => string;
     getDisplayLinkProbeResult: () => string;
     getEmitterProbeResult: () => string;
@@ -63,6 +64,7 @@ interface OCA extends Harness {
     beginShadowPathKeyframeProbe: () => void;
     beginTransformComponentProbe: () => void;
     beginConstraintLayoutProbe: () => void;
+    beginAggregateByValueProbe: () => void;
     beginCompositionProbe: () => void;
     beginTransformDepthProbe: () => void;
     beginShadowProbe: () => void;
@@ -182,6 +184,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         await h.beginConstraintLayoutProbe();
         await expect.poll(() => h.getConstraintLayoutProbeResult(), { timeout: 10_000 }).toBe(
             "frames=true,pixels=255,0,0,255;0,255,0,255;0,0,255,255"
+        );
+
+        await h.beginAggregateByValueProbe();
+        await expect.poll(() => h.getAggregateByValueProbeResult(), { timeout: 10_000 }).toBe(
+            "255,0,0,255;153,51,51,255;0,0,0,255;0,255,0,255,presentation=true"
         );
 
         await h.beginTransformDepthProbe();

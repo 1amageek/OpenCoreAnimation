@@ -56,7 +56,7 @@ open class CALayer: CAMediaTiming, Hashable {
             // markDirty during init (we reset dirty state below).
             self._contents = otherLayer._contents
             self._contentsRect = otherLayer._contentsRect
-            self.contentsCenter = otherLayer.contentsCenter
+            self._contentsCenter = otherLayer._contentsCenter
             self.contentsGravity = otherLayer.contentsGravity
             self.contentsFormat = otherLayer.contentsFormat
 
@@ -294,7 +294,7 @@ open class CALayer: CAMediaTiming, Hashable {
         // Copy contents-related properties (critical for texture animation)
         presentation._contents = _contents
         presentation._contentsRect = _contentsRect
-        presentation.contentsCenter = contentsCenter
+        presentation._contentsCenter = _contentsCenter
         presentation.contentsGravity = contentsGravity
         presentation.contentsFormat = contentsFormat
 
@@ -887,6 +887,45 @@ open class CALayer: CAMediaTiming, Hashable {
         return nil
     }
 
+    /// Resolves CABasicAnimation endpoints for aggregate value families using
+    /// the same from/to/by rules as scalar and geometry component animations.
+    private func resolveFromToValues(
+        _ animation: CABasicAnimation,
+        currentValue: Any
+    ) -> (from: Any, to: Any)? {
+        if let from = animation.fromValue, let to = animation.toValue {
+            return (from, to)
+        }
+        if let from = animation.fromValue, let by = animation.byValue {
+            guard let to = combineAnimationValues(from, by, subtract: false) else {
+                return nil
+            }
+            return (from, to)
+        }
+        if let to = animation.toValue, let by = animation.byValue {
+            guard let from = combineAnimationValues(to, by, subtract: true) else {
+                return nil
+            }
+            return (from, to)
+        }
+        if let by = animation.byValue,
+           let to = combineAnimationValues(currentValue, by, subtract: false) {
+            return (currentValue, to)
+        }
+        if let from = animation.fromValue {
+            return (from, currentValue)
+        }
+        if let to = animation.toValue {
+            return (currentValue, to)
+        }
+        return nil
+    }
+
+    private func animationHasIndependentEndpoints(_ animation: CABasicAnimation) -> Bool {
+        (animation.fromValue != nil && (animation.toValue != nil || animation.byValue != nil))
+            || (animation.toValue != nil && animation.byValue != nil)
+    }
+
     /// Resolves the value contributed by one completed repeat cycle.
     private func cumulativeTerminalValue(
         for animation: CABasicAnimation,
@@ -925,6 +964,14 @@ open class CALayer: CAMediaTiming, Hashable {
         case is CGColor: return CGColor(red: 0, green: 0, blue: 0, alpha: 0)
         case is CATransform3D: return CATransform3DIdentity
         case let values as [CGFloat]: return Array(repeating: CGFloat(0), count: values.count)
+        case let values as [Any]:
+            var result: [Any] = []
+            result.reserveCapacity(values.count)
+            for value in values {
+                guard let zero = zeroAnimationValue(matching: value) else { return nil }
+                result.append(zero)
+            }
+            return result
         default: return nil
         }
     }
@@ -967,10 +1014,44 @@ open class CALayer: CAMediaTiming, Hashable {
         if let lhs = lhs as? [CGFloat], let rhs = rhs as? [CGFloat], lhs.count == rhs.count {
             return zip(lhs, rhs).map { $0 + sign * $1 }
         }
-        if let lhs = lhs as? CATransform3D, let rhs = rhs as? CATransform3D, !subtract {
+        if let lhs = lhs as? CATransform3D, let rhs = rhs as? CATransform3D {
+            if subtract {
+                let inverse = CATransform3DInvert(rhs)
+                guard transformIsApproximatelyIdentity(CATransform3DConcat(rhs, inverse)) else {
+                    return nil
+                }
+                return CATransform3DConcat(lhs, inverse)
+            }
             return CATransform3DConcat(lhs, rhs)
         }
+        if let lhs = lhs as? [Any], let rhs = rhs as? [Any], lhs.count == rhs.count {
+            var result: [Any] = []
+            result.reserveCapacity(lhs.count)
+            for (lhsValue, rhsValue) in zip(lhs, rhs) {
+                guard let value = combineAnimationValues(lhsValue, rhsValue, subtract: subtract) else {
+                    return nil
+                }
+                result.append(value)
+            }
+            return result
+        }
         return nil
+    }
+
+    private func transformIsApproximatelyIdentity(_ transform: CATransform3D) -> Bool {
+        let actual = [
+            transform.m11, transform.m12, transform.m13, transform.m14,
+            transform.m21, transform.m22, transform.m23, transform.m24,
+            transform.m31, transform.m32, transform.m33, transform.m34,
+            transform.m41, transform.m42, transform.m43, transform.m44,
+        ]
+        let expected = [
+            CGFloat(1), 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1,
+        ]
+        return zip(actual, expected).allSatisfy { abs($0 - $1) <= 1e-9 }
     }
 
     private func currentAnimationValue(for keyPath: String) -> Any? {
@@ -1003,7 +1084,7 @@ open class CALayer: CAMediaTiming, Hashable {
         case "shadowOffset": return _shadowOffset
         case "shadowRadius": return _shadowRadius
         case "contentsRect": return _contentsRect
-        case "contentsCenter": return contentsCenter
+        case "contentsCenter": return _contentsCenter
         case "contentsScale": return _contentsScale
         case "rasterizationScale": return _rasterizationScale
         case "strokeStart": return (self as? CAShapeLayer)?._strokeStart
@@ -1228,7 +1309,7 @@ open class CALayer: CAMediaTiming, Hashable {
         case "rasterizationScale":
             guard let resolved = resolveFromTo(animation, currentValue: additive ? 0 : rasterizationScale) else { return }
             let value = resolved.from + CGFloat(progress) * (resolved.to - resolved.from)
-            layer.rasterizationScale = additive ? layer.rasterizationScale + value : value
+            layer._rasterizationScale = additive ? layer._rasterizationScale + value : value
 
         // CAShapeLayer properties
         case "strokeStart":
@@ -1456,11 +1537,12 @@ open class CALayer: CAMediaTiming, Hashable {
         let additive = animation.isAdditive
         switch keyPath {
         case "bounds":
-            let fromVal = animation.fromValue as? CGRect
-            let toVal = animation.toValue as? CGRect
-            let fallback = additive ? CGRect.zero : _bounds
-            let from = fromVal ?? fallback
-            let to = toVal ?? fallback
+            guard let resolved = resolveFromToValues(
+                animation,
+                currentValue: additive ? CGRect.zero : _bounds
+            ),
+            let from = resolved.from as? CGRect,
+            let to = resolved.to as? CGRect else { return }
             let value = CGRect(
                 x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
                 y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
@@ -1488,11 +1570,12 @@ open class CALayer: CAMediaTiming, Hashable {
                 layer._bounds.size = value
             }
         case "contentsRect":
-            let fromVal = animation.fromValue as? CGRect
-            let toVal = animation.toValue as? CGRect
-            let crFallback = additive ? CGRect.zero : contentsRect
-            let from = fromVal ?? crFallback
-            let to = toVal ?? crFallback
+            guard let resolved = resolveFromToValues(
+                animation,
+                currentValue: additive ? CGRect.zero : _contentsRect
+            ),
+            let from = resolved.from as? CGRect,
+            let to = resolved.to as? CGRect else { return }
             let value = CGRect(
                 x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
                 y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
@@ -1500,22 +1583,23 @@ open class CALayer: CAMediaTiming, Hashable {
                 height: from.size.height + CGFloat(progress) * (to.size.height - from.size.height)
             )
             if additive {
-                let cur = layer.contentsRect
-                layer.contentsRect = CGRect(
-                    x: cur.origin.x + value.origin.x,
-                    y: cur.origin.y + value.origin.y,
-                    width: cur.size.width + value.size.width,
-                    height: cur.size.height + value.size.height
+                let current = layer._contentsRect
+                layer._contentsRect = CGRect(
+                    x: current.origin.x + value.origin.x,
+                    y: current.origin.y + value.origin.y,
+                    width: current.size.width + value.size.width,
+                    height: current.size.height + value.size.height
                 )
             } else {
-                layer.contentsRect = value
+                layer._contentsRect = value
             }
         case "contentsCenter":
-            let fromVal = animation.fromValue as? CGRect
-            let toVal = animation.toValue as? CGRect
-            let ccFallback = additive ? CGRect.zero : contentsCenter
-            let from = fromVal ?? ccFallback
-            let to = toVal ?? ccFallback
+            guard let resolved = resolveFromToValues(
+                animation,
+                currentValue: additive ? CGRect.zero : _contentsCenter
+            ),
+            let from = resolved.from as? CGRect,
+            let to = resolved.to as? CGRect else { return }
             let value = CGRect(
                 x: from.origin.x + CGFloat(progress) * (to.origin.x - from.origin.x),
                 y: from.origin.y + CGFloat(progress) * (to.origin.y - from.origin.y),
@@ -1523,15 +1607,15 @@ open class CALayer: CAMediaTiming, Hashable {
                 height: from.size.height + CGFloat(progress) * (to.size.height - from.size.height)
             )
             if additive {
-                let cur = layer.contentsCenter
-                layer.contentsCenter = CGRect(
-                    x: cur.origin.x + value.origin.x,
-                    y: cur.origin.y + value.origin.y,
-                    width: cur.size.width + value.size.width,
-                    height: cur.size.height + value.size.height
+                let current = layer._contentsCenter
+                layer._contentsCenter = CGRect(
+                    x: current.origin.x + value.origin.x,
+                    y: current.origin.y + value.origin.y,
+                    width: current.size.width + value.size.width,
+                    height: current.size.height + value.size.height
                 )
             } else {
-                layer.contentsCenter = value
+                layer._contentsCenter = value
             }
         default:
             break
@@ -1545,9 +1629,12 @@ open class CALayer: CAMediaTiming, Hashable {
 
         switch keyPath {
         case "transform":
-            // Full transform animation: interpolate between from and to values
-            guard let from = (animation.fromValue as? CATransform3D) ?? _transform as CATransform3D?,
-                  let to = (animation.toValue as? CATransform3D) ?? _transform as CATransform3D? else { return }
+            guard let resolved = resolveFromToValues(
+                animation,
+                currentValue: animation.isAdditive ? CATransform3DIdentity : _transform
+            ),
+            let from = resolved.from as? CATransform3D,
+            let to = resolved.to as? CATransform3D else { return }
             let value = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
             if animation.isAdditive {
                 layer._transform = CATransform3DConcat(value, baseTransform)
@@ -1582,9 +1669,12 @@ open class CALayer: CAMediaTiming, Hashable {
             }
 
         case "sublayerTransform":
-            // Full sublayerTransform animation: interpolate between from and to values
-            guard let from = (animation.fromValue as? CATransform3D) ?? _sublayerTransform as CATransform3D?,
-                  let to = (animation.toValue as? CATransform3D) ?? _sublayerTransform as CATransform3D? else { return }
+            guard let resolved = resolveFromToValues(
+                animation,
+                currentValue: animation.isAdditive ? CATransform3DIdentity : _sublayerTransform
+            ),
+            let from = resolved.from as? CATransform3D,
+            let to = resolved.to as? CATransform3D else { return }
             let value = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
             if animation.isAdditive {
                 layer._sublayerTransform = CATransform3DConcat(value, layer._sublayerTransform)
@@ -1595,8 +1685,14 @@ open class CALayer: CAMediaTiming, Hashable {
         case "instanceTransform":
             guard let replicatorLayer = layer as? CAReplicatorLayer,
                   let modelReplicatorLayer = self as? CAReplicatorLayer else { return }
-            let from = (animation.fromValue as? CATransform3D) ?? modelReplicatorLayer._instanceTransform
-            let to = (animation.toValue as? CATransform3D) ?? modelReplicatorLayer._instanceTransform
+            guard let resolved = resolveFromToValues(
+                animation,
+                currentValue: animation.isAdditive
+                    ? CATransform3DIdentity
+                    : modelReplicatorLayer._instanceTransform
+            ),
+            let from = resolved.from as? CATransform3D,
+            let to = resolved.to as? CATransform3D else { return }
             let value = interpolateTransform(from: from, to: to, progress: CGFloat(progress))
             replicatorLayer._instanceTransform = animation.isAdditive
                 ? CATransform3DConcat(value, replicatorLayer._instanceTransform)
@@ -1645,18 +1741,30 @@ open class CALayer: CAMediaTiming, Hashable {
         let additive = animation.isAdditive
         switch keyPath {
         case "backgroundColor":
-            guard let from = extractColor(animation.fromValue) ?? _backgroundColor,
-                  let to = extractColor(animation.toValue) ?? _backgroundColor else { return }
+            guard let resolved = resolveFromToColors(
+                animation,
+                currentValue: _backgroundColor,
+                additive: additive
+            ) else { return }
+            let (from, to) = resolved
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             layer._backgroundColor = additive ? addColor(value, to: layer._backgroundColor) : value
         case "borderColor":
-            guard let from = extractColor(animation.fromValue) ?? _borderColor,
-                  let to = extractColor(animation.toValue) ?? _borderColor else { return }
+            guard let resolved = resolveFromToColors(
+                animation,
+                currentValue: _borderColor,
+                additive: additive
+            ) else { return }
+            let (from, to) = resolved
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             layer._borderColor = additive ? addColor(value, to: layer._borderColor) : value
         case "shadowColor":
-            guard let from = extractColor(animation.fromValue) ?? _shadowColor,
-                  let to = extractColor(animation.toValue) ?? _shadowColor else { return }
+            guard let resolved = resolveFromToColors(
+                animation,
+                currentValue: _shadowColor,
+                additive: additive
+            ) else { return }
+            let (from, to) = resolved
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             layer._shadowColor = additive ? addColor(value, to: layer._shadowColor) : value
 
@@ -1664,31 +1772,47 @@ open class CALayer: CAMediaTiming, Hashable {
         case "fillColor":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            guard let from = extractColor(animation.fromValue) ?? modelShapeLayer._fillColor,
-                  let to = extractColor(animation.toValue) ?? modelShapeLayer._fillColor else { return }
+            guard let resolved = resolveFromToColors(
+                animation,
+                currentValue: modelShapeLayer._fillColor,
+                additive: additive
+            ) else { return }
+            let (from, to) = resolved
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             shapeLayer._fillColor = additive ? addColor(value, to: shapeLayer._fillColor) : value
         case "strokeColor":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
-            guard let from = extractColor(animation.fromValue) ?? modelShapeLayer._strokeColor,
-                  let to = extractColor(animation.toValue) ?? modelShapeLayer._strokeColor else { return }
+            guard let resolved = resolveFromToColors(
+                animation,
+                currentValue: modelShapeLayer._strokeColor,
+                additive: additive
+            ) else { return }
+            let (from, to) = resolved
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             shapeLayer._strokeColor = additive ? addColor(value, to: shapeLayer._strokeColor) : value
 
         case "foregroundColor":
             guard let textLayer = layer as? CATextLayer,
                   let modelTextLayer = self as? CATextLayer,
-                  let from = extractColor(animation.fromValue) ?? modelTextLayer._foregroundColor,
-                  let to = extractColor(animation.toValue) ?? modelTextLayer._foregroundColor else { return }
+                  let resolved = resolveFromToColors(
+                    animation,
+                    currentValue: modelTextLayer._foregroundColor,
+                    additive: additive
+                  ) else { return }
+            let (from, to) = resolved
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             textLayer._foregroundColor = additive ? addColor(value, to: textLayer._foregroundColor) : value
 
         case "instanceColor":
             guard let replicatorLayer = layer as? CAReplicatorLayer,
                   let modelReplicatorLayer = self as? CAReplicatorLayer,
-                  let from = extractColor(animation.fromValue) ?? modelReplicatorLayer._instanceColor,
-                  let to = extractColor(animation.toValue) ?? modelReplicatorLayer._instanceColor else { return }
+                  let resolved = resolveFromToColors(
+                    animation,
+                    currentValue: modelReplicatorLayer._instanceColor,
+                    additive: additive
+                  ) else { return }
+            let (from, to) = resolved
             let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
             replicatorLayer._instanceColor = additive ? addColor(value, to: replicatorLayer._instanceColor) : value
 
@@ -1700,6 +1824,23 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Safely extracts a CGColor from an Any value.
     private func extractColor(_ value: Any?) -> CGColor? {
         return value as? CGColor
+    }
+
+    private func resolveFromToColors(
+        _ animation: CABasicAnimation,
+        currentValue: CGColor?,
+        additive: Bool
+    ) -> (from: CGColor, to: CGColor)? {
+        guard currentValue != nil || animationHasIndependentEndpoints(animation) else { return nil }
+        let base = additive
+            ? CGColor(red: 0, green: 0, blue: 0, alpha: 0)
+            : currentValue ?? CGColor(red: 0, green: 0, blue: 0, alpha: 0)
+        guard let resolved = resolveFromToValues(animation, currentValue: base),
+              let from = extractColor(resolved.from),
+              let to = extractColor(resolved.to) else {
+            return nil
+        }
+        return (from, to)
     }
 
     /// Adds RGBA components of two colors (for additive animation).
@@ -1859,47 +2000,101 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func applyArrayAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+        let additive = animation.isAdditive
         switch keyPath {
         // CAGradientLayer array properties
         case "colors":
             guard let gradientLayer = layer as? CAGradientLayer,
                   let modelGradientLayer = self as? CAGradientLayer else { return }
-            guard let fromColors = (animation.fromValue as? [Any]) ?? modelGradientLayer._colors,
-                  let toColors = (animation.toValue as? [Any]) ?? modelGradientLayer._colors else { return }
-
-            // Interpolate each color in the array
-            let count = min(fromColors.count, toColors.count)
-            var interpolatedColors: [Any] = []
-            for i in 0..<count {
-                if let fromColor = extractColor(fromColors[i]),
-                   let toColor = extractColor(toColors[i]) {
-                    interpolatedColors.append(interpolateColor(from: fromColor, to: toColor, progress: CGFloat(progress)))
-                } else {
-                    // Can't interpolate, use from value
-                    interpolatedColors.append(fromColors[i])
-                }
+            let modelColors = modelGradientLayer._colors
+            guard modelColors != nil || animationHasIndependentEndpoints(animation) else { return }
+            let current: [Any]
+            if additive {
+                let template = modelColors
+                    ?? animation.fromValue as? [Any]
+                    ?? animation.toValue as? [Any]
+                    ?? animation.byValue as? [Any]
+                guard let template,
+                      let zero = zeroAnimationValue(matching: template) as? [Any] else { return }
+                current = zero
+            } else {
+                current = modelColors ?? []
             }
-            gradientLayer._colors = interpolatedColors
+            guard let resolved = resolveFromToValues(animation, currentValue: current),
+                  let fromColors = resolved.from as? [Any],
+                  let toColors = resolved.to as? [Any],
+                  let value = interpolateColorArray(
+                    from: fromColors,
+                    to: toColors,
+                    progress: CGFloat(progress)
+                  ) else { return }
+            if additive {
+                if let presentationColors = gradientLayer._colors {
+                    guard let combined = combineAnimationValues(
+                        presentationColors,
+                        value,
+                        subtract: false
+                    ) as? [Any] else { return }
+                    gradientLayer._colors = combined
+                } else {
+                    gradientLayer._colors = value
+                }
+            } else {
+                gradientLayer._colors = value
+            }
 
         case "locations":
             guard let gradientLayer = layer as? CAGradientLayer,
                   let modelGradientLayer = self as? CAGradientLayer else { return }
-            guard let fromLocations = (animation.fromValue as? [CGFloat]) ?? modelGradientLayer._locations,
-                  let toLocations = (animation.toValue as? [CGFloat]) ?? modelGradientLayer._locations else { return }
-
-            // Interpolate each location in the array
-            let count = min(fromLocations.count, toLocations.count)
-            var interpolatedLocations: [CGFloat] = []
-            for i in 0..<count {
-                let from = fromLocations[i]
-                let to = toLocations[i]
-                interpolatedLocations.append(from + CGFloat(progress) * (to - from))
+            let modelLocations = modelGradientLayer._locations
+            guard modelLocations != nil || animationHasIndependentEndpoints(animation) else { return }
+            let template = modelLocations
+                ?? animation.fromValue as? [CGFloat]
+                ?? animation.toValue as? [CGFloat]
+                ?? animation.byValue as? [CGFloat]
+            guard let template else { return }
+            let current = additive
+                ? Array(repeating: CGFloat(0), count: template.count)
+                : modelLocations ?? []
+            guard let resolved = resolveFromToValues(animation, currentValue: current),
+                  let fromLocations = resolved.from as? [CGFloat],
+                  let toLocations = resolved.to as? [CGFloat],
+                  fromLocations.count == toLocations.count else { return }
+            let value = zip(fromLocations, toLocations).map { from, to in
+                from + CGFloat(progress) * (to - from)
             }
-            gradientLayer._locations = interpolatedLocations
+            if additive {
+                if let presentationLocations = gradientLayer._locations {
+                    guard presentationLocations.count == value.count else { return }
+                    gradientLayer._locations = zip(presentationLocations, value).map { $0 + $1 }
+                } else {
+                    gradientLayer._locations = value
+                }
+            } else {
+                gradientLayer._locations = value
+            }
 
         default:
             break
         }
+    }
+
+    private func interpolateColorArray(
+        from: [Any],
+        to: [Any],
+        progress: CGFloat
+    ) -> [Any]? {
+        guard from.count == to.count else { return nil }
+        var result: [Any] = []
+        result.reserveCapacity(from.count)
+        for (fromValue, toValue) in zip(from, to) {
+            guard let fromColor = extractColor(fromValue),
+                  let toColor = extractColor(toValue) else {
+                return nil
+            }
+            result.append(interpolateColor(from: fromColor, to: toColor, progress: progress))
+        }
+        return result
     }
 
     // MARK: - Path Sampling for Keyframe Animation
@@ -2584,7 +2779,7 @@ open class CALayer: CAMediaTiming, Hashable {
         case "contentsScale":
             if let v = value as? CGFloat { layer._contentsScale = v }
         case "rasterizationScale":
-            if let v = value as? CGFloat { layer.rasterizationScale = v }
+            if let v = value as? CGFloat { layer._rasterizationScale = v }
 
         // Additional Float properties
         case "shadowOpacity":
@@ -2608,9 +2803,9 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // CGRect properties
         case "contentsRect":
-            if let v = value as? CGRect { layer.contentsRect = v }
+            if let v = value as? CGRect { layer._contentsRect = v }
         case "contentsCenter":
-            if let v = value as? CGRect { layer.contentsCenter = v }
+            if let v = value as? CGRect { layer._contentsCenter = v }
 
         // CATransform3D properties
         case "sublayerTransform":
@@ -2733,7 +2928,7 @@ open class CALayer: CAMediaTiming, Hashable {
                 case "zPosition": layer._zPosition = value
                 case "anchorPointZ": layer._anchorPointZ = value
                 case "contentsScale": layer._contentsScale = value
-                case "rasterizationScale": layer.rasterizationScale = value
+                case "rasterizationScale": layer._rasterizationScale = value
                 default: break
                 }
             }
@@ -2788,8 +2983,8 @@ open class CALayer: CAMediaTiming, Hashable {
                     height: f.size.height + CGFloat(progress) * (t.size.height - f.size.height)
                 )
                 switch keyPath {
-                case "contentsRect": layer.contentsRect = value
-                case "contentsCenter": layer.contentsCenter = value
+                case "contentsRect": layer._contentsRect = value
+                case "contentsCenter": layer._contentsCenter = value
                 default: break
                 }
             }
@@ -3444,12 +3639,16 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// The rectangle that defines how the layer contents are scaled if the layer's contents
     /// are resized. Animatable.
-    open var contentsCenter: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1) {
-        didSet {
-            guard oldValue != contentsCenter else { return }
+    private var _contentsCenter = CGRect(x: 0, y: 0, width: 1, height: 1)
+    open var contentsCenter: CGRect {
+        get { _contentsCenter }
+        set {
+            let oldValue = _contentsCenter
+            guard oldValue != newValue else { return }
+            _contentsCenter = newValue
             markDirty(.contents)
             if Self.needsDisplay(forKey: "contentsCenter") { setNeedsDisplay() }
-            CATransaction.registerChange(layer: self, keyPath: "contentsCenter", oldValue: oldValue, newValue: contentsCenter)
+            CATransaction.registerChange(layer: self, keyPath: "contentsCenter", oldValue: oldValue, newValue: newValue)
         }
     }
 

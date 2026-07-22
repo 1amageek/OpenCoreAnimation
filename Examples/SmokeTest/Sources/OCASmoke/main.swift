@@ -45,6 +45,7 @@ nonisolated(unsafe) var rasterizationScaleProbeResult: String = "pending"
 nonisolated(unsafe) var shadowPathKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var transformComponentProbeResult: String = "pending"
 nonisolated(unsafe) var constraintLayoutProbeResult: String = "pending"
+nonisolated(unsafe) var aggregateByValueProbeResult: String = "pending"
 nonisolated(unsafe) var delegateDrawProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
@@ -165,6 +166,7 @@ public func setup() {
             shadowPathKeyframeProbeResult = "pending"
             transformComponentProbeResult = "pending"
             constraintLayoutProbeResult = "pending"
+            aggregateByValueProbeResult = "pending"
             delegateDrawProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
@@ -363,6 +365,9 @@ func installHarness() {
         })
         h.expose("getConstraintLayoutProbeResult", returning: {
             .string(constraintLayoutProbeResult)
+        })
+        h.expose("getAggregateByValueProbeResult", returning: {
+            .string(aggregateByValueProbeResult)
         })
         h.expose("getDelegateDrawProbeResult", returning: {
             .string(delegateDrawProbeResult)
@@ -1734,6 +1739,126 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     constraintLayoutProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginAggregateByValueProbe", action: {
+            Task { @MainActor in
+                aggregateByValueProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.renderer as? CAWebGPURenderer else {
+                    aggregateByValueProbeResult = "error: aggregate byValue dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func makeLayer(
+                    position: CGPoint,
+                    size: CGSize,
+                    color: CGColor
+                ) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(origin: .zero, size: size)
+                    layer.position = position
+                    layer.zPosition = 100
+                    layer.backgroundColor = color
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                func configure(_ animation: CABasicAnimation) {
+                    animation.duration = 1
+                    animation.speed = 0
+                    animation.timeOffset = 0.5
+                    animation.fillMode = .both
+                    animation.isRemovedOnCompletion = false
+                }
+
+                let boundsLayer = makeLayer(
+                    position: CGPoint(x: 60, y: 150),
+                    size: CGSize(width: 40, height: 40),
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                )
+                let boundsAnimation = CABasicAnimation(keyPath: "bounds")
+                boundsAnimation.byValue = CGRect(x: 0, y: 0, width: 40, height: 0)
+                configure(boundsAnimation)
+                boundsLayer.add(boundsAnimation, forKey: "browserAggregateBounds")
+
+                let colorLayer = makeLayer(
+                    position: CGPoint(x: 160, y: 150),
+                    size: CGSize(width: 40, height: 40),
+                    color: CGColor(red: 0.2, green: 0.2, blue: 0.2, alpha: 1)
+                )
+                let colorAnimation = CABasicAnimation(keyPath: "backgroundColor")
+                colorAnimation.byValue = CGColor(red: 0.8, green: 0, blue: 0, alpha: 0)
+                configure(colorAnimation)
+                colorLayer.add(colorAnimation, forKey: "browserAggregateColor")
+
+                let transformLayer = makeLayer(
+                    position: CGPoint(x: 330, y: 150),
+                    size: CGSize(width: 20, height: 20),
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                )
+                let transformAnimation = CABasicAnimation(keyPath: "transform")
+                transformAnimation.byValue = CATransform3DMakeTranslation(40, 0, 0)
+                configure(transformAnimation)
+                transformLayer.add(transformAnimation, forKey: "browserAggregateTransform")
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    boundsLayer.removeFromSuperlayer()
+                    colorLayer.removeFromSuperlayer()
+                    transformLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                guard let boundsPresentation = boundsLayer.presentation(),
+                      let colorPresentation = colorLayer.presentation(),
+                      let transformPresentation = transformLayer.presentation(),
+                      let components = colorPresentation.backgroundColor?.components,
+                      components.count == 4 else {
+                    restoreScene()
+                    aggregateByValueProbeResult = "error: aggregate presentation unavailable"
+                    return
+                }
+                let presentationMatches = abs(boundsPresentation.bounds.width - 60) < 0.001
+                    && abs(components[0] - 0.6) < 0.001
+                    && abs(components[1] - 0.2) < 0.001
+                    && abs(components[2] - 0.2) < 0.001
+                    && abs(components[3] - 1) < 0.001
+                    && abs(transformPresentation.transform.m41 - 20) < 0.001
+
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 88, y: 150),
+                        CGPoint(x: 160, y: 150),
+                        CGPoint(x: 330, y: 150),
+                        CGPoint(x: 350, y: 150),
+                    ])
+                    restoreScene()
+                    aggregateByValueProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                        + ",presentation=\(presentationMatches)"
+                } catch {
+                    restoreScene()
+                    aggregateByValueProbeResult = "error: \(error)"
                 }
             }
         })
