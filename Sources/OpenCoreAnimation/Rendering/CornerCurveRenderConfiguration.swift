@@ -6,7 +6,9 @@ struct CornerCurveRenderConfiguration: Equatable {
 
     let exponent: CGFloat
 
-    init(curve: CALayerCornerCurve) throws {
+    init(
+        curve: CALayerCornerCurve
+    ) throws(CornerCurveRenderConfigurationError) {
         switch curve {
         case .circular:
             exponent = Self.circularExponent

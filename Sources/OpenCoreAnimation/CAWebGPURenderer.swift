@@ -874,6 +874,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var cornerCurveRenderFailureCount: Int = 0
 
+    /// The most recent typed corner-curve rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastCornerCurveRenderFailure: CACornerCurveRenderFailure?
+
     /// Number of image-content draws rejected because their geometry, resources, or pixels are invalid.
     @_spi(RendererDiagnostics)
     public private(set) var contentsRenderFailureCount: Int = 0
@@ -4480,6 +4484,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         gradientRenderFailureCount = 0
         lastGradientRenderFailure = nil
         cornerCurveRenderFailureCount = 0
+        lastCornerCurveRenderFailure = nil
         contentsRenderFailureCount = 0
         textRenderFailureCount = 0
         lastTextRenderFailure = nil
@@ -4738,8 +4743,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Skip hidden layers (using presentation layer values)
         guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
         if presentationLayer.cornerRadius > 0,
-           presentationLayer.cornerCurveRenderExponent == nil {
-            cornerCurveRenderFailureCount += 1
+           let error = presentationLayer.cornerCurveRenderError {
+            recordCornerCurveRenderFailure(.layer(error))
             return
         }
 
@@ -5946,6 +5951,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Mask Rendering (Stencil)
 
+    private func recordCornerCurveRenderFailure(
+        _ failure: CACornerCurveRenderFailure
+    ) {
+        cornerCurveRenderFailureCount += 1
+        lastCornerCurveRenderFailure = failure
+    }
+
     /// Renders a mask layer to the stencil buffer.
     ///
     /// This writes to the stencil buffer where the mask layer has visible content.
@@ -5964,9 +5976,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Validate before mutating the stencil state. A failed mask must not clear
         // or decrement an enclosing mask when the caller unwinds.
         let maskPresentationLayer = renderPresentation(for: maskLayer)
-        guard maskPresentationLayer.cornerRadius <= 0
-                || maskPresentationLayer.cornerCurveRenderExponent != nil else {
-            cornerCurveRenderFailureCount += 1
+        if maskPresentationLayer.cornerRadius > 0,
+           let error = maskPresentationLayer.cornerCurveRenderError {
+            recordCornerCurveRenderFailure(.mask(error))
             return false
         }
 
@@ -6070,8 +6082,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let bindGroup = bindGroup else { return false }
-        guard layer.cornerCurveRenderExponent != nil else {
-            cornerCurveRenderFailureCount += 1
+        if let error = layer.cornerCurveRenderError {
+            recordCornerCurveRenderFailure(.roundedClip(error))
             return false
         }
 

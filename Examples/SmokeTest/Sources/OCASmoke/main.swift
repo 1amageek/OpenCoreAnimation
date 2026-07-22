@@ -5257,7 +5257,18 @@ func installHarness() {
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
                     let failureDelta = renderer.cornerCurveRenderFailureCount - failureCountBefore
-                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta)"
+                    let typedFailure: String
+                    switch renderer.lastCornerCurveRenderFailure {
+                    case .layer(.unsupportedCurve(let value)):
+                        typedFailure = "layer:\(value)"
+                    case .mask(.unsupportedCurve(let value)):
+                        typedFailure = "mask:\(value)"
+                    case .roundedClip(.unsupportedCurve(let value)):
+                        typedFailure = "roundedClip:\(value)"
+                    case nil:
+                        typedFailure = "nil"
+                    }
+                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta),typed=\(typedFailure)"
                 } catch {
                     cornerCurveProbeResult = "error: \(error)"
                 }

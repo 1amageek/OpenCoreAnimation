@@ -4,6 +4,15 @@ import Foundation
 // MARK: - WASM Helper Extensions
 
 extension CALayer {
+    internal var cornerCurveRenderError: CornerCurveRenderConfigurationError? {
+        do {
+            _ = try CornerCurveRenderConfiguration(curve: cornerCurve)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     internal var cornerCurveRenderExponent: Float? {
         do {
             return Float(try CornerCurveRenderConfiguration(curve: cornerCurve).exponent)

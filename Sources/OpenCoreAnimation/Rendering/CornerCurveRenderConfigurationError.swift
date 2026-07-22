@@ -1,3 +1,4 @@
-enum CornerCurveRenderConfigurationError: Error, Equatable {
+@_spi(RendererDiagnostics)
+public enum CornerCurveRenderConfigurationError: Error, Equatable, Sendable {
     case unsupportedCurve(String)
 }

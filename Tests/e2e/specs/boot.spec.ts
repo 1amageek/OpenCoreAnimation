@@ -162,7 +162,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginCornerCurveProbe();
         await expect.poll(() => h.getCornerCurveProbeResult(), { timeout: 10_000 }).toBe(
-            "79,20,29,255;48,207,0,255;0,48,207,255;255,255,0,255;243,48,219,255;5,212,214,255;255,0,255,255;0,0,0,255,failures=2"
+            "79,20,29,255;48,207,0,255;0,48,207,255;255,255,0,255;243,48,219,255;5,212,214,255;255,0,255,255;0,0,0,255,failures=2,typed=layer:future-curve"
         );
 
         await h.beginTransitionFilterProbes();

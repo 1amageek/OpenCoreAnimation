@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@_spi(RendererDiagnostics)
 @testable import OpenCoreAnimation
 
 @Suite("Corner Curve Render Configuration Tests")
