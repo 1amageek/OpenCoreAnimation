@@ -17,4 +17,9 @@ public enum CACompositionFilterRenderFailure: Error, Equatable, Sendable {
     case backgroundFilterMaskFailed
     case backgroundFilterMixFailed
     case compositionExecutionFailed
+    case displayResourcesUnavailable
+    case invalidDisplayGeometry
+    case invalidDisplayTransform
+    case invalidSamplingTransform
+    case displayVertexCapacityExceeded
 }

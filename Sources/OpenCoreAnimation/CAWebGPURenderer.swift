@@ -1587,6 +1587,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private var deferredCompositionRasterizationKeys: Set<LayerRenderKey> = []
     private var capturesOnlyDeferredCompositionRasterizations = false
     private var failedCompositionKeys: Set<LayerRenderKey> = []
+    private var failedCompositionDisplayKeys: Set<LayerRenderKey> = []
 
     /// Number of requested backdrop compositions rejected before GPU dispatch.
     @_spi(RendererDiagnostics)
@@ -4626,6 +4627,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         deferredCompositionRasterizationKeys.removeAll(keepingCapacity: false)
         capturesOnlyDeferredCompositionRasterizations = false
         failedCompositionKeys.removeAll(keepingCapacity: false)
+        failedCompositionDisplayKeys.removeAll(keepingCapacity: false)
         compositionFilterFailureCount = 0
         lastCompositionFilterFailure = nil
 
@@ -4978,13 +4980,21 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         if filterPrerenderRootLayer !== layer, hasBackdropComposition {
             if let composition = prerenderedCompositions[currentRenderKey] {
-                renderPreparedComposition(
-                    composition,
-                    presentationLayer: presentationLayer,
-                    device: device,
-                    renderPass: renderPass,
-                    modelMatrix: modelMatrix
-                )
+                do {
+                    try renderPreparedComposition(
+                        composition,
+                        presentationLayer: presentationLayer,
+                        device: device,
+                        renderPass: renderPass,
+                        modelMatrix: modelMatrix
+                    )
+                    failedCompositionDisplayKeys.remove(currentRenderKey)
+                } catch let failure {
+                    lastCompositionFilterFailure = failure
+                    if failedCompositionDisplayKeys.insert(currentRenderKey).inserted {
+                        compositionFilterFailureCount += 1
+                    }
+                }
             }
             // Requested backdrop effects never fall through to an unprocessed source-over draw.
             return
@@ -10221,6 +10231,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
 
         failedCompositionKeys.formIntersection(failedKeys)
+        failedCompositionDisplayKeys.formIntersection(activeKeys)
         let staleKeys = compositionLayerResources.keys.filter { !activeKeys.contains($0) }
         for key in staleKeys {
             compositionLayerResources.removeValue(forKey: key)?.destroy()
@@ -11967,9 +11978,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
-    ) {
+    ) throws(CACompositionFilterRenderFailure) {
         if transformDepthNesting > 0 || rasterizePrerenderRootLayer != nil {
-            renderPreparedCompositionPlane(
+            try renderPreparedCompositionPlane(
                 composition,
                 presentationLayer: presentationLayer,
                 device: device,
@@ -11979,7 +11990,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
             return
         }
         guard let filterReplacementPipeline,
-              let blurSampler else { return }
+              let blurSampler else {
+            throw .displayResourcesUnavailable
+        }
 
         var uniforms = FilterCompositeUniforms()
         let uniformData = createFloat32Array(from: &uniforms)
@@ -12012,7 +12025,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
-    ) {
+    ) throws(CACompositionFilterRenderFailure) {
+        let configuration = try CACompositionPlaneRenderConfiguration(
+            bounds: presentationLayer.bounds,
+            viewportSize: size
+        )
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(configuration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, configuration.size.y, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = modelMatrix * scaleMatrix
+        try configuration.validateDisplayTransform(columns: finalMatrix.columns)
+
         let selectedPipeline: GPURenderPipeline?
         if transformDepthNesting > 0 {
             selectedPipeline = maskNestingDepth > 0
@@ -12025,26 +12051,29 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
         guard let selectedPipeline,
               let blurSampler,
-              let vertexBuffer else { return }
-        let bounds = presentationLayer.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return }
+              let vertexBuffer else {
+            throw .displayResourcesUnavailable
+        }
 
-        let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(bounds.height), 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
-        ))
+        let planeVertices: [CACompositionPlaneVertex]
+        if rasterizePrerenderRootLayer != nil {
+            planeVertices = try configuration.capturedVertices(
+                samplingColumns: composition.samplingModelMatrix.columns
+            )
+        } else {
+            planeVertices = configuration.standardVertices()
+        }
+        var vertices = planeVertices.map {
+            CARendererVertex(position: $0.position, texCoord: $0.texCoord, color: $0.color)
+        }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            throw .displayVertexCapacityExceeded
+        }
+
         var uniforms = TexturedUniforms(
-            mvpMatrix: modelMatrix * scaleMatrix,
-            layerSize: SIMD2<Float>(Float(size.width), Float(size.height))
+            mvpMatrix: finalMatrix,
+            layerSize: configuration.viewportSize
         )
-        device.queue.writeBuffer(
-            composition.resources.transformedDisplayUniformBuffer,
-            bufferOffset: 0,
-            data: createFloat32Array(from: &uniforms)
-        )
-
         let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
             layout: selectedPipeline.getBindGroupLayout(index: 0),
             entries: [
@@ -12057,25 +12086,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 GPUBindGroupEntry(binding: 2, resource: .sampler(blurSampler)),
             ]
         ))
-        var vertices: [CARendererVertex]
-        if rasterizePrerenderRootLayer != nil {
-            guard let capturedVertices = capturedCompositionPlaneVertices(
-                samplingMatrix: composition.samplingModelMatrix,
-                bounds: bounds
-            ) else { return }
-            vertices = capturedVertices
-        } else {
-            let white = SIMD4<Float>(repeating: 1)
-            vertices = [
-                CARendererVertex(position: SIMD2(0, 0), texCoord: .zero, color: white),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: .zero, color: white),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: .zero, color: white),
-                CARendererVertex(position: SIMD2(1, 0), texCoord: .zero, color: white),
-                CARendererVertex(position: SIMD2(1, 1), texCoord: .zero, color: white),
-                CARendererVertex(position: SIMD2(0, 1), texCoord: .zero, color: white),
-            ]
-        }
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        device.queue.writeBuffer(
+            composition.resources.transformedDisplayUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &uniforms)
+        )
         device.queue.writeBuffer(
             vertexBuffer,
             bufferOffset: allocation.vertexOffset,
@@ -12086,46 +12101,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass.setBindGroup(0, bindGroup: bindGroup)
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: allocation.vertexOffset)
         renderPass.draw(vertexCount: 6)
-    }
-
-    private func capturedCompositionPlaneVertices(
-        samplingMatrix: Matrix4x4,
-        bounds: CGRect
-    ) -> [CARendererVertex]? {
-        let scaleMatrix = Matrix4x4(columns: (
-            SIMD4<Float>(Float(bounds.width), 0, 0, 0),
-            SIMD4<Float>(0, Float(bounds.height), 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(0, 0, 0, 1)
-        ))
-        let samplingMVP = samplingMatrix * scaleMatrix
-
-        func vertex(at position: SIMD2<Float>) -> CARendererVertex? {
-            let clip = samplingMVP * SIMD4<Float>(position.x, position.y, 0, 1)
-            guard clip.x.isFinite,
-                  clip.y.isFinite,
-                  clip.w.isFinite,
-                  abs(clip.w) > 0.000001 else {
-                return nil
-            }
-            let viewportNumerator = SIMD2<Float>(
-                (clip.x + clip.w) * 0.5,
-                (clip.w - clip.y) * 0.5
-            )
-            return CARendererVertex(
-                position: position,
-                texCoord: viewportNumerator,
-                color: SIMD4<Float>(clip.w, 0, 0, 0)
-            )
-        }
-
-        guard let minMin = vertex(at: SIMD2(0, 0)),
-              let maxMin = vertex(at: SIMD2(1, 0)),
-              let minMax = vertex(at: SIMD2(0, 1)),
-              let maxMax = vertex(at: SIMD2(1, 1)) else {
-            return nil
-        }
-        return [minMin, maxMin, minMax, maxMin, maxMax, minMax]
     }
 
     private func renderPremultipliedFullScreenTexture(
