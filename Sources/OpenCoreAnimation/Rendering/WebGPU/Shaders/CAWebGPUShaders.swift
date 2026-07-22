@@ -263,6 +263,39 @@ public enum CAWebGPUShaders {
         return getGradientColor(colorCount - 1);
     }
 
+    // Matches CAGradientLayer's unit-coordinate geometry. A negative value
+    // identifies radial geometry that has no drawable two-dimensional extent.
+    fn gradientParameter(position: vec2<f32>) -> f32 {
+        let delta = uniforms.gradientEndPoint - uniforms.gradientStartPoint;
+        let relative = position - uniforms.gradientStartPoint;
+
+        if (uniforms.renderMode < 2.5) {
+            let squaredLength = dot(delta, delta);
+            if (squaredLength <= 0.0) {
+                return 0.0;
+            }
+            return dot(relative, delta) / squaredLength;
+        }
+
+        if (uniforms.renderMode < 3.5) {
+            let radius = abs(delta);
+            if (radius.x <= 0.0 || radius.y <= 0.0) {
+                return -1.0;
+            }
+            return length(relative / radius);
+        }
+
+        var directionAngle: f32 = 0.0;
+        if (dot(delta, delta) > 0.0) {
+            directionAngle = atan2(delta.y, delta.x);
+        }
+        if (dot(relative, relative) <= 0.0) {
+            return 0.0;
+        }
+        let pointAngle = atan2(relative.y, relative.x);
+        return fract((pointAngle - directionAngle) / 6.283185307179586 + 1.0);
+    }
+
     @fragment
     fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
         let layerEdgeCoverage = edgeCoverage(input.texCoord);
@@ -286,14 +319,9 @@ public enum CAWebGPUShaders {
 
         // Gradient rendering mode
         if (uniforms.renderMode > 1.5) {
-            // Calculate gradient position
-            let gradientDir = uniforms.gradientEndPoint - uniforms.gradientStartPoint;
-            let gradientLen = length(gradientDir);
-            var t: f32 = 0.0;
-            if (gradientLen > 0.0001) {
-                let normalizedDir = gradientDir / gradientLen;
-                let relativePos = input.texCoord - uniforms.gradientStartPoint;
-                t = dot(relativePos, normalizedDir) / gradientLen;
+            let t = gradientParameter(input.texCoord);
+            if (t < 0.0) {
+                discard;
             }
 
             // Sample gradient

@@ -55,6 +55,7 @@ nonisolated(unsafe) var replicatorProbeResult: String = "pending"
 nonisolated(unsafe) var compositionProbeResult: String = "pending"
 nonisolated(unsafe) var transformDepthProbeResult: String = "pending"
 nonisolated(unsafe) var shapeFillRuleProbeResult: String = "pending"
+nonisolated(unsafe) var gradientTypeProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -178,6 +179,7 @@ public func setup() {
             compositionProbeResult = "pending"
             transformDepthProbeResult = "pending"
             shapeFillRuleProbeResult = "pending"
+            gradientTypeProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -399,6 +401,9 @@ func installHarness() {
         })
         h.expose("getShapeFillRuleProbeResult", returning: {
             .string(shapeFillRuleProbeResult)
+        })
+        h.expose("getGradientTypeProbeResult", returning: {
+            .string(gradientTypeProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -4274,6 +4279,98 @@ func installHarness() {
                 unsupported.removeFromSuperlayer()
                 shadow.removeFromSuperlayer()
                 stroke.removeFromSuperlayer()
+                CAAnimationEngine.shared.renderFrame()
+            }
+        })
+        h.expose("beginGradientTypeProbe", action: {
+            Task { @MainActor in
+                guard let root = rootLayerRef,
+                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                    gradientTypeProbeResult = "error: renderer unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+
+                let colors: [Any] = [
+                    CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                    CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+                    CGColor(red: 0, green: 0, blue: 1, alpha: 1),
+                ]
+
+                func makeGradient(
+                    position: CGPoint,
+                    type: CAGradientLayerType,
+                    startPoint: CGPoint,
+                    endPoint: CGPoint
+                ) -> CAGradientLayer {
+                    let layer = CAGradientLayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = position
+                    layer.colors = colors
+                    layer.locations = [0, 0.5, 1]
+                    layer.startPoint = startPoint
+                    layer.endPoint = endPoint
+                    layer.type = type
+                    layer.zPosition = 100
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                let axial = makeGradient(
+                    position: CGPoint(x: 50, y: 150),
+                    type: .axial,
+                    startPoint: CGPoint(x: 0.25, y: 0.5),
+                    endPoint: CGPoint(x: 0.75, y: 0.5)
+                )
+                let radial = makeGradient(
+                    position: CGPoint(x: 140, y: 150),
+                    type: .radial,
+                    startPoint: CGPoint(x: 0.5, y: 0.5),
+                    endPoint: CGPoint(x: 0.9, y: 0.9)
+                )
+                let conic = makeGradient(
+                    position: CGPoint(x: 250, y: 150),
+                    type: .conic,
+                    startPoint: CGPoint(x: 0.5, y: 0.5),
+                    endPoint: CGPoint(x: 1, y: 0.5)
+                )
+                let unsupported = makeGradient(
+                    position: CGPoint(x: 350, y: 150),
+                    type: CAGradientLayerType(rawValue: "future-gradient"),
+                    startPoint: CGPoint(x: 0, y: 0.5),
+                    endPoint: CGPoint(x: 1, y: 0.5)
+                )
+                CATransaction.commit()
+
+                CAAnimationEngine.shared.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 40, y: 150),
+                        CGPoint(x: 50, y: 150),
+                        CGPoint(x: 60, y: 150),
+                        CGPoint(x: 140, y: 150),
+                        CGPoint(x: 148, y: 150),
+                        CGPoint(x: 156, y: 150),
+                        CGPoint(x: 266, y: 149),
+                        CGPoint(x: 250, y: 134),
+                        CGPoint(x: 234, y: 150),
+                        CGPoint(x: 250, y: 166),
+                        CGPoint(x: 350, y: 150),
+                    ])
+                    let pixelText = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                    gradientTypeProbeResult = "\(pixelText),failures=\(renderer.gradientRenderFailureCount)"
+                } catch {
+                    gradientTypeProbeResult = "error: \(error)"
+                }
+
+                axial.removeFromSuperlayer()
+                radial.removeFromSuperlayer()
+                conic.removeFromSuperlayer()
+                unsupported.removeFromSuperlayer()
                 CAAnimationEngine.shared.renderFrame()
             }
         })

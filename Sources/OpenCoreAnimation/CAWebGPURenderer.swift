@@ -802,6 +802,10 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var shapeRenderFailureCount: Int = 0
 
+    /// Number of gradient draws rejected because their configuration was invalid.
+    @_spi(RendererDiagnostics)
+    public private(set) var gradientRenderFailureCount: Int = 0
+
     /// Number of shape-fill draw calls encoded in the latest frame.
     @_spi(RendererDiagnostics)
     public private(set) var shapeFillDrawCount: Int = 0
@@ -3962,6 +3966,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         prerenderedShadows.removeAll(keepingCapacity: false)
         shadowRenderFailureCount = 0
         shapeRenderFailureCount = 0
+        gradientRenderFailureCount = 0
         shapeFillDrawCount = 0
         shapeFillVertexCount = 0
         rasterizationFailureCount = 0
@@ -7142,6 +7147,24 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let uniformBuffer = uniformBuffer,
               let colors = gradientLayer.colors, !colors.isEmpty else { return }
 
+        let configuration: GradientRenderConfiguration
+        do {
+            configuration = try GradientRenderConfiguration(
+                type: gradientLayer.type,
+                colors: colors,
+                locations: gradientLayer.locations,
+                startPoint: gradientLayer.startPoint,
+                endPoint: gradientLayer.endPoint
+            )
+        } catch {
+            gradientRenderFailureCount += 1
+            return
+        }
+
+        // Other foreground renderers select textured or additive pipelines.
+        // Gradients always return to the solid pipeline before binding uniforms.
+        renderPass.setPipeline(stencilAwarePipeline())
+
         // Create scale matrix for layer bounds
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(Float(gradientLayer.bounds.width), 0, 0, 0),
@@ -7159,22 +7182,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
             cornerRadius: Float(gradientLayer.cornerRadius),
             layerSize: SIMD2<Float>(Float(gradientLayer.bounds.width), Float(gradientLayer.bounds.height)),
             borderWidth: 0,
-            renderMode: 2.0,  // Gradient mode
+            renderMode: configuration.renderMode,
             gradientStartPoint: SIMD2<Float>(Float(gradientLayer.startPoint.x), Float(gradientLayer.startPoint.y)),
             gradientEndPoint: SIMD2<Float>(Float(gradientLayer.endPoint.x), Float(gradientLayer.endPoint.y)),
-            gradientColorCount: Float(min(colors.count, kMaxGradientStops)),
+            gradientColorCount: Float(configuration.colors.count),
             edgeAntialiasingMask: gradientLayer.edgeAntialiasingMaskValue,
             cornerRadii: gradientLayer.cornerRadiiComponents
         )
 
         // Extract gradient colors
         var gradientColors: [SIMD4<Float>] = []
-        for colorAny in colors.prefix(kMaxGradientStops) {
-            if let cgColor = colorAny as? CGColor {
-                gradientColors.append(replicatedColor(rgbaComponents(cgColor)))
-            } else {
-                gradientColors.append(SIMD4<Float>(0, 0, 0, 1))
-            }
+        for color in configuration.colors {
+            gradientColors.append(replicatedColor(rgbaComponents(color)))
         }
 
         // Pad to 8 colors
@@ -7188,16 +7207,7 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         )
 
         // Extract or generate locations
-        let colorCount = min(colors.count, kMaxGradientStops)
-        var locations: [Float] = []
-        if let providedLocations = gradientLayer.locations, !providedLocations.isEmpty {
-            locations = providedLocations.prefix(kMaxGradientStops).map { Float($0) }
-        } else {
-            // Generate evenly spaced locations
-            for i in 0..<colorCount {
-                locations.append(Float(i) / Float(max(colorCount - 1, 1)))
-            }
-        }
+        var locations = configuration.locations
 
         // Pad locations to 8
         while locations.count < kMaxGradientStops {

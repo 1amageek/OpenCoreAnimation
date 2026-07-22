@@ -26,7 +26,7 @@ public struct CARendererUniforms {
     public var cornerRadius: Float
     public var layerSize: SIMD2<Float>
     public var borderWidth: Float
-    public var renderMode: Float  // 0 = fill, 1 = border, 2 = gradient
+    public var renderMode: Float  // 0 = fill, 1 = border, 2 = axial, 3 = radial, 4 = conic
     public var gradientStartPoint: SIMD2<Float>
     public var gradientEndPoint: SIMD2<Float>
     public var gradientColorCount: Float
