@@ -78,4 +78,16 @@ open class CATransition: CAAnimation {
             self.sourceLayerSnapshot = source.sourceLayerSnapshot
         }
     }
+
+    /// Returns the default value for a transition property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "type":
+            return CATransitionType.fade
+        case "endProgress":
+            return Float(1)
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
 }

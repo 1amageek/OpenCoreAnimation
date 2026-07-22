@@ -226,23 +226,11 @@ open class CAAnimation: CAMediaTiming, CAAction {
     /// - Returns: The default value for the property, or `nil` if no default is defined.
     open class func defaultValue(forKey key: String) -> Any? {
         switch key {
-        case "beginTime":
-            return CFTimeInterval(0)
-        case "timeOffset":
-            return CFTimeInterval(0)
-        case "repeatCount":
-            return Float(0)
-        case "repeatDuration":
-            return CFTimeInterval(0)
-        case "duration":
-            return CFTimeInterval(0)
         case "speed":
             return Float(1)
-        case "autoreverses":
-            return false
         case "fillMode":
             return CAMediaTimingFillMode.removed
-        case "isRemovedOnCompletion":
+        case "removedOnCompletion":
             return true
         default:
             return nil

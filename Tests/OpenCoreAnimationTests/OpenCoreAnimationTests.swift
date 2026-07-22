@@ -901,12 +901,13 @@ struct CAAnimationTests {
         #expect(animation.isRemovedOnCompletion == true)
     }
 
-    @Test("Default value for key returns correct values")
+    @Test("Stored default values use QuartzCore key semantics")
     func defaultValueForKey() {
-        #expect(CAAnimation.defaultValue(forKey: "duration") as? CFTimeInterval == 0)
+        #expect(CAAnimation.defaultValue(forKey: "duration") == nil)
         #expect(CAAnimation.defaultValue(forKey: "speed") as? Float == 1)
-        #expect(CAAnimation.defaultValue(forKey: "autoreverses") as? Bool == false)
-        #expect(CAAnimation.defaultValue(forKey: "isRemovedOnCompletion") as? Bool == true)
+        #expect(CAAnimation.defaultValue(forKey: "autoreverses") == nil)
+        #expect(CAAnimation.defaultValue(forKey: "removedOnCompletion") as? Bool == true)
+        #expect(CAAnimation.defaultValue(forKey: "isRemovedOnCompletion") == nil)
     }
 
     @Test("Effective base duration uses default when duration is 0")

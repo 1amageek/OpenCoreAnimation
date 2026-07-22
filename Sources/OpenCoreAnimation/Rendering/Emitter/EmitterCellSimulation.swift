@@ -21,9 +21,9 @@ internal enum EmitterCellSimulation {
         }
         guard cell.beginTime.isFinite,
               cell.timeOffset.isFinite,
-              cell.duration.isFinite,
-              cell.repeatDuration.isFinite,
-              cell.repeatCount.isFinite,
+              isFiniteOrPositiveInfinity(cell.duration),
+              isFiniteOrPositiveInfinity(cell.repeatDuration),
+              isFiniteOrPositiveInfinity(cell.repeatCount),
               cell.speed.isFinite else {
             throw EmitterCellSimulationError.nonFiniteTiming
         }
@@ -39,14 +39,16 @@ internal enum EmitterCellSimulation {
         }
 
         let activeUpperBound: CFTimeInterval
-        if cell.duration > 0 {
+        if cell.duration == .infinity {
+            activeUpperBound = .infinity
+        } else if cell.duration > 0 {
             activeUpperBound = CAMediaTimingEvaluator.activeDuration(
                 duration: cell.duration,
                 repeatCount: cell.repeatCount,
                 repeatDuration: cell.repeatDuration,
                 autoreverses: cell.autoreverses
             )
-            guard activeUpperBound.isFinite else {
+            guard isFiniteOrPositiveInfinity(activeUpperBound) else {
                 throw EmitterCellSimulationError.nonFiniteTiming
             }
         } else {
@@ -62,6 +64,10 @@ internal enum EmitterCellSimulation {
             throw EmitterCellSimulationError.nonFiniteTiming
         }
         return Float(overlap)
+    }
+
+    private static func isFiniteOrPositiveInfinity<T: BinaryFloatingPoint>(_ value: T) -> Bool {
+        value.isFinite || value == .infinity
     }
 
     /// Rotates a child cell's local emission direction into its parent's direction frame.

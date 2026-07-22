@@ -47,7 +47,7 @@ open class CAEmitterCell: CAMediaTiming {
     // MARK: - Color Properties
 
     /// The color of each emitted object.
-    open var color: CGColor?
+    open var color: CGColor? = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
 
     /// The amount by which the red color component of the cell can vary.
     open var redRange: Float = 0
@@ -122,13 +122,16 @@ open class CAEmitterCell: CAMediaTiming {
     /// A Boolean indicating whether or not cells from this emitter are rendered.
     open var isEnabled: Bool = true
 
+    /// An optional dictionary of style properties for the cell.
+    open var style: [AnyHashable: Any]?
+
     // MARK: - CAMediaTiming
 
     open var beginTime: CFTimeInterval = 0
     open var timeOffset: CFTimeInterval = 0
     open var repeatCount: Float = 0
     open var repeatDuration: CFTimeInterval = 0
-    open var duration: CFTimeInterval = 0
+    open var duration: CFTimeInterval = .infinity
     open var speed: Float = 1
     open var autoreverses: Bool = false
     open var fillMode: CAMediaTimingFillMode = .removed
@@ -141,72 +144,24 @@ open class CAEmitterCell: CAMediaTiming {
     /// - Returns: The default value for the property, or `nil` if no default is defined.
     open class func defaultValue(forKey key: String) -> Any? {
         switch key {
-        // Cell Content
         case "contentsRect":
             return CGRect(x: 0, y: 0, width: 1, height: 1)
         case "contentsScale":
             return CGFloat(1.0)
         case "magnificationFilter", "minificationFilter":
             return CALayerContentsFilter.linear.rawValue
-        case "minificationFilterBias":
-            return Float(0)
-
-        // Emitter Behavior
-        case "birthRate":
-            return Float(0)
-        case "lifetime":
-            return Float(0)
-        case "lifetimeRange":
-            return Float(0)
-
-        // Color Properties
-        case "redRange", "greenRange", "blueRange", "alphaRange":
-            return Float(0)
-        case "redSpeed", "greenSpeed", "blueSpeed", "alphaSpeed":
-            return Float(0)
-
-        // Geometry
-        case "velocity":
-            return CGFloat(0)
-        case "velocityRange":
-            return CGFloat(0)
-        case "xAcceleration", "yAcceleration", "zAcceleration":
-            return CGFloat(0)
+        case "color":
+            return CGColor(red: 1, green: 1, blue: 1, alpha: 1)
         case "scale":
             return CGFloat(1)
-        case "scaleRange":
-            return CGFloat(0)
-        case "scaleSpeed":
-            return CGFloat(0)
-        case "spin":
-            return CGFloat(0)
-        case "spinRange":
-            return CGFloat(0)
-        case "emissionLatitude", "emissionLongitude", "emissionRange":
-            return CGFloat(0)
-
-        // Identifying
-        case "isEnabled":
+        case "enabled":
             return true
-
-        // CAMediaTiming
-        case "beginTime":
-            return CFTimeInterval(0)
-        case "timeOffset":
-            return CFTimeInterval(0)
-        case "repeatCount":
-            return Float(0)
-        case "repeatDuration":
-            return CFTimeInterval(0)
         case "duration":
-            return CFTimeInterval(0)
+            return CFTimeInterval.infinity
         case "speed":
             return Float(1)
-        case "autoreverses":
-            return false
         case "fillMode":
             return CAMediaTimingFillMode.removed
-
         default:
             return nil
         }

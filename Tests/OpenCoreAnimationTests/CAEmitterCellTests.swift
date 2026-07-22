@@ -21,7 +21,7 @@ struct CAEmitterCellTests {
             CAEmitterCell.defaultValue(forKey: "minificationFilter") as? String
                 == CALayerContentsFilter.linear.rawValue
         )
-        #expect(CAEmitterCell.defaultValue(forKey: "minificationFilterBias") as? Float == 0)
+        #expect(CAEmitterCell.defaultValue(forKey: "minificationFilterBias") == nil)
     }
 
     @Test("Content sampling properties preserve configured values")

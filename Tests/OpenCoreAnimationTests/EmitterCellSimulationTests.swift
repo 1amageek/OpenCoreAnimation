@@ -3,13 +3,64 @@ import Testing
 
 @Suite("Emitter Cell Simulation Tests")
 struct EmitterCellSimulationTests {
-    @Test("Default zero duration emits continuously after begin time")
+    @Test("Default infinite duration emits continuously after begin time")
     func unboundedDefaultTiming() throws {
         let cell = CAEmitterCell()
         cell.beginTime = 1
 
+        #expect(cell.duration == .infinity)
         #expect(try EmitterCellSimulation.activeEmissionDelta(for: cell, from: 0, to: 0.5) == 0)
         #expect(try EmitterCellSimulation.activeEmissionDelta(for: cell, from: 0.5, to: 1.5) == 0.5)
+    }
+
+    @Test("Positive infinite repeat values keep emission active")
+    func infiniteRepeatTiming() throws {
+        let repeatCountCell = CAEmitterCell()
+        repeatCountCell.duration = 1
+        repeatCountCell.repeatCount = .infinity
+
+        let repeatDurationCell = CAEmitterCell()
+        repeatDurationCell.duration = 1
+        repeatDurationCell.repeatDuration = .infinity
+
+        #expect(
+            try EmitterCellSimulation.activeEmissionDelta(
+                for: repeatCountCell,
+                from: 100,
+                to: 101
+            ) == 1
+        )
+        #expect(
+            try EmitterCellSimulation.activeEmissionDelta(
+                for: repeatDurationCell,
+                from: 100,
+                to: 101
+            ) == 1
+        )
+    }
+
+    @Test("Invalid non-finite timing is reported as an error")
+    func invalidNonFiniteTiming() {
+        let notANumberCell = CAEmitterCell()
+        notANumberCell.duration = .nan
+
+        let negativeInfinityCell = CAEmitterCell()
+        negativeInfinityCell.repeatDuration = -.infinity
+
+        #expect(throws: EmitterCellSimulationError.nonFiniteTiming) {
+            try EmitterCellSimulation.activeEmissionDelta(
+                for: notANumberCell,
+                from: 0,
+                to: 1
+            )
+        }
+        #expect(throws: EmitterCellSimulationError.nonFiniteTiming) {
+            try EmitterCellSimulation.activeEmissionDelta(
+                for: negativeInfinityCell,
+                from: 0,
+                to: 1
+            )
+        }
     }
 
     @Test("Speed and finite repeat duration clip active emission time")

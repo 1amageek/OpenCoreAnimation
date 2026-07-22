@@ -59,4 +59,14 @@ open class CAKeyframeAnimation: CAPropertyAnimation {
             self.rotationMode = source.rotationMode
         }
     }
+
+    /// Returns the default value for a keyframe animation property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "calculationMode":
+            return CAAnimationCalculationMode.linear
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
 }

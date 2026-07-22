@@ -61,6 +61,20 @@ open class CASpringAnimation: CABasicAnimation {
         }
     }
 
+    /// Returns the default value for a spring animation property.
+    open override class func defaultValue(forKey key: String) -> Any? {
+        switch key {
+        case "mass":
+            return CGFloat(1)
+        case "stiffness":
+            return CGFloat(100)
+        case "damping":
+            return CGFloat(10)
+        default:
+            return super.defaultValue(forKey: key)
+        }
+    }
+
     /// The estimated duration required for the spring system to be considered at rest.
     ///
     /// This is calculated based on the spring parameters. The spring is considered
