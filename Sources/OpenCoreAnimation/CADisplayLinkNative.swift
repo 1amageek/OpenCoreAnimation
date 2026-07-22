@@ -27,7 +27,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     // MARK: - Properties
 
     /// The time interval between screen refresh updates.
-    open private(set) var duration: CFTimeInterval = 1.0 / 60.0
+    open private(set) var duration: CFTimeInterval = 0
 
     /// The time value associated with the last frame that was displayed.
     open private(set) var timestamp: CFTimeInterval = 0
@@ -69,6 +69,11 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     private var isInvalidated = false
     private var timer: Timer?
 
+    /// Native rendering is a test path, so use a stable nominal 60 Hz display
+    /// while preserving QuartzCore's distinction between maximum refresh
+    /// duration and the selected callback interval.
+    private let maximumRefreshInterval: CFTimeInterval = 1.0 / 60.0
+
     private var isRunning: Bool {
         !isInvalidated && !registrations.isEmpty
     }
@@ -81,7 +86,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         if let frameRate = preferredFrameRateRange.effectiveFrameRate {
             return 1.0 / CFTimeInterval(frameRate)
         }
-        return duration
+        return maximumRefreshInterval
     }
 
     // MARK: - Initialization
@@ -109,14 +114,17 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     ///   - mode: The run loop mode.
     open func add(to runloop: RunLoop, forMode mode: RunLoop.Mode) {
         guard !isInvalidated else { return }
+        let wasRunning = isRunning
         let registration = Registration(
             runLoopID: ObjectIdentifier(runloop),
             mode: mode
         )
         guard registrations[registration] == nil else { return }
         registrations[registration] = runloop
-        if !isPaused {
+        if !wasRunning && !isPaused {
             startTimer()
+        } else if let timer, !isPaused {
+            runloop.add(timer, forMode: mode)
         }
     }
 
@@ -136,13 +144,17 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     ///   - mode: The run loop mode to remove.
     open func remove(from runloop: RunLoop, forMode mode: RunLoop.Mode) {
         guard !isInvalidated else { return }
-        registrations.removeValue(forKey: Registration(
+        let registration = Registration(
             runLoopID: ObjectIdentifier(runloop),
             mode: mode
-        ))
+        )
+        guard registrations.removeValue(forKey: registration) != nil else { return }
         if registrations.isEmpty || isPaused {
             stopTimer()
         } else {
+            // Foundation Timer cannot be detached from one run-loop mode.
+            // Rebuild the single timer from the surviving registrations so a
+            // removed mode can no longer deliver callbacks.
             startTimer()
         }
     }
@@ -159,8 +171,9 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
                 guard let self else { return }
                 guard self.isRunning && !self.isPaused else { return }
 
+                self.duration = self.maximumRefreshInterval
                 self.timestamp = CACurrentMediaTime()
-                self.targetTimestamp = self.timestamp + self.duration
+                self.targetTimestamp = self.timestamp + interval
 
                 if let delegate = self.target as? CADisplayLinkDelegate {
                     delegate.displayLinkDidFire(self)

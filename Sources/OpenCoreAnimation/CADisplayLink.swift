@@ -39,12 +39,20 @@ public struct CAFrameRateRange: Equatable, Sendable {
     public static let `default` = CAFrameRateRange()
 
     internal var effectiveFrameRate: Float? {
-        if let preferred, preferred > 0 {
-            return preferred
+        func validRate(_ value: Float?) -> Float? {
+            guard let value, value.isFinite, value > 0 else { return nil }
+            return value
         }
-        if maximum > 0 {
-            return maximum
+
+        if var resolved = validRate(preferred) {
+            if let minimum = validRate(minimum) {
+                resolved = max(resolved, minimum)
+            }
+            if let maximum = validRate(maximum) {
+                resolved = min(resolved, maximum)
+            }
+            return resolved
         }
-        return nil
+        return validRate(maximum) ?? validRate(minimum)
     }
 }

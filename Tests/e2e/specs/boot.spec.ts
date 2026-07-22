@@ -262,7 +262,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginDisplayLinkProbe();
         await expect.poll(() => h.getDisplayLinkProbeResult(), { timeout: 10_000 }).toBe(
-            "started=true,retained=true,stopped=true,duration=true"
+            "started=true,retained=true,stopped=true,duration=true,cadence=true,paused=true,resumed=true"
         );
 
         await h.exerciseUnsupportedTransitionFilter();

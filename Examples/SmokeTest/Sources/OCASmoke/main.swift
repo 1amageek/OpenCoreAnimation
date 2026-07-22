@@ -133,8 +133,22 @@ final class DelegateDisplayProbeDelegate: CALayerDelegate {
 @MainActor
 final class DisplayLinkProbeTarget: CADisplayLinkDelegate {
     private(set) var callbackCount = 0
+    private(set) var timingIsValid = true
+    private(set) var selectedIntervalExceedsRefreshDuration = true
+    private var previousTimestamp: CFTimeInterval?
 
     func displayLinkDidFire(_ displayLink: CADisplayLink) {
+        let selectedInterval = displayLink.targetTimestamp - displayLink.timestamp
+        if displayLink.timestamp < 0
+            || displayLink.duration <= 0
+            || selectedInterval <= 0
+            || previousTimestamp.map({ displayLink.timestamp <= $0 }) == true {
+            timingIsValid = false
+        }
+        if selectedInterval < displayLink.duration * 1.5 {
+            selectedIntervalExceedsRefreshDuration = false
+        }
+        previousTimestamp = displayLink.timestamp
         callbackCount += 1
     }
 }
@@ -4284,12 +4298,24 @@ func installHarness() {
                     target: target,
                     selector: Selector("displayLinkDidFire")
                 )
+                displayLink.preferredFrameRateRange = CAFrameRateRange(
+                    minimum: 30,
+                    maximum: 60,
+                    preferred: 30
+                )
                 displayLink.add(to: .main, forMode: .default)
                 displayLink.add(to: .main, forMode: .common)
 
                 do {
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await Task.sleep(for: .milliseconds(140))
                     let initialCount = target.callbackCount
+
+                    displayLink.isPaused = true
+                    try await Task.sleep(for: .milliseconds(80))
+                    let pausedCount = target.callbackCount
+                    displayLink.isPaused = false
+                    try await Task.sleep(for: .milliseconds(100))
+                    let resumedCount = target.callbackCount
 
                     displayLink.remove(from: .main, forMode: .default)
                     try await Task.sleep(for: .milliseconds(100))
@@ -4302,9 +4328,12 @@ func installHarness() {
 
                     displayLinkProbeResult = [
                         "started=\(initialCount > 0)",
-                        "retained=\(retainedModeCount > initialCount)",
+                        "retained=\(retainedModeCount > resumedCount)",
                         "stopped=\(finalCount == stoppedCount)",
                         "duration=\(displayLink.duration > 0)",
+                        "cadence=\(target.timingIsValid && target.selectedIntervalExceedsRefreshDuration)",
+                        "paused=\(pausedCount == initialCount)",
+                        "resumed=\(resumedCount > pausedCount)",
                     ].joined(separator: ",")
                 } catch {
                     displayLinkProbeResult = "error: \(error)"

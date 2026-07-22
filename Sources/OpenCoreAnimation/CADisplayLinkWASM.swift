@@ -44,7 +44,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     // MARK: - Properties
 
     /// The time interval between screen refresh updates.
-    open private(set) var duration: CFTimeInterval = 1.0 / 60.0
+    open private(set) var duration: CFTimeInterval = 0
 
     /// The time value associated with the last frame that was displayed.
     open private(set) var timestamp: CFTimeInterval = 0
@@ -73,6 +73,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         didSet {
             if isRunning {
                 lastDispatchedTimestamp = 0
+                hasDispatchedFrame = false
             }
         }
     }
@@ -102,8 +103,19 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     /// The timestamp of the last frame that was dispatched to the delegate.
     private var lastDispatchedTimestamp: CFTimeInterval = 0
 
+    /// Distinguishes a real first frame from a browser timestamp of exactly zero.
+    private var hasDispatchedFrame = false
+
     /// Browser refresh timestamp used to measure the physical rAF cadence.
     private var previousRefreshTimestamp: CFTimeInterval?
+
+    /// Sliding samples estimate the fastest current physical refresh interval.
+    /// Taking the minimum prevents a delayed callback from redefining the
+    /// display's maximum refresh rate, while the bounded window permits a
+    /// runtime refresh-rate change to converge.
+    private var refreshIntervalSamples: [CFTimeInterval] = []
+
+    private let nominalRefreshInterval: CFTimeInterval = 1.0 / 60.0
 
     /// The minimum time interval between frame dispatches based on preferred frame rate.
     private var minimumFrameInterval: CFTimeInterval {
@@ -111,6 +123,16 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
             return 1.0 / CFTimeInterval(frameRate)
         }
         return 0
+    }
+
+    /// Resolves the requested callback interval to a whole number of physical
+    /// refreshes, matching display-link factor selection.
+    private var callbackInterval: CFTimeInterval {
+        let refreshInterval = duration > 0 ? duration : nominalRefreshInterval
+        let requestedInterval = minimumFrameInterval
+        guard requestedInterval > refreshInterval else { return refreshInterval }
+        let refreshCount = max(1, Int((requestedInterval / refreshInterval).rounded()))
+        return refreshInterval * CFTimeInterval(refreshCount)
     }
 
     // MARK: - Initialization
@@ -196,20 +218,33 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         let currentTimestamp = timestampMilliseconds / 1000.0
         if let previousRefreshTimestamp {
             let measuredDuration = currentTimestamp - previousRefreshTimestamp
-            if measuredDuration > 0 {
-                duration = measuredDuration
+            if measuredDuration.isFinite, measuredDuration > 0 {
+                refreshIntervalSamples.append(measuredDuration)
+                if refreshIntervalSamples.count > 8 {
+                    refreshIntervalSamples.removeFirst(
+                        refreshIntervalSamples.count - 8
+                    )
+                }
+                if let fastestInterval = refreshIntervalSamples.min() {
+                    duration = fastestInterval
+                }
             }
+        } else {
+            duration = nominalRefreshInterval
         }
         previousRefreshTimestamp = currentTimestamp
-        timestamp = currentTimestamp
-        targetTimestamp = currentTimestamp + duration
 
-        let minInterval = minimumFrameInterval
-        let shouldDispatch = minInterval == 0
-            || currentTimestamp - lastDispatchedTimestamp >= minInterval
+        let resolvedCallbackInterval = callbackInterval
+        let tolerance = min(duration * 0.25, resolvedCallbackInterval * 0.1)
+        let shouldDispatch = !hasDispatchedFrame
+            || currentTimestamp - lastDispatchedTimestamp
+                >= resolvedCallbackInterval - tolerance
 
         if shouldDispatch {
+            hasDispatchedFrame = true
             lastDispatchedTimestamp = currentTimestamp
+            timestamp = currentTimestamp
+            targetTimestamp = currentTimestamp + resolvedCallbackInterval
             if let delegate = target as? CADisplayLinkDelegate {
                 delegate.displayLinkDidFire(self)
             }
@@ -233,6 +268,9 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         }
         animationFrameCallback = nil
         previousRefreshTimestamp = nil
+        refreshIntervalSamples.removeAll(keepingCapacity: true)
+        lastDispatchedTimestamp = 0
+        hasDispatchedFrame = false
     }
 }
 
