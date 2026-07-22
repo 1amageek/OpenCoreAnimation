@@ -3940,6 +3940,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
             recordFrameRenderFailure(.depthTextureViewUnavailable)
             return
         }
+        guard let layerFilterProcessor else {
+            recordFrameRenderFailure(.layerFilterProcessorUnavailable)
+            return
+        }
+        guard let rasterizationCache else {
+            recordFrameRenderFailure(.rasterizationCacheUnavailable)
+            return
+        }
 
         guard prepareDynamicRangeOutput(for: rootLayer) else { return }
 
@@ -4074,7 +4082,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
             far: 1000
         )
 
-        prerenderTransitions(rootLayer, encoder: encoder)
+        prerenderTransitions(
+            rootLayer,
+            device: device,
+            pipeline: pipeline,
+            encoder: encoder
+        )
 
         // A shadow silhouette can depend on rendered mask-tree alpha. Prepare
         // those filtered/masked captures without recursively drawing shadows,
@@ -4083,6 +4096,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
             suppressShadowRendering = true
             prerenderFilteredLayers(
                 rootLayer,
+                device: device,
+                pipeline: pipeline,
+                depthTextureView: depthTextureView,
                 encoder: encoder,
                 projectionMatrix: projectionMatrix
             )
@@ -4090,10 +4106,24 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
 
         // Pre-render shadows with 2-pass Gaussian blur.
-        prerenderShadows(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
+        prerenderShadows(
+            rootLayer,
+            device: device,
+            pipeline: pipeline,
+            depthTextureView: depthTextureView,
+            encoder: encoder,
+            projectionMatrix: projectionMatrix
+        )
 
         // Pre-render layers with blur filters
-        prerenderFilteredLayers(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
+        prerenderFilteredLayers(
+            rootLayer,
+            device: device,
+            pipeline: pipeline,
+            depthTextureView: depthTextureView,
+            encoder: encoder,
+            projectionMatrix: projectionMatrix
+        )
 
         prepareDeferredCompositionRasterizations(
             rootLayer,
@@ -4101,7 +4131,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
 
         // Pre-render shouldRasterize subtrees (R3.2 / R3.3)
-        prerenderRasterizedLayers(rootLayer, encoder: encoder, projectionMatrix: projectionMatrix)
+        prerenderRasterizedLayers(
+            rootLayer,
+            device: device,
+            pipeline: pipeline,
+            cache: rasterizationCache,
+            encoder: encoder,
+            projectionMatrix: projectionMatrix
+        )
 
         // Use root layer's backgroundColor as clear color (for SKScene background)
         // This prevents SKScene's backgroundColor from rendering at zPosition=0
@@ -4136,6 +4173,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         prerenderBackdropCompositions(
             rootLayer,
+            device: device,
+            pipeline: pipeline,
+            depthTextureView: depthTextureView,
+            processor: layerFilterProcessor,
             clearColor: clearColor,
             encoder: encoder,
             projectionMatrix: projectionMatrix
@@ -4144,6 +4185,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
             capturesOnlyDeferredCompositionRasterizations = true
             prerenderRasterizedLayers(
                 rootLayer,
+                device: device,
+                pipeline: pipeline,
+                cache: rasterizationCache,
                 encoder: encoder,
                 projectionMatrix: projectionMatrix
             )
@@ -4221,10 +4265,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // than 6 frames (~100 ms @ 60 Hz) and any overflow above the
         // viewport-derived byte budget. Idle eviction first so the
         // budget pass operates on the trimmed live set.
-        if let cache = rasterizationCache {
-            cache.evictIdle(currentFrame: CALayer._currentFrameToken, olderThan: 6)
-            cache.evictToBudget()
-        }
+        rasterizationCache.evictIdle(
+            currentFrame: CALayer._currentFrameToken,
+            olderThan: 6
+        )
+        rasterizationCache.evictToBudget()
         prerasterizedTextures.removeAll(keepingCapacity: true)
         emitterLayerStates = emitterLayerStates.filter {
             activeEmitterLayerIDs.contains($0.key)
@@ -5357,9 +5402,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     private func prerenderTransitions(
         _ rootLayer: CALayer,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
         encoder: GPUCommandEncoder
     ) {
-        guard let device, let pipeline else { return }
         var visited: Set<ObjectIdentifier> = []
 
         func collect(_ layer: CALayer) {
@@ -8579,6 +8625,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     private func prerenderShadows(
         _ rootLayer: CALayer,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        depthTextureView: GPUTextureView,
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
@@ -8597,10 +8646,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         reportedShadowRenderFailureKeys.formIntersection(targetRenderKeys)
         failedShadowDisplayKeys.formIntersection(targetRenderKeys)
 
-        guard let device = device,
-              let pipeline = pipeline,
-              let depthTextureView = depthTextureView,
-              let bindGroupLayout = bindGroupLayout,
+        guard let bindGroupLayout = bindGroupLayout,
               let dummyGradientStopBuffer = dummyGradientStopBuffer,
               let shadowMaskPipeline = shadowMaskPipeline,
               let shadowBlurHorizontalPipeline = shadowBlurHorizontalPipeline,
@@ -8965,13 +9011,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// already-filtered output of its filtered descendants.
     private func prerenderFilteredLayers(
         _ rootLayer: CALayer,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        depthTextureView: GPUTextureView,
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
-        guard let device = device,
-              let pipeline = pipeline,
-              let depthTextureView = depthTextureView else { return }
-
         var targets: [LayerPrepassTarget] = []
         var visitedRenderKeys: Set<LayerRenderKey> = []
         collectFilteredLayers(
@@ -10044,15 +10089,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     private func prerenderBackdropCompositions(
         _ rootLayer: CALayer,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        depthTextureView: GPUTextureView,
+        processor: CIWebGPUFilterProcessor,
         clearColor: GPUColor,
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
-        guard let device,
-              let pipeline,
-              let depthTextureView,
-              let processor = layerFilterProcessor else { return }
-
         let roots = backdropCompositionRoots(
             rootLayer,
             projectionMatrix: projectionMatrix,
@@ -10101,6 +10145,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 if let previousDepth, compositionTarget.depth < previousDepth {
                     prerenderFilteredLayers(
                         rootLayer,
+                        device: device,
+                        pipeline: pipeline,
+                        depthTextureView: depthTextureView,
                         encoder: encoder,
                         projectionMatrix: projectionMatrix
                     )
@@ -10433,6 +10480,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 // that became available inside detached content masks.
                 prerenderFilteredLayers(
                     rootLayer,
+                    device: device,
+                    pipeline: pipeline,
+                    depthTextureView: depthTextureView,
                     encoder: encoder,
                     projectionMatrix: projectionMatrix
                 )
@@ -10576,13 +10626,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// opaque-clear contract; automatic transform flattening clears transparent.
     private func prerenderRasterizedLayers(
         _ rootLayer: CALayer,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        cache: RasterizationCache<GPUTexture>,
         encoder: GPUCommandEncoder,
         projectionMatrix: Matrix4x4
     ) {
-        guard let device = device,
-              let pipeline = pipeline,
-              let cache = rasterizationCache else { return }
-
         // Frame token already bumped at the top of `render`; use it for
         // both lookup `lastUsedFrame` updates and insert tagging.
         let frameToken = CALayer._currentFrameToken

@@ -11,4 +11,6 @@ public enum CAWebGPUFrameRenderFailure: Error, Equatable, Sendable {
     case baseBindGroupUnavailable
     case depthTextureUnavailable
     case depthTextureViewUnavailable
+    case layerFilterProcessorUnavailable
+    case rasterizationCacheUnavailable
 }
