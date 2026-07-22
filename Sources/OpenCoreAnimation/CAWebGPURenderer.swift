@@ -3611,7 +3611,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Create shadow mask pipeline (same as main pipeline but WITHOUT depth/stencil).
         // The shadow mask render pass has no depth attachment, so using the main pipeline
         // (which has depthStencil state) would cause a mismatch.
-        guard let bindGroupLayout = bindGroupLayout else { return }
+        guard let bindGroupLayout = bindGroupLayout else {
+            throw CARendererError.pipelineCreationFailed
+        }
         let maskPipelineLayout = device.createPipelineLayout(descriptor: GPUPipelineLayoutDescriptor(
             bindGroupLayouts: [bindGroupLayout]
         ))
