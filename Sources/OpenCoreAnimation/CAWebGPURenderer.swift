@@ -4992,8 +4992,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
     ) {
-        guard let device = device,
-              let bindGroup = bindGroup else { return }
+        guard let device else {
+            recordFrameRenderFailure(.deviceUnavailable)
+            return
+        }
+        guard let bindGroup else {
+            recordFrameRenderFailure(.baseBindGroupUnavailable)
+            return
+        }
 
         // Get the presentation layer for animated values, fall back to model layer
         // This is critical for animations to be visible - the presentation layer
