@@ -46,16 +46,17 @@ extension CAShapeLayer: CALayerContextRenderable {
                 strokeStart: strokeStart,
                 strokeEnd: strokeEnd
             )
-        } catch ShapeStrokeTessellationError.invalidGeometry {
-            throw .invalidShapeStrokeGeometry
-        } catch ShapeStrokeTessellationError.invalidDashPattern {
-            throw .invalidShapeDashPattern
-        } catch ShapeStrokeTessellationError.unsupportedLineCap(let value) {
-            throw .unsupportedShapeLineCap(value)
-        } catch ShapeStrokeTessellationError.unsupportedLineJoin(let value) {
-            throw .unsupportedShapeLineJoin(value)
         } catch {
-            throw .invalidShapeStrokeGeometry
+            switch error {
+            case .invalidGeometry:
+                throw .invalidShapeStrokeGeometry
+            case .invalidDashPattern:
+                throw .invalidShapeDashPattern
+            case .unsupportedLineCap(let value):
+                throw .unsupportedShapeLineCap(value)
+            case .unsupportedLineJoin(let value):
+                throw .unsupportedShapeLineJoin(value)
+            }
         }
 
         let strokeOutline = CGMutablePath()

@@ -4922,6 +4922,13 @@ func installHarness() {
                     color: CGColor(red: 0, green: 1, blue: 0, alpha: 1),
                     rule: .nonZero
                 )
+                let invalidFill = makeShape(
+                    position: CGPoint(x: 360, y: 150),
+                    color: CGColor(red: .nan, green: 0, blue: 0, alpha: 1),
+                    rule: .nonZero
+                )
+                invalidFill.strokeColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                invalidFill.lineWidth = 4
                 let unsupported = makeShape(
                     position: CGPoint(x: 160, y: 150),
                     color: CGColor(red: 0, green: 0, blue: 1, alpha: 1),
@@ -4976,16 +4983,21 @@ func installHarness() {
                         CGPoint(x: 297, y: 150),
                         CGPoint(x: 302, y: 150),
                         CGPoint(x: 308, y: 150),
+                        CGPoint(x: 341, y: 150),
+                        CGPoint(x: 360, y: 150),
                     ])
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
-                    shapeFillRuleProbeResult = "\(pixelText),failures=\(renderer.shapeRenderFailureCount),draws=\(renderer.shapeFillDrawCount),vertices=\(renderer.shapeFillVertexCount)"
+                    let hasTypedFailure = renderer.lastShapeRenderFailure
+                        == .fillTessellationFailed(.unsupportedFillRule("future-rule"))
+                    shapeFillRuleProbeResult = "\(pixelText),failures=\(renderer.shapeRenderFailureCount),typed=\(hasTypedFailure),draws=\(renderer.shapeFillDrawCount),vertices=\(renderer.shapeFillVertexCount)"
                 } catch {
                     shapeFillRuleProbeResult = "error: \(error)"
                 }
                 evenOdd.removeFromSuperlayer()
                 nonZero.removeFromSuperlayer()
+                invalidFill.removeFromSuperlayer()
                 unsupported.removeFromSuperlayer()
                 shadow.removeFromSuperlayer()
                 stroke.removeFromSuperlayer()

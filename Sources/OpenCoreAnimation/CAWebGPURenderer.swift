@@ -858,6 +858,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var shapeRenderFailureCount: Int = 0
 
+    /// The most recent typed shape-rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastShapeRenderFailure: CAShapeRenderFailure?
+
     /// Number of gradient draws rejected because their configuration was invalid.
     @_spi(RendererDiagnostics)
     public private(set) var gradientRenderFailureCount: Int = 0
@@ -4468,6 +4472,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         shadowRenderFailureCount = 0
         lastShadowRenderFailure = nil
         shapeRenderFailureCount = 0
+        lastShapeRenderFailure = nil
         gradientRenderFailureCount = 0
         cornerCurveRenderFailureCount = 0
         contentsRenderFailureCount = 0
@@ -7482,6 +7487,41 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Shape Layer Rendering
 
+    private func recordShapeRenderFailure(_ failure: CAShapeRenderFailure) {
+        shapeRenderFailureCount += 1
+        lastShapeRenderFailure = failure
+    }
+
+    private func shapeColorComponents(
+        _ color: CGColor,
+        invalidFailure: CAShapeRenderFailure
+    ) -> SIMD4<Float>? {
+        guard let converted = color.converted(
+            to: .deviceRGB,
+            intent: .defaultIntent,
+            options: nil
+        ), let components = converted.components,
+           components.count == 4,
+           components.allSatisfy(\.isFinite) else {
+            recordShapeRenderFailure(invalidFailure)
+            return nil
+        }
+        let result = SIMD4<Float>(
+            Float(components[0]),
+            Float(components[1]),
+            Float(components[2]),
+            Float(components[3])
+        )
+        guard result.x.isFinite,
+              result.y.isFinite,
+              result.z.isFinite,
+              result.w.isFinite else {
+            recordShapeRenderFailure(invalidFailure)
+            return nil
+        }
+        return replicatedColor(result)
+    }
+
     /// Renders a CAShapeLayer with its path.
     private func renderShapeLayer(
         _ shapeLayer: CAShapeLayer,
@@ -7495,12 +7535,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else {
+            recordShapeRenderFailure(.rendererResourcesUnavailable)
             return
         }
         do {
             try ShapeFillTessellator.validate(path)
         } catch {
-            shapeRenderFailureCount += 1
+            recordShapeRenderFailure(.pathValidationFailed(error))
             return
         }
 
@@ -7519,59 +7560,66 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     rule: shapeLayer.fillRule
                 )
             } catch {
-                shapeRenderFailureCount += 1
+                recordShapeRenderFailure(.fillTessellationFailed(error))
                 fillPoints = []
             }
 
-            let colorComponents = cgColorToSIMD4(fillColor)
-            let bounds = shapeLayer.bounds
-            let hasValidBounds = bounds.width > 0 && bounds.height > 0
-            var vertices = fillPoints.map { point in
-                let layerCoordinate = hasValidBounds
-                    ? SIMD2(
-                        Float((point.x - bounds.minX) / bounds.width),
-                        Float((point.y - bounds.minY) / bounds.height)
+            if !fillPoints.isEmpty,
+               let colorComponents = shapeColorComponents(
+                   fillColor,
+                   invalidFailure: .invalidFillColor
+               ) {
+                let bounds = shapeLayer.bounds
+                let hasValidBounds = bounds.width > 0 && bounds.height > 0
+                var vertices = fillPoints.map { point in
+                    let layerCoordinate = hasValidBounds
+                        ? SIMD2(
+                            Float((point.x - bounds.minX) / bounds.width),
+                            Float((point.y - bounds.minY) / bounds.height)
+                        )
+                        : .zero
+                    return CARendererVertex(
+                        position: SIMD2(Float(point.x), Float(point.y)),
+                        texCoord: layerCoordinate,
+                        color: colorComponents
                     )
-                    : .zero
-                return CARendererVertex(
-                    position: SIMD2(Float(point.x), Float(point.y)),
-                    texCoord: layerCoordinate,
-                    color: colorComponents
-                )
-            }
-
-            if !vertices.isEmpty,
-               let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) {
-                var uniforms = CARendererUniforms(
-                    mvpMatrix: modelMatrix,
-                    opacity: currentEffectiveOpacity,
-                    cornerRadius: 0,
-                    layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
-                    edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
-                )
-                let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
-                device.queue.writeBuffer(
-                    uniformBuffer,
-                    bufferOffset: uniformOffset,
-                    data: createFloat32Array(from: &uniforms)
-                )
-                device.queue.writeBuffer(
-                    vertexBuffer,
-                    bufferOffset: vertexOffset,
-                    data: createFloat32Array(from: &vertices)
-                )
-                renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-                renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-                renderPass.draw(vertexCount: UInt32(vertices.count))
-                shapeFillDrawCount += 1
-                shapeFillVertexCount += vertices.count
+                }
+                if let (vertexOffset, uniformIndex) = allocateVertices(
+                    count: vertices.count
+                ) {
+                    var uniforms = CARendererUniforms(
+                        mvpMatrix: modelMatrix,
+                        opacity: currentEffectiveOpacity,
+                        cornerRadius: 0,
+                        layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
+                        edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
+                    )
+                    let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
+                    device.queue.writeBuffer(
+                        uniformBuffer,
+                        bufferOffset: uniformOffset,
+                        data: createFloat32Array(from: &uniforms)
+                    )
+                    device.queue.writeBuffer(
+                        vertexBuffer,
+                        bufferOffset: vertexOffset,
+                        data: createFloat32Array(from: &vertices)
+                    )
+                    renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+                    renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+                    renderPass.draw(vertexCount: UInt32(vertices.count))
+                    shapeFillDrawCount += 1
+                    shapeFillVertexCount += vertices.count
+                } else {
+                    recordShapeRenderFailure(.fillVertexCapacityExceeded)
+                }
             }
         }
 
         // Render stroke if strokeColor is set
         if let strokeColor = shapeLayer.strokeColor {
             guard shapeLayer.lineWidth.isFinite else {
-                shapeRenderFailureCount += 1
+                recordShapeRenderFailure(.nonFiniteLineWidth)
                 return
             }
             guard shapeLayer.lineWidth > 0 else { return }
@@ -7589,55 +7637,58 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     strokeEnd: shapeLayer.strokeEnd
                 )
             } catch {
-                shapeRenderFailureCount += 1
+                recordShapeRenderFailure(.strokeTessellationFailed(error))
                 strokePoints = []
             }
 
-            let bounds = shapeLayer.bounds
-            let hasValidBounds = bounds.width > 0 && bounds.height > 0
-            let colorComponents = cgColorToSIMD4(strokeColor)
-            var vertices = strokePoints.map { point in
-                CARendererVertex(
-                    position: SIMD2(Float(point.x), Float(point.y)),
-                    texCoord: hasValidBounds
-                        ? SIMD2(
-                            Float((point.x - bounds.minX) / bounds.width),
-                            Float((point.y - bounds.minY) / bounds.height)
-                        )
-                        : .zero,
-                    color: colorComponents
-                )
-            }
-            if !vertices.isEmpty,
-               let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) {
-                var uniforms = CARendererUniforms(
-                    mvpMatrix: modelMatrix,
-                    opacity: currentEffectiveOpacity,
-                    cornerRadius: 0,
-                    layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
-                    edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
-                )
-                let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
-                device.queue.writeBuffer(
-                    uniformBuffer,
-                    bufferOffset: uniformOffset,
-                    data: createFloat32Array(from: &uniforms)
-                )
-                device.queue.writeBuffer(
-                    vertexBuffer,
-                    bufferOffset: vertexOffset,
-                    data: createFloat32Array(from: &vertices)
-                )
-                renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
-                renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
-                renderPass.draw(vertexCount: UInt32(vertices.count))
+            if !strokePoints.isEmpty,
+               let colorComponents = shapeColorComponents(
+                   strokeColor,
+                   invalidFailure: .invalidStrokeColor
+               ) {
+                let bounds = shapeLayer.bounds
+                let hasValidBounds = bounds.width > 0 && bounds.height > 0
+                var vertices = strokePoints.map { point in
+                    CARendererVertex(
+                        position: SIMD2(Float(point.x), Float(point.y)),
+                        texCoord: hasValidBounds
+                            ? SIMD2(
+                                Float((point.x - bounds.minX) / bounds.width),
+                                Float((point.y - bounds.minY) / bounds.height)
+                            )
+                            : .zero,
+                        color: colorComponents
+                    )
+                }
+                if let (vertexOffset, uniformIndex) = allocateVertices(
+                    count: vertices.count
+                ) {
+                    var uniforms = CARendererUniforms(
+                        mvpMatrix: modelMatrix,
+                        opacity: currentEffectiveOpacity,
+                        cornerRadius: 0,
+                        layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
+                        edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
+                    )
+                    let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
+                    device.queue.writeBuffer(
+                        uniformBuffer,
+                        bufferOffset: uniformOffset,
+                        data: createFloat32Array(from: &uniforms)
+                    )
+                    device.queue.writeBuffer(
+                        vertexBuffer,
+                        bufferOffset: vertexOffset,
+                        data: createFloat32Array(from: &vertices)
+                    )
+                    renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
+                    renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
+                    renderPass.draw(vertexCount: UInt32(vertices.count))
+                } else {
+                    recordShapeRenderFailure(.strokeVertexCapacityExceeded)
+                }
             }
         }
-    }
-
-    /// Converts CGColor to SIMD4<Float>.
-    private func cgColorToSIMD4(_ color: CGColor) -> SIMD4<Float> {
-        replicatedColor(rgbaComponents(color))
     }
 
     // MARK: - Gradient Layer Rendering

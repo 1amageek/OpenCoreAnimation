@@ -35,7 +35,7 @@ internal enum ShapeStrokeTessellator {
         strokeStart: CGFloat,
         strokeEnd: CGFloat,
         flatness: CGFloat = 0.5
-    ) throws -> [CGPoint] {
+    ) throws(ShapeStrokeTessellationError) -> [CGPoint] {
         guard lineWidth.isFinite, lineWidth > 0,
               miterLimit.isFinite,
               dashPhase.isFinite,
@@ -45,7 +45,11 @@ internal enum ShapeStrokeTessellator {
               flatness > 0 else {
             throw ShapeStrokeTessellationError.invalidGeometry
         }
-        try ShapeFillTessellator.validate(path)
+        do {
+            try ShapeFillTessellator.validate(path)
+        } catch {
+            throw .invalidGeometry
+        }
         let cap = try coreGraphicsLineCap(lineCap)
         let join = try coreGraphicsLineJoin(lineJoin)
         let pattern = dashPattern ?? []
@@ -82,7 +86,11 @@ internal enum ShapeStrokeTessellator {
             lineJoin: join,
             miterLimit: miterLimit
         )
-        return try ShapeFillTessellator.triangles(for: outline, rule: .nonZero)
+        do {
+            return try ShapeFillTessellator.triangles(for: outline, rule: .nonZero)
+        } catch {
+            throw .invalidGeometry
+        }
     }
 
     private static func trimmedSubpaths(
@@ -90,7 +98,7 @@ internal enum ShapeStrokeTessellator {
         start: CGFloat,
         end: CGFloat,
         flatness: CGFloat
-    ) throws -> [TrimmedSubpath] {
+    ) throws(ShapeStrokeTessellationError) -> [TrimmedSubpath] {
         let contours = contours(in: path.flattened(threshold: flatness))
         let lengths = contours.map { contour in
             contour.segments.reduce(CGFloat.zero) { $0 + $1.2 }
@@ -190,7 +198,9 @@ internal enum ShapeStrokeTessellator {
         )
     }
 
-    private static func coreGraphicsLineCap(_ value: CAShapeLayerLineCap) throws -> CGLineCap {
+    private static func coreGraphicsLineCap(
+        _ value: CAShapeLayerLineCap
+    ) throws(ShapeStrokeTessellationError) -> CGLineCap {
         switch value {
         case .butt: return .butt
         case .round: return .round
@@ -199,7 +209,9 @@ internal enum ShapeStrokeTessellator {
         }
     }
 
-    private static func coreGraphicsLineJoin(_ value: CAShapeLayerLineJoin) throws -> CGLineJoin {
+    private static func coreGraphicsLineJoin(
+        _ value: CAShapeLayerLineJoin
+    ) throws(ShapeStrokeTessellationError) -> CGLineJoin {
         switch value {
         case .miter: return .miter
         case .round: return .round

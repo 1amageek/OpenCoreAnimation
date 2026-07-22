@@ -21,7 +21,7 @@ internal enum ShapeFillTessellator {
         let edge: Edge
     }
 
-    static func validate(_ path: CGPath) throws {
+    static func validate(_ path: CGPath) throws(ShapeFillTessellationError) {
         var failure: ShapeFillTessellationError?
         path.applyWithBlock { elementPointer in
             guard failure == nil else { return }
@@ -60,7 +60,7 @@ internal enum ShapeFillTessellator {
         for path: CGPath,
         rule: CAShapeLayerFillRule,
         flatness: CGFloat = 0.5
-    ) throws -> [CGPoint] {
+    ) throws(ShapeFillTessellationError) -> [CGPoint] {
         guard flatness.isFinite, flatness > 0 else {
             throw ShapeFillTessellationError.nonFinitePath
         }
@@ -229,7 +229,7 @@ internal enum ShapeFillTessellator {
     private static func flattenedContours(
         _ path: CGPath,
         flatness: CGFloat
-    ) throws -> [[CGPoint]] {
+    ) throws(ShapeFillTessellationError) -> [[CGPoint]] {
         var contours: [[CGPoint]] = []
         var current: [CGPoint] = []
         var currentPoint = CGPoint.zero
