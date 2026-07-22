@@ -7,6 +7,9 @@ public struct CALayerContentsFormat: Hashable, Equatable, RawRepresentable, Send
         self.rawValue = rawValue
     }
 
+    /// Lets Core Animation select the most appropriate contents format.
+    public static let automatic = CALayerContentsFormat(rawValue: "Automatic")
+
     /// A 32-bit RGBA pixel format.
     public static let RGBA8Uint = CALayerContentsFormat(rawValue: "RGBA8")
 

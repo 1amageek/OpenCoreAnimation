@@ -222,6 +222,42 @@ open class CAAnimation: CAMediaTiming, CAAction {
         layer.add(self, forKey: event)
     }
 
+    // MARK: - Archiving
+
+    /// Returns whether the value for the specified key differs from its archive default.
+    open func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "beginTime":
+            return beginTime != 0
+        case "timeOffset":
+            return timeOffset != 0
+        case "repeatCount":
+            return repeatCount != 0
+        case "repeatDuration":
+            return repeatDuration != 0
+        case "duration":
+            return duration != 0
+        case "speed":
+            return speed != 1
+        case "autoreverses":
+            return autoreverses
+        case "fillMode":
+            return fillMode != .removed
+        case "timingFunction":
+            return timingFunction != nil
+        case "delegate":
+            return delegate != nil
+        case "removedOnCompletion":
+            return !isRemovedOnCompletion
+        case "preferredFrameRateRange":
+            // QuartzCore treats this as a runtime scheduling hint rather than
+            // persistent animation state, even when it differs from `.default`.
+            return false
+        default:
+            return false
+        }
+    }
+
     // MARK: - Class Methods
 
     /// Returns the default value of the property with the specified key.

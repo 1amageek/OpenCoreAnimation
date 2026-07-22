@@ -114,6 +114,25 @@ open class CASpringAnimation: CABasicAnimation {
         }
     }
 
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "mass":
+            return mass != 1
+        case "stiffness":
+            return stiffness != 100
+        case "damping":
+            return damping != 10
+        case "initialVelocity":
+            // QuartzCore derives this from the runtime spring configuration
+            // and does not persist it through shouldArchiveValue(forKey:).
+            return false
+        case "allowsOverdamping":
+            return allowsOverdamping
+        default:
+            return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
     /// Returns the default value for a spring animation property.
     open override class func defaultValue(forKey key: String) -> Any? {
         switch key {

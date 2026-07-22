@@ -35,4 +35,19 @@ open class CAPropertyAnimation: CAAnimation {
 
     /// An optional value function that is applied to interpolated values.
     open var valueFunction: CAValueFunction?
+
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "keyPath":
+            return keyPath != nil
+        case "additive":
+            return isAdditive
+        case "cumulative":
+            return isCumulative
+        case "valueFunction":
+            return valueFunction != nil
+        default:
+            return super.shouldArchiveValue(forKey: key)
+        }
+    }
 }

@@ -136,6 +136,58 @@ open class CAEmitterCell: CAMediaTiming {
     open var autoreverses: Bool = false
     open var fillMode: CAMediaTimingFillMode = .removed
 
+    // MARK: - Archiving
+
+    /// Returns whether the value for the specified key differs from its archive default.
+    open func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "contents": return contents != nil
+        case "contentsRect": return contentsRect != CGRect(x: 0, y: 0, width: 1, height: 1)
+        case "contentsScale": return contentsScale != 1
+        case "magnificationFilter": return magnificationFilter != CALayerContentsFilter.linear.rawValue
+        case "minificationFilter": return minificationFilter != CALayerContentsFilter.linear.rawValue
+        case "minificationFilterBias": return minificationFilterBias != 0
+        case "birthRate": return birthRate != 0
+        case "lifetime": return lifetime != 0
+        case "lifetimeRange": return lifetimeRange != 0
+        case "emitterCells": return emitterCells != nil
+        case "color": return color != CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        case "redRange": return redRange != 0
+        case "greenRange": return greenRange != 0
+        case "blueRange": return blueRange != 0
+        case "alphaRange": return alphaRange != 0
+        case "redSpeed": return redSpeed != 0
+        case "greenSpeed": return greenSpeed != 0
+        case "blueSpeed": return blueSpeed != 0
+        case "alphaSpeed": return alphaSpeed != 0
+        case "velocity": return velocity != 0
+        case "velocityRange": return velocityRange != 0
+        case "xAcceleration": return xAcceleration != 0
+        case "yAcceleration": return yAcceleration != 0
+        case "zAcceleration": return zAcceleration != 0
+        case "scale": return scale != 1
+        case "scaleRange": return scaleRange != 0
+        case "scaleSpeed": return scaleSpeed != 0
+        case "spin": return spin != 0
+        case "spinRange": return spinRange != 0
+        case "emissionLatitude": return emissionLatitude != 0
+        case "emissionLongitude": return emissionLongitude != 0
+        case "emissionRange": return emissionRange != 0
+        case "name": return name != nil
+        case "enabled": return !isEnabled
+        case "style": return style != nil
+        case "beginTime": return beginTime != 0
+        case "timeOffset": return timeOffset != 0
+        case "repeatCount": return repeatCount != 0
+        case "repeatDuration": return repeatDuration != 0
+        case "duration": return duration != .infinity
+        case "speed": return speed != 1
+        case "autoreverses": return autoreverses
+        case "fillMode": return fillMode != .removed
+        default: return false
+        }
+    }
+
     // MARK: - Default Value
 
     /// Returns the default value for a given property key.

@@ -60,6 +60,31 @@ open class CAKeyframeAnimation: CAPropertyAnimation {
         }
     }
 
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "values":
+            return values != nil
+        case "path":
+            return path != nil
+        case "keyTimes":
+            return keyTimes != nil
+        case "timingFunctions":
+            return timingFunctions != nil
+        case "calculationMode":
+            return calculationMode != .linear
+        case "tensionValues":
+            return tensionValues != nil
+        case "continuityValues":
+            return continuityValues != nil
+        case "biasValues":
+            return biasValues != nil
+        case "rotationMode":
+            return rotationMode != nil
+        default:
+            return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
     /// Returns the default value for a keyframe animation property.
     open override class func defaultValue(forKey key: String) -> Any? {
         switch key {

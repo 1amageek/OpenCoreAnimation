@@ -23,4 +23,17 @@ open class CABasicAnimation: CAPropertyAnimation {
             self.byValue = source.byValue
         }
     }
+
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "fromValue":
+            return fromValue != nil
+        case "toValue":
+            return toValue != nil
+        case "byValue":
+            return byValue != nil
+        default:
+            return super.shouldArchiveValue(forKey: key)
+        }
+    }
 }

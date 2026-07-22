@@ -22,4 +22,13 @@ open class CAAnimationGroup: CAAnimation {
             self.animations = source.animations?.map { $0.copy() }
         }
     }
+
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "animations":
+            return animations != nil
+        default:
+            return super.shouldArchiveValue(forKey: key)
+        }
+    }
 }

@@ -79,6 +79,23 @@ open class CATransition: CAAnimation {
         }
     }
 
+    open override func shouldArchiveValue(forKey key: String) -> Bool {
+        switch key {
+        case "type":
+            return type != .fade
+        case "subtype":
+            return subtype != nil
+        case "startProgress":
+            return startProgress != 0
+        case "endProgress":
+            return endProgress != 1
+        case "filter":
+            return filter != nil
+        default:
+            return super.shouldArchiveValue(forKey: key)
+        }
+    }
+
     /// Returns the default value for a transition property.
     open override class func defaultValue(forKey key: String) -> Any? {
         switch key {
