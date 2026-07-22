@@ -882,6 +882,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var contentsRenderFailureCount: Int = 0
 
+    /// The most recent typed contents-rendering failure.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastContentsRenderFailure: CAContentsRenderFailure?
+
     /// Number of text draws rejected because their input, browser rasterizer, or GPU resources failed.
     @_spi(RendererDiagnostics)
     public private(set) var textRenderFailureCount: Int = 0
@@ -3763,6 +3767,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     public func render(layer rootLayer: CALayer) {
         lastContentsConversionError = nil
+        lastContentsRenderFailure = nil
         guard let device = device,
               let context = context,
               let pipeline = pipeline,
@@ -4486,6 +4491,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         cornerCurveRenderFailureCount = 0
         lastCornerCurveRenderFailure = nil
         contentsRenderFailureCount = 0
+        lastContentsRenderFailure = nil
         textRenderFailureCount = 0
         lastTextRenderFailure = nil
         tiledLayerRenderFailureCount = 0
@@ -6405,6 +6411,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Contents Layer Rendering (CGImage)
 
+    private func recordContentsRenderFailure(_ failure: CAContentsRenderFailure) {
+        contentsRenderFailureCount += 1
+        lastContentsRenderFailure = failure
+        if case .imageConversion(let error) = failure {
+            lastContentsConversionError = error
+        }
+    }
+
     /// Checks if 9-patch (contentsCenter) scaling is needed.
     ///
     /// Returns true if contentsCenter is not the default (0, 0, 1, 1),
@@ -6450,7 +6464,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let selectedPipeline = selectTexturedPipeline(for: layer) else {
-            contentsRenderFailureCount += 1
+            recordContentsRenderFailure(.rendererResourcesUnavailable)
             return
         }
 
@@ -6467,7 +6481,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 gravity: layer.contentsGravity
             )
         } catch {
-            contentsRenderFailureCount += 1
+            recordContentsRenderFailure(.nineSliceConfiguration(error))
             return
         }
 
@@ -6499,9 +6513,40 @@ public final class CAWebGPURenderer: CARendererDelegate {
         )
 
         let white = currentReplicatorColor
+        let totalVertexCount = configuration.patches.count * 6
+        guard totalVertexCount > 0 else { return }
+        guard let (baseVertexOffset, layerIndex) = allocateVertices(
+            count: totalVertexCount
+        ) else {
+            recordContentsRenderFailure(.nineSliceVertexCapacityExceeded)
+            return
+        }
+
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        var uploadedUniforms = uniforms
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uploadedUniforms)
+        )
+        let texturedBindGroup = cachedTexturedBindGroup(
+            cacheKey: .image(ObjectIdentifier(contents)),
+            gpuTexture: gpuTexture,
+            device: device,
+            layout: texturedBindGroupLayout,
+            sampler: textureSampler,
+            uniformBuffer: uniformBuffer,
+            uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
+        )
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: texturedBindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
 
         // Render each patch
-        for patch in configuration.patches {
+        for (patchIndex, patch) in configuration.patches.enumerated() {
             let destination = patch.destinationRect
             let source = patch.sourceUnitRect
             let pMinX = Float(destination.minX / boundsWidth)
@@ -6527,17 +6572,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 CARendererVertex(position: SIMD2(pMinX, pMaxY), texCoord: SIMD2(uMinX, uMinY), color: white),
             ]
 
-            guard let allocation = allocateVertices(count: vertices.count) else { continue }
-            let (vertexOffset, layerIndex) = allocation
-
-            // Write uniforms for this patch
-            let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
-            var patchUniforms = uniforms
-            let uniformData = createFloat32Array(from: &patchUniforms)
-            device.queue.writeBuffer(
-                uniformBuffer,
-                bufferOffset: uniformOffset,
-                data: uniformData
+            let vertexOffset = baseVertexOffset + UInt64(
+                patchIndex * 6 * MemoryLayout<CARendererVertex>.stride
             )
             let vertexData = createFloat32Array(from: &vertices)
             device.queue.writeBuffer(
@@ -6546,22 +6582,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 data: vertexData
             )
 
-            // Create bind group with texture (per-frame cached, keyed by
-            // CGImage identity — the texture manager retains `contents`
-            // for the cached lifetime so the key stays unique).
-            let texturedBindGroup = cachedTexturedBindGroup(
-                cacheKey: .image(ObjectIdentifier(contents)),
-                gpuTexture: gpuTexture,
-                device: device,
-                layout: texturedBindGroupLayout,
-                sampler: textureSampler,
-                uniformBuffer: uniformBuffer,
-                uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
-            )
-
             // Render this patch
-            renderPass.setPipeline(selectedPipeline)
-            renderPass.setBindGroup(0, bindGroup: texturedBindGroup, dynamicOffsets: [UInt32(uniformOffset)])
             renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
             renderPass.draw(vertexCount: 6)
         }
@@ -6585,7 +6606,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let selectedPipeline = selectTexturedPipeline(for: layer) else {
-            contentsRenderFailureCount += 1
+            recordContentsRenderFailure(.rendererResourcesUnavailable)
             return
         }
 
@@ -6608,19 +6629,39 @@ public final class CAWebGPURenderer: CARendererDelegate {
             recordContentsConversionFailure(error)
             return
         }
-        guard let gpuTexture = textureManager?.getOrCreateTexture(
+        guard let textureManager else {
+            recordContentsRenderFailure(.textureManagerUnavailable)
+            return
+        }
+        var textureConversionError: CAImageContentsConversionError?
+        let gpuTexture = textureManager.getOrCreateTexture(
             for: contents,
             width: imageWidth,
             height: imageHeight,
             memorySizeBytes: memorySizeBytes,
-            factory: { [weak self] in
-                self?.createGPUTexture(
-                    from: contents,
-                    format: textureFormat,
-                    device: device
-                )
+            factory: {
+                do {
+                    return try self.createGPUTexture(
+                        from: contents,
+                        format: textureFormat,
+                        device: device
+                    )
+                } catch let error as CAImageContentsConversionError {
+                    textureConversionError = error
+                    return nil
+                } catch {
+                    return nil
+                }
             }
-        ) else { return }
+        )
+        guard let gpuTexture else {
+            if let textureConversionError {
+                recordContentsConversionFailure(textureConversionError)
+            } else {
+                recordContentsRenderFailure(.textureCreationFailed)
+            }
+            return
+        }
 
         // Check if 9-patch scaling is needed
         if needs9PatchScaling(layer) {
@@ -6649,7 +6690,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 gravity: layer.contentsGravity
             )
         } catch {
-            contentsRenderFailureCount += 1
+            recordContentsRenderFailure(.standardConfiguration(error))
             return
         }
 
@@ -6704,7 +6745,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
             CARendererVertex(position: SIMD2(posMinX, posMaxY), texCoord: SIMD2(uvMinX, uvMinY), color: white),
         ]
 
-        guard let allocation = allocateVertices(count: vertices.count) else { return }
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            recordContentsRenderFailure(.standardVertexCapacityExceeded)
+            return
+        }
         let (vertexOffset, layerIndex) = allocation
 
         // Create scale matrix for layer bounds
@@ -6843,18 +6887,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
         from cgImage: CGImage,
         format: CGImageTexturePixelFormat,
         device: GPUDevice
-    ) -> GPUTexture? {
+    ) throws(CAImageContentsConversionError) -> GPUTexture {
         let width = cgImage.width
         let height = cgImage.height
-        guard width > 0 && height > 0 else { return nil }
-
-        let baseLevel: CGImageTextureStorage
-        do {
-            baseLevel = try CGImageTextureStorageConverter.convert(cgImage, to: format)
-        } catch {
-            recordContentsConversionFailure(error)
-            return nil
+        guard width > 0 && height > 0 else {
+            throw .invalidDimensions(width: width, height: height)
         }
+
+        let baseLevel = try CGImageTextureStorageConverter.convert(cgImage, to: format)
 
         var mipLevelCount: UInt32 = 1
         var mipWidth = width
@@ -6897,12 +6937,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 )
             )
             guard level + 1 < mipLevelCount else { continue }
-            do {
-                levelStorage = try CGImageTextureMipGenerator.nextLevel(from: levelStorage)
-            } catch {
-                recordContentsConversionFailure(error)
-                return nil
-            }
+            levelStorage = try CGImageTextureMipGenerator.nextLevel(from: levelStorage)
         }
 
         return texture
@@ -6934,8 +6969,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     }
 
     private func recordContentsConversionFailure(_ error: CAImageContentsConversionError) {
-        contentsRenderFailureCount += 1
-        lastContentsConversionError = error
+        recordContentsRenderFailure(.imageConversion(error))
     }
 
     /// Creates a JavaScript Uint8Array from Data.
@@ -12292,19 +12326,32 @@ public final class CAWebGPURenderer: CARendererDelegate {
         guard let textureManager else {
             throw .textureResourcesUnavailable
         }
-        guard let texture = textureManager.getOrCreateTexture(
+        var textureConversionError: CAImageContentsConversionError?
+        let texture = textureManager.getOrCreateTexture(
             for: image,
             width: image.width,
             height: image.height,
             memorySizeBytes: memorySizeBytes,
-            factory: { [weak self] in
-                self?.createGPUTexture(
-                    from: image,
-                    format: textureFormat,
-                    device: device
-                )
+            factory: {
+                do {
+                    return try self.createGPUTexture(
+                        from: image,
+                        format: textureFormat,
+                        device: device
+                    )
+                } catch let error as CAImageContentsConversionError {
+                    textureConversionError = error
+                    return nil
+                } catch {
+                    return nil
+                }
             }
-        ) else {
+        )
+        guard let texture else {
+            if let textureConversionError {
+                recordContentsConversionFailure(textureConversionError)
+                throw .imageConversionFailed(textureConversionError)
+            }
             throw .textureResourcesUnavailable
         }
 
@@ -12664,20 +12711,38 @@ public final class CAWebGPURenderer: CARendererDelegate {
             recordContentsConversionFailure(error)
             return
         }
-        guard let texture = textureManager?.getOrCreateTexture(
+        guard let textureManager else {
+            recordTiledLayerRenderFailure(.rendererResourcesUnavailable)
+            return
+        }
+        var textureConversionError: CAImageContentsConversionError?
+        let texture = textureManager.getOrCreateTexture(
             for: image,
             width: imageWidth,
             height: imageHeight,
             memorySizeBytes: memorySizeBytes,
-            factory: { [weak self] in
-                self?.createGPUTexture(
-                    from: image,
-                    format: textureFormat,
-                    device: device
-                )
+            factory: {
+                do {
+                    return try self.createGPUTexture(
+                        from: image,
+                        format: textureFormat,
+                        device: device
+                    )
+                } catch let error as CAImageContentsConversionError {
+                    textureConversionError = error
+                    return nil
+                } catch {
+                    return nil
+                }
             }
-        ) else {
-            recordTiledLayerRenderFailure(.rendererResourcesUnavailable)
+        )
+        guard let texture else {
+            if let textureConversionError {
+                recordContentsConversionFailure(textureConversionError)
+                recordTiledLayerRenderFailure(.imageConversionFailed(textureConversionError))
+            } else {
+                recordTiledLayerRenderFailure(.rendererResourcesUnavailable)
+            }
             return
         }
 

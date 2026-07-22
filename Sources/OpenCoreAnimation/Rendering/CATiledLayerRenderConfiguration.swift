@@ -12,6 +12,7 @@ public enum CATiledLayerRenderFailure: Error, Equatable, Sendable {
     case rendererResourcesUnavailable
     case drawingContextCreationFailed
     case imageCreationFailed
+    case imageConversionFailed(CAImageContentsConversionError)
 }
 
 /// Validated, renderer-independent tiled-layer input.

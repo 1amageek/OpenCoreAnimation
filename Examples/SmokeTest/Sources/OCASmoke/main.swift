@@ -1197,8 +1197,10 @@ func installHarness() {
                         CGPoint(x: 200, y: 150),
                     ])
                     let failures = renderer.contentsRenderFailureCount - failureCountBeforeRender
-                    let typedFailure = renderer.lastContentsConversionError
-                        == .insufficientPixelData(required: 4, actual: 3)
+                    let typedFailure = renderer.lastContentsRenderFailure
+                        == .imageConversion(
+                            .insufficientPixelData(required: 4, actual: 3)
+                        )
                     restoreScene()
                     contentsGeometryProbeResult = pixels.map {
                         $0.map(String.init).joined(separator: ",")

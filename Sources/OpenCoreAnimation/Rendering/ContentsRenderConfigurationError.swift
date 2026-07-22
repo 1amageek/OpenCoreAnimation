@@ -1,6 +1,7 @@
 import Foundation
 
-enum ContentsRenderConfigurationError: Error, Equatable {
+@_spi(RendererDiagnostics)
+public enum ContentsRenderConfigurationError: Error, Equatable, Sendable {
     case invalidImageSize
     case invalidBounds
     case invalidContentsRect

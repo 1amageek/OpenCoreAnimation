@@ -30,7 +30,7 @@ struct ContentsRenderConfiguration: Equatable {
         contentsCenter: CGRect,
         contentsScale: CGFloat,
         gravity: CALayerContentsGravity
-    ) throws {
+    ) throws(ContentsRenderConfigurationError) {
         guard imageSize.width.isFinite,
               imageSize.height.isFinite,
               imageSize.width > 0,
@@ -162,7 +162,7 @@ struct ContentsRenderConfiguration: Equatable {
         contentsRect: CGRect,
         contentsScale: CGFloat,
         gravity: CALayerContentsGravity
-    ) throws -> CGRect {
+    ) throws(ContentsRenderConfigurationError) -> CGRect {
         guard imageSize.width.isFinite,
               imageSize.height.isFinite,
               imageSize.width > 0,
@@ -211,7 +211,7 @@ struct ContentsRenderConfiguration: Equatable {
         sourcePointSize: CGSize,
         boundsSize: CGSize,
         gravity: CALayerContentsGravity
-    ) throws -> CGRect {
+    ) throws(ContentsRenderConfigurationError) -> CGRect {
         switch gravity {
         case .center:
             return CGRect(
