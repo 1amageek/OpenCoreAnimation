@@ -54,6 +54,7 @@ nonisolated(unsafe) var emitterProbeResult: String = "pending"
 nonisolated(unsafe) var replicatorProbeResult: String = "pending"
 nonisolated(unsafe) var compositionProbeResult: String = "pending"
 nonisolated(unsafe) var transformDepthProbeResult: String = "pending"
+nonisolated(unsafe) var shapeFillRuleProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -176,6 +177,7 @@ public func setup() {
             replicatorProbeResult = "pending"
             compositionProbeResult = "pending"
             transformDepthProbeResult = "pending"
+            shapeFillRuleProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -394,6 +396,9 @@ func installHarness() {
         })
         h.expose("getTransformDepthProbeResult", returning: {
             .string(transformDepthProbeResult)
+        })
+        h.expose("getShapeFillRuleProbeResult", returning: {
+            .string(shapeFillRuleProbeResult)
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {
@@ -4159,6 +4164,96 @@ func installHarness() {
                 } catch {
                     pixelReadbackResult = "error: \(error)"
                 }
+            }
+        })
+        h.expose("beginShapeFillRuleProbe", action: {
+            Task { @MainActor in
+                guard let root = rootLayerRef,
+                      let renderer = CAAnimationEngine.shared.renderer as? CAWebGPURenderer else {
+                    shapeFillRuleProbeResult = "error: renderer unavailable"
+                    return
+                }
+
+                let path = CGMutablePath()
+                path.addRect(CGRect(x: 0, y: 0, width: 40, height: 40))
+                path.addRect(CGRect(x: 12, y: 12, width: 16, height: 16))
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+
+                func makeShape(
+                    position: CGPoint,
+                    color: CGColor,
+                    rule: CAShapeLayerFillRule
+                ) -> CAShapeLayer {
+                    let layer = CAShapeLayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    layer.position = position
+                    layer.path = path
+                    layer.fillColor = color
+                    layer.fillRule = rule
+                    layer.zPosition = 100
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                let evenOdd = makeShape(
+                    position: CGPoint(x: 40, y: 150),
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+                    rule: .evenOdd
+                )
+                let nonZero = makeShape(
+                    position: CGPoint(x: 100, y: 150),
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+                    rule: .nonZero
+                )
+                let unsupported = makeShape(
+                    position: CGPoint(x: 160, y: 150),
+                    color: CGColor(red: 0, green: 0, blue: 1, alpha: 1),
+                    rule: CAShapeLayerFillRule(rawValue: "future-rule")
+                )
+
+                let shadowPath = CGMutablePath()
+                shadowPath.addRect(CGRect(x: 0, y: 0, width: 40, height: 40))
+                shadowPath.move(to: CGPoint(x: 12, y: 12))
+                shadowPath.addLine(to: CGPoint(x: 12, y: 28))
+                shadowPath.addLine(to: CGPoint(x: 28, y: 28))
+                shadowPath.addLine(to: CGPoint(x: 28, y: 12))
+                shadowPath.closeSubpath()
+                let shadow = CALayer()
+                shadow.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                shadow.position = CGPoint(x: 220, y: 150)
+                shadow.zPosition = 100
+                shadow.shadowPath = shadowPath
+                shadow.shadowColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                shadow.shadowOpacity = 1
+                shadow.shadowOffset = .zero
+                shadow.shadowRadius = 0
+                root.addSublayer(shadow)
+                CATransaction.commit()
+
+                CAAnimationEngine.shared.renderFrame()
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 25, y: 150),
+                        CGPoint(x: 40, y: 150),
+                        CGPoint(x: 100, y: 150),
+                        CGPoint(x: 160, y: 150),
+                        CGPoint(x: 205, y: 150),
+                        CGPoint(x: 220, y: 150),
+                    ])
+                    let pixelText = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                    shapeFillRuleProbeResult = "\(pixelText),failures=\(renderer.shapeRenderFailureCount),draws=\(renderer.shapeFillDrawCount),vertices=\(renderer.shapeFillVertexCount)"
+                } catch {
+                    shapeFillRuleProbeResult = "error: \(error)"
+                }
+                evenOdd.removeFromSuperlayer()
+                nonZero.removeFromSuperlayer()
+                unsupported.removeFromSuperlayer()
+                shadow.removeFromSuperlayer()
+                CAAnimationEngine.shared.renderFrame()
             }
         })
     }

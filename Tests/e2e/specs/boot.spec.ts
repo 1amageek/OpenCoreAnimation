@@ -38,6 +38,7 @@ interface OCA extends Harness {
     getReplicatorProbeResult: () => string;
     getCompositionProbeResult: () => string;
     getTransformDepthProbeResult: () => string;
+    getShapeFillRuleProbeResult: () => string;
     getTransitionSourceCaptureCount: () => number;
     getTransitionTargetCaptureCount: () => number;
     getActiveTransitionTextureCount: () => number;
@@ -69,6 +70,7 @@ interface OCA extends Harness {
     beginAdditiveKeyframeProbe: () => void;
     beginCompositionProbe: () => void;
     beginTransformDepthProbe: () => void;
+    beginShapeFillRuleProbe: () => void;
     beginShadowProbe: () => void;
     beginDisplayLinkProbe: () => void;
     beginEmitterProbe: () => void;
@@ -124,6 +126,11 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getFirstUncapturedGPUError()).toBe("none");
         expect(await h.getPixelReadback()).toBe(
             "255,0,0,255;0,255,0,255;0,0,255,255;26,26,38,255;255,0,255,255;77,13,83,255;191,255,64,255"
+        );
+
+        await h.beginShapeFillRuleProbe();
+        await expect.poll(() => h.getShapeFillRuleProbeResult(), { timeout: 10_000 }).toBe(
+            "255,0,0,255;26,26,38,255;0,255,0,255;26,26,38,255;0,0,255,255;26,26,38,255,failures=1,draws=2,vertices=42"
         );
 
         await h.beginTransitionFilterProbes();

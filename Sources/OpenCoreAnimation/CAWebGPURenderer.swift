@@ -798,6 +798,18 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var shadowRenderFailureCount: Int = 0
 
+    /// Number of shape fills rejected because their path or fill rule was invalid.
+    @_spi(RendererDiagnostics)
+    public private(set) var shapeRenderFailureCount: Int = 0
+
+    /// Number of shape-fill draw calls encoded in the latest frame.
+    @_spi(RendererDiagnostics)
+    public private(set) var shapeFillDrawCount: Int = 0
+
+    /// Number of tessellated shape-fill vertices submitted in the latest frame.
+    @_spi(RendererDiagnostics)
+    public private(set) var shapeFillVertexCount: Int = 0
+
     /// Number of rasterization captures rejected because their extent or scale was invalid.
     @_spi(RendererDiagnostics)
     public private(set) var rasterizationFailureCount: Int = 0
@@ -3410,6 +3422,8 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         currentLayerIndex = 0
         currentVertexOffset = 0
         droppedLayerCount = 0
+        shapeFillDrawCount = 0
+        shapeFillVertexCount = 0
         opacityStack.removeAll()
         replicatorColorStack.removeAll()
         replicatorTimeOffsetStack.removeAll()
@@ -3947,6 +3961,9 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         shadowLayerResources.removeAll(keepingCapacity: false)
         prerenderedShadows.removeAll(keepingCapacity: false)
         shadowRenderFailureCount = 0
+        shapeRenderFailureCount = 0
+        shapeFillDrawCount = 0
+        shapeFillVertexCount = 0
         rasterizationFailureCount = 0
         delegateBackingStores.removeAll(keepingCapacity: false)
         delegateDrawFailureCount = 0
@@ -7065,133 +7082,6 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
         }
     }
 
-    /// Triangulates a simple polygon using ear-clipping algorithm.
-    /// Returns array of vertex indices forming triangles.
-    private func triangulatePolygon(_ polygon: [CGPoint]) -> [Int] {
-        guard polygon.count >= 3 else { return [] }
-
-        // Remove duplicate last point if closed
-        var points = polygon
-        if let first = points.first, let last = points.last,
-           first.x == last.x && first.y == last.y && points.count > 1 {
-            points.removeLast()
-        }
-
-        guard points.count >= 3 else { return [] }
-
-        var indices: [Int] = []
-        var remaining = Array(0..<points.count)
-
-        // Ensure polygon is counter-clockwise
-        let area = signedArea(points)
-        if area < 0 {
-            remaining.reverse()
-        }
-
-        var safetyCounter = remaining.count * remaining.count
-
-        while remaining.count > 3 && safetyCounter > 0 {
-            safetyCounter -= 1
-            var earFound = false
-
-            for i in 0..<remaining.count {
-                let prev = (i + remaining.count - 1) % remaining.count
-                let next = (i + 1) % remaining.count
-
-                let a = points[remaining[prev]]
-                let b = points[remaining[i]]
-                let c = points[remaining[next]]
-
-                if isEar(a: a, b: b, c: c, polygon: points, remaining: remaining) {
-                    indices.append(remaining[prev])
-                    indices.append(remaining[i])
-                    indices.append(remaining[next])
-                    remaining.remove(at: i)
-                    earFound = true
-                    break
-                }
-            }
-
-            if !earFound {
-                // Fallback: just use first three vertices as triangle
-                if remaining.count >= 3 {
-                    indices.append(remaining[0])
-                    indices.append(remaining[1])
-                    indices.append(remaining[2])
-                    remaining.remove(at: 1)
-                }
-            }
-        }
-
-        // Add final triangle
-        if remaining.count == 3 {
-            indices.append(remaining[0])
-            indices.append(remaining[1])
-            indices.append(remaining[2])
-        }
-
-        return indices
-    }
-
-    /// Calculates the signed area of a polygon.
-    private func signedArea(_ polygon: [CGPoint]) -> CGFloat {
-        var area: CGFloat = 0
-        let n = polygon.count
-        for i in 0..<n {
-            let j = (i + 1) % n
-            area += polygon[i].x * polygon[j].y
-            area -= polygon[j].x * polygon[i].y
-        }
-        return area / 2
-    }
-
-    /// Checks if vertex b is an ear (can be clipped).
-    private func isEar(a: CGPoint, b: CGPoint, c: CGPoint,
-                       polygon: [CGPoint], remaining: [Int]) -> Bool {
-        // Check if triangle is convex (counter-clockwise)
-        let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
-        if cross <= 0 {
-            return false
-        }
-
-        // Check if any other point is inside the triangle
-        for idx in remaining {
-            let p = polygon[idx]
-            if (p.x == a.x && p.y == a.y) ||
-               (p.x == b.x && p.y == b.y) ||
-               (p.x == c.x && p.y == c.y) {
-                continue
-            }
-            if pointInTriangle(p: p, a: a, b: b, c: c) {
-                return false
-            }
-        }
-
-        return true
-    }
-
-    /// Checks if point p is inside triangle abc.
-    private func pointInTriangle(p: CGPoint, a: CGPoint, b: CGPoint, c: CGPoint) -> Bool {
-        let v0x = c.x - a.x
-        let v0y = c.y - a.y
-        let v1x = b.x - a.x
-        let v1y = b.y - a.y
-        let v2x = p.x - a.x
-        let v2y = p.y - a.y
-
-        let dot00 = v0x * v0x + v0y * v0y
-        let dot01 = v0x * v1x + v0y * v1y
-        let dot02 = v0x * v2x + v0y * v2y
-        let dot11 = v1x * v1x + v1y * v1y
-        let dot12 = v1x * v2x + v1y * v2y
-
-        let invDenom = 1 / (dot00 * dot11 - dot01 * dot01)
-        let u = (dot11 * dot02 - dot01 * dot12) * invDenom
-        let v = (dot00 * dot12 - dot01 * dot02) * invDenom
-
-        return (u >= 0) && (v >= 0) && (u + v <= 1)
-    }
-
     /// Generates stroke geometry for a polyline.
     /// Returns vertices forming triangle strips along the path.
     private func generateStrokeGeometry(polyline: [CGPoint], lineWidth: CGFloat,
@@ -7364,51 +7254,51 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
               let uniformBuffer = uniformBuffer else {
             return
         }
-
-        // Flatten the path
-        let polylines = flattenPath(path)
-        guard !polylines.isEmpty else {
+        do {
+            try ShapeFillTessellator.validate(path)
+        } catch {
+            shapeRenderFailureCount += 1
             return
         }
 
-        // Render fill if fillColor is set
+        // Renderers for textured, gradient, filter, and emitter layers change
+        // the active pipeline. A shape must therefore select its own solid
+        // pipeline instead of depending on whichever sibling rendered first.
+        renderPass.setPipeline(stencilAwarePipeline())
+
+        // Render the complete fill in one tessellation so subpath winding and
+        // even-odd holes are preserved across contour boundaries.
         if let fillColor = shapeLayer.fillColor {
-            for polyline in polylines {
-                guard polyline.count >= 3 else { continue }
+            let fillPoints: [CGPoint]
+            do {
+                fillPoints = try ShapeFillTessellator.triangles(
+                    for: path,
+                    rule: shapeLayer.fillRule
+                )
+            } catch {
+                shapeRenderFailureCount += 1
+                fillPoints = []
+            }
 
-                // Triangulate the polygon
-                let indices = triangulatePolygon(polyline)
-                guard !indices.isEmpty else { continue }
+            let colorComponents = cgColorToSIMD4(fillColor)
+            let bounds = shapeLayer.bounds
+            let hasValidBounds = bounds.width > 0 && bounds.height > 0
+            var vertices = fillPoints.map { point in
+                let layerCoordinate = hasValidBounds
+                    ? SIMD2(
+                        Float((point.x - bounds.minX) / bounds.width),
+                        Float((point.y - bounds.minY) / bounds.height)
+                    )
+                    : .zero
+                return CARendererVertex(
+                    position: SIMD2(Float(point.x), Float(point.y)),
+                    texCoord: layerCoordinate,
+                    color: colorComponents
+                )
+            }
 
-                // Create vertices from triangulation
-                var vertices: [CARendererVertex] = []
-                let colorComponents = cgColorToSIMD4(fillColor)
-                let bounds = shapeLayer.bounds
-                let hasValidBounds = bounds.width > 0 && bounds.height > 0
-
-                for idx in indices {
-                    let point = polyline[idx]
-                    let layerCoordinate = hasValidBounds
-                        ? SIMD2(
-                            Float((point.x - bounds.minX) / bounds.width),
-                            Float((point.y - bounds.minY) / bounds.height)
-                        )
-                        : .zero
-                    vertices.append(CARendererVertex(
-                        position: SIMD2(Float(point.x), Float(point.y)),
-                        texCoord: layerCoordinate,
-                        color: colorComponents
-                    ))
-                }
-
-                guard !vertices.isEmpty else { continue }
-
-                // Allocate vertices dynamically
-                guard let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) else {
-                    continue  // Buffer full, skip this polyline
-                }
-
-                // Update uniforms
+            if !vertices.isEmpty,
+               let (vertexOffset, uniformIndex) = allocateVertices(count: vertices.count) {
                 var uniforms = CARendererUniforms(
                     mvpMatrix: modelMatrix,
                     opacity: currentEffectiveOpacity,
@@ -7416,32 +7306,28 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                     layerSize: SIMD2(Float(bounds.width), Float(bounds.height)),
                     edgeAntialiasingMask: hasValidBounds ? shapeLayer.edgeAntialiasingMaskValue : 0
                 )
-
                 let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
-                let uniformData = createFloat32Array(from: &uniforms)
                 device.queue.writeBuffer(
                     uniformBuffer,
                     bufferOffset: uniformOffset,
-                    data: uniformData
+                    data: createFloat32Array(from: &uniforms)
                 )
-
-                // Write vertices at dynamically allocated offset
-                let vertexData = createFloat32Array(from: &vertices)
                 device.queue.writeBuffer(
                     vertexBuffer,
                     bufferOffset: vertexOffset,
-                    data: vertexData
+                    data: createFloat32Array(from: &vertices)
                 )
-
-                // Draw
                 renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
                 renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
                 renderPass.draw(vertexCount: UInt32(vertices.count))
+                shapeFillDrawCount += 1
+                shapeFillVertexCount += vertices.count
             }
         }
 
         // Render stroke if strokeColor is set
         if let strokeColor = shapeLayer.strokeColor, shapeLayer.lineWidth > 0 {
+            let polylines = flattenPath(path)
             for polyline in polylines {
                 guard polyline.count >= 2 else { continue }
 
@@ -7802,16 +7688,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 ))
 
                 let whiteColor = SIMD4<Float>(1, 1, 1, 1)
-                var maskVertices: [CARendererVertex] = []
-                for polyline in flattenPath(shadowPath) where polyline.count >= 3 {
-                    for index in triangulatePolygon(polyline) {
-                        let point = polyline[index]
-                        maskVertices.append(CARendererVertex(
+                var maskVertices: [CARendererVertex]
+                do {
+                    maskVertices = try ShapeFillTessellator.triangles(
+                        for: shadowPath,
+                        rule: .nonZero
+                    ).map { point in
+                        CARendererVertex(
                             position: SIMD2(Float(point.x), Float(point.y)),
                             texCoord: .zero,
                             color: whiteColor
-                        ))
+                        )
                     }
+                } catch {
+                    shadowRenderFailureCount += 1
+                    maskVertices = []
                 }
 
                 let maskVertexBuffer = resources.ensureMaskVertexCapacity(
@@ -10273,16 +10164,21 @@ public final class CAWebGPURenderer: CARenderer, CARendererDelegate {
                 ]
             ))
             let white = SIMD4<Float>(repeating: 1)
-            var vertices: [CARendererVertex] = []
-            for polyline in flattenPath(shadowPath) where polyline.count >= 3 {
-                for index in triangulatePolygon(polyline) {
-                    let point = polyline[index]
-                    vertices.append(CARendererVertex(
+            var vertices: [CARendererVertex]
+            do {
+                vertices = try ShapeFillTessellator.triangles(
+                    for: shadowPath,
+                    rule: .nonZero
+                ).map { point in
+                    CARendererVertex(
                         position: SIMD2(Float(point.x), Float(point.y)),
                         texCoord: .zero,
                         color: white
-                    ))
+                    )
                 }
+            } catch {
+                shadowRenderFailureCount += 1
+                return nil
             }
             let vertexBuffer = resources.ensureMaskVertexCapacity(vertices.count, device: device)
             if !vertices.isEmpty {
