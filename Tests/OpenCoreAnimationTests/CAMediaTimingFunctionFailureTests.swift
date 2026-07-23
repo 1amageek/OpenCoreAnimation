@@ -19,6 +19,35 @@ struct CAMediaTimingFunctionFailureTests {
         #expect(function.evaluateIfFinite(at: 0.5) == nil)
     }
 
+    @Test("Predefined names resolve to their documented control points")
+    func predefinedNamesResolveExactly() {
+        let expected: [(CAMediaTimingFunctionName, [Float])] = [
+            (.linear, [0, 0, 1, 1]),
+            (.easeIn, [0.42, 0, 1, 1]),
+            (.easeOut, [0, 0, 0.58, 1]),
+            (.easeInEaseOut, [0.42, 0, 0.58, 1]),
+            (.default, [0.25, 0.1, 0.25, 1]),
+        ]
+
+        for (name, components) in expected {
+            let function = CAMediaTimingFunction(name: name)
+            var first = [Float](repeating: 0, count: 2)
+            var second = [Float](repeating: 0, count: 2)
+            function.getControlPoint(at: 1, values: &first)
+            function.getControlPoint(at: 2, values: &second)
+            #expect(first + second == components)
+        }
+    }
+
+    @Test("Unknown predefined names fail instead of becoming linear")
+    func unknownNameFails() async {
+        await #expect(processExitsWith: .failure) {
+            _ = CAMediaTimingFunction(
+                name: CAMediaTimingFunctionName(rawValue: "future")
+            )
+        }
+    }
+
     @Test("Basic and keyframe timing failures leave presentation unchanged")
     func propertyAnimationsFailAtomically() throws {
         let basicLayer = CALayer()

@@ -16,20 +16,15 @@ public class CAMediaTimingFunction: Hashable {
     ///
     /// - Parameter name: The name of the predefined timing function.
     public convenience init(name: CAMediaTimingFunctionName) {
-        switch name {
-        case .linear:
-            self.init(controlPoints: 0.0, 0.0, 1.0, 1.0)
-        case .easeIn:
-            self.init(controlPoints: 0.42, 0.0, 1.0, 1.0)
-        case .easeOut:
-            self.init(controlPoints: 0.0, 0.0, 0.58, 1.0)
-        case .easeInEaseOut:
-            self.init(controlPoints: 0.42, 0.0, 0.58, 1.0)
-        case .default:
-            self.init(controlPoints: 0.25, 0.1, 0.25, 1.0)
-        default:
-            self.init(controlPoints: 0.0, 0.0, 1.0, 1.0)
+        guard let points = Self.predefinedControlPoints(for: name) else {
+            preconditionFailure("Unknown timing function name: \(name.rawValue)")
         }
+        self.init(
+            controlPoints: points.0,
+            points.1,
+            points.2,
+            points.3
+        )
     }
 
     /// Returns an initialized timing function modeled as a cubic Bézier curve using the specified control points.
@@ -135,6 +130,25 @@ public class CAMediaTimingFunction: Hashable {
     internal func evaluateIfFinite(at t: Float) -> Float? {
         let result = evaluate(at: t)
         return result.isFinite ? result : nil
+    }
+
+    internal static func predefinedControlPoints(
+        for name: CAMediaTimingFunctionName
+    ) -> (Float, Float, Float, Float)? {
+        switch name {
+        case .linear:
+            return (0, 0, 1, 1)
+        case .easeIn:
+            return (0.42, 0, 1, 1)
+        case .easeOut:
+            return (0, 0, 0.58, 1)
+        case .easeInEaseOut:
+            return (0.42, 0, 0.58, 1)
+        case .default:
+            return (0.25, 0.1, 0.25, 1)
+        default:
+            return nil
+        }
     }
 
     /// Fallback bisection method for finding the parameter u where x(u) = t.
