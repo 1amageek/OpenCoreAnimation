@@ -1594,6 +1594,106 @@ struct CAKeyframeAnimationTests {
         let tight = sampledPosition(tension: [1, 1, 1, 1])
         #expect(abs(rounded.x - tight.x) > 0.01 || abs(rounded.y - tight.y) > 0.01)
     }
+
+    @Test("Paced size keyframes use vector distance")
+    func pacedSizeKeyframesUseVectorDistance() throws {
+        let layer = CALayer()
+        let animation = CAKeyframeAnimation(keyPath: "bounds.size")
+        animation.values = [
+            CGSize(width: 0, height: 0),
+            CGSize(width: 6, height: 8),
+            CGSize(width: 6, height: 38),
+        ]
+        animation.calculationMode = .paced
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        layer.add(animation, forKey: "pacedSize")
+
+        let size = try #require(layer.presentation()).bounds.size
+        #expect(abs(size.width - 6) < 0.001)
+        #expect(abs(size.height - 18) < 0.001)
+    }
+
+    @Test("Cubic-paced keyframes scale tangents for paced key times")
+    func cubicPacedKeyframesScaleTangentsForPacedKeyTimes() throws {
+        let pointLayer = CALayer()
+        let pointAnimation = CAKeyframeAnimation(keyPath: "position")
+        pointAnimation.values = [
+            CGPoint(x: 0, y: 0),
+            CGPoint(x: 20, y: 80),
+            CGPoint(x: 100, y: 20),
+            CGPoint(x: 120, y: 100),
+        ]
+        pointAnimation.calculationMode = .cubicPaced
+        pointAnimation.duration = 1
+        pointAnimation.speed = 0
+        pointAnimation.timeOffset = 0.35
+        pointLayer.add(pointAnimation, forKey: "cubicPacedPoint")
+
+        let scalarLayer = CALayer()
+        let scalarAnimation = CAKeyframeAnimation(keyPath: "zPosition")
+        scalarAnimation.values = [
+            CGFloat(0),
+            CGFloat(80),
+            CGFloat(20),
+            CGFloat(100),
+        ]
+        scalarAnimation.calculationMode = .cubicPaced
+        scalarAnimation.duration = 1
+        scalarAnimation.speed = 0
+        scalarAnimation.timeOffset = 0.35
+        scalarLayer.add(scalarAnimation, forKey: "cubicPacedScalar")
+
+        let point = try #require(pointLayer.presentation()).position
+        let scalar = try #require(scalarLayer.presentation()).zPosition
+        #expect(abs(point.x - 26.365239) < 0.01)
+        #expect(abs(point.y - 79.036540) < 0.01)
+        #expect(abs(scalar - 79.382188) < 0.01)
+    }
+
+    @Test("Unsupported paced values leave presentation state unchanged")
+    func unsupportedPacedValuesDoNotSynthesizeProgress() throws {
+        let layer = CALayer()
+        layer.transform = CATransform3DMakeScale(2, 3, 4)
+        let animation = CAKeyframeAnimation(keyPath: "transform")
+        animation.values = [
+            CATransform3DMakeTranslation(0, 0, 0),
+            CATransform3DMakeTranslation(10, 20, 30),
+        ]
+        animation.calculationMode = .paced
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        layer.add(animation, forKey: "unsupportedPacedTransform")
+
+        let transform = try #require(layer.presentation()).transform
+        #expect(abs(transform.m11 - 2) < 0.001)
+        #expect(abs(transform.m22 - 3) < 0.001)
+        #expect(abs(transform.m33 - 4) < 0.001)
+        #expect(abs(transform.m41) < 0.001)
+        #expect(abs(transform.m42) < 0.001)
+        #expect(abs(transform.m43) < 0.001)
+    }
+
+    @Test("Non-finite paced values leave presentation state unchanged")
+    func nonFinitePacedValuesDoNotApply() throws {
+        let layer = CALayer()
+        layer.position = CGPoint(x: 7, y: 11)
+        let animation = CAKeyframeAnimation(keyPath: "position")
+        animation.values = [
+            CGPoint(x: 0, y: 0),
+            CGPoint(x: CGFloat.infinity, y: 20),
+        ]
+        animation.calculationMode = .paced
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        layer.add(animation, forKey: "nonFinitePacedPosition")
+
+        let position = try #require(layer.presentation()).position
+        #expect(position == CGPoint(x: 7, y: 11))
+    }
 }
 
 // MARK: - CAAnimationGroup Tests

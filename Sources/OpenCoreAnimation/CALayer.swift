@@ -2303,19 +2303,21 @@ open class CALayer: CAMediaTiming, Hashable {
             return
         }
 
-        // For paced modes, remap progress based on arc length
+        // For paced modes, derive key times from value distance.
         let effectiveProgress: CFTimeInterval
         var effectiveKeyTimes: [CGFloat]
 
         switch animation.calculationMode {
         case .paced, .cubicPaced:
-            // Calculate arc-length parameterized progress
-            let (remappedProgress, pacedKeyTimes) = calculatePacedProgress(
-                progress: CGFloat(progress),
-                values: values,
-                animation: animation
-            )
-            effectiveProgress = CFTimeInterval(remappedProgress)
+            guard progress.isFinite,
+                  let pacedKeyTimes = calculatePacedKeyTimes(
+                    values: values,
+                    animation: animation,
+                    keyPath: keyPath
+                  ) else {
+                return
+            }
+            effectiveProgress = progress
             effectiveKeyTimes = pacedKeyTimes
         default:
             effectiveProgress = progress
@@ -2421,6 +2423,13 @@ open class CALayer: CAMediaTiming, Hashable {
             let p1 = values[startIndex]
             let p2 = values[endIndex]
             let p3 = values[p3Index]
+            let tangentScales = animation.calculationMode == .cubicPaced
+                ? cubicPacedTangentScales(
+                    keyTimes: effectiveKeyTimes,
+                    startIndex: startIndex,
+                    endIndex: endIndex
+                )
+                : (start: CGFloat(1), end: CGFloat(1))
 
             interpolateCubicKeyframeValue(
                 p0: p0,
@@ -2428,8 +2437,16 @@ open class CALayer: CAMediaTiming, Hashable {
                 p2: p2,
                 p3: p3,
                 t: CGFloat(adjustedProgress),
-                startParameters: cubicParameters(for: animation, at: startIndex),
-                endParameters: cubicParameters(for: animation, at: endIndex),
+                startParameters: cubicParameters(
+                    for: animation,
+                    at: startIndex,
+                    tangentScale: tangentScales.start
+                ),
+                endParameters: cubicParameters(
+                    for: animation,
+                    at: endIndex,
+                    tangentScale: tangentScales.end
+                ),
                 layer: layer,
                 keyPath: keyPath,
                 additive: animation.isAdditive,
@@ -2450,269 +2467,167 @@ open class CALayer: CAMediaTiming, Hashable {
         }
     }
 
-    /// Calculates arc-length parameterized progress for paced animation modes.
-    ///
-    /// Returns the remapped progress and the paced key times array.
-    private func calculatePacedProgress(
-        progress: CGFloat,
+    /// Calculates distance-parameterized key times for paced animation modes.
+    private func calculatePacedKeyTimes(
         values: [Any],
-        animation: CAKeyframeAnimation
-    ) -> (CGFloat, [CGFloat]) {
-        guard values.count > 1 else { return (progress, [0]) }
+        animation: CAKeyframeAnimation,
+        keyPath: String
+    ) -> [CGFloat]? {
+        guard values.count > 1 else { return [0] }
 
         // QuartzCore preserves even keyframe spacing for the aggregate scale
-        // and translate value functions. Scalar value functions are paced by
-        // their transformed component distance.
+        // and translate value functions, aggregate arrays, contents, and path
+        // values. Scalar value functions are paced by their transformed
+        // component distance.
         if let valueFunction = animation.valueFunction,
            valueFunction.componentCount > 1 {
-            return (progress, defaultKeyTimes(for: values.count))
+            return defaultKeyTimes(for: values.count)
+        }
+        if usesEvenPacing(values: values, keyPath: keyPath) {
+            return defaultKeyTimes(for: values.count)
         }
 
-        // Calculate distances between consecutive keyframes
         var distances: [CGFloat] = []
+        distances.reserveCapacity(values.count - 1)
         for i in 0..<(values.count - 1) {
-            let distance: CGFloat
+            let distance: CGFloat?
             if let valueFunction = animation.valueFunction {
-                let measuredDistance: CGFloat?
-                if animation.calculationMode == .cubicPaced {
-                    let p0Index = max(0, i - 1)
-                    let p3Index = min(values.count - 1, i + 2)
-                    measuredDistance = estimateValueFunctionCubicArcLength(
-                        p0: values[p0Index],
-                        p1: values[i],
-                        p2: values[i + 1],
-                        p3: values[p3Index],
-                        valueFunction: valueFunction,
-                        startParameters: cubicParameters(for: animation, at: i),
-                        endParameters: cubicParameters(for: animation, at: i + 1),
-                        isFirstSegment: i == 0,
-                        isLastSegment: i + 1 == values.count - 1
-                    )
-                } else {
-                    measuredDistance = valueFunction.distance(from: values[i], to: values[i + 1])
-                }
-                guard let measuredDistance, measuredDistance.isFinite else {
-                    return (progress, Array(repeating: .nan, count: values.count))
-                }
-                distance = measuredDistance
-            } else if animation.calculationMode == .cubicPaced {
-                // For cubic paced, estimate the Kochanek-Bartels segment length.
-                let p0Index = max(0, i - 1)
-                let p3Index = min(values.count - 1, i + 2)
-                distance = estimateCubicArcLength(
-                    p0: values[p0Index],
-                    p1: values[i],
-                    p2: values[i + 1],
-                    p3: values[p3Index],
-                    startParameters: cubicParameters(for: animation, at: i),
-                    endParameters: cubicParameters(for: animation, at: i + 1),
-                    isFirstSegment: i == 0,
-                    isLastSegment: i + 1 == values.count - 1
-                )
+                distance = valueFunction.distance(from: values[i], to: values[i + 1])
             } else {
                 distance = calculateDistance(from: values[i], to: values[i + 1])
             }
-            distances.append(max(distance, 0.0001)) // Avoid zero distance
+            guard let distance, distance.isFinite, distance >= 0 else {
+                return nil
+            }
+            distances.append(distance)
         }
 
-        // Calculate cumulative distances
         var cumulativeDistances: [CGFloat] = [0]
+        cumulativeDistances.reserveCapacity(values.count)
         for distance in distances {
-            cumulativeDistances.append(cumulativeDistances.last! + distance)
+            guard let previousDistance = cumulativeDistances.last else { return nil }
+            let cumulativeDistance = previousDistance + distance
+            guard cumulativeDistance.isFinite else { return nil }
+            cumulativeDistances.append(cumulativeDistance)
         }
-        let totalDistance = cumulativeDistances.last!
-
-        // Calculate paced key times (normalized by total distance)
-        var pacedKeyTimes: [CGFloat] = []
-        for cumDist in cumulativeDistances {
-            pacedKeyTimes.append(cumDist / totalDistance)
+        guard let totalDistance = cumulativeDistances.last else { return nil }
+        guard totalDistance > 0 else {
+            return defaultKeyTimes(for: values.count)
         }
 
-        return (progress, pacedKeyTimes)
+        return cumulativeDistances.map { $0 / totalDistance }
     }
 
     /// Calculates the distance between two animation values.
-    private func calculateDistance(from: Any, to: Any) -> CGFloat {
-        // CGPoint distance (Euclidean)
-        if let fromPoint = from as? CGPoint, let toPoint = to as? CGPoint {
-            let dx = toPoint.x - fromPoint.x
-            let dy = toPoint.y - fromPoint.y
-            return sqrt(dx * dx + dy * dy)
-        }
-
-        // Scalar distance (absolute)
-        if let fromScalar = transformScalarValue(from),
-           let toScalar = transformScalarValue(to) {
-            return abs(toScalar - fromScalar)
-        }
-
-        if let fromBool = from as? Bool, let toBool = to as? Bool {
-            return fromBool == toBool ? 0 : 1
-        }
-
-        // CGRect distance (sum of component distances)
-        if let fromRect = from as? CGRect, let toRect = to as? CGRect {
-            return abs(toRect.origin.x - fromRect.origin.x) +
-                   abs(toRect.origin.y - fromRect.origin.y) +
-                   abs(toRect.size.width - fromRect.size.width) +
-                   abs(toRect.size.height - fromRect.size.height)
-        }
-
-        // CGColor distance (RGBA Euclidean)
-        if let fromColor = extractColor(from), let toColor = extractColor(to) {
-            let fromComponents = fromColor.components ?? [0, 0, 0, 1]
-            let toComponents = toColor.components ?? [0, 0, 0, 1]
-            var sum: CGFloat = 0
-            for i in 0..<min(fromComponents.count, toComponents.count) {
-                let diff = toComponents[i] - fromComponents[i]
-                sum += diff * diff
-            }
-            return sqrt(sum)
-        }
-
-        // Default: return 1 for equal spacing
-        return 1.0
-    }
-
-    /// Estimates the arc length of a Kochanek-Bartels spline segment using numerical integration.
-    private func estimateCubicArcLength(
-        p0: Any,
-        p1: Any,
-        p2: Any,
-        p3: Any,
-        startParameters: CubicParameters,
-        endParameters: CubicParameters,
-        isFirstSegment: Bool,
-        isLastSegment: Bool
-    ) -> CGFloat {
-        // Sample the curve at multiple points and sum the chord lengths.
-        let numSamples = 10
-        var arcLength: CGFloat = 0
-
-        guard let prev = interpolateForDistance(
-            p0: p0,
-            p1: p1,
-            p2: p2,
-            p3: p3,
-            t: 0,
-            startParameters: startParameters,
-            endParameters: endParameters,
-            isFirstSegment: isFirstSegment,
-            isLastSegment: isLastSegment
-        ) else {
-            // Fallback to linear distance
-            return calculateDistance(from: p1, to: p2)
-        }
-
-        var previousPoint = prev
-
-        for i in 1...numSamples {
-            let t = CGFloat(i) / CGFloat(numSamples)
-            guard let currentPoint = interpolateForDistance(
-                p0: p0,
-                p1: p1,
-                p2: p2,
-                p3: p3,
-                t: t,
-                startParameters: startParameters,
-                endParameters: endParameters,
-                isFirstSegment: isFirstSegment,
-                isLastSegment: isLastSegment
-            ) else {
-                return calculateDistance(from: p1, to: p2)
-            }
-            arcLength += calculatePointDistance(from: previousPoint, to: currentPoint)
-            previousPoint = currentPoint
-        }
-
-        return arcLength
-    }
-
-    private func estimateValueFunctionCubicArcLength(
-        p0: Any,
-        p1: Any,
-        p2: Any,
-        p3: Any,
-        valueFunction: CAValueFunction,
-        startParameters: CubicParameters,
-        endParameters: CubicParameters,
-        isFirstSegment: Bool,
-        isLastSegment: Bool
-    ) -> CGFloat? {
-        guard let c0 = valueFunction.components(from: p0),
-              let c1 = valueFunction.components(from: p1),
-              let c2 = valueFunction.components(from: p2),
-              let c3 = valueFunction.components(from: p3) else {
+    private func calculateDistance(from: Any, to: Any) -> CGFloat? {
+        guard let fromComponents = pacedComponents(from: from),
+              let toComponents = pacedComponents(from: to) else {
             return nil
         }
-
-        func components(at progress: CGFloat) -> [CGFloat] {
-            c0.indices.map { index in
-                return cubicInterpolate(
-                    c0[index], c1[index], c2[index], c3[index], progress,
-                    startParameters: startParameters,
-                    endParameters: endParameters,
-                    isFirstSegment: isFirstSegment,
-                    isLastSegment: isLastSegment
-                )
-            }
-        }
-
-        func distance(_ lhs: [CGFloat], _ rhs: [CGFloat]) -> CGFloat {
-            sqrt(zip(lhs, rhs).reduce(CGFloat(0)) { partialResult, pair in
-                let difference = pair.1 - pair.0
-                return partialResult + difference * difference
-            })
-        }
-
-        let sampleCount = 10
-        var previous = components(at: 0)
-        var length: CGFloat = 0
-        for index in 1...sampleCount {
-            let current = components(at: CGFloat(index) / CGFloat(sampleCount))
-            length += distance(previous, current)
-            previous = current
-        }
-        return length
+        return componentDistance(fromComponents, toComponents)
     }
 
-    /// Interpolates a point on the Kochanek-Bartels spline for distance calculation.
-    private func interpolateForDistance(
-        p0: Any,
-        p1: Any,
-        p2: Any,
-        p3: Any,
-        t: CGFloat,
-        startParameters: CubicParameters,
-        endParameters: CubicParameters,
-        isFirstSegment: Bool,
-        isLastSegment: Bool
-    ) -> (x: CGFloat, y: CGFloat)? {
-        if let v0 = p0 as? CGPoint, let v1 = p1 as? CGPoint, let v2 = p2 as? CGPoint, let v3 = p3 as? CGPoint {
-            let x = cubicInterpolate(
-                v0.x, v1.x, v2.x, v3.x, t,
-                startParameters: startParameters,
-                endParameters: endParameters,
-                isFirstSegment: isFirstSegment,
-                isLastSegment: isLastSegment
-            )
-            let y = cubicInterpolate(
-                v0.y, v1.y, v2.y, v3.y, t,
-                startParameters: startParameters,
-                endParameters: endParameters,
-                isFirstSegment: isFirstSegment,
-                isLastSegment: isLastSegment
-            )
-            return (x, y)
+    private func componentDistance(_ lhs: [CGFloat], _ rhs: [CGFloat]) -> CGFloat? {
+        guard !lhs.isEmpty,
+              lhs.count == rhs.count,
+              lhs.allSatisfy(\.isFinite),
+              rhs.allSatisfy(\.isFinite) else {
+            return nil
+        }
+        let squaredDistance = zip(lhs, rhs).reduce(CGFloat(0)) { result, pair in
+            let difference = pair.1 - pair.0
+            return result + difference * difference
+        }
+        let distance = sqrt(squaredDistance)
+        return distance.isFinite ? distance : nil
+    }
+
+    private func pacedComponents(from value: Any) -> [CGFloat]? {
+        if let value = value as? CGFloat {
+            return value.isFinite ? [value] : nil
+        }
+        if let value = value as? Double {
+            return value.isFinite ? [CGFloat(value)] : nil
+        }
+        if let value = value as? Float {
+            return value.isFinite ? [CGFloat(value)] : nil
+        }
+        if let value = value as? Int {
+            return [CGFloat(value)]
+        }
+        if let value = value as? Bool {
+            return [value ? 1 : 0]
+        }
+        if let value = value as? CGPoint {
+            let components = [value.x, value.y]
+            return components.allSatisfy(\.isFinite) ? components : nil
+        }
+        if let value = value as? CGSize {
+            let components = [value.width, value.height]
+            return components.allSatisfy(\.isFinite) ? components : nil
+        }
+        if let value = value as? CGRect {
+            let components = [
+                value.origin.x,
+                value.origin.y,
+                value.size.width,
+                value.size.height,
+            ]
+            return components.allSatisfy(\.isFinite) ? components : nil
+        }
+        if let color = extractColor(value),
+           let rgbColor = color.converted(
+            to: .deviceRGB,
+            intent: .defaultIntent,
+            options: nil
+           ),
+           let components = rgbColor.components,
+           components.count == 4,
+           components.allSatisfy(\.isFinite) {
+            return components
         }
         return nil
     }
 
-    /// Calculates Euclidean distance between two 2D points.
-    private func calculatePointDistance(from: (x: CGFloat, y: CGFloat), to: (x: CGFloat, y: CGFloat)) -> CGFloat {
-        let dx = to.x - from.x
-        let dy = to.y - from.y
-        return sqrt(dx * dx + dy * dy)
+    private func usesEvenPacing(values: [Any], keyPath: String) -> Bool {
+        if keyPath == "contents" {
+            return true
+        }
+        return values.allSatisfy { value in
+            value is [CGFloat]
+                || value is [Any]
+                || extractPath(value) != nil
+        }
+    }
+
+    private func cubicPacedTangentScales(
+        keyTimes: [CGFloat],
+        startIndex: Int,
+        endIndex: Int
+    ) -> (start: CGFloat, end: CGFloat) {
+        let segmentDuration = keyTimes[endIndex] - keyTimes[startIndex]
+        guard segmentDuration > 0 else { return (1, 1) }
+
+        let startScale: CGFloat
+        if startIndex == 0 {
+            startScale = 1
+        } else {
+            let neighborSpan = keyTimes[endIndex] - keyTimes[startIndex - 1]
+            startScale = neighborSpan > 0
+                ? 2 * segmentDuration / neighborSpan
+                : 1
+        }
+
+        let endScale: CGFloat
+        if endIndex == keyTimes.count - 1 {
+            endScale = 1
+        } else {
+            let neighborSpan = keyTimes[endIndex + 1] - keyTimes[startIndex]
+            endScale = neighborSpan > 0
+                ? 2 * segmentDuration / neighborSpan
+                : 1
+        }
+        return (startScale, endScale)
     }
 
     /// Generates default key times evenly distributed.
@@ -3042,11 +2957,13 @@ open class CALayer: CAMediaTiming, Hashable {
         let tension: CGFloat
         let continuity: CGFloat
         let bias: CGFloat
+        let tangentScale: CGFloat
     }
 
     private func cubicParameters(
         for animation: CAKeyframeAnimation,
-        at index: Int
+        at index: Int,
+        tangentScale: CGFloat = 1
     ) -> CubicParameters {
         func value(_ values: [CGFloat]?) -> CGFloat {
             guard let values, values.indices.contains(index) else { return 0 }
@@ -3055,7 +2972,8 @@ open class CALayer: CAMediaTiming, Hashable {
         return CubicParameters(
             tension: value(animation.tensionValues),
             continuity: value(animation.continuityValues),
-            bias: value(animation.biasValues)
+            bias: value(animation.biasValues),
+            tangentScale: tangentScale
         )
     }
 
@@ -3294,12 +3212,16 @@ open class CALayer: CAMediaTiming, Hashable {
     ) -> CGFloat {
         let previous = isFirstSegment ? 2 * p1 - p2 : p0
         let following = isLastSegment ? 2 * p2 - p1 : p3
-        let startScale = 0.5 * (1 - startParameters.tension)
+        let startScale = 0.5
+            * (1 - startParameters.tension)
+            * startParameters.tangentScale
         let outgoing = startScale * (
             (1 + startParameters.continuity) * (1 + startParameters.bias) * (p1 - previous)
                 + (1 - startParameters.continuity) * (1 - startParameters.bias) * (p2 - p1)
         )
-        let endScale = 0.5 * (1 - endParameters.tension)
+        let endScale = 0.5
+            * (1 - endParameters.tension)
+            * endParameters.tangentScale
         let incoming = endScale * (
             (1 - endParameters.continuity) * (1 + endParameters.bias) * (p2 - p1)
                 + (1 + endParameters.continuity) * (1 - endParameters.bias) * (following - p2)

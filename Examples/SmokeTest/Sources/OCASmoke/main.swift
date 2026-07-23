@@ -2104,6 +2104,24 @@ func installHarness() {
                 rotation.rotationMode = .rotateAuto
                 configure(rotation, path: rotationPath, offset: 0.5)
                 rotationLayer.add(rotation, forKey: "browserPathRotation")
+
+                let cubicPacedLayer = makeLayer(
+                    color: CGColor(red: 1, green: 0.5, blue: 0, alpha: 1)
+                )
+                let cubicPaced = CAKeyframeAnimation(keyPath: "position")
+                cubicPaced.values = [
+                    CGPoint(x: 250, y: 20),
+                    CGPoint(x: 270, y: 100),
+                    CGPoint(x: 350, y: 40),
+                    CGPoint(x: 370, y: 120),
+                ]
+                cubicPaced.calculationMode = .cubicPaced
+                cubicPaced.duration = 1
+                cubicPaced.speed = 0
+                cubicPaced.timeOffset = 0.35
+                cubicPaced.fillMode = .both
+                cubicPaced.isRemovedOnCompletion = false
+                cubicPacedLayer.add(cubicPaced, forKey: "browserCubicPacedValues")
                 CATransaction.commit()
 
                 @MainActor
@@ -2114,6 +2132,7 @@ func installHarness() {
                     keyedLayer.removeFromSuperlayer()
                     curveLayer.removeFromSuperlayer()
                     rotationLayer.removeFromSuperlayer()
+                    cubicPacedLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
@@ -2127,7 +2146,8 @@ func installHarness() {
                       let discretePresentation = discreteLayer.presentation(),
                       let keyedPresentation = keyedLayer.presentation(),
                       let curvePresentation = curveLayer.presentation(),
-                      let rotationPresentation = rotationLayer.presentation() else {
+                      let rotationPresentation = rotationLayer.presentation(),
+                      let cubicPacedPresentation = cubicPacedLayer.presentation() else {
                     restoreScene()
                     pathKeyframeProbeResult = "error: path presentation unavailable"
                     return
@@ -2145,6 +2165,8 @@ func installHarness() {
                     && abs(curvePresentation.position.y - 201.6) < 0.1
                     && abs(rotationPresentation.transform.m12 - 3) < 0.001
                     && abs(rotationPresentation.transform.m21 + 2) < 0.001
+                    && abs(cubicPacedPresentation.position.x - 276.365239) < 0.01
+                    && abs(cubicPacedPresentation.position.y - 99.036540) < 0.01
 
                 func textureCoordinate(for layerPosition: CGPoint) -> CGPoint {
                     CGPoint(
@@ -2161,6 +2183,7 @@ func installHarness() {
                         textureCoordinate(for: keyedPresentation.position),
                         textureCoordinate(for: curvePresentation.position),
                         textureCoordinate(for: rotationPresentation.position),
+                        textureCoordinate(for: cubicPacedPresentation.position),
                     ])
                     restoreScene()
                     pathKeyframeProbeResult = pixels
