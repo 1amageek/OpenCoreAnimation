@@ -66,7 +66,7 @@ open class CAScrollLayer: CALayer {
         case .both:
             newOrigin = p
         default:
-            newOrigin = p
+            return
         }
 
         bounds.origin = newOrigin
@@ -118,7 +118,7 @@ open class CAScrollLayer: CALayer {
                 visibleSize: bounds.height
             )
         default:
-            newOrigin = r.origin
+            return
         }
 
         bounds.origin = newOrigin

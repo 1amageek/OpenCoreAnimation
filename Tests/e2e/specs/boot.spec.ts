@@ -18,6 +18,7 @@ interface OCA extends Harness {
     getSublayerCount: () => number;
     getTileDrawCount: () => number;
     getTileState: () => string;
+    getScrollModeProbeResult: () => string;
     isEngineRunning: () => boolean;
     getPixelReadback: () => string;
     getTransitionFilterProbeResult: () => string;
@@ -106,6 +107,9 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getCanvasWidth(), "canvas width").toBe(400);
         expect(await h.getCanvasHeight(), "canvas height").toBe(300);
         expect(await h.getSublayerCount(), "root sublayer count").toBe(6);
+        expect(await h.getScrollModeProbeResult(), "unknown scroll mode").toBe(
+            "point=10.0,20.0,rect=10.0,20.0"
+        );
     });
 
     test("engine: display link is running", async ({ harness }) => {

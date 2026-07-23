@@ -23,6 +23,56 @@ struct CALayerScrollingAndAutoresizingTests {
         #expect(scrollLayer.bounds.origin == CGPoint(x: 40, y: 60))
     }
 
+    @Test("CAScrollLayer point scrolling respects every mode")
+    func pointScrollingModes() {
+        let expectations: [(CAScrollLayerScrollMode, CGPoint)] = [
+            (.none, CGPoint(x: 10, y: 20)),
+            (.horizontally, CGPoint(x: 30, y: 20)),
+            (.vertically, CGPoint(x: 10, y: 50)),
+            (.both, CGPoint(x: 30, y: 50)),
+            (
+                CAScrollLayerScrollMode(rawValue: "future"),
+                CGPoint(x: 10, y: 20)
+            ),
+        ]
+
+        for (mode, expectedOrigin) in expectations {
+            let scrollLayer = CAScrollLayer()
+            scrollLayer.bounds = CGRect(x: 10, y: 20, width: 100, height: 80)
+            scrollLayer.scrollMode = mode
+
+            scrollLayer.scroll(to: CGPoint(x: 30, y: 50))
+
+            #expect(scrollLayer.bounds.origin == expectedOrigin)
+        }
+    }
+
+    @Test("CAScrollLayer rectangle scrolling respects every mode")
+    func rectangleScrollingModes() {
+        let expectations: [(CAScrollLayerScrollMode, CGPoint)] = [
+            (.none, CGPoint(x: 10, y: 20)),
+            (.horizontally, CGPoint(x: 20, y: 20)),
+            (.vertically, CGPoint(x: 10, y: 35)),
+            (.both, CGPoint(x: 20, y: 35)),
+            (
+                CAScrollLayerScrollMode(rawValue: "future"),
+                CGPoint(x: 10, y: 20)
+            ),
+        ]
+
+        for (mode, expectedOrigin) in expectations {
+            let scrollLayer = CAScrollLayer()
+            scrollLayer.bounds = CGRect(x: 10, y: 20, width: 100, height: 80)
+            scrollLayer.scrollMode = mode
+
+            scrollLayer.scroll(
+                to: CGRect(x: 90, y: 75, width: 30, height: 40)
+            )
+
+            #expect(scrollLayer.bounds.origin == expectedOrigin)
+        }
+    }
+
     @Test("CALayer scrolling targets the closest ancestor scroll layer")
     func ancestorScrolling() {
         let outerScrollLayer = CAScrollLayer()

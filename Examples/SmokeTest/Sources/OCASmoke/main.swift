@@ -377,6 +377,21 @@ func installHarness() {
             let layer = tiledLayerRef
             return .string("delegate=\(layer?.delegate != nil),bounds=\(layer?.bounds.width ?? -1)x\(layer?.bounds.height ?? -1)")
         })
+        h.expose("getScrollModeProbeResult", returning: {
+            let layer = CAScrollLayer()
+            layer.bounds = CGRect(x: 10, y: 20, width: 100, height: 80)
+            layer.scrollMode = CAScrollLayerScrollMode(rawValue: "future")
+            layer.scroll(to: CGPoint(x: 30, y: 50))
+            let pointOrigin = layer.bounds.origin
+            layer.scroll(
+                to: CGRect(x: 90, y: 75, width: 30, height: 40)
+            )
+            let rectOrigin = layer.bounds.origin
+            return .string(
+                "point=\(pointOrigin.x),\(pointOrigin.y),"
+                    + "rect=\(rectOrigin.x),\(rectOrigin.y)"
+            )
+        })
         h.expose("getPixelReadback", returning: {
             .string(pixelReadbackResult)
         })
