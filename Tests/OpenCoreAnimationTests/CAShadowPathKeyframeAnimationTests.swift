@@ -42,7 +42,7 @@ struct CAShadowPathKeyframeAnimationTests {
         let second = rectangle(x: 20)
         let animation = CAKeyframeAnimation(keyPath: "shadowPath")
         animation.values = [first, second]
-        animation.keyTimes = [0, 1]
+        animation.keyTimes = [0, 0.8, 1]
         animation.calculationMode = .discrete
 
         let result = try #require(presentation(for: animation, elapsed: 0.75).shadowPath)

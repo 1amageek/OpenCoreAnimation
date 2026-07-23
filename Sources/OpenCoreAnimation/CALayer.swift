@@ -2409,6 +2409,9 @@ open class CALayer: CAMediaTiming, Hashable {
         }
 
         guard let values = animation.values, !values.isEmpty else { return }
+        guard CAKeyframeTimingConfiguration.supports(animation.calculationMode) else {
+            return
+        }
         if values.count == 1 {
             applyKeyframeValue(
                 values[0],
@@ -2422,7 +2425,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // For paced modes, derive key times from value distance.
         let effectiveProgress: CFTimeInterval
-        var effectiveKeyTimes: [CGFloat]
+        let effectiveKeyTimes: [CGFloat]
 
         switch animation.calculationMode {
         case .paced, .cubicPaced:
@@ -2436,14 +2439,19 @@ open class CALayer: CAMediaTiming, Hashable {
             }
             effectiveProgress = progress
             effectiveKeyTimes = pacedKeyTimes
-        default:
+        case .discrete:
             effectiveProgress = progress
-            effectiveKeyTimes = animation.keyTimes ?? defaultKeyTimes(for: values.count)
-        }
-
-        guard effectiveKeyTimes.count == values.count,
-              effectiveKeyTimes.allSatisfy(\.isFinite),
-              zip(effectiveKeyTimes, effectiveKeyTimes.dropFirst()).allSatisfy({ $0 <= $1 }) else {
+            effectiveKeyTimes = CAKeyframeTimingConfiguration.effectiveKeyTimes(
+                animation.keyTimes,
+                expectedCount: values.count + 1
+            )
+        case .linear, .cubic:
+            effectiveProgress = progress
+            effectiveKeyTimes = CAKeyframeTimingConfiguration.effectiveKeyTimes(
+                animation.keyTimes,
+                expectedCount: values.count
+            )
+        default:
             return
         }
 
@@ -2458,7 +2466,7 @@ open class CALayer: CAMediaTiming, Hashable {
             )
             return
         }
-        if clampedProgress >= effectiveKeyTimes[values.count - 1] {
+        if clampedProgress >= effectiveKeyTimes[effectiveKeyTimes.count - 1] {
             applyKeyframeValue(
                 values[values.count - 1],
                 layer: layer,
@@ -2469,7 +2477,10 @@ open class CALayer: CAMediaTiming, Hashable {
             return
         }
         if animation.calculationMode == .discrete {
-            let valueIndex = effectiveKeyTimes.lastIndex(where: { $0 <= clampedProgress }) ?? 0
+            let valueIndex = min(
+                effectiveKeyTimes.lastIndex(where: { $0 <= clampedProgress }) ?? 0,
+                values.count - 1
+            )
             applyKeyframeValue(
                 values[valueIndex],
                 layer: layer,
@@ -2598,10 +2609,16 @@ open class CALayer: CAMediaTiming, Hashable {
         // component distance.
         if let valueFunction = animation.valueFunction,
            valueFunction.componentCount > 1 {
-            return defaultKeyTimes(for: values.count)
+            return CAKeyframeTimingConfiguration.effectiveKeyTimes(
+                nil,
+                expectedCount: values.count
+            )
         }
         if usesEvenPacing(values: values, keyPath: keyPath) {
-            return defaultKeyTimes(for: values.count)
+            return CAKeyframeTimingConfiguration.effectiveKeyTimes(
+                nil,
+                expectedCount: values.count
+            )
         }
 
         var distances: [CGFloat] = []
@@ -2629,7 +2646,10 @@ open class CALayer: CAMediaTiming, Hashable {
         }
         guard let totalDistance = cumulativeDistances.last else { return nil }
         guard totalDistance > 0 else {
-            return defaultKeyTimes(for: values.count)
+            return CAKeyframeTimingConfiguration.effectiveKeyTimes(
+                nil,
+                expectedCount: values.count
+            )
         }
 
         return cumulativeDistances.map { $0 / totalDistance }
@@ -2738,12 +2758,6 @@ open class CALayer: CAMediaTiming, Hashable {
                 : 1
         }
         return (startScale, endScale)
-    }
-
-    /// Generates default key times evenly distributed.
-    private func defaultKeyTimes(for count: Int) -> [CGFloat] {
-        guard count > 1 else { return [0] }
-        return (0..<count).map { CGFloat($0) / CGFloat(count - 1) }
     }
 
     /// Finds the segment index for a given progress value.

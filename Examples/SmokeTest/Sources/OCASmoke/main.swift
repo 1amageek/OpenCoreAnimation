@@ -1633,7 +1633,7 @@ func installHarness() {
                 let discreteLayer = makeLayer(x: 290)
                 let discrete = CAKeyframeAnimation(keyPath: "contents")
                 discrete.values = [redImage, greenImage, blueImage]
-                discrete.keyTimes = [0, 0.5, 1]
+                discrete.keyTimes = [0, 0.5, 0.8, 1]
                 discrete.calculationMode = .discrete
                 configure(discrete, offset: 0.75)
                 discreteLayer.add(discrete, forKey: "discrete")
@@ -1783,7 +1783,7 @@ func installHarness() {
                 discreteLayer.shadowPath = discreteRight
                 let discrete = CAKeyframeAnimation(keyPath: "shadowPath")
                 discrete.values = [discreteLeft, discreteRight]
-                discrete.keyTimes = [0, 1]
+                discrete.keyTimes = [0, 0.8, 1]
                 discrete.calculationMode = .discrete
                 configure(discrete, offset: 0.75)
                 discreteLayer.add(discrete, forKey: "browserDiscreteShadowPath")
@@ -2122,6 +2122,45 @@ func installHarness() {
                 cubicPaced.fillMode = .both
                 cubicPaced.isRemovedOnCompletion = false
                 cubicPacedLayer.add(cubicPaced, forKey: "browserCubicPacedValues")
+
+                let invalidKeyTimesLayer = makeLayer(
+                    color: CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+                )
+                let invalidKeyTimes = CAKeyframeAnimation(keyPath: "position")
+                invalidKeyTimes.values = [
+                    CGPoint(x: 40, y: 280),
+                    CGPoint(x: 80, y: 280),
+                    CGPoint(x: 120, y: 280),
+                ]
+                invalidKeyTimes.keyTimes = [-1, 0.5, 1]
+                invalidKeyTimes.duration = 1
+                invalidKeyTimes.speed = 0
+                invalidKeyTimes.timeOffset = 0.25
+                invalidKeyTimes.fillMode = .both
+                invalidKeyTimes.isRemovedOnCompletion = false
+                invalidKeyTimesLayer.add(
+                    invalidKeyTimes,
+                    forKey: "browserInvalidKeyTimes"
+                )
+
+                let unknownModeLayer = makeLayer(
+                    color: CGColor(red: 0, green: 0.5, blue: 1, alpha: 1)
+                )
+                unknownModeLayer.position = CGPoint(x: 160, y: 280)
+                let unknownMode = CAKeyframeAnimation(keyPath: "position")
+                unknownMode.values = [
+                    CGPoint(x: 200, y: 280),
+                    CGPoint(x: 240, y: 280),
+                ]
+                unknownMode.calculationMode = CAAnimationCalculationMode(
+                    rawValue: "unknown"
+                )
+                unknownMode.duration = 1
+                unknownMode.speed = 0
+                unknownMode.timeOffset = 0.5
+                unknownMode.fillMode = .both
+                unknownMode.isRemovedOnCompletion = false
+                unknownModeLayer.add(unknownMode, forKey: "browserUnknownMode")
                 CATransaction.commit()
 
                 @MainActor
@@ -2133,6 +2172,8 @@ func installHarness() {
                     curveLayer.removeFromSuperlayer()
                     rotationLayer.removeFromSuperlayer()
                     cubicPacedLayer.removeFromSuperlayer()
+                    invalidKeyTimesLayer.removeFromSuperlayer()
+                    unknownModeLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
@@ -2147,7 +2188,9 @@ func installHarness() {
                       let keyedPresentation = keyedLayer.presentation(),
                       let curvePresentation = curveLayer.presentation(),
                       let rotationPresentation = rotationLayer.presentation(),
-                      let cubicPacedPresentation = cubicPacedLayer.presentation() else {
+                      let cubicPacedPresentation = cubicPacedLayer.presentation(),
+                      let invalidKeyTimesPresentation = invalidKeyTimesLayer.presentation(),
+                      let unknownModePresentation = unknownModeLayer.presentation() else {
                     restoreScene()
                     pathKeyframeProbeResult = "error: path presentation unavailable"
                     return
@@ -2167,6 +2210,10 @@ func installHarness() {
                     && abs(rotationPresentation.transform.m21 + 2) < 0.001
                     && abs(cubicPacedPresentation.position.x - 276.365239) < 0.01
                     && abs(cubicPacedPresentation.position.y - 99.036540) < 0.01
+                    && abs(invalidKeyTimesPresentation.position.x - 60) < 0.001
+                    && abs(invalidKeyTimesPresentation.position.y - 280) < 0.001
+                    && abs(unknownModePresentation.position.x - 160) < 0.001
+                    && abs(unknownModePresentation.position.y - 280) < 0.001
 
                 func textureCoordinate(for layerPosition: CGPoint) -> CGPoint {
                     CGPoint(
@@ -2184,6 +2231,8 @@ func installHarness() {
                         textureCoordinate(for: curvePresentation.position),
                         textureCoordinate(for: rotationPresentation.position),
                         textureCoordinate(for: cubicPacedPresentation.position),
+                        textureCoordinate(for: invalidKeyTimesPresentation.position),
+                        textureCoordinate(for: unknownModePresentation.position),
                     ])
                     restoreScene()
                     pathKeyframeProbeResult = pixels

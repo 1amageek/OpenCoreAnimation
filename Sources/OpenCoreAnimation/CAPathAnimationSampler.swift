@@ -356,7 +356,10 @@ internal struct CAPathAnimationSampler {
         keyTimes: [CGFloat]?,
         timingFunctions: [CAMediaTimingFunction]?
     ) -> Sample? {
-        guard progress.isFinite else { return nil }
+        guard progress.isFinite,
+              CAKeyframeTimingConfiguration.supports(calculationMode) else {
+            return nil
+        }
         let clampedProgress = min(max(progress, 0), 1)
         let result: Sample?
         switch calculationMode {
@@ -435,7 +438,10 @@ internal struct CAPathAnimationSampler {
             return Sample(point: geometry.end, tangent: geometry.tangent(at: 1))
         }
 
-        let effectiveKeyTimes = validatedKeyTimes(keyTimes) ?? defaultKeyTimes()
+        let effectiveKeyTimes = CAKeyframeTimingConfiguration.effectiveKeyTimes(
+            keyTimes,
+            expectedCount: segments.count + 1
+        )
         let segmentIndex = min(
             effectiveKeyTimes.lastIndex(where: { $0 <= progress }) ?? 0,
             segments.count - 1
@@ -458,23 +464,6 @@ internal struct CAPathAnimationSampler {
             point: segment.point(at: parameter),
             tangent: segment.tangent(at: parameter)
         )
-    }
-
-    private func validatedKeyTimes(_ keyTimes: [CGFloat]?) -> [CGFloat]? {
-        guard let keyTimes,
-              keyTimes.count == segments.count + 1,
-              keyTimes.first == 0,
-              keyTimes.last == 1,
-              keyTimes.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1 }),
-              zip(keyTimes, keyTimes.dropFirst()).allSatisfy({ $0 <= $1 }) else {
-            return nil
-        }
-        return keyTimes
-    }
-
-    private func defaultKeyTimes() -> [CGFloat] {
-        let divisor = CGFloat(segments.count)
-        return (0...segments.count).map { CGFloat($0) / divisor }
     }
 
     private static func isFinite(_ point: CGPoint) -> Bool {

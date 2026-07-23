@@ -64,14 +64,14 @@ struct CABooleanAndDiscreteAnimationTests {
         let middleLayer = CALayer()
         let middle = CAKeyframeAnimation(keyPath: "hidden")
         middle.values = [false, true, false]
-        middle.keyTimes = [0, 0.25, 0.75]
+        middle.keyTimes = [0, 0.25, 0.75, 1]
         middle.calculationMode = .discrete
         add(middle, to: middleLayer, key: "hidden", elapsed: 0.5)
 
         let finalLayer = CALayer()
         let final = CAKeyframeAnimation(keyPath: "hidden")
         final.values = [false, true, false]
-        final.keyTimes = [0, 0.25, 0.75]
+        final.keyTimes = [0, 0.25, 0.75, 1]
         final.calculationMode = .discrete
         add(final, to: finalLayer, key: "hidden", elapsed: 0.9)
 
@@ -98,16 +98,18 @@ struct CABooleanAndDiscreteAnimationTests {
         #expect(positionPresentation.position.y == 7)
     }
 
-    @Test("Linear keyframes hold the final value after the final key time")
-    func linearKeyframesHoldFinalValue() throws {
+    @Test("Invalid linear key times are ignored")
+    func invalidLinearKeyTimesAreIgnored() throws {
         let layer = CALayer()
         let animation = CAKeyframeAnimation(keyPath: "opacity")
         animation.values = [Float(0), Float(1)]
         animation.keyTimes = [0, 0.5]
+        animation.speed = 0
+        animation.timeOffset = 0.75
         add(animation, to: layer, key: "opacity", elapsed: 0.75)
 
         let presentation = try #require(layer.presentation())
-        #expect(presentation.opacity == 1)
+        #expect(abs(presentation.opacity - 0.75) < 0.001)
     }
 
     @Test("shouldRasterize mutations participate in custom action resolution")

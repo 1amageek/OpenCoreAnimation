@@ -80,7 +80,7 @@ struct CAContentsAnimationTests {
         let third = ContentsToken()
         let animation = CAKeyframeAnimation(keyPath: "contents")
         animation.values = [first, second, third]
-        animation.keyTimes = [0, 0.5, 1]
+        animation.keyTimes = [0, 0.5, 0.8, 1]
         animation.calculationMode = .discrete
 
         let presentation = try presentation(for: animation, modelContents: third, elapsed: 0.75)

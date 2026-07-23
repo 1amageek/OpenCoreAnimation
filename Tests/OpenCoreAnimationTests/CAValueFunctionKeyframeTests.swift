@@ -101,7 +101,7 @@ struct CAValueFunctionKeyframeTests {
         let discrete = CAKeyframeAnimation(keyPath: "transform")
         discrete.valueFunction = CAValueFunction(name: .scaleX)
         discrete.values = [CGFloat(1), CGFloat(3)]
-        discrete.keyTimes = [0, 1]
+        discrete.keyTimes = [0, 0.8, 1]
         discrete.calculationMode = .discrete
         let scaled = try presentation(for: discrete, elapsed: 0.75)
         #expect(abs(scaled.m11 - 1) < epsilon)

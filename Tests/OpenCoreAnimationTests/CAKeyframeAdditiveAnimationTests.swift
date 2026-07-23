@@ -53,7 +53,7 @@ struct CAKeyframeAdditiveAnimationTests {
         discreteLayer.position.x = 10
         let discrete = animation("position.x", values: [CGFloat(2), CGFloat(8)])
         discrete.calculationMode = .discrete
-        discrete.keyTimes = [0, 1]
+        discrete.keyTimes = [0, 0.8, 1]
         let discreteResult = try presentation(
             of: discreteLayer,
             animations: [discrete],

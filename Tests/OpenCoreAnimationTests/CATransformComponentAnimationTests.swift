@@ -121,6 +121,7 @@ struct CATransformComponentAnimationTests {
     func discreteAndCubicModesApplyComponents() throws {
         let discrete = CAKeyframeAnimation(keyPath: "transform.translation.z")
         discrete.values = [CGFloat(4), CGFloat(12)]
+        discrete.keyTimes = [0, 0.8, 1]
         discrete.calculationMode = .discrete
         let discretePresentation = try presentation(
             for: discrete,
