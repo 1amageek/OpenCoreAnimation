@@ -18,6 +18,7 @@ internal enum CAMediaTimingEvaluator {
         let basicTime: CFTimeInterval
         let progress: CFTimeInterval
         let completedCycles: Int
+        let isValid: Bool
 
         func applies(fillMode: CAMediaTimingFillMode) -> Bool {
             switch phase {
@@ -37,6 +38,11 @@ internal enum CAMediaTimingEvaluator {
         repeatDuration: CFTimeInterval,
         autoreverses: Bool
     ) -> CFTimeInterval {
+        guard isFiniteOrPositiveInfinity(duration),
+              isFiniteOrPositiveInfinity(repeatCount),
+              isFiniteOrPositiveInfinity(repeatDuration) else {
+            return .nan
+        }
         let basicDuration = max(0, duration)
         guard basicDuration > 0 else { return 0 }
 
@@ -58,6 +64,22 @@ internal enum CAMediaTimingEvaluator {
         parentTime: CFTimeInterval,
         duration: CFTimeInterval
     ) -> Result {
+        guard parentTime.isFinite,
+              animation.beginTime.isFinite,
+              animation.timeOffset.isFinite,
+              animation.speed.isFinite,
+              isFiniteOrPositiveInfinity(duration),
+              isFiniteOrPositiveInfinity(animation.repeatCount),
+              isFiniteOrPositiveInfinity(animation.repeatDuration) else {
+            return Result(
+                phase: .after,
+                basicTime: .nan,
+                progress: .nan,
+                completedCycles: 0,
+                isValid: false
+            )
+        }
+
         let activeDuration = activeDuration(
             duration: duration,
             repeatCount: animation.repeatCount,
@@ -67,7 +89,13 @@ internal enum CAMediaTimingEvaluator {
 
         guard duration > 0, activeDuration > 0 else {
             let phase: Phase = parentTime < animation.beginTime ? .before : .after
-            return Result(phase: phase, basicTime: duration, progress: 1, completedCycles: 0)
+            return Result(
+                phase: phase,
+                basicTime: duration,
+                progress: 1,
+                completedCycles: 0,
+                isValid: true
+            )
         }
 
         let speed = CFTimeInterval(animation.speed)
@@ -125,8 +153,15 @@ internal enum CAMediaTimingEvaluator {
             phase: phase,
             basicTime: basicTime,
             progress: min(1, max(0, basicTime / duration)),
-            completedCycles: completedCycles
+            completedCycles: completedCycles,
+            isValid: true
         )
+    }
+
+    private static func isFiniteOrPositiveInfinity<T: BinaryFloatingPoint>(
+        _ value: T
+    ) -> Bool {
+        value.isFinite || value == .infinity
     }
 
     private static func mapActiveTimeToBasicTime(

@@ -186,14 +186,13 @@ internal enum CARenderTimeContext {
             var futureBeginTimes: [CFTimeInterval] = []
             layer.forEachAttachedAnimation { animation in
                 guard !animation.isFinished else { return }
-                let duration = animation.duration > 0
-                    ? animation.duration
-                    : animation.effectiveBaseDuration
+                let duration = animation.durationOrFallback(animation.effectiveBaseDuration)
                 let timing = CAMediaTimingEvaluator.evaluate(
                     animation,
                     parentTime: parentTime,
                     duration: duration
                 )
+                guard timing.isValid else { return }
                 switch timing.phase {
                 case .active:
                     if animation.speed != 0 {

@@ -237,7 +237,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginPathKeyframeProbe();
         await expect.poll(() => h.getPathKeyframeProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;0,255,0,255;0,0,255,255;0,255,255,255;255,0,255,255;255,255,0,255;255,128,0,255;255,255,255,255;0,128,255,255;255,0,128,255,presentation=true"
+            "255,0,0,255;0,255,0,255;0,0,255,255;0,255,255,255;255,0,255,255;255,255,0,255;255,128,0,255;255,255,255,255;0,128,255,255;255,0,128,255;255,128,0,255,presentation=true"
         );
 
         await h.beginConstraintLayoutProbe();

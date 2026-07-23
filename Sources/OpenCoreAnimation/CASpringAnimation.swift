@@ -193,8 +193,7 @@ open class CASpringAnimation: CABasicAnimation {
 
     /// Override to use settlingDuration when duration is not explicitly set.
     internal override var effectiveBaseDuration: CFTimeInterval {
-        // If duration is explicitly set, use it; otherwise use settlingDuration
-        return duration > 0 ? duration : settlingDuration
+        return durationOrFallback(settlingDuration)
     }
 
     // MARK: - Spring Physics

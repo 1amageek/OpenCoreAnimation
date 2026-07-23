@@ -2181,6 +2181,22 @@ func installHarness() {
                 invalidTiming.fillMode = .both
                 invalidTiming.isRemovedOnCompletion = false
                 invalidTimingLayer.add(invalidTiming, forKey: "browserInvalidTiming")
+
+                let invalidMediaTimingLayer = makeLayer(
+                    color: CGColor(red: 1, green: 0.5, blue: 0, alpha: 1)
+                )
+                invalidMediaTimingLayer.position = CGPoint(x: 240, y: 280)
+                let invalidMediaTiming = CABasicAnimation(keyPath: "position")
+                invalidMediaTiming.fromValue = CGPoint(x: 280, y: 280)
+                invalidMediaTiming.toValue = CGPoint(x: 320, y: 280)
+                invalidMediaTiming.duration = 1
+                invalidMediaTiming.speed = .nan
+                invalidMediaTiming.fillMode = .both
+                invalidMediaTiming.isRemovedOnCompletion = false
+                invalidMediaTimingLayer.add(
+                    invalidMediaTiming,
+                    forKey: "browserInvalidMediaTiming"
+                )
                 CATransaction.commit()
 
                 @MainActor
@@ -2195,6 +2211,7 @@ func installHarness() {
                     invalidKeyTimesLayer.removeFromSuperlayer()
                     unknownModeLayer.removeFromSuperlayer()
                     invalidTimingLayer.removeFromSuperlayer()
+                    invalidMediaTimingLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
@@ -2212,7 +2229,8 @@ func installHarness() {
                       let cubicPacedPresentation = cubicPacedLayer.presentation(),
                       let invalidKeyTimesPresentation = invalidKeyTimesLayer.presentation(),
                       let unknownModePresentation = unknownModeLayer.presentation(),
-                      let invalidTimingPresentation = invalidTimingLayer.presentation() else {
+                      let invalidTimingPresentation = invalidTimingLayer.presentation(),
+                      let invalidMediaTimingPresentation = invalidMediaTimingLayer.presentation() else {
                     restoreScene()
                     pathKeyframeProbeResult = "error: path presentation unavailable"
                     return
@@ -2238,6 +2256,8 @@ func installHarness() {
                     && abs(unknownModePresentation.position.y - 280) < 0.001
                     && abs(invalidTimingPresentation.position.x - 200) < 0.001
                     && abs(invalidTimingPresentation.position.y - 280) < 0.001
+                    && abs(invalidMediaTimingPresentation.position.x - 240) < 0.001
+                    && abs(invalidMediaTimingPresentation.position.y - 280) < 0.001
 
                 func textureCoordinate(for layerPosition: CGPoint) -> CGPoint {
                     CGPoint(
@@ -2258,6 +2278,7 @@ func installHarness() {
                         textureCoordinate(for: invalidKeyTimesPresentation.position),
                         textureCoordinate(for: unknownModePresentation.position),
                         textureCoordinate(for: invalidTimingPresentation.position),
+                        textureCoordinate(for: invalidMediaTimingPresentation.position),
                     ])
                     restoreScene()
                     pathKeyframeProbeResult = pixels

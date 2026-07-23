@@ -274,14 +274,15 @@ import JavaScriptKit
         into accumulator: inout FrameRateRangeAccumulator
     ) {
         guard !animation.isFinished else { return }
-        let duration = animation.duration > 0
-            ? animation.duration
-            : inheritedDuration ?? animation.effectiveBaseDuration
+        let duration = animation.durationOrFallback(
+            inheritedDuration ?? animation.effectiveBaseDuration
+        )
         let timing = CAMediaTimingEvaluator.evaluate(
             animation,
             parentTime: parentTime,
             duration: duration
         )
+        guard timing.isValid else { return }
         guard timing.phase == .active else { return }
 
         if animation.preferredFrameRateRange != .default {

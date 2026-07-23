@@ -459,9 +459,13 @@ open class CALayer: CAMediaTiming, Hashable {
         let singleCycleDuration: CFTimeInterval
         if let springAnimation = animation as? CASpringAnimation {
             // For spring animations, use settlingDuration if duration is not explicitly set
-            singleCycleDuration = animation.duration > 0 ? animation.duration : springAnimation.settlingDuration
+            singleCycleDuration = animation.durationOrFallback(
+                springAnimation.settlingDuration
+            )
         } else {
-            singleCycleDuration = animation.duration > 0 ? animation.duration : CATransaction.animationDuration()
+            singleCycleDuration = animation.durationOrFallback(
+                CATransaction.animationDuration()
+            )
         }
 
         let timing = CAMediaTimingEvaluator.evaluate(
@@ -469,6 +473,7 @@ open class CALayer: CAMediaTiming, Hashable {
             parentTime: time,
             duration: singleCycleDuration
         )
+        guard timing.isValid else { return }
         if timing.phase != .before {
             animation.markStarted()
         }
@@ -519,10 +524,11 @@ open class CALayer: CAMediaTiming, Hashable {
         managesLifecycle: Bool
     ) {
         // Calculate transition progress
-        let duration = transition.duration > 0
-            ? transition.duration
-            : effectiveDuration ?? CATransaction.animationDuration()
+        let duration = transition.durationOrFallback(
+            effectiveDuration ?? CATransaction.animationDuration()
+        )
         let timing = CAMediaTimingEvaluator.evaluate(transition, parentTime: time, duration: duration)
+        guard timing.isValid else { return }
         if managesLifecycle, timing.phase != .before {
             transition.markStarted()
         }
@@ -564,10 +570,11 @@ open class CALayer: CAMediaTiming, Hashable {
         pass: AnimationApplicationPass,
         managesLifecycle: Bool
     ) {
-        let groupBaseDuration = group.duration > 0
-            ? group.duration
-            : effectiveDuration ?? CATransaction.animationDuration()
+        let groupBaseDuration = group.durationOrFallback(
+            effectiveDuration ?? CATransaction.animationDuration()
+        )
         let timing = CAMediaTimingEvaluator.evaluate(group, parentTime: time, duration: groupBaseDuration)
+        guard timing.isValid else { return }
         if managesLifecycle, timing.phase != .before {
             group.markStarted()
         }
@@ -588,7 +595,7 @@ open class CALayer: CAMediaTiming, Hashable {
         // Children are evaluated in the group's repeating basic time space.
         // The group's duration clips longer children without scaling them.
         for animation in animations {
-            let effectiveDuration = animation.duration > 0 ? animation.duration : groupBaseDuration
+            let effectiveDuration = animation.durationOrFallback(groupBaseDuration)
             applyAnimationWithContext(
                 animation,
                 to: layer,
@@ -639,9 +646,13 @@ open class CALayer: CAMediaTiming, Hashable {
         // Get the effective duration for a single cycle
         let singleCycleDuration: CFTimeInterval
         if let springAnimation = animation as? CASpringAnimation {
-            singleCycleDuration = effectiveDuration > 0 ? effectiveDuration : springAnimation.settlingDuration
+            singleCycleDuration = animation.durationOrFallback(
+                effectiveDuration > 0 ? effectiveDuration : springAnimation.settlingDuration
+            )
         } else {
-            singleCycleDuration = effectiveDuration > 0 ? effectiveDuration : CATransaction.animationDuration()
+            singleCycleDuration = animation.durationOrFallback(
+                effectiveDuration > 0 ? effectiveDuration : CATransaction.animationDuration()
+            )
         }
 
         guard singleCycleDuration > 0 else { return }
@@ -651,6 +662,7 @@ open class CALayer: CAMediaTiming, Hashable {
             parentTime: time,
             duration: singleCycleDuration
         )
+        guard timing.isValid else { return }
         guard timing.applies(fillMode: animation.fillMode) else { return }
         var progress = timing.progress
 
@@ -5177,13 +5189,20 @@ open class CALayer: CAMediaTiming, Hashable {
                 continue
             }
 
-            let duration = animation.duration > 0 ? animation.duration : animation.effectiveBaseDuration
+            let duration = animation.durationOrFallback(animation.effectiveBaseDuration)
             let timing = CAMediaTimingEvaluator.evaluate(
                 animation,
                 parentTime: currentTime,
                 duration: duration
             )
 
+            guard timing.isValid else {
+                animation.markFinished(completed: false)
+                if animation.isRemovedOnCompletion {
+                    keysToRemove.append(key)
+                }
+                continue
+            }
             if timing.phase == .after {
                 // Animation has completed
                 animation.markStarted()

@@ -116,6 +116,9 @@ open class CAAnimation: CAMediaTiming, CAAction {
             repeatDuration: repeatDuration,
             autoreverses: autoreverses
         )
+        guard total.isFinite || total == .infinity, speed.isFinite else {
+            return .nan
+        }
 
         // Convert from local time to wall-clock time by dividing by abs(speed).
         // speed=0 means the animation is paused and never completes.
@@ -129,7 +132,18 @@ open class CAAnimation: CAMediaTiming, CAAction {
     /// The effective base duration for the animation.
     /// Subclasses can override this to provide custom duration logic (e.g., CASpringAnimation).
     internal var effectiveBaseDuration: CFTimeInterval {
-        return duration > 0 ? duration : 0.25
+        return durationOrFallback(0.25)
+    }
+
+    /// Resolves only finite nonpositive durations through the caller's default.
+    ///
+    /// Non-finite values must reach the timing evaluator so it can reject the
+    /// animation instead of silently converting malformed timing into success.
+    internal func durationOrFallback(_ fallback: CFTimeInterval) -> CFTimeInterval {
+        guard duration.isFinite || duration == .infinity else {
+            return duration
+        }
+        return duration > 0 ? duration : fallback
     }
 
     /// Marks the animation as finished and notifies the delegate.
