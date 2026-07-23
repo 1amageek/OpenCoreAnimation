@@ -130,19 +130,19 @@ struct CATransform3DInterpolationTests {
 
     @Test("Translation interpolates linearly while rotation slerps")
     func combinedTranslationRotationMidpoint() {
-        // Destination matrix has m41..m43 = (0, 100, 0) and upper-left 3x3 = R(pi/2, Z).
-        // Build as R then Translate so concat order (row-vector) is R * T — the translation
-        // ends up directly in m41..m43 without being pre-rotated, which matches how the
-        // industry-standard decomposition (Unmatrix / CSS) extracts the translation component.
+        // Destination matrix has m41..m43 = (0, 100, 0) and upper-left 3x3 =
+        // R(pi/2, Z). Set the matrix translation directly because
+        // CATransform3DTranslate applies Core Animation's transform-relative
+        // concatenation semantics.
         let from = CATransform3DIdentity
         var to = CATransform3DMakeRotation(.pi / 2, 0, 0, 1)
-        to = CATransform3DTranslate(to, 0, 100, 0)
+        to.m42 = 100
 
         let mid = CATransform3DInterpolation.interpolate(from: from, to: to, progress: 0.5)
 
         // At progress 0.5: translation lerps to (0, 50, 0), rotation slerps to pi/4 around Z.
         var expected = CATransform3DMakeRotation(.pi / 4, 0, 0, 1)
-        expected = CATransform3DTranslate(expected, 0, 50, 0)
+        expected.m42 = 50
         #expect(Self.isApproximatelyEqual(mid, expected, tolerance: 1e-5))
     }
 }

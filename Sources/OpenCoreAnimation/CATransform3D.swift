@@ -145,28 +145,19 @@ public func CATransform3DConcat(_ a: CATransform3D, _ b: CATransform3D) -> CATra
     )
 }
 
-/// Translates t by (tx, ty, tz) and returns the result: t' = t * translate(tx, ty, tz).
-///
-/// The translation is applied after the existing transform, meaning points are first
-/// transformed by t, then translated.
+/// Translates `t` by `(tx, ty, tz)` using Core Animation's concatenation order.
 public func CATransform3DTranslate(_ t: CATransform3D, _ tx: CGFloat, _ ty: CGFloat, _ tz: CGFloat) -> CATransform3D {
-    return CATransform3DConcat(t, CATransform3DMakeTranslation(tx, ty, tz))
+    return CATransform3DConcat(CATransform3DMakeTranslation(tx, ty, tz), t)
 }
 
-/// Scales t by (sx, sy, sz) and returns the result: t' = t * scale(sx, sy, sz).
-///
-/// The scaling is applied after the existing transform, meaning points are first
-/// transformed by t, then scaled.
+/// Scales `t` by `(sx, sy, sz)` using Core Animation's concatenation order.
 public func CATransform3DScale(_ t: CATransform3D, _ sx: CGFloat, _ sy: CGFloat, _ sz: CGFloat) -> CATransform3D {
     return CATransform3DConcat(t, CATransform3DMakeScale(sx, sy, sz))
 }
 
-/// Rotates t by `angle` radians about the vector (x, y, z) and returns the result: t' = t * rotate(angle, x, y, z).
-///
-/// The rotation is applied after the existing transform, meaning points are first
-/// transformed by t, then rotated.
+/// Rotates `t` by `angle` radians using Core Animation's concatenation order.
 public func CATransform3DRotate(_ t: CATransform3D, _ angle: CGFloat, _ x: CGFloat, _ y: CGFloat, _ z: CGFloat) -> CATransform3D {
-    return CATransform3DConcat(t, CATransform3DMakeRotation(angle, x, y, z))
+    return CATransform3DConcat(CATransform3DMakeRotation(angle, x, y, z), t)
 }
 
 // MARK: - Inverting a Transform

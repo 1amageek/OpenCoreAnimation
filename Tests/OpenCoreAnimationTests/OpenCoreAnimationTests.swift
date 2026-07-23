@@ -68,6 +68,20 @@ struct CATransform3DTests {
         #expect(t2.m41 == 15)
     }
 
+    @Test("Translation concatenation matches QuartzCore for a scaled transform")
+    func translatedScaleConcatenation() {
+        let translated = CATransform3DTranslate(
+            CATransform3DMakeScale(2, 3, 1),
+            10,
+            20,
+            0
+        )
+        #expect(translated.m11 == 2)
+        #expect(translated.m22 == 3)
+        #expect(translated.m41 == 20)
+        #expect(translated.m42 == 60)
+    }
+
     // MARK: - Scale
 
     @Test("Scale transform creates correct matrix")
@@ -106,6 +120,21 @@ struct CATransform3DTests {
     func rotationZeroVector() {
         let t = CATransform3DMakeRotation(CGFloat.pi, 0, 0, 0)
         #expect(CATransform3DIsIdentity(t))
+    }
+
+    @Test("Rotation concatenation matches QuartzCore for a scaled transform")
+    func rotatedScaleConcatenation() {
+        let rotated = CATransform3DRotate(
+            CATransform3DMakeScale(2, 3, 1),
+            .pi / 2,
+            0,
+            0,
+            1
+        )
+        #expect(abs(rotated.m11) < 0.0001)
+        #expect(abs(rotated.m12 - 3) < 0.0001)
+        #expect(abs(rotated.m21 + 2) < 0.0001)
+        #expect(abs(rotated.m22) < 0.0001)
     }
 
     // MARK: - Concatenation

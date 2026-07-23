@@ -669,12 +669,23 @@ open class CALayer: CAMediaTiming, Hashable {
         completedCycles: Int
     ) {
         if let keyframeAnimation = animation as? CAKeyframeAnimation {
-            applyKeyframeAnimation(keyframeAnimation, to: layer, keyPath: keyPath, progress: progress)
+            applyKeyframeAnimation(
+                keyframeAnimation,
+                to: layer,
+                keyPath: keyPath,
+                progress: progress,
+                completedCycles: completedCycles
+            )
         } else if let basicAnimation = animation as? CABasicAnimation {
             applyBasicAnimation(basicAnimation, to: layer, keyPath: keyPath, progress: progress)
         }
 
         guard animation.isCumulative, completedCycles > 0 else { return }
+        if let keyframeAnimation = animation as? CAKeyframeAnimation,
+           keyframeAnimation.path != nil,
+           keyPath == "position" {
+            return
+        }
         let terminalValue: Any?
         if let basicAnimation = animation as? CABasicAnimation,
            let valueFunction = basicAnimation.valueFunction {
@@ -2181,167 +2192,102 @@ open class CALayer: CAMediaTiming, Hashable {
         return result
     }
 
-    // MARK: - Path Sampling for Keyframe Animation
-
-    /// Samples a CGPath at regular intervals and returns an array of points.
-    ///
-    /// The path is flattened (curves converted to line segments) and then points
-    /// are extracted at regular intervals based on arc length.
-    private func samplePathPoints(_ path: CGPath, numPoints: Int = 100) -> [CGPoint] {
-        var points: [CGPoint] = []
-        var currentPoint = CGPoint.zero
-        var subpathStart = CGPoint.zero
-
-        // First, flatten the path into line segments
-        path.applyWithBlock { elementPtr in
-            let element = elementPtr.pointee
-            guard let elementPoints = element.points else { return }
-            switch element.type {
-            case .moveToPoint:
-                let point = elementPoints[0]
-                points.append(point)
-                currentPoint = point
-                subpathStart = point
-
-            case .addLineToPoint:
-                let point = elementPoints[0]
-                points.append(point)
-                currentPoint = point
-
-            case .addQuadCurveToPoint:
-                let control = elementPoints[0]
-                let end = elementPoints[1]
-                // Flatten quad bezier into line segments
-                for i in 1...10 {
-                    let t = CGFloat(i) / 10.0
-                    let tt = t * t
-                    let u = 1 - t
-                    let uu = u * u
-                    let x = uu * currentPoint.x + 2 * u * t * control.x + tt * end.x
-                    let y = uu * currentPoint.y + 2 * u * t * control.y + tt * end.y
-                    points.append(CGPoint(x: x, y: y))
-                }
-                currentPoint = end
-
-            case .addCurveToPoint:
-                let control1 = elementPoints[0]
-                let control2 = elementPoints[1]
-                let end = elementPoints[2]
-                // Flatten cubic bezier into line segments
-                for i in 1...10 {
-                    let t = CGFloat(i) / 10.0
-                    let tt = t * t
-                    let ttt = tt * t
-                    let u = 1 - t
-                    let uu = u * u
-                    let uuu = uu * u
-                    let x = uuu * currentPoint.x + 3 * uu * t * control1.x + 3 * u * tt * control2.x + ttt * end.x
-                    let y = uuu * currentPoint.y + 3 * uu * t * control1.y + 3 * u * tt * control2.y + ttt * end.y
-                    points.append(CGPoint(x: x, y: y))
-                }
-                currentPoint = end
-
-            case .closeSubpath:
-                if currentPoint != subpathStart {
-                    points.append(subpathStart)
-                }
-                currentPoint = subpathStart
-
-            @unknown default:
-                break
-            }
-        }
-
-        return points
-    }
-
-    /// Samples a point and optional tangent on a path at a given normalized progress (0-1).
-    ///
-    /// Uses arc-length parameterization for uniform motion along the path.
-    private func samplePathAtProgress(_ path: CGPath, progress: CGFloat) -> (point: CGPoint, tangent: CGFloat)? {
-        let points = samplePathPoints(path)
-        guard points.count >= 2 else { return nil }
-
-        // Calculate cumulative arc lengths
-        var arcLengths: [CGFloat] = [0]
-        for i in 1..<points.count {
-            let dx = points[i].x - points[i - 1].x
-            let dy = points[i].y - points[i - 1].y
-            let segmentLength = sqrt(dx * dx + dy * dy)
-            arcLengths.append(arcLengths.last! + segmentLength)
-        }
-
-        let totalLength = arcLengths.last!
-        guard totalLength > 0 else { return (point: points[0], tangent: 0) }
-
-        // Find the target arc length
-        let targetLength = totalLength * min(max(progress, 0), 1)
-
-        // Find the segment containing this arc length
-        var segmentIndex = 0
-        for i in 1..<arcLengths.count {
-            if arcLengths[i] >= targetLength {
-                segmentIndex = i - 1
-                break
-            }
-        }
-
-        // Interpolate within the segment
-        let segmentStart = arcLengths[segmentIndex]
-        let segmentEnd = arcLengths[segmentIndex + 1]
-        let segmentProgress: CGFloat
-        if segmentEnd > segmentStart {
-            segmentProgress = (targetLength - segmentStart) / (segmentEnd - segmentStart)
-        } else {
-            segmentProgress = 0
-        }
-
-        let p0 = points[segmentIndex]
-        let p1 = points[segmentIndex + 1]
-
-        let point = CGPoint(
-            x: p0.x + segmentProgress * (p1.x - p0.x),
-            y: p0.y + segmentProgress * (p1.y - p0.y)
-        )
-
-        // Calculate tangent angle
-        let dx = p1.x - p0.x
-        let dy = p1.y - p0.y
-        let tangent = CGFloat(atan2(dy, dx))
-
-        return (point: point, tangent: tangent)
-    }
-
     /// Applies a path-based keyframe animation to a layer.
     ///
     /// The path is used for position animation, and optionally for rotation
     /// if rotationMode is set.
-    private func applyPathKeyframeAnimation(_ animation: CAKeyframeAnimation, path: CGPath, to layer: CALayer, progress: CFTimeInterval) {
-        guard let sample = samplePathAtProgress(path, progress: CGFloat(progress)) else { return }
+    private func applyPathKeyframeAnimation(
+        _ animation: CAKeyframeAnimation,
+        path: CGPath,
+        to layer: CALayer,
+        progress: CFTimeInterval,
+        completedCycles: Int
+    ) {
+        guard let sampler = CAPathAnimationSampler(path: path),
+              let sample = sampler.sample(
+                at: CGFloat(progress),
+                calculationMode: animation.calculationMode,
+                keyTimes: animation.keyTimes,
+                timingFunctions: animation.timingFunctions
+              ) else {
+            return
+        }
 
-        // Apply position
-        layer._position = sample.point
+        var resolvedPosition: CGPoint
+        if animation.isAdditive {
+            resolvedPosition = CGPoint(
+                x: layer._position.x + sample.point.x,
+                y: layer._position.y + sample.point.y
+            )
+        } else {
+            resolvedPosition = sample.point
+        }
+        if animation.isCumulative, completedCycles > 0, !animation.autoreverses {
+            guard let displacement = sampler.cycleDisplacement else { return }
+            let cycleCount = CGFloat(completedCycles)
+            resolvedPosition = CGPoint(
+                x: resolvedPosition.x + displacement.x * cycleCount,
+                y: resolvedPosition.y + displacement.y * cycleCount
+            )
+        }
+        guard resolvedPosition.x.isFinite, resolvedPosition.y.isFinite else { return }
 
-        // Apply rotation if rotationMode is set
+        var resolvedTransform = layer._transform
         if let rotationMode = animation.rotationMode {
             switch rotationMode {
             case .rotateAuto:
-                // Rotate to match path tangent
-                layer._transform = CATransform3DMakeRotation(sample.tangent, 0, 0, 1)
+                resolvedTransform = CATransform3DRotate(
+                    resolvedTransform,
+                    sample.tangent,
+                    0,
+                    0,
+                    1
+                )
             case .rotateAutoReverse:
-                // Rotate to match path tangent + 180 degrees
-                layer._transform = CATransform3DMakeRotation(sample.tangent + .pi, 0, 0, 1)
+                resolvedTransform = CATransform3DRotate(
+                    resolvedTransform,
+                    sample.tangent + .pi,
+                    0,
+                    0,
+                    1
+                )
             default:
                 break
             }
         }
+        guard Self.isFinitePathAnimationTransform(resolvedTransform) else { return }
+        layer._position = resolvedPosition
+        layer._transform = resolvedTransform
+    }
+
+    private static func isFinitePathAnimationTransform(_ transform: CATransform3D) -> Bool {
+        transform.m11.isFinite && transform.m12.isFinite
+            && transform.m13.isFinite && transform.m14.isFinite
+            && transform.m21.isFinite && transform.m22.isFinite
+            && transform.m23.isFinite && transform.m24.isFinite
+            && transform.m31.isFinite && transform.m32.isFinite
+            && transform.m33.isFinite && transform.m34.isFinite
+            && transform.m41.isFinite && transform.m42.isFinite
+            && transform.m43.isFinite && transform.m44.isFinite
     }
 
     /// Applies a keyframe animation to a layer property.
-    private func applyKeyframeAnimation(_ animation: CAKeyframeAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
+    private func applyKeyframeAnimation(
+        _ animation: CAKeyframeAnimation,
+        to layer: CALayer,
+        keyPath: String,
+        progress: CFTimeInterval,
+        completedCycles: Int
+    ) {
         // Check if path is available for position animation
         if let path = animation.path, keyPath == "position" {
-            applyPathKeyframeAnimation(animation, path: path, to: layer, progress: progress)
+            applyPathKeyframeAnimation(
+                animation,
+                path: path,
+                to: layer,
+                progress: progress,
+                completedCycles: completedCycles
+            )
             return
         }
 

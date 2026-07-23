@@ -45,6 +45,7 @@ nonisolated(unsafe) var contentsAnimationProbeResult: String = "pending"
 nonisolated(unsafe) var rasterizationScaleProbeResult: String = "pending"
 nonisolated(unsafe) var shadowPathKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var transformComponentProbeResult: String = "pending"
+nonisolated(unsafe) var pathKeyframeProbeResult: String = "pending"
 nonisolated(unsafe) var constraintLayoutProbeResult: String = "pending"
 nonisolated(unsafe) var aggregateByValueProbeResult: String = "pending"
 nonisolated(unsafe) var additiveKeyframeProbeResult: String = "pending"
@@ -201,6 +202,7 @@ public func setup() {
             rasterizationScaleProbeResult = "pending"
             shadowPathKeyframeProbeResult = "pending"
             transformComponentProbeResult = "pending"
+            pathKeyframeProbeResult = "pending"
             constraintLayoutProbeResult = "pending"
             aggregateByValueProbeResult = "pending"
             additiveKeyframeProbeResult = "pending"
@@ -407,6 +409,9 @@ func installHarness() {
         })
         h.expose("getTransformComponentProbeResult", returning: {
             .string(transformComponentProbeResult)
+        })
+        h.expose("getPathKeyframeProbeResult", returning: {
+            .string(pathKeyframeProbeResult)
         })
         h.expose("getConstraintLayoutProbeResult", returning: {
             .string(constraintLayoutProbeResult)
@@ -1980,6 +1985,191 @@ func installHarness() {
                 } catch {
                     restoreScene()
                     transformComponentProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginPathKeyframeProbe", action: {
+            Task { @MainActor in
+                pathKeyframeProbeResult = "running"
+                let engine = CAAnimationEngine.shared
+                engine.pause()
+                guard let root = rootLayerRef,
+                      let renderer = engine.rendererBackend as? CAWebGPURenderer else {
+                    pathKeyframeProbeResult = "error: path keyframe dependencies unavailable"
+                    return
+                }
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                let originalRootBackground = root.backgroundColor
+                let existingLayerStates = (root.sublayers ?? []).map { ($0, $0.isHidden) }
+                for (layer, _) in existingLayerStates {
+                    layer.isHidden = true
+                }
+                root.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+                func makeLayer(color: CGColor) -> CALayer {
+                    let layer = CALayer()
+                    layer.bounds = CGRect(x: 0, y: 0, width: 12, height: 12)
+                    layer.backgroundColor = color
+                    layer.zPosition = 100
+                    root.addSublayer(layer)
+                    return layer
+                }
+
+                func configure(
+                    _ animation: CAKeyframeAnimation,
+                    path: CGPath,
+                    mode: CAAnimationCalculationMode = .linear,
+                    offset: CFTimeInterval
+                ) {
+                    animation.path = path
+                    animation.calculationMode = mode
+                    animation.duration = 1
+                    animation.speed = 0
+                    animation.timeOffset = offset
+                    animation.fillMode = .both
+                    animation.isRemovedOnCompletion = false
+                }
+
+                func twoSegmentPath(y: CGFloat) -> CGPath {
+                    let path = CGMutablePath()
+                    path.move(to: CGPoint(x: 40, y: y))
+                    path.addLine(to: CGPoint(x: 120, y: y))
+                    path.addLine(to: CGPoint(x: 120, y: y + 160))
+                    return path
+                }
+
+                let linearLayer = makeLayer(
+                    color: CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                )
+                let linear = CAKeyframeAnimation(keyPath: "position")
+                configure(linear, path: twoSegmentPath(y: 40), offset: 0.25)
+                linearLayer.add(linear, forKey: "browserLinearPath")
+
+                let pacedLayer = makeLayer(
+                    color: CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                )
+                let paced = CAKeyframeAnimation(keyPath: "position")
+                configure(
+                    paced,
+                    path: twoSegmentPath(y: 100),
+                    mode: .paced,
+                    offset: 0.25
+                )
+                pacedLayer.add(paced, forKey: "browserPacedPath")
+
+                let discreteLayer = makeLayer(
+                    color: CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                )
+                let discrete = CAKeyframeAnimation(keyPath: "position")
+                configure(
+                    discrete,
+                    path: twoSegmentPath(y: 150),
+                    mode: .discrete,
+                    offset: 0.75
+                )
+                discreteLayer.add(discrete, forKey: "browserDiscretePath")
+
+                let keyedLayer = makeLayer(
+                    color: CGColor(red: 0, green: 1, blue: 1, alpha: 1)
+                )
+                let keyed = CAKeyframeAnimation(keyPath: "position")
+                keyed.keyTimes = [0, 0.8, 1]
+                configure(keyed, path: twoSegmentPath(y: 200), offset: 0.25)
+                keyedLayer.add(keyed, forKey: "browserKeyedPath")
+
+                let curvePath = CGMutablePath()
+                curvePath.move(to: CGPoint(x: 260, y: 250))
+                curvePath.addCurve(
+                    to: CGPoint(x: 360, y: 250),
+                    control1: CGPoint(x: 260, y: 150),
+                    control2: CGPoint(x: 360, y: 150)
+                )
+                let curveLayer = makeLayer(
+                    color: CGColor(red: 1, green: 0, blue: 1, alpha: 1)
+                )
+                let curve = CAKeyframeAnimation(keyPath: "position")
+                configure(curve, path: curvePath, mode: .paced, offset: 0.25)
+                curveLayer.add(curve, forKey: "browserPacedCurve")
+
+                let rotationPath = CGMutablePath()
+                rotationPath.move(to: CGPoint(x: 200, y: 40))
+                rotationPath.addLine(to: CGPoint(x: 200, y: 120))
+                let rotationLayer = makeLayer(
+                    color: CGColor(red: 1, green: 1, blue: 0, alpha: 1)
+                )
+                rotationLayer.transform = CATransform3DMakeScale(2, 3, 1)
+                let rotation = CAKeyframeAnimation(keyPath: "position")
+                rotation.rotationMode = .rotateAuto
+                configure(rotation, path: rotationPath, offset: 0.5)
+                rotationLayer.add(rotation, forKey: "browserPathRotation")
+                CATransaction.commit()
+
+                @MainActor
+                func restoreScene() {
+                    linearLayer.removeFromSuperlayer()
+                    pacedLayer.removeFromSuperlayer()
+                    discreteLayer.removeFromSuperlayer()
+                    keyedLayer.removeFromSuperlayer()
+                    curveLayer.removeFromSuperlayer()
+                    rotationLayer.removeFromSuperlayer()
+                    root.backgroundColor = originalRootBackground
+                    for (layer, wasHidden) in existingLayerStates {
+                        layer.isHidden = wasHidden
+                    }
+                    engine.renderFrame()
+                }
+
+                engine.renderFrame()
+                guard let linearPresentation = linearLayer.presentation(),
+                      let pacedPresentation = pacedLayer.presentation(),
+                      let discretePresentation = discreteLayer.presentation(),
+                      let keyedPresentation = keyedLayer.presentation(),
+                      let curvePresentation = curveLayer.presentation(),
+                      let rotationPresentation = rotationLayer.presentation() else {
+                    restoreScene()
+                    pathKeyframeProbeResult = "error: path presentation unavailable"
+                    return
+                }
+                let presentationMatches =
+                    abs(linearPresentation.position.x - 80) < 0.001
+                    && abs(linearPresentation.position.y - 40) < 0.001
+                    && abs(pacedPresentation.position.x - 100) < 0.001
+                    && abs(pacedPresentation.position.y - 100) < 0.001
+                    && abs(discretePresentation.position.x - 120) < 0.001
+                    && abs(discretePresentation.position.y - 150) < 0.001
+                    && abs(keyedPresentation.position.x - 65) < 0.001
+                    && abs(keyedPresentation.position.y - 200) < 0.001
+                    && abs(curvePresentation.position.x - 270.6) < 0.1
+                    && abs(curvePresentation.position.y - 201.6) < 0.1
+                    && abs(rotationPresentation.transform.m12 - 3) < 0.001
+                    && abs(rotationPresentation.transform.m21 + 2) < 0.001
+
+                func textureCoordinate(for layerPosition: CGPoint) -> CGPoint {
+                    CGPoint(
+                        x: layerPosition.x.rounded(),
+                        y: (CGFloat(canvasHeight) - layerPosition.y).rounded()
+                    )
+                }
+
+                do {
+                    let pixels = try await renderer.readbackPixels(at: [
+                        textureCoordinate(for: linearPresentation.position),
+                        textureCoordinate(for: pacedPresentation.position),
+                        textureCoordinate(for: discretePresentation.position),
+                        textureCoordinate(for: keyedPresentation.position),
+                        textureCoordinate(for: curvePresentation.position),
+                        textureCoordinate(for: rotationPresentation.position),
+                    ])
+                    restoreScene()
+                    pathKeyframeProbeResult = pixels
+                        .map { $0.map(String.init).joined(separator: ",") }
+                        .joined(separator: ";")
+                        + ",presentation=\(presentationMatches)"
+                } catch {
+                    restoreScene()
+                    pathKeyframeProbeResult = "error: \(error)"
                 }
             }
         })
