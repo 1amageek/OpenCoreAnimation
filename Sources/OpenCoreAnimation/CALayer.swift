@@ -4388,7 +4388,7 @@ open class CALayer: CAMediaTiming, Hashable {
         )
         let boundsSize = bounds.size
 
-        switch contentsGravity {
+        switch ContentsRenderConfiguration.resolvedGravity(contentsGravity) {
         case .center:
             return CGRect(
                 x: (boundsSize.width - imageSize.width) / 2,
@@ -4432,8 +4432,6 @@ open class CALayer: CAMediaTiming, Hashable {
             return CGRect(x: 0, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
         case .bottomRight:
             return CGRect(x: boundsSize.width - imageSize.width, y: boundsSize.height - imageSize.height, width: imageSize.width, height: imageSize.height)
-        default:
-            return bounds
         }
     }
 

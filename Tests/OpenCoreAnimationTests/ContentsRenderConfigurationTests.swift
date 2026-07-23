@@ -68,6 +68,19 @@ struct ContentsRenderConfigurationTests {
         #expect(destination == CGRect(x: 3.5, y: 3, width: 3, height: 4))
     }
 
+    @Test("unknown gravity resolves to the QuartzCore center layout")
+    func unknownGravityUsesCenterLayout() throws {
+        let destination = try ContentsRenderConfiguration.destinationRect(
+            imageSize: CGSize(width: 12, height: 8),
+            boundsSize: CGSize(width: 10, height: 10),
+            contentsRect: CGRect(x: 0.5, y: 0, width: 0.5, height: 1),
+            contentsScale: 2,
+            gravity: CALayerContentsGravity(rawValue: "future")
+        )
+
+        #expect(destination == CGRect(x: 3.5, y: 3, width: 3, height: 4))
+    }
+
     @Test("nine-slice is restricted to resizing gravity modes")
     func gravityControlsNineSliceSelection() {
         let center = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
@@ -110,15 +123,6 @@ struct ContentsRenderConfigurationTests {
                 contentsCenter: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5),
                 contentsScale: 0,
                 gravity: .resize
-            )
-        }
-        #expect(throws: ContentsRenderConfigurationError.unsupportedGravity("unknown")) {
-            _ = try ContentsRenderConfiguration.destinationRect(
-                imageSize: CGSize(width: 8, height: 8),
-                boundsSize: CGSize(width: 8, height: 8),
-                contentsRect: CGRect(x: 0, y: 0, width: 1, height: 1),
-                contentsScale: 1,
-                gravity: CALayerContentsGravity(rawValue: "unknown")
             )
         }
     }

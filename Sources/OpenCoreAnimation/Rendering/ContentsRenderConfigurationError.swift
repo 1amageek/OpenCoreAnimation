@@ -7,5 +7,4 @@ public enum ContentsRenderConfigurationError: Error, Equatable, Sendable {
     case invalidContentsRect
     case invalidContentsCenter
     case invalidContentsScale
-    case unsupportedGravity(String)
 }

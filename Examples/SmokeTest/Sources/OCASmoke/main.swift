@@ -1251,6 +1251,10 @@ func installHarness() {
                     position: CGPoint(x: 280, y: 150),
                     gravity: .center
                 )
+                let unknownGravityLayer = makeContentsLayer(
+                    position: CGPoint(x: 80, y: 40),
+                    gravity: CALayerContentsGravity(rawValue: "future")
+                )
                 let invalidLayer = makeContentsLayer(
                     position: CGPoint(x: 200, y: 40),
                     gravity: .resize
@@ -1276,6 +1280,7 @@ func installHarness() {
                 func restoreScene() {
                     stretchedLayer.removeFromSuperlayer()
                     centeredLayer.removeFromSuperlayer()
+                    unknownGravityLayer.removeFromSuperlayer()
                     invalidLayer.removeFromSuperlayer()
                     translucentLayer.removeFromSuperlayer()
                     malformedLayer.removeFromSuperlayer()
@@ -1298,6 +1303,11 @@ func installHarness() {
                         CGPoint(x: 280, y: 150),
                         CGPoint(x: 293, y: 150),
                         CGPoint(x: 335, y: 150),
+                        CGPoint(x: 25, y: 260),
+                        CGPoint(x: 67, y: 260),
+                        CGPoint(x: 80, y: 260),
+                        CGPoint(x: 93, y: 260),
+                        CGPoint(x: 135, y: 260),
                         CGPoint(x: 180, y: 150),
                         CGPoint(x: 200, y: 150),
                     ])

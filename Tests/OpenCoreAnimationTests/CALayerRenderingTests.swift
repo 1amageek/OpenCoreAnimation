@@ -259,6 +259,28 @@ struct CALayerRenderingTests {
         ))
     }
 
+    @Test("unknown contents gravity uses the QuartzCore center layout")
+    func unknownContentsGravityUsesCenterLayout() {
+        let renderer = RecordingRenderer()
+        let context = makeContext(renderer: renderer)
+
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+        layer.contents = makeImage(width: 4, height: 4)
+        layer.contentsGravity = CALayerContentsGravity(rawValue: "future")
+
+        layer.render(in: context)
+
+        #expect(renderer.imageDrawCalls.count == 1)
+        #expect(renderer.imageDrawCalls.first?.rect == CGRect(
+            x: 2,
+            y: 2,
+            width: 4,
+            height: 4
+        ))
+        #expect(layer.lastContextRenderError == nil)
+    }
+
     @Test("masksToBounds pushes a clip path into the renderer state")
     func masksToBoundsAddsClipPathToRendererState() {
         let renderer = RecordingRenderer()

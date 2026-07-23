@@ -1,6 +1,21 @@
 import Foundation
 
 struct ContentsRenderConfiguration: Equatable {
+    enum ResolvedGravity {
+        case center
+        case resize
+        case resizeAspect
+        case resizeAspectFill
+        case top
+        case bottom
+        case left
+        case right
+        case topLeft
+        case topRight
+        case bottomLeft
+        case bottomRight
+    }
+
     struct Patch: Equatable {
         let destinationRect: CGRect
         let sourceUnitRect: CGRect
@@ -15,11 +30,44 @@ struct ContentsRenderConfiguration: Equatable {
         guard contentsCenter != CGRect(x: 0, y: 0, width: 1, height: 1) else {
             return false
         }
-        switch gravity {
+        switch resolvedGravity(gravity) {
         case .resize, .resizeAspect, .resizeAspectFill:
             return true
         default:
             return false
+        }
+    }
+
+    static func resolvedGravity(
+        _ gravity: CALayerContentsGravity
+    ) -> ResolvedGravity {
+        switch gravity {
+        case .center:
+            return .center
+        case .resize:
+            return .resize
+        case .resizeAspect:
+            return .resizeAspect
+        case .resizeAspectFill:
+            return .resizeAspectFill
+        case .top:
+            return .top
+        case .bottom:
+            return .bottom
+        case .left:
+            return .left
+        case .right:
+            return .right
+        case .topLeft:
+            return .topLeft
+        case .topRight:
+            return .topRight
+        case .bottomLeft:
+            return .bottomLeft
+        case .bottomRight:
+            return .bottomRight
+        default:
+            return .center
         }
     }
 
@@ -212,7 +260,7 @@ struct ContentsRenderConfiguration: Equatable {
         boundsSize: CGSize,
         gravity: CALayerContentsGravity
     ) throws(ContentsRenderConfigurationError) -> CGRect {
-        switch gravity {
+        switch resolvedGravity(gravity) {
         case .center:
             return CGRect(
                 x: (boundsSize.width - sourcePointSize.width) / 2,
@@ -303,8 +351,6 @@ struct ContentsRenderConfiguration: Equatable {
                 width: sourcePointSize.width,
                 height: sourcePointSize.height
             )
-        default:
-            throw ContentsRenderConfigurationError.unsupportedGravity(gravity.rawValue)
         }
     }
 }
