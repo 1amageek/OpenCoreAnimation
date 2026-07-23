@@ -1342,8 +1342,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     private func withPrepassContext<T>(
         _ target: LayerPrepassTarget,
-        _ body: () -> T
-    ) -> T {
+        _ body: () throws -> T
+    ) rethrows -> T {
         let savedColorStack = replicatorColorStack
         let savedTimeOffsetStack = replicatorTimeOffsetStack
         let savedInstancePath = replicatorInstancePath
@@ -1356,7 +1356,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             replicatorTimeOffsetStack = savedTimeOffsetStack
             replicatorInstancePath = savedInstancePath
         }
-        return body()
+        return try body()
     }
 
     /// The full viewport clip rect.
@@ -1661,6 +1661,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// Frozen source/target pairs keyed by the immutable transition source snapshot.
     private var transitionCaptures: [ObjectIdentifier: TransitionCapturePair] = [:]
 
+    /// Transition resources removed while a command encoder may still reference them.
+    /// They are destroyed at the next frame boundary, after the current submission.
+    private var retiredTransitionCaptures: [TransitionCapturePair] = []
+    private var retiredTransitionTextures: [GPUTexture] = []
+
     /// Executes Core Image transition shaders on this renderer's GPU device.
     private var transitionFilterProcessor: CIWebGPUTransitionProcessor?
 
@@ -1684,6 +1689,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// for compositing. Populated by `prerenderRasterizedLayers`,
     /// consumed by `renderLayer`, cleared after submit.
     private var prerasterizedTextures: [LayerRenderKey: PrerasterizedTexture] = [:]
+
+    /// Per-frame capture failures that must not fall through to live subtree rendering.
+    private var failedRasterizationRenderKeys: Set<LayerRenderKey> = []
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCaptureCount: Int = 0
@@ -3877,6 +3885,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // capture and its dependent texture view before replacement.
         configureRasterizationCache(width: renderTarget.width, height: renderTarget.height)
         prerasterizedTextures.removeAll(keepingCapacity: true)
+        failedRasterizationRenderKeys.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
     }
 
@@ -3976,6 +3985,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
         transitionSuppressedLayer = nil
         renderTargetSizeOverride = nil
         activeTransitionSourceIDs.removeAll(keepingCapacity: true)
+        for capture in retiredTransitionCaptures {
+            capture.filterExecution?.invalidate()
+            capture.source.texture.destroy()
+            capture.target.texture.destroy()
+        }
+        retiredTransitionCaptures.removeAll(keepingCapacity: true)
+        for texture in retiredTransitionTextures {
+            texture.destroy()
+        }
+        retiredTransitionTextures.removeAll(keepingCapacity: true)
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
@@ -4037,6 +4056,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
+        failedRasterizationRenderKeys.removeAll(keepingCapacity: true)
         rasterizePrerenderRootLayer = nil
 
         // Drop the previous frame's textured bind groups: the buffer pool has
@@ -4831,6 +4851,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
         transitionCaptures.removeAll(keepingCapacity: false)
         activeTransitionSourceIDs.removeAll(keepingCapacity: false)
         failedTransitionSourceIDs.removeAll(keepingCapacity: false)
+        for capture in retiredTransitionCaptures {
+            capture.filterExecution?.invalidate()
+            capture.source.texture.destroy()
+            capture.target.texture.destroy()
+        }
+        retiredTransitionCaptures.removeAll(keepingCapacity: false)
+        for texture in retiredTransitionTextures {
+            texture.destroy()
+        }
+        retiredTransitionTextures.removeAll(keepingCapacity: false)
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
@@ -4856,6 +4886,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         transitionFilterProcessor?.invalidate()
         transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
+        failedRasterizationRenderKeys.removeAll(keepingCapacity: false)
         rasterizePrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
         suppressShadowRendering = false
@@ -5111,6 +5142,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 renderPass: renderPass,
                 modelMatrix: modelMatrix
             )
+            return
+        }
+
+        if rasterizePrerenderRootLayer !== layer,
+           failedRasterizationRenderKeys.contains(currentRenderKey) {
             return
         }
 
@@ -5529,7 +5565,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
                 if let execution = transitionCaptures[sourceID]?.filterExecution {
                     guard state.progress.isFinite else {
-                        destroyTransitionCapture(for: sourceID)
+                        retireTransitionCapture(for: sourceID)
                         failedTransitionSourceIDs.insert(sourceID)
                         recordTransitionFailure(.invalidProgress(state.progress), category: .filter)
                         return
@@ -5541,7 +5577,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         )
                         transitionFilterDispatchCount += 1
                     } catch {
-                        destroyTransitionCapture(for: sourceID)
+                        retireTransitionCapture(for: sourceID)
                         failedTransitionSourceIDs.insert(sourceID)
                         recordTransitionFailure(
                             .filterDispatchFailed(String(describing: error)),
@@ -5558,7 +5594,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             !activeTransitionSourceIDs.contains($0)
         }
         for sourceID in staleSourceIDs {
-            destroyTransitionCapture(for: sourceID)
+            retireTransitionCapture(for: sourceID)
         }
         failedTransitionSourceIDs = failedTransitionSourceIDs.intersection(activeTransitionSourceIDs)
     }
@@ -5587,7 +5623,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 encoder: encoder
             )
         } catch let failure {
-            source.texture.destroy()
+            retiredTransitionTextures.append(source.texture)
             throw failure
         }
         return TransitionCapturePair(source: source, target: target, filterExecution: nil)
@@ -5621,7 +5657,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 encoder: encoder
             )
         } catch let failure {
-            target.texture.destroy()
+            retiredTransitionTextures.append(target.texture)
             throw failure
         }
 
@@ -5639,17 +5675,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 filterExecution: execution
             )
         } catch {
-            source.texture.destroy()
-            target.texture.destroy()
+            retiredTransitionTextures.append(source.texture)
+            retiredTransitionTextures.append(target.texture)
             throw .filterExecutionCreationFailed(String(describing: error))
         }
     }
 
-    private func destroyTransitionCapture(for sourceID: ObjectIdentifier) {
+    private func retireTransitionCapture(for sourceID: ObjectIdentifier) {
         if let capture = transitionCaptures.removeValue(forKey: sourceID) {
-            capture.filterExecution?.invalidate()
-            capture.source.texture.destroy()
-            capture.target.texture.destroy()
+            retiredTransitionCaptures.append(capture)
         }
         texturedTextureViewCache.removeValue(forKey: .transitionSource(sourceID))
         texturedTextureViewCache.removeValue(forKey: .transitionTarget(sourceID))
@@ -5752,6 +5786,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = 0
         currentStencilValue = 0
 
+        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
         renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
 
         rasterizePrerenderRootLayer = previousCaptureRoot
@@ -5762,6 +5797,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = previousMaskNestingDepth
         currentStencilValue = previousStencilValue
         capturePass.end()
+
+        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+           let failure = lastReplicatorRenderFailure {
+            retiredTransitionTextures.append(texture)
+            throw .participantReplicatorFailed(role, failure)
+        }
 
         let compositeLayer = type(of: presentation).init(layer: presentation)
         compositeLayer.recursivelyClearDirtyAfterCommit()
@@ -8867,15 +8908,26 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 }
                 maskRenderPass.end()
             } else {
-                withPrepassContext(target) {
-                    captureShadowContent(
-                        shadowLayer,
-                        parentMatrix: target.parentMatrix,
-                        resources: resources,
-                        pipeline: pipeline,
-                        depthTextureView: depthTextureView,
-                        encoder: encoder
+                do {
+                    try withPrepassContext(target) {
+                        try captureShadowContent(
+                            shadowLayer,
+                            parentMatrix: target.parentMatrix,
+                            resources: resources,
+                            pipeline: pipeline,
+                            depthTextureView: depthTextureView,
+                            encoder: encoder
+                        )
+                    }
+                } catch let error as CAShadowRenderFailure {
+                    recordShadowRenderFailure(error, for: shadowRenderKey)
+                    continue
+                } catch {
+                    recordShadowRenderFailure(
+                        .rendererResourcesUnavailable,
+                        for: shadowRenderKey
                     )
+                    continue
                 }
             }
 
@@ -8963,7 +9015,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         pipeline: GPURenderPipeline,
         depthTextureView: GPUTextureView,
         encoder: GPUCommandEncoder
-    ) {
+    ) throws(CAShadowRenderFailure) {
         let contentRenderPass = encoder.beginRenderPass(descriptor: GPURenderPassDescriptor(
             colorAttachments: [
                 GPURenderPassColorAttachment(
@@ -9007,6 +9059,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = 0
         currentStencilValue = 0
 
+        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
         renderLayer(layer, renderPass: contentRenderPass, parentMatrix: parentMatrix)
 
         shadowCaptureRootLayer = previousCaptureRoot
@@ -9016,6 +9069,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = previousMaskNestingDepth
         currentStencilValue = previousStencilValue
         contentRenderPass.end()
+        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+           let failure = lastReplicatorRenderFailure {
+            throw .subtreeReplicatorFailed(failure)
+        }
     }
 
     private func subtreeHasAnimations(_ rootLayer: CALayer) -> Bool {
@@ -9141,6 +9198,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
             let previousFilterRoot = filterPrerenderRootLayer
             let previousSuppressedMaskRoot = contentMaskCaptureSuppressedRootLayer
+            let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
             withPrepassContext(target) {
                 filterPrerenderRootLayer = filteredLayer
                 if requiresContentMask {
@@ -9155,6 +9213,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
             filterPrerenderRootLayer = previousFilterRoot
             contentMaskCaptureSuppressedRootLayer = previousSuppressedMaskRoot
             contentRenderPass.end()
+
+            if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+               let failure = lastReplicatorRenderFailure {
+                failedRenderKeys.insert(filteredRenderKey)
+                recordLayerFilterFailure(
+                    .subtreeReplicatorFailed(failure),
+                    for: filteredRenderKey
+                )
+                continue
+            }
 
             var currentTexture = resources.sourceTexture
             var currentView = resources.sourceView
@@ -9820,6 +9888,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             filterPrerenderRootLayer = target.layer
         }
 
+        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
         withPrepassContext(target) {
             renderLayer(
                 target.layer,
@@ -9840,6 +9909,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
         filterPrerenderRootLayer = savedFilterPrerenderRoot
         renderTargetSizeOverride = savedRenderTargetSize
         renderPass.end()
+        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture {
+            return false
+        }
         return true
     }
 
@@ -10300,6 +10372,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 compositionCaptureStopKey = key
                 compositionCaptureDidReachStop = false
                 compositionCapturePassThroughKeys = Set(compositionTarget.ancestorRenderKeys)
+                let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
 
                 if let scope = compositionTarget.scope {
                     filterPrerenderRootLayer = scope.layer
@@ -10333,6 +10406,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 compositionCapturePassThroughKeys = savedPassThroughKeys
                 filterPrerenderRootLayer = savedFilterPrerenderRoot
                 backdropPass.end()
+
+                if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+                   let failure = lastReplicatorRenderFailure {
+                    recordFailure(key, .backdropReplicatorFailed(failure))
+                    continue
+                }
 
                 let clipMaskView: GPUTextureView?
                 do {
@@ -10812,6 +10891,14 @@ public final class CAWebGPURenderer: CARendererDelegate {
         lastRasterizationRenderFailure = failure
     }
 
+    private func recordRasterizationCaptureFailure(
+        _ failure: CARasterizationRenderFailure,
+        for renderKey: LayerRenderKey
+    ) {
+        failedRasterizationRenderKeys.insert(renderKey)
+        recordRasterizationFailure(failure)
+    }
+
     private func captureRasterizedLayer(
         _ layer: CALayer,
         purpose: RasterizationCachePurpose,
@@ -10825,7 +10912,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
         let key = RasterizationCacheKey(layerRenderKey, purpose: purpose)
         let presentationLayer = renderPresentation(for: layer)
         guard let captureBounds = rasterizationCaptureBounds(for: layer) else {
-            recordRasterizationFailure(.invalidCaptureBounds)
+            recordRasterizationCaptureFailure(
+                .invalidCaptureBounds,
+                for: layerRenderKey
+            )
             return
         }
         let contentBoundsHash = rasterizationContentBoundsHash(
@@ -10844,6 +10934,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                purpose: purpose,
                contentBoundsHash: contentBoundsHash
            ) {
+            failedRasterizationRenderKeys.remove(layerRenderKey)
             prerasterizedTextures[layerRenderKey] = PrerasterizedTexture(
                 texture: entry.texture,
                 purpose: purpose,
@@ -10862,7 +10953,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 maximumTextureDimension: Int(device.limits.maxTextureDimension2D)
             )
         } catch let failure {
-            recordRasterizationFailure(failure)
+            recordRasterizationCaptureFailure(failure, for: layerRenderKey)
             return
         }
         let pixelWidth = captureConfiguration.pixelWidth
@@ -10877,6 +10968,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 filterStages = try layerFilterStages(from: requestedFilters)
             } catch {
                 recordLayerFilterFailure(error, for: layerRenderKey)
+                failedRasterizationRenderKeys.insert(layerRenderKey)
                 return
             }
         }
@@ -10965,6 +11057,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = 0
         transformDepthNesting = 0
         currentStencilValue = 0
+        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
         renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
 
         rasterizePrerenderRootLayer = previousCaptureRoot
@@ -10976,6 +11069,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
         currentStencilValue = previousStencilValue
 
         capturePass.end()
+
+        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+           let failure = lastReplicatorRenderFailure {
+            transientRasterizationTextures.append(captureTexture)
+            recordRasterizationCaptureFailure(
+                .subtreeReplicatorFailed(failure),
+                for: layerRenderKey
+            )
+            return
+        }
 
         var cachedTexture: GPUTexture
         if filterStages.isEmpty {
@@ -10995,6 +11098,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 )
             } catch {
                 recordLayerFilterFailure(error, for: layerRenderKey)
+                failedRasterizationRenderKeys.insert(layerRenderKey)
                 return
             }
             failedLayerFilterKeys.remove(layerRenderKey)
@@ -11018,6 +11122,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 )
             } catch {
                 recordLayerFilterFailure(error, for: layerRenderKey)
+                failedRasterizationRenderKeys.insert(layerRenderKey)
                 return
             }
             failedLayerFilterKeys.remove(layerRenderKey)
@@ -11037,6 +11142,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 )
             } catch {
                 recordShadowRenderFailure(error, for: layerRenderKey)
+                failedRasterizationRenderKeys.insert(layerRenderKey)
                 return
             }
         }
@@ -11057,6 +11163,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             purpose: purpose,
             captureBounds: captureBounds
         )
+        failedRasterizationRenderKeys.remove(layerRenderKey)
         if purpose == .transformFlattening {
             transformFlatteningCaptureCount += 1
         } else if purpose == .explicit {

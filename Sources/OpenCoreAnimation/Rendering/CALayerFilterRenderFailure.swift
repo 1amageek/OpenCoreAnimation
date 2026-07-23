@@ -7,6 +7,7 @@ public enum CALayerFilterRenderFailure: Error, Equatable, Sendable {
     case unsupportedFilterValue(String)
     case unavailableCoreImageFilter(String)
     case rendererResourcesUnavailable
+    case subtreeReplicatorFailed(CAReplicatorRenderFailure)
     case alphaConversionFailed
     case rendererOperationFailed
     case coreImageProcessorUnavailable

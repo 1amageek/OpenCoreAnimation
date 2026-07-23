@@ -7,6 +7,7 @@ public enum CARasterizationRenderFailure: Error, Equatable, Sendable {
     case invalidRasterizationScale(CGFloat)
     case invalidScaledExtent(CGSize)
     case captureProjectionOutOfRange(CGRect)
+    case subtreeReplicatorFailed(CAReplicatorRenderFailure)
     case compositeResourcesUnavailable
     case invalidCompositeBounds(CGRect)
     case compositeVertexCapacityExceeded

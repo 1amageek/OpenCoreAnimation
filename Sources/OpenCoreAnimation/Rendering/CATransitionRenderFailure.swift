@@ -18,6 +18,10 @@ public enum CATransitionRenderFailure: Error, Equatable, Sendable {
     case invalidParticipantContentsScale(CATransitionParticipantRole, CGFloat)
     case invalidParticipantPixelSize(CATransitionParticipantRole, CGSize)
     case participantProjectionOutOfRange(CATransitionParticipantRole, CGRect)
+    case participantReplicatorFailed(
+        CATransitionParticipantRole,
+        CAReplicatorRenderFailure
+    )
     case filterExecutionCreationFailed(String)
     case invalidProgress(CFTimeInterval)
     case filterDispatchFailed(String)

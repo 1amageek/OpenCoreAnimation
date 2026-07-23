@@ -7,6 +7,7 @@ public enum CAShadowRenderFailure: Error, Equatable, Sendable {
     case invalidColor
     case rendererResourcesUnavailable
     case shadowPathTessellationFailed
+    case subtreeReplicatorFailed(CAReplicatorRenderFailure)
     case rasterizedShadowResourcesUnavailable
     case vertexCapacityExceeded
     case prerenderedShadowUnavailable

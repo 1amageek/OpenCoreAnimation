@@ -13,6 +13,7 @@ public enum CACompositionFilterRenderFailure: Error, Equatable, Sendable {
     case clipMaskFailed
     case sourceAdjustmentFailed
     case backdropCaptureIncomplete
+    case backdropReplicatorFailed(CAReplicatorRenderFailure)
     case alphaConversionFailed
     case backgroundFilterExecutionFailed(CALayerFilterRenderFailure)
     case contentMaskFilterExecutionFailed(CALayerFilterRenderFailure)

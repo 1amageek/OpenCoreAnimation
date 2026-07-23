@@ -4366,7 +4366,189 @@ func installHarness() {
                     flattenedDepthReplicator.removeFromSuperlayer()
                     preservingDepthReplicator.removeFromSuperlayer()
 
-                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches),filter=\(filterMatches),shadow=\(shadowMatches),raster=\(rasterMatches),depth=\(depthPreservationMatches)"
+                    func makeInvalidCaptureContainer(
+                        x: CGFloat,
+                        configure: (CALayer) -> Void
+                    ) -> CALayer {
+                        let container = CALayer()
+                        container.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                        container.position = CGPoint(x: x, y: 20)
+                        container.zPosition = 300
+                        container.backgroundColor = CGColor(
+                            red: 1,
+                            green: 1,
+                            blue: 1,
+                            alpha: 1
+                        )
+                        configure(container)
+
+                        let invalidReplicator = CAReplicatorLayer()
+                        invalidReplicator.bounds = container.bounds
+                        invalidReplicator.position = CGPoint(x: 10, y: 10)
+                        invalidReplicator.instanceCount = 1
+                        invalidReplicator.instanceDelay = .nan
+                        let child = CALayer()
+                        child.bounds = container.bounds
+                        child.position = CGPoint(x: 10, y: 10)
+                        child.backgroundColor = CGColor(
+                            red: 1,
+                            green: 0,
+                            blue: 0,
+                            alpha: 1
+                        )
+                        invalidReplicator.addSublayer(child)
+                        container.addSublayer(invalidReplicator)
+                        return container
+                    }
+
+                    let darkPixel: [UInt8] = [25, 25, 38, 255]
+
+                    let filterFailuresBeforeCapture = renderer.layerFilterFailureCount
+                    let filterCapture = makeInvalidCaptureContainer(x: 20) { container in
+                        container.filters = [CAFilter.brightness(0)]
+                    }
+                    root.addSublayer(filterCapture)
+                    engine.renderFrame()
+                    let filterCapturePixel = try await renderer.readbackPixel(x: 20, y: 280)
+                    let filterCaptureWasRejected = filterCapturePixel == darkPixel
+                        && renderer.layerFilterFailureCount == filterFailuresBeforeCapture + 1
+                        && renderer.lastLayerFilterFailure
+                            == .subtreeReplicatorFailed(.nonFiniteInstanceDelay)
+                    filterCapture.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    let rasterizationFailuresBeforeCapture = renderer.rasterizationFailureCount
+                    let rasterCapture = makeInvalidCaptureContainer(x: 60) { container in
+                        container.shouldRasterize = true
+                        container.rasterizationScale = 1
+                    }
+                    root.addSublayer(rasterCapture)
+                    engine.renderFrame()
+                    let rasterCapturePixel = try await renderer.readbackPixel(x: 60, y: 280)
+                    let rasterCaptureWasRejected = rasterCapturePixel == darkPixel
+                        && renderer.rasterizationFailureCount
+                            == rasterizationFailuresBeforeCapture + 1
+                        && renderer.lastRasterizationRenderFailure
+                            == .subtreeReplicatorFailed(.nonFiniteInstanceDelay)
+                    rasterCapture.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    let shadowFailuresBeforeCapture = renderer.shadowRenderFailureCount
+                    let shadowCapture = makeInvalidCaptureContainer(x: 100) { container in
+                        container.shadowColor = CGColor(
+                            red: 1,
+                            green: 1,
+                            blue: 1,
+                            alpha: 1
+                        )
+                        container.shadowOpacity = 1
+                        container.shadowRadius = 0
+                        container.shadowOffset = CGSize(width: 30, height: 0)
+                    }
+                    root.addSublayer(shadowCapture)
+                    engine.renderFrame()
+                    let shadowCapturePixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 100, y: 280),
+                        CGPoint(x: 130, y: 280),
+                    ])
+                    let shadowCaptureWasRejected = shadowCapturePixels == [
+                        [255, 255, 255, 255],
+                        darkPixel,
+                    ]
+                        && renderer.shadowRenderFailureCount
+                            == shadowFailuresBeforeCapture + 1
+                        && renderer.lastShadowRenderFailure
+                            == .subtreeReplicatorFailed(.nonFiniteInstanceDelay)
+                    shadowCapture.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    let transitionCapture = makeInvalidCaptureContainer(x: 160) { _ in }
+                    root.addSublayer(transitionCapture)
+                    engine.renderFrame()
+                    let transitionFailuresBeforeCapture = renderer.transitionRenderFailureCount
+                    let transition = CATransition()
+                    transition.type = .fade
+                    transition.duration = 1
+                    transition.speed = 0
+                    transition.timeOffset = 0.5
+                    transitionCapture.add(transition, forKey: "invalidReplicatorTransition")
+                    transitionCapture.backgroundColor = CGColor(
+                        red: 0,
+                        green: 0,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    engine.renderFrame()
+                    let transitionCapturePixel = try await renderer.readbackPixel(x: 160, y: 280)
+                    let transitionFailureIsTyped: Bool
+                    switch renderer.lastTransitionRenderFailure {
+                    case .participantReplicatorFailed(
+                        _,
+                        .nonFiniteInstanceDelay
+                    ):
+                        transitionFailureIsTyped = true
+                    default:
+                        transitionFailureIsTyped = false
+                    }
+                    let transitionCaptureWasRejected = transitionCapturePixel == darkPixel
+                        && renderer.transitionRenderFailureCount
+                            == transitionFailuresBeforeCapture + 1
+                        && transitionFailureIsTyped
+                    let transitionPixelWasRejected = transitionCapturePixel == darkPixel
+                    let transitionFailureWasCounted = renderer.transitionRenderFailureCount
+                        == transitionFailuresBeforeCapture + 1
+                    transitionCapture.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    let compositionFailuresBeforeCapture =
+                        renderer.compositionFilterFailureCount
+                    let invalidBackdrop = CAReplicatorLayer()
+                    invalidBackdrop.bounds = root.bounds
+                    invalidBackdrop.position = root.position
+                    invalidBackdrop.zPosition = 300
+                    invalidBackdrop.instanceCount = 1
+                    invalidBackdrop.instanceDelay = .nan
+                    let backdropChild = CALayer()
+                    backdropChild.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
+                    backdropChild.position = CGPoint(x: 220, y: 20)
+                    backdropChild.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    invalidBackdrop.addSublayer(backdropChild)
+                    root.addSublayer(invalidBackdrop)
+
+                    let compositionTarget = CALayer()
+                    compositionTarget.bounds = backdropChild.bounds
+                    compositionTarget.position = backdropChild.position
+                    compositionTarget.zPosition = 301
+                    compositionTarget.backgroundColor = CGColor(
+                        red: 0,
+                        green: 1,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    compositionTarget.compositingFilter = CIFilter(
+                        name: "CIScreenCompositing"
+                    )
+                    root.addSublayer(compositionTarget)
+                    engine.renderFrame()
+                    let compositionCapturePixel = try await renderer.readbackPixel(
+                        x: 220,
+                        y: 280
+                    )
+                    let compositionCaptureWasRejected = compositionCapturePixel == darkPixel
+                        && renderer.compositionFilterFailureCount
+                            == compositionFailuresBeforeCapture + 1
+                        && renderer.lastCompositionFilterFailure
+                            == .backdropReplicatorFailed(.nonFiniteInstanceDelay)
+                    compositionTarget.removeFromSuperlayer()
+                    invalidBackdrop.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches),filter=\(filterMatches),shadow=\(shadowMatches),raster=\(rasterMatches),depth=\(depthPreservationMatches),filterCapture=\(filterCaptureWasRejected),rasterCapture=\(rasterCaptureWasRejected),shadowCapture=\(shadowCaptureWasRejected),transitionCapture=\(transitionCaptureWasRejected),transitionPixel=\(transitionPixelWasRejected),transitionRGBA=\(transitionCapturePixel.map(String.init).joined(separator: ":")),transitionCount=\(transitionFailureWasCounted),transitionTyped=\(transitionFailureIsTyped),compositionCapture=\(compositionCaptureWasRejected)"
                 } catch {
                     replicatorProbeResult = "error: \(error)"
                 }

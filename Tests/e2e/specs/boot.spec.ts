@@ -274,7 +274,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginReplicatorProbe();
         await expect.poll(() => h.getReplicatorProbeResult(), { timeout: 10_000 }).toBe(
-            "content=true,zero=true,delay=true,filter=true,shadow=true,raster=true,depth=true"
+            "content=true,zero=true,delay=true,filter=true,shadow=true,raster=true,depth=true,filterCapture=true,rasterCapture=true,shadowCapture=true,transitionCapture=true,transitionPixel=true,transitionRGBA=25:25:38:255,transitionCount=true,transitionTyped=true,compositionCapture=true"
         );
 
         await h.beginDisplayLinkProbe();
@@ -288,12 +288,12 @@ test.describe("OpenCoreAnimation smoke", () => {
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.exerciseUnsupportedBuiltInTransition();
-        await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(1);
+        await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(2);
         expect(await h.getLastTransitionFailure()).toBe("unsupportedType=unsupported");
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
         await h.exerciseUnsupportedTransitionSubtype();
-        await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(2);
+        await expect.poll(() => h.getTransitionRenderFailureCount()).toBe(3);
         expect(await h.getLastTransitionFailure()).toBe("unsupportedSubtype=unsupported");
         expect(await h.getActiveTransitionTextureCount()).toBe(2);
 
