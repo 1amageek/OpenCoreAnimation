@@ -873,6 +873,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var lastReplicatorRenderFailure: CAReplicatorRenderFailure?
 
+    /// Monotonic within a renderer lifetime so capture scopes observe every failure,
+    /// even when the public diagnostic count is deduplicated by render key.
+    private var replicatorRenderFailureGeneration: UInt64 = 0
+    private var reportedReplicatorRenderFailureKeys: Set<LayerRenderKey> = []
+
     /// Number of transform-layer depth groups rejected before rendering.
     @_spi(RendererDiagnostics)
     public private(set) var transformDepthRenderFailureCount: Int = 0
@@ -1293,11 +1298,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 maximumInstanceCount: Self.maxLayers
             )
         } catch {
+            recordReplicatorRenderFailure(error, for: replicatorModel)
             return
         }
         var cumulativeTransform = CATransform3DIdentity
         for instanceIndex in 0..<configuration.instanceCount {
             guard CAReplicatorRenderConfiguration.isFinite(cumulativeTransform) else {
+                recordReplicatorRenderFailure(
+                    .cumulativeTransformOverflow(instanceIndex: instanceIndex),
+                    for: replicatorModel
+                )
                 return
             }
             let inheritedTimeOffset = currentReplicatorTimeOffset
@@ -1308,10 +1318,17 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 instanceColor = try configuration.color(at: instanceIndex)
                 instanceTimeOffset = try configuration.timeOffset(at: instanceIndex)
             } catch {
+                recordReplicatorRenderFailure(error, for: replicatorModel)
                 return
             }
             let combinedTimeOffset = inheritedTimeOffset + instanceTimeOffset
-            guard combinedTimeOffset.isFinite else { return }
+            guard combinedTimeOffset.isFinite else {
+                recordReplicatorRenderFailure(
+                    .instanceTimeOffsetOverflow(instanceIndex: instanceIndex),
+                    for: replicatorModel
+                )
+                return
+            }
             replicatorColorStack.append(inheritedColor * instanceColor)
             replicatorTimeOffsetStack.append(combinedTimeOffset)
             replicatorInstancePath.append(ReplicatorInstancePathComponent(
@@ -1334,6 +1351,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         nextInstanceIndex: instanceIndex + 1
                     )
                 } catch {
+                    recordReplicatorRenderFailure(error, for: replicatorModel)
                     return
                 }
             }
@@ -3982,6 +4000,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         replicatorColorStack.removeAll()
         replicatorTimeOffsetStack.removeAll()
         replicatorInstancePath.removeAll()
+        reportedReplicatorRenderFailureKeys.removeAll(keepingCapacity: true)
         transitionSuppressedLayer = nil
         renderTargetSizeOverride = nil
         activeTransitionSourceIDs.removeAll(keepingCapacity: true)
@@ -4937,6 +4956,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         lastEmitterRenderFailure = nil
         replicatorRenderFailureCount = 0
         lastReplicatorRenderFailure = nil
+        replicatorRenderFailureGeneration = 0
+        reportedReplicatorRenderFailureKeys.removeAll(keepingCapacity: false)
         transformDepthRenderFailureCount = 0
         lastTransformDepthRenderFailure = nil
 
@@ -5786,7 +5807,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = 0
         currentStencilValue = 0
 
-        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
+        let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration
         renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
 
         rasterizePrerenderRootLayer = previousCaptureRoot
@@ -5798,7 +5819,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         currentStencilValue = previousStencilValue
         capturePass.end()
 
-        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+        if replicatorRenderFailureGeneration != replicatorFailureGenerationBeforeCapture,
            let failure = lastReplicatorRenderFailure {
             retiredTransitionTextures.append(texture)
             throw .participantReplicatorFailed(role, failure)
@@ -6770,9 +6791,20 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Replicator Layer Rendering
 
-    private func recordReplicatorRenderFailure(_ failure: CAReplicatorRenderFailure) {
-        replicatorRenderFailureCount += 1
+    private func recordReplicatorRenderFailure(
+        _ failure: CAReplicatorRenderFailure,
+        for replicatorModelLayer: CAReplicatorLayer
+    ) {
+        if replicatorRenderFailureGeneration == .max {
+            replicatorRenderFailureGeneration = 0
+        } else {
+            replicatorRenderFailureGeneration += 1
+        }
         lastReplicatorRenderFailure = failure
+        let key = renderKey(for: replicatorModelLayer)
+        if reportedReplicatorRenderFailureKeys.insert(key).inserted {
+            replicatorRenderFailureCount += 1
+        }
     }
 
     /// Renders the sublayers of a CAReplicatorLayer with instance transformations.
@@ -6796,7 +6828,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 maximumInstanceCount: Self.maxLayers
             )
         } catch {
-            recordReplicatorRenderFailure(error)
+            recordReplicatorRenderFailure(error, for: replicatorModelLayer)
             return
         }
         guard configuration.instanceCount > 0 else { return }
@@ -6817,7 +6849,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         for instanceIndex in 0..<configuration.instanceCount {
             guard CAReplicatorRenderConfiguration.isFinite(cumulativeTransform) else {
                 recordReplicatorRenderFailure(
-                    .cumulativeTransformOverflow(instanceIndex: instanceIndex)
+                    .cumulativeTransformOverflow(instanceIndex: instanceIndex),
+                    for: replicatorModelLayer
                 )
                 return
             }
@@ -6827,7 +6860,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 instanceColor = try configuration.color(at: instanceIndex)
                 timeOffset = try configuration.timeOffset(at: instanceIndex)
             } catch {
-                recordReplicatorRenderFailure(error)
+                recordReplicatorRenderFailure(error, for: replicatorModelLayer)
                 return
             }
             // Calculate instance matrix
@@ -6841,7 +6874,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
             let combinedTimeOffset = inheritedTimeOffset + timeOffset
             guard combinedTimeOffset.isFinite else {
                 recordReplicatorRenderFailure(
-                    .instanceTimeOffsetOverflow(instanceIndex: instanceIndex)
+                    .instanceTimeOffsetOverflow(instanceIndex: instanceIndex),
+                    for: replicatorModelLayer
                 )
                 return
             }
@@ -6877,7 +6911,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         nextInstanceIndex: instanceIndex + 1
                     )
                 } catch {
-                    recordReplicatorRenderFailure(error)
+                    recordReplicatorRenderFailure(error, for: replicatorModelLayer)
                     return
                 }
             }
@@ -6910,7 +6944,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         for instanceIndex in 0..<configuration.instanceCount {
             guard CAReplicatorRenderConfiguration.isFinite(cumulativeTransform) else {
                 recordReplicatorRenderFailure(
-                    .cumulativeTransformOverflow(instanceIndex: instanceIndex)
+                    .cumulativeTransformOverflow(instanceIndex: instanceIndex),
+                    for: replicatorModelLayer
                 )
                 return
             }
@@ -6920,14 +6955,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 instanceColor = try configuration.color(at: instanceIndex)
                 instanceTimeOffset = try configuration.timeOffset(at: instanceIndex)
             } catch {
-                recordReplicatorRenderFailure(error)
+                recordReplicatorRenderFailure(error, for: replicatorModelLayer)
                 return
             }
             let instanceMatrix = parentMatrix * cumulativeTransform.matrix4x4
             let timeOffset = inheritedTimeOffset + instanceTimeOffset
             guard timeOffset.isFinite else {
                 recordReplicatorRenderFailure(
-                    .instanceTimeOffsetOverflow(instanceIndex: instanceIndex)
+                    .instanceTimeOffsetOverflow(instanceIndex: instanceIndex),
+                    for: replicatorModelLayer
                 )
                 return
             }
@@ -6945,7 +6981,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         instanceIndex: instanceIndex,
                         sublayerIndex: sublayerIndex,
                         reason: error
-                    ))
+                    ), for: replicatorModelLayer)
                     return
                 }
                 items.append(DrawItem(
@@ -6966,7 +7002,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                         nextInstanceIndex: instanceIndex + 1
                     )
                 } catch {
-                    recordReplicatorRenderFailure(error)
+                    recordReplicatorRenderFailure(error, for: replicatorModelLayer)
                     return
                 }
             }
@@ -6980,12 +7016,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 currentNestingDepth: transformDepthNesting
             )
         } catch {
-            recordReplicatorRenderFailure(.depthGroupStateFailure(error))
+            recordReplicatorRenderFailure(
+                .depthGroupStateFailure(error),
+                for: replicatorModelLayer
+            )
             return
         }
         if depthConfiguration.requiresDepthClear {
             guard let depthClearPipeline else {
-                recordReplicatorRenderFailure(.depthResourcesUnavailable)
+                recordReplicatorRenderFailure(
+                    .depthResourcesUnavailable,
+                    for: replicatorModelLayer
+                )
                 return
             }
             renderPass.setPipeline(depthClearPipeline)
@@ -9059,7 +9101,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = 0
         currentStencilValue = 0
 
-        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
+        let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration
         renderLayer(layer, renderPass: contentRenderPass, parentMatrix: parentMatrix)
 
         shadowCaptureRootLayer = previousCaptureRoot
@@ -9069,7 +9111,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = previousMaskNestingDepth
         currentStencilValue = previousStencilValue
         contentRenderPass.end()
-        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+        if replicatorRenderFailureGeneration != replicatorFailureGenerationBeforeCapture,
            let failure = lastReplicatorRenderFailure {
             throw .subtreeReplicatorFailed(failure)
         }
@@ -9198,7 +9240,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
             let previousFilterRoot = filterPrerenderRootLayer
             let previousSuppressedMaskRoot = contentMaskCaptureSuppressedRootLayer
-            let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
+            let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration
             withPrepassContext(target) {
                 filterPrerenderRootLayer = filteredLayer
                 if requiresContentMask {
@@ -9214,7 +9256,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             contentMaskCaptureSuppressedRootLayer = previousSuppressedMaskRoot
             contentRenderPass.end()
 
-            if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+            if replicatorRenderFailureGeneration != replicatorFailureGenerationBeforeCapture,
                let failure = lastReplicatorRenderFailure {
                 failedRenderKeys.insert(filteredRenderKey)
                 recordLayerFilterFailure(
@@ -9888,7 +9930,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             filterPrerenderRootLayer = target.layer
         }
 
-        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
+        let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration
         withPrepassContext(target) {
             renderLayer(
                 target.layer,
@@ -9909,7 +9951,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         filterPrerenderRootLayer = savedFilterPrerenderRoot
         renderTargetSizeOverride = savedRenderTargetSize
         renderPass.end()
-        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture {
+        if replicatorRenderFailureGeneration != replicatorFailureGenerationBeforeCapture {
             return false
         }
         return true
@@ -10372,7 +10414,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 compositionCaptureStopKey = key
                 compositionCaptureDidReachStop = false
                 compositionCapturePassThroughKeys = Set(compositionTarget.ancestorRenderKeys)
-                let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
+                let replicatorFailureGenerationBeforeCapture =
+                    replicatorRenderFailureGeneration
 
                 if let scope = compositionTarget.scope {
                     filterPrerenderRootLayer = scope.layer
@@ -10407,7 +10450,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 filterPrerenderRootLayer = savedFilterPrerenderRoot
                 backdropPass.end()
 
-                if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+                if replicatorRenderFailureGeneration
+                    != replicatorFailureGenerationBeforeCapture,
                    let failure = lastReplicatorRenderFailure {
                     recordFailure(key, .backdropReplicatorFailed(failure))
                     continue
@@ -11057,7 +11101,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         maskNestingDepth = 0
         transformDepthNesting = 0
         currentStencilValue = 0
-        let replicatorFailureCountBeforeCapture = replicatorRenderFailureCount
+        let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration
         renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
 
         rasterizePrerenderRootLayer = previousCaptureRoot
@@ -11070,7 +11114,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         capturePass.end()
 
-        if replicatorRenderFailureCount != replicatorFailureCountBeforeCapture,
+        if replicatorRenderFailureGeneration != replicatorFailureGenerationBeforeCapture,
            let failure = lastReplicatorRenderFailure {
             transientRasterizationTextures.append(captureTexture)
             recordRasterizationCaptureFailure(
