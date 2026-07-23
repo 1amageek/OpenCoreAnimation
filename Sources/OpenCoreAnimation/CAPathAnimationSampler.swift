@@ -432,7 +432,7 @@ internal struct CAPathAnimationSampler {
         calculationMode: CAAnimationCalculationMode,
         keyTimes: [CGFloat]?,
         timingFunctions: [CAMediaTimingFunction]?
-    ) -> Sample {
+    ) -> Sample? {
         if progress >= 1 {
             let geometry = segments[segments.count - 1]
             return Sample(point: geometry.end, tangent: geometry.tangent(at: 1))
@@ -456,7 +456,12 @@ internal struct CAPathAnimationSampler {
         if calculationMode == .discrete {
             parameter = 0
         } else if let timingFunctions, segmentIndex < timingFunctions.count {
-            parameter = CGFloat(timingFunctions[segmentIndex].evaluate(at: Float(rawParameter)))
+            guard let evaluatedParameter = timingFunctions[segmentIndex].evaluateIfFinite(
+                at: Float(rawParameter)
+            ) else {
+                return nil
+            }
+            parameter = CGFloat(evaluatedParameter)
         } else {
             parameter = rawParameter
         }

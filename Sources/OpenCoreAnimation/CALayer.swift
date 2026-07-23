@@ -485,7 +485,12 @@ open class CALayer: CAMediaTiming, Hashable {
             // Spring animations can overshoot, so don't clamp to 0-1
         } else if let timingFunction = animation.timingFunction {
             // Apply timing function for non-spring animations
-            adjustedProgress = CFTimeInterval(timingFunction.evaluate(at: Float(adjustedProgress)))
+            guard let evaluatedProgress = timingFunction.evaluateIfFinite(
+                at: Float(adjustedProgress)
+            ) else {
+                return
+            }
+            adjustedProgress = CFTimeInterval(evaluatedProgress)
             adjustedProgress = max(0, min(1, adjustedProgress))
         } else {
             adjustedProgress = max(0, min(1, adjustedProgress))
@@ -527,7 +532,12 @@ open class CALayer: CAMediaTiming, Hashable {
         // Apply timing function if available
         var adjustedProgress = progress
         if let timingFunction = transition.timingFunction {
-            adjustedProgress = CFTimeInterval(timingFunction.evaluate(at: Float(adjustedProgress)))
+            guard let evaluatedProgress = timingFunction.evaluateIfFinite(
+                at: Float(adjustedProgress)
+            ) else {
+                return
+            }
+            adjustedProgress = CFTimeInterval(evaluatedProgress)
         }
 
         // Apply start/end progress range
@@ -565,7 +575,11 @@ open class CALayer: CAMediaTiming, Hashable {
         guard let animations = group.animations else { return }
         let childTime: CFTimeInterval
         if let timingFunction = group.timingFunction {
-            let easedProgress = timingFunction.evaluate(at: Float(timing.progress))
+            guard let easedProgress = timingFunction.evaluateIfFinite(
+                at: Float(timing.progress)
+            ) else {
+                return
+            }
             childTime = CFTimeInterval(max(0, min(1, easedProgress))) * groupBaseDuration
         } else {
             childTime = timing.basicTime
@@ -645,7 +659,12 @@ open class CALayer: CAMediaTiming, Hashable {
             let springTime = progress * singleCycleDuration
             progress = CFTimeInterval(springAnimation.springValue(at: springTime))
         } else if let timingFunction = animation.timingFunction {
-            progress = CFTimeInterval(timingFunction.evaluate(at: Float(progress)))
+            guard let evaluatedProgress = timingFunction.evaluateIfFinite(
+                at: Float(progress)
+            ) else {
+                return
+            }
+            progress = CFTimeInterval(evaluatedProgress)
             progress = max(0, min(1, progress))
         } else {
             progress = max(0, min(1, progress))
@@ -2511,7 +2530,12 @@ open class CALayer: CAMediaTiming, Hashable {
         if animation.calculationMode != .paced && animation.calculationMode != .cubicPaced,
            let timingFunctions = animation.timingFunctions,
            startIndex < timingFunctions.count {
-            adjustedProgress = timingFunctions[startIndex].evaluate(at: segmentProgress)
+            guard let evaluatedProgress = timingFunctions[startIndex].evaluateIfFinite(
+                at: segmentProgress
+            ) else {
+                return
+            }
+            adjustedProgress = evaluatedProgress
         } else {
             adjustedProgress = segmentProgress
         }

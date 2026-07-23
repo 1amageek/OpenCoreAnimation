@@ -78,6 +78,10 @@ public class CAMediaTimingFunction: Hashable {
     /// - Parameter t: The input time, normalized to the range [0, 1].
     /// - Returns: The output time, also in the range [0, 1].
     public func evaluate(at t: Float) -> Float {
+        guard t.isFinite, controlPoints.allSatisfy(\.isFinite) else {
+            return .nan
+        }
+
         // Handle edge cases
         if t <= 0 { return 0 }
         if t >= 1 { return 1 }
@@ -121,6 +125,16 @@ public class CAMediaTimingFunction: Hashable {
 
         // Calculate y at the found parameter u
         return bezierY(u, c1y: c1y, c2y: c2y)
+    }
+
+    /// Evaluates a timing function for an animation application path.
+    ///
+    /// The public evaluator preserves invalid input as a non-finite result.
+    /// Animation callers use this checked form so malformed control points
+    /// cannot partially update presentation state.
+    internal func evaluateIfFinite(at t: Float) -> Float? {
+        let result = evaluate(at: t)
+        return result.isFinite ? result : nil
     }
 
     /// Fallback bisection method for finding the parameter u where x(u) = t.

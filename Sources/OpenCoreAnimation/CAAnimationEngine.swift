@@ -290,7 +290,11 @@ import JavaScriptKit
         if let group = animation as? CAAnimationGroup {
             let childTime: CFTimeInterval
             if let timingFunction = group.timingFunction {
-                let easedProgress = timingFunction.evaluate(at: Float(timing.progress))
+                guard let easedProgress = timingFunction.evaluateIfFinite(
+                    at: Float(timing.progress)
+                ) else {
+                    return
+                }
                 childTime = CFTimeInterval(max(0, min(1, easedProgress))) * duration
             } else {
                 childTime = timing.basicTime
