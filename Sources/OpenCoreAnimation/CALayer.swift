@@ -1076,9 +1076,11 @@ open class CALayer: CAMediaTiming, Hashable {
             )
         }
         if let lhs = lhs as? CGColor, let rhs = rhs as? CGColor {
-            let (lr, lg, lb, la) = extractRGBA(from: lhs)
-            let (rr, rg, rb, ra) = extractRGBA(from: rhs)
-            return CGColor(
+            guard let (lr, lg, lb, la) = extractRGBA(from: lhs),
+                  let (rr, rg, rb, ra) = extractRGBA(from: rhs) else {
+                return nil
+            }
+            return finiteRGBColor(
                 red: lr + sign * rr,
                 green: lg + sign * rg,
                 blue: lb + sign * rb,
@@ -1267,10 +1269,24 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private func addCumulativeColor(_ contribution: Any, cycles: CGFloat, to color: inout CGColor?) {
-        guard let contribution = contribution as? CGColor else { return }
-        let (r, g, b, a) = extractRGBA(from: contribution)
-        let (br, bg, bb, ba) = color.map(extractRGBA) ?? (0, 0, 0, 0)
-        color = CGColor(red: br + r * cycles, green: bg + g * cycles, blue: bb + b * cycles, alpha: ba + a * cycles)
+        guard let contribution = contribution as? CGColor,
+              let (r, g, b, a) = extractRGBA(from: contribution) else {
+            return
+        }
+        let base: (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)
+        if let color {
+            guard let components = extractRGBA(from: color) else { return }
+            base = components
+        } else {
+            base = (0, 0, 0, 0)
+        }
+        let (br, bg, bb, ba) = base
+        color = finiteRGBColor(
+            red: br + r * cycles,
+            green: bg + g * cycles,
+            blue: bb + b * cycles,
+            alpha: ba + a * cycles
+        )
     }
 
     private func applySpecializedCumulativeContribution(
@@ -1317,15 +1333,20 @@ open class CALayer: CAMediaTiming, Hashable {
             colors.reserveCapacity(initial.count)
             for (initialValue, contributionValue) in zip(initial, value) {
                 guard let initialColor = extractColor(initialValue),
-                      let contributionColor = extractColor(contributionValue) else { return }
-                let base = extractRGBA(from: initialColor)
-                let addition = extractRGBA(from: contributionColor)
-                colors.append(CGColor(
+                      let contributionColor = extractColor(contributionValue),
+                      let base = extractRGBA(from: initialColor),
+                      let addition = extractRGBA(from: contributionColor) else {
+                    return
+                }
+                guard let color = finiteRGBColor(
                     red: base.r + addition.r * count,
                     green: base.g + addition.g * count,
                     blue: base.b + addition.b * count,
                     alpha: base.a + addition.a * count
-                ))
+                ) else {
+                    return
+                }
+                colors.append(color)
             }
             gradient._colors = colors
         case "emitterPosition": if let emitter = layer as? CAEmitterLayer, let value = contribution as? CGPoint {
@@ -1842,8 +1863,14 @@ open class CALayer: CAMediaTiming, Hashable {
                 additive: additive
             ) else { return }
             let (from, to) = resolved
-            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
-            layer._backgroundColor = additive ? addColor(value, to: layer._backgroundColor) : value
+            guard let value = animatedColor(
+                from: from,
+                to: to,
+                progress: CGFloat(progress),
+                additive: additive,
+                base: layer._backgroundColor
+            ) else { return }
+            layer._backgroundColor = value
         case "borderColor":
             guard let resolved = resolveFromToColors(
                 animation,
@@ -1851,8 +1878,14 @@ open class CALayer: CAMediaTiming, Hashable {
                 additive: additive
             ) else { return }
             let (from, to) = resolved
-            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
-            layer._borderColor = additive ? addColor(value, to: layer._borderColor) : value
+            guard let value = animatedColor(
+                from: from,
+                to: to,
+                progress: CGFloat(progress),
+                additive: additive,
+                base: layer._borderColor
+            ) else { return }
+            layer._borderColor = value
         case "shadowColor":
             guard let resolved = resolveFromToColors(
                 animation,
@@ -1860,8 +1893,14 @@ open class CALayer: CAMediaTiming, Hashable {
                 additive: additive
             ) else { return }
             let (from, to) = resolved
-            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
-            layer._shadowColor = additive ? addColor(value, to: layer._shadowColor) : value
+            guard let value = animatedColor(
+                from: from,
+                to: to,
+                progress: CGFloat(progress),
+                additive: additive,
+                base: layer._shadowColor
+            ) else { return }
+            layer._shadowColor = value
 
         // CAShapeLayer color properties
         case "fillColor":
@@ -1873,8 +1912,14 @@ open class CALayer: CAMediaTiming, Hashable {
                 additive: additive
             ) else { return }
             let (from, to) = resolved
-            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
-            shapeLayer._fillColor = additive ? addColor(value, to: shapeLayer._fillColor) : value
+            guard let value = animatedColor(
+                from: from,
+                to: to,
+                progress: CGFloat(progress),
+                additive: additive,
+                base: shapeLayer._fillColor
+            ) else { return }
+            shapeLayer._fillColor = value
         case "strokeColor":
             guard let shapeLayer = layer as? CAShapeLayer,
                   let modelShapeLayer = self as? CAShapeLayer else { return }
@@ -1884,8 +1929,14 @@ open class CALayer: CAMediaTiming, Hashable {
                 additive: additive
             ) else { return }
             let (from, to) = resolved
-            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
-            shapeLayer._strokeColor = additive ? addColor(value, to: shapeLayer._strokeColor) : value
+            guard let value = animatedColor(
+                from: from,
+                to: to,
+                progress: CGFloat(progress),
+                additive: additive,
+                base: shapeLayer._strokeColor
+            ) else { return }
+            shapeLayer._strokeColor = value
 
         case "foregroundColor":
             guard let textLayer = layer as? CATextLayer,
@@ -1896,8 +1947,14 @@ open class CALayer: CAMediaTiming, Hashable {
                     additive: additive
                   ) else { return }
             let (from, to) = resolved
-            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
-            textLayer._foregroundColor = additive ? addColor(value, to: textLayer._foregroundColor) : value
+            guard let value = animatedColor(
+                from: from,
+                to: to,
+                progress: CGFloat(progress),
+                additive: additive,
+                base: textLayer._foregroundColor
+            ) else { return }
+            textLayer._foregroundColor = value
 
         case "instanceColor":
             guard let replicatorLayer = layer as? CAReplicatorLayer,
@@ -1908,12 +1965,31 @@ open class CALayer: CAMediaTiming, Hashable {
                     additive: additive
                   ) else { return }
             let (from, to) = resolved
-            let value = interpolateColor(from: from, to: to, progress: CGFloat(progress))
-            replicatorLayer._instanceColor = additive ? addColor(value, to: replicatorLayer._instanceColor) : value
+            guard let value = animatedColor(
+                from: from,
+                to: to,
+                progress: CGFloat(progress),
+                additive: additive,
+                base: replicatorLayer._instanceColor
+            ) else { return }
+            replicatorLayer._instanceColor = value
 
         default:
             break
         }
+    }
+
+    private func animatedColor(
+        from: CGColor,
+        to: CGColor,
+        progress: CGFloat,
+        additive: Bool,
+        base: CGColor?
+    ) -> CGColor? {
+        guard let value = interpolateColor(from: from, to: to, progress: progress) else {
+            return nil
+        }
+        return additive ? addColor(value, to: base) : value
     }
 
     /// Safely extracts a CGColor from an Any value.
@@ -1939,11 +2015,24 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// Adds RGBA components of two colors (for additive animation).
-    private func addColor(_ value: CGColor, to base: CGColor?) -> CGColor {
-        guard let base = base else { return value }
-        let (vR, vG, vB, vA) = extractRGBA(from: value)
-        let (bR, bG, bB, bA) = extractRGBA(from: base)
-        return CGColor(red: bR + vR, green: bG + vG, blue: bB + vB, alpha: bA + vA)
+    private func addColor(_ value: CGColor, to base: CGColor?) -> CGColor? {
+        guard let (vR, vG, vB, vA) = extractRGBA(from: value) else {
+            return nil
+        }
+        let baseComponents: (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)
+        if let base {
+            guard let components = extractRGBA(from: base) else { return nil }
+            baseComponents = components
+        } else {
+            baseComponents = (0, 0, 0, 0)
+        }
+        let (bR, bG, bB, bA) = baseComponents
+        return finiteRGBColor(
+            red: bR + vR,
+            green: bG + vG,
+            blue: bB + vB,
+            alpha: bA + vA
+        )
     }
 
     private struct PathElementSample {
@@ -2049,49 +2138,72 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     /// Interpolates between two colors in RGBA color space.
-    private func interpolateColor(from: CGColor, to: CGColor, progress: CGFloat) -> CGColor {
-        // Convert both colors to RGBA format, handling different component counts
-        let (fromR, fromG, fromB, fromA) = extractRGBA(from: from)
-        let (toR, toG, toB, toA) = extractRGBA(from: to)
+    private func interpolateColor(from: CGColor, to: CGColor, progress: CGFloat) -> CGColor? {
+        guard progress.isFinite,
+              let (fromR, fromG, fromB, fromA) = extractRGBA(from: from),
+              let (toR, toG, toB, toA) = extractRGBA(from: to) else {
+            return nil
+        }
 
         let r = fromR + progress * (toR - fromR)
         let g = fromG + progress * (toG - fromG)
         let b = fromB + progress * (toB - fromB)
         let a = fromA + progress * (toA - fromA)
-
-        return CGColor(red: r, green: g, blue: b, alpha: a)
+        return finiteRGBColor(red: r, green: g, blue: b, alpha: a)
     }
 
-    /// Extracts RGBA components from a CGColor, handling different color space formats.
-    ///
-    /// - 1 component: gray (alpha = 1)
-    /// - 2 components: [gray, alpha]
-    /// - 3 components: [R, G, B] (alpha = 1)
-    /// - 4 components: [R, G, B, A]
-    private func extractRGBA(from color: CGColor) -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat) {
-        let components = color.components ?? [0, 0, 0, 1]
-        let count = components.count
-
-        switch count {
-        case 1:
-            // Gray only, assume alpha = 1
-            let gray = components[0]
-            return (gray, gray, gray, 1.0)
-        case 2:
-            // Grayscale: [gray, alpha]
-            let gray = components[0]
-            let alpha = components[1]
-            return (gray, gray, gray, alpha)
-        case 3:
-            // RGB without alpha
-            return (components[0], components[1], components[2], 1.0)
-        case 4:
-            // RGBA
-            return (components[0], components[1], components[2], components[3])
-        default:
-            // Fallback
-            return (0, 0, 0, 1)
+    /// Converts a finite solid color to managed or device RGB components.
+    private func extractRGBA(
+        from color: CGColor
+    ) -> (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)? {
+        guard let colorSpace = color.colorSpace,
+              let components = color.components,
+              components.count == colorSpace.numberOfComponents + 1,
+              components.allSatisfy(\.isFinite) else {
+            return nil
         }
+
+        let converted: CGColor
+        if let managedRGB = CGColorSpace(name: CGColorSpace.sRGB),
+           let managedColor = color.converted(
+            to: managedRGB,
+            intent: .defaultIntent,
+            options: nil
+           ) {
+            converted = managedColor
+        } else if let deviceColor = color.converted(
+            to: .deviceRGB,
+            intent: .defaultIntent,
+            options: nil
+        ) {
+            converted = deviceColor
+        } else {
+            return nil
+        }
+
+        guard let convertedComponents = converted.components,
+              convertedComponents.count == 4,
+              convertedComponents.allSatisfy(\.isFinite) else {
+            return nil
+        }
+        return (
+            convertedComponents[0],
+            convertedComponents[1],
+            convertedComponents[2],
+            convertedComponents[3]
+        )
+    }
+
+    private func finiteRGBColor(
+        red: CGFloat,
+        green: CGFloat,
+        blue: CGFloat,
+        alpha: CGFloat
+    ) -> CGColor? {
+        guard red.isFinite, green.isFinite, blue.isFinite, alpha.isFinite else {
+            return nil
+        }
+        return CGColor(red: red, green: green, blue: blue, alpha: alpha)
     }
 
     private func applyArrayAnimation(_ animation: CABasicAnimation, to layer: CALayer, keyPath: String, progress: CFTimeInterval) {
@@ -2184,10 +2296,15 @@ open class CALayer: CAMediaTiming, Hashable {
         result.reserveCapacity(from.count)
         for (fromValue, toValue) in zip(from, to) {
             guard let fromColor = extractColor(fromValue),
-                  let toColor = extractColor(toValue) else {
+                  let toColor = extractColor(toValue),
+                  let color = interpolateColor(
+                    from: fromColor,
+                    to: toColor,
+                    progress: progress
+                  ) else {
                 return nil
             }
-            result.append(interpolateColor(from: fromColor, to: toColor, progress: progress))
+            result.append(color)
         }
         return result
     }
@@ -2576,15 +2693,8 @@ open class CALayer: CAMediaTiming, Hashable {
             return components.allSatisfy(\.isFinite) ? components : nil
         }
         if let color = extractColor(value),
-           let rgbColor = color.converted(
-            to: .deviceRGB,
-            intent: .defaultIntent,
-            options: nil
-           ),
-           let components = rgbColor.components,
-           components.count == 4,
-           components.allSatisfy(\.isFinite) {
-            return components
+           let components = extractRGBA(from: color) {
+            return [components.r, components.g, components.b, components.a]
         }
         return nil
     }
@@ -3134,12 +3244,12 @@ open class CALayer: CAMediaTiming, Hashable {
         if let v0 = extractColor(p0),
            let v1 = extractColor(p1),
            let v2 = extractColor(p2),
-           let v3 = extractColor(p3) {
-            let c0 = extractRGBA(from: v0)
-            let c1 = extractRGBA(from: v1)
-            let c2 = extractRGBA(from: v2)
-            let c3 = extractRGBA(from: v3)
-            return CGColor(
+           let v3 = extractColor(p3),
+           let c0 = extractRGBA(from: v0),
+           let c1 = extractRGBA(from: v1),
+           let c2 = extractRGBA(from: v2),
+           let c3 = extractRGBA(from: v3) {
+            return finiteRGBColor(
                 red: scalar(c0.r, c1.r, c2.r, c3.r),
                 green: scalar(c0.g, c1.g, c2.g, c3.g),
                 blue: scalar(c0.b, c1.b, c2.b, c3.b),

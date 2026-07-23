@@ -2379,6 +2379,32 @@ func installHarness() {
                 configure(colorAnimation)
                 colorLayer.add(colorAnimation, forKey: "browserAggregateColor")
 
+                let convertedColorLayer = makeLayer(
+                    position: CGPoint(x: 250, y: 150),
+                    size: CGSize(width: 40, height: 40),
+                    color: CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+                )
+                let convertedColorAnimation = CABasicAnimation(keyPath: "backgroundColor")
+                convertedColorAnimation.fromValue = CGColor(
+                    genericCMYKCyan: 0,
+                    magenta: 0,
+                    yellow: 0,
+                    black: 0,
+                    alpha: 1
+                )
+                convertedColorAnimation.toValue = CGColor(
+                    genericCMYKCyan: 0,
+                    magenta: 1,
+                    yellow: 1,
+                    black: 0,
+                    alpha: 1
+                )
+                configure(convertedColorAnimation)
+                convertedColorLayer.add(
+                    convertedColorAnimation,
+                    forKey: "browserConvertedColor"
+                )
+
                 let transformLayer = makeLayer(
                     position: CGPoint(x: 330, y: 150),
                     size: CGSize(width: 20, height: 20),
@@ -2394,6 +2420,7 @@ func installHarness() {
                 func restoreScene() {
                     boundsLayer.removeFromSuperlayer()
                     colorLayer.removeFromSuperlayer()
+                    convertedColorLayer.removeFromSuperlayer()
                     transformLayer.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
@@ -2405,9 +2432,12 @@ func installHarness() {
                 engine.renderFrame()
                 guard let boundsPresentation = boundsLayer.presentation(),
                       let colorPresentation = colorLayer.presentation(),
+                      let convertedColorPresentation = convertedColorLayer.presentation(),
                       let transformPresentation = transformLayer.presentation(),
                       let components = colorPresentation.backgroundColor?.components,
-                      components.count == 4 else {
+                      components.count == 4,
+                      let convertedComponents = convertedColorPresentation.backgroundColor?.components,
+                      convertedComponents.count == 4 else {
                     restoreScene()
                     aggregateByValueProbeResult = "error: aggregate presentation unavailable"
                     return
@@ -2417,12 +2447,17 @@ func installHarness() {
                     && abs(components[1] - 0.2) < 0.001
                     && abs(components[2] - 0.2) < 0.001
                     && abs(components[3] - 1) < 0.001
+                    && abs(convertedComponents[0] - 1) < 0.001
+                    && abs(convertedComponents[1] - 0.5) < 0.001
+                    && abs(convertedComponents[2] - 0.5) < 0.001
+                    && abs(convertedComponents[3] - 1) < 0.001
                     && abs(transformPresentation.transform.m41 - 20) < 0.001
 
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 88, y: 150),
                         CGPoint(x: 160, y: 150),
+                        CGPoint(x: 250, y: 150),
                         CGPoint(x: 330, y: 150),
                         CGPoint(x: 350, y: 150),
                     ])

@@ -247,7 +247,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginAggregateByValueProbe();
         await expect.poll(() => h.getAggregateByValueProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;153,51,51,255;0,0,0,255;0,255,0,255,presentation=true"
+            "255,0,0,255;153,51,51,255;255,128,128,255;0,0,0,255;0,255,0,255,presentation=true"
         );
 
         await h.beginAdditiveKeyframeProbe();
