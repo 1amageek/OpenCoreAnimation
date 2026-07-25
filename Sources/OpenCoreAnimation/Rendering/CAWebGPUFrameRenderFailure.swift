@@ -7,6 +7,7 @@ public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
     case contents(CAContentsRenderFailure)
     case contentMask(CALayerFilterRenderFailure)
     case groupOpacity(CALayerFilterRenderFailure)
+    case filter(CALayerFilterRenderFailure)
     case shadow(CAShadowRenderFailure)
 }
 

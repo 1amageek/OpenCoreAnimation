@@ -397,6 +397,11 @@ public final class CAMetalRenderer: CARendererDelegate {
             return .shadow
         }
         if snapshot.nodes.contains(where: {
+            !$0.presentationValues.filters.isEmpty
+        }) {
+            return .filters
+        }
+        if snapshot.nodes.contains(where: {
             $0.presentationValues.imageContents != nil
         }) {
             return .imageContents

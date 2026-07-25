@@ -125,9 +125,11 @@ struct CARenderSnapshotTests {
         )
     }
 
-    @Test("Mask effects retain an explicit live-resource requirement")
-    func maskEffectsRemainOnLiveResourcePath() throws {
+    @Test("Layer and mask filters become value-owned snapshot plans")
+    func filtersAreCapturedByValue() throws {
         let root = CALayer()
+        var rootFilter = CAFilter.brightness(0.25)
+        root.filters = [rootFilter]
         let mask = CALayer()
         mask.filters = [CAFilter.blur(radius: 4)]
         root.mask = mask
@@ -137,8 +139,48 @@ struct CARenderSnapshotTests {
             frameToken: 45
         )
 
-        #expect(snapshot.liveTreeRequirement == .filters)
-        #expect(snapshot.nodes[snapshot.rootIndex].maskIndex != nil)
+        let rootNode = snapshot.nodes[snapshot.rootIndex]
+        let maskIndex = try #require(rootNode.maskIndex)
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(
+            rootNode.presentationValues.filters
+                == [.renderer(.brightness(amount: 0.25))]
+        )
+        #expect(
+            snapshot.nodes[maskIndex].presentationValues.filters
+                == [.renderer(.gaussianBlur(radius: 4))]
+        )
+
+        rootFilter.parameters["inputBrightness"] = -0.75
+        root.filters = [rootFilter]
+        mask.filters = [CAFilter.blur(radius: 12)]
+        #expect(
+            rootNode.presentationValues.filters
+                == [.renderer(.brightness(amount: 0.25))]
+        )
+        #expect(
+            snapshot.nodes[maskIndex].presentationValues.filters
+                == [.renderer(.gaussianBlur(radius: 4))]
+        )
+    }
+
+    @Test("Invalid filter plans fail snapshot capture explicitly")
+    func invalidFilterCaptureIsTyped() {
+        let layer = CALayer()
+        layer.filters = [
+            CAFilter(
+                type: .brightness,
+                parameters: ["inputBrightness": "invalid"]
+            ),
+        ]
+
+        #expect(throws: CARendererError.invalidLayerFilter(
+            .invalidConfiguration(
+                .invalidParameterType("inputBrightness")
+            )
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 46)
+        }
     }
 
     @Test("Group opacity becomes value-owned snapshot state")
@@ -977,6 +1019,32 @@ private final class SnapshotDisplayDelegate: CALayerDelegate {
 import Metal
 
 extension CARenderSnapshotTests {
+    @Test("Metal reports committed filters instead of dropping them")
+    func metalRejectsUnsupportedFilterSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.filters = [CAFilter.colorInvert()]
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.filters))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
     @Test("Metal reports committed shadows instead of dropping them")
     func metalRejectsUnsupportedShadowSnapshot() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())

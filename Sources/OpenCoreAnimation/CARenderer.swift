@@ -13,7 +13,21 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case imageContents
     case contentMask
     case groupOpacity
+    case filters
     case shadow
+}
+
+/// A layer filter value that could not cross the immutable commit boundary.
+public enum CARenderSnapshotFilterError: Error, Equatable, Sendable {
+    case invalidConfiguration(CAFilterConfigurationError)
+    case unsupportedFilterValue(String)
+    case invalidCoreImageFilterName
+    case unsupportedCoreImageParameter(
+        filter: String,
+        key: String,
+        valueType: String
+    )
+    case nonFiniteCoreImageParameter(filter: String, key: String)
 }
 
 /// A shadow value that could not cross the immutable commit boundary.
@@ -59,6 +73,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidDelegateBackingStore(CADelegateBackingStoreError)
     /// A visible shadow could not become an immutable renderer resource.
     case invalidLayerShadow(CARenderSnapshotShadowError)
+    /// A layer filter could not become an immutable renderer resource.
+    case invalidLayerFilter(CARenderSnapshotFilterError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

@@ -5,7 +5,7 @@
 
 import Foundation
 
-internal enum CAFilterOperation: Equatable {
+internal enum CAFilterOperation: Equatable, Sendable {
     case gaussianBlur(radius: CGFloat)
     case brightness(amount: CGFloat)
     case contrast(amount: CGFloat)
@@ -13,7 +13,6 @@ internal enum CAFilterOperation: Equatable {
     case colorInvert
 }
 
-@_spi(RendererDiagnostics)
 public enum CAFilterConfigurationError: Error, Equatable, Sendable {
     case unexpectedParameter(String)
     case invalidParameterType(String)
@@ -21,7 +20,7 @@ public enum CAFilterConfigurationError: Error, Equatable, Sendable {
     case parameterOutOfRange(String, minimum: CGFloat, maximum: CGFloat?)
 }
 
-internal enum CAFilterExecutionPlan: Equatable {
+internal enum CAFilterExecutionPlan: Equatable, Sendable {
     case renderer(CAFilterOperation)
     case coreImage(name: String, parameters: [String: CGFloat])
 }

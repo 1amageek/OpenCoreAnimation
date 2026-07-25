@@ -3,7 +3,6 @@ import Foundation
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
     case contents
-    case filters
     case backdropComposition
     case rasterization
     case transition
@@ -17,9 +16,11 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 /// frame that is already being encoded.
 // FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot contains every value
 // consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
-// including nested rectangular and rounded clipping and ordinary CGImage
-// contents. Production WebGPU still uses explicitly typed live-tree branches
-// for non-image contents, specialized layers, and animation evaluation.
+// including nested rectangular and rounded clipping, ordinary CGImage
+// contents, and layer filter execution plans. Production WebGPU still uses
+// explicitly typed live-tree branches for non-image contents, specialized
+// layers, backdrop composition, rasterization, transitions, and animation
+// evaluation.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -58,6 +59,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let preferredDynamicRange: CALayer.DynamicRange
         internal let contentsHeadroom: Float
         internal let imageContents: CAImageContentsSnapshot?
+        internal let filters: [CARenderSnapshotFilterStage]
         internal let shadow: Shadow?
     }
 
@@ -192,9 +194,6 @@ internal struct CARenderSnapshot: Sendable {
            !(presentationLayer.contents is CGImage) {
             return .contents
         }
-        if presentationLayer.filters?.isEmpty == false {
-            return .filters
-        }
         if presentationLayer.compositingFilter != nil
             || presentationLayer.backgroundFilters?.isEmpty == false {
             return .backdropComposition
@@ -299,6 +298,14 @@ internal struct CARenderSnapshot: Sendable {
         } catch {
             throw .invalidLayerContents(error)
         }
+        let filters: [CARenderSnapshotFilterStage]
+        do {
+            filters = try CARenderSnapshotFilterStage.capture(
+                layer.filters ?? []
+            )
+        } catch {
+            throw .invalidLayerFilter(error)
+        }
         let shadow: PresentationValues.Shadow?
         if layer.shadowOpacity > 0, layer.shadowColor != nil {
             let configuration: CAShadowRenderConfiguration
@@ -384,6 +391,7 @@ internal struct CARenderSnapshot: Sendable {
             preferredDynamicRange: layer.preferredDynamicRange,
             contentsHeadroom: contentsHeadroom,
             imageContents: imageContents,
+            filters: filters,
             shadow: shadow
         )
     }

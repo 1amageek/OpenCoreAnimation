@@ -340,6 +340,7 @@ private struct PrerenderedFilter {
 private enum SnapshotCompositeKind: Equatable {
     case contentMask
     case groupOpacity
+    case filter
 }
 
 private struct SnapshotCompositedNode {
@@ -4365,6 +4366,15 @@ private final class EmitterLayerState {
                         ].identity
                     )
                 )
+            case .filter(let failure):
+                recordLayerFilterFailure(
+                    failure,
+                    for: LayerRenderKey(
+                        layer: snapshot.nodes[
+                            snapshot.rootIndex
+                        ].identity
+                    )
+                )
             case .shadow(let failure):
                 recordShadowRenderFailure(
                     failure,
@@ -4390,10 +4400,12 @@ private final class EmitterLayerState {
             rootValues.allowsGroupOpacity
             && rootValues.opacity < 1
             && !snapshot.nodes[snapshot.rootIndex].childIndices.isEmpty
+        let rootRequiresFilter = !rootValues.filters.isEmpty
         let clearColor: GPUColor
         if rootValues.cornerRadius > 0
             || rootHasContentMask
-            || rootRequiresGroupOpacity {
+            || rootRequiresGroupOpacity
+            || rootRequiresFilter {
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
         } else if let color = rootValues.backgroundColor {
             clearColor = GPUColor(
@@ -4464,6 +4476,13 @@ private final class EmitterLayerState {
                     )
                 )
             case .groupOpacity(let failure):
+                recordLayerFilterFailure(
+                    failure,
+                    for: LayerRenderKey(
+                        layer: snapshot.nodes[snapshot.rootIndex].identity
+                    )
+                )
+            case .filter(let failure):
                 recordLayerFilterFailure(
                     failure,
                     for: LayerRenderKey(
@@ -4575,10 +4594,7 @@ private final class EmitterLayerState {
         for execution in retiringCompositionExecutions {
             execution.invalidate()
         }
-        for execution in activeCompositionExecutions {
-            execution.invalidate()
-        }
-        retiringCompositionExecutions.removeAll(keepingCapacity: true)
+        retiringCompositionExecutions = activeCompositionExecutions
         activeCompositionExecutions.removeAll(keepingCapacity: true)
         compositionCaptureStopKey = nil
         compositionCaptureDidReachStop = false
@@ -4621,6 +4637,10 @@ private final class EmitterLayerState {
             resources.destroy()
         }
         transientRasterizationShadowResources.removeAll(keepingCapacity: true)
+        for execution in activeCompositionExecutions {
+            execution.invalidate()
+        }
+        activeCompositionExecutions.removeAll(keepingCapacity: true)
         snapshotCompositedNodes.removeAll(keepingCapacity: true)
         snapshotCompositeCaptureRootNodeIndex = nil
         snapshotCompositeCaptureSuppressesOpacity = false
@@ -6093,7 +6113,9 @@ private final class EmitterLayerState {
                 values.allowsGroupOpacity
                 && values.opacity < 1
                 && !node.childIndices.isEmpty
-            if node.maskIndex != nil || requiresGroupOpacity {
+            if node.maskIndex != nil
+                || requiresGroupOpacity
+                || !values.filters.isEmpty {
                 targets.append(
                     SnapshotCompositeTarget(
                         nodeIndex: nodeIndex,
@@ -6112,10 +6134,6 @@ private final class EmitterLayerState {
         for target in targets {
             let node = snapshot.nodes[target.nodeIndex]
             let values = node.presentationValues
-            let requiresGroupOpacity =
-                values.allowsGroupOpacity
-                && values.opacity < 1
-                && !node.childIndices.isEmpty
             let resources = FilterLayerResources(
                 device: device,
                 width: Int(size.width),
@@ -6182,6 +6200,57 @@ private final class EmitterLayerState {
             snapshotCompositeCaptureSuppressesOpacity = false
             contentPass.end()
 
+            var currentTexture = resources.sourceTexture
+            var currentView = resources.sourceView
+            if !values.filters.isEmpty {
+                let stages: [LayerFilterStage]
+                do {
+                    stages = try layerFilterStages(
+                        from: values.filters
+                    )
+                } catch {
+                    throw .filter(error)
+                }
+                let filtered: (
+                    texture: GPUTexture,
+                    view: GPUTextureView
+                )
+                do {
+                    filtered = try executeBackdropFilterStages(
+                        stages,
+                        inputTexture: currentTexture,
+                        inputView: currentView,
+                        inputAlphaMode: .premultiplied,
+                        resources: resources,
+                        device: device,
+                        processor: layerFilterProcessor,
+                        encoder: encoder
+                    )
+                } catch {
+                    throw .filter(error)
+                }
+                let premultipliedTexture =
+                    filtered.texture === resources.resultTexture
+                        ? resources.sourceTexture
+                        : resources.resultTexture
+                guard let premultipliedView = resources.view(
+                    for: premultipliedTexture
+                ), applyAlphaConversion(
+                    from: .straight,
+                    inputTexture: filtered.texture,
+                    outputView: premultipliedView,
+                    uniformBuffer: resources.uniformBuffer(
+                        forOperationAt: stages.count + 16,
+                        device: device
+                    ),
+                    encoder: encoder
+                ) else {
+                    throw .filter(.alphaConversionFailed)
+                }
+                currentTexture = premultipliedTexture
+                currentView = premultipliedView
+            }
+
             let outputView: GPUTextureView
             if let maskIndex = node.maskIndex {
                 guard let compositionMaskApplyPipeline else {
@@ -6244,24 +6313,30 @@ private final class EmitterLayerState {
 
                 guard encodeCompositionMaskOperation(
                     pipeline: compositionMaskApplyPipeline,
-                    firstView: resources.sourceView,
+                    firstView: currentView,
                     secondView: resources.intermediateView,
-                    outputView: resources.resultView,
+                    outputView: currentTexture === resources.resultTexture
+                        ? resources.sourceView
+                        : resources.resultView,
                     encoder: encoder
                 ) else {
                     throw .contentMask(.contentMaskCompositeFailed)
                 }
-                outputView = resources.resultView
+                outputView = currentTexture === resources.resultTexture
+                    ? resources.sourceView
+                    : resources.resultView
             } else {
-                outputView = resources.sourceView
+                outputView = currentView
             }
             snapshotCompositedNodes[target.nodeIndex] =
                 SnapshotCompositedNode(
                     resources: resources,
                     outputView: outputView,
-                    kind: requiresGroupOpacity
-                        ? .groupOpacity
-                        : .contentMask
+                    kind: node.maskIndex != nil
+                        ? .contentMask
+                        : !values.filters.isEmpty
+                            ? .filter
+                            : .groupOpacity
                 )
         }
     }
@@ -6307,6 +6382,8 @@ private final class EmitterLayerState {
                     throw .contentMask(error)
                 case .groupOpacity:
                     throw .groupOpacity(error)
+                case .filter:
+                    throw .filter(error)
                 }
             }
             return
@@ -11764,6 +11841,35 @@ private final class EmitterLayerState {
             }
         }
 
+        return stages
+    }
+
+    private func layerFilterStages(
+        from snapshotStages: [CARenderSnapshotFilterStage]
+    ) throws(CALayerFilterRenderFailure) -> [LayerFilterStage] {
+        var stages: [LayerFilterStage] = []
+        stages.reserveCapacity(snapshotStages.count)
+
+        for stage in snapshotStages {
+            switch stage {
+            case let .renderer(operation):
+                stages.append(.renderer(operation))
+            case let .coreImage(name, parameters):
+                guard let filter = CIFilter(name: name) else {
+                    throw .unavailableCoreImageFilter(name)
+                }
+                for key in parameters.keys.sorted() {
+                    guard let parameter = parameters[key] else {
+                        continue
+                    }
+                    filter.setValue(
+                        parameter.materializedValue,
+                        forKey: key
+                    )
+                }
+                stages.append(.coreImage(filter))
+            }
+        }
         return stages
     }
 

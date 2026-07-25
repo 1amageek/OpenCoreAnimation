@@ -6019,6 +6019,15 @@ func installHarness() {
                 let snapshotShadowLayer = CALayer()
                 let snapshotPathShadowLayer = CALayer()
                 let snapshotShadowPath = CGMutablePath()
+                let snapshotCAFilterLayer = CALayer()
+                let snapshotCoreImageFilterLayer = CALayer()
+                guard let snapshotCoreImageFilter = CIFilter(
+                    name: "CIColorInvert"
+                ) else {
+                    ImmutableSnapshotProbeState.result =
+                        "error: filter creation failed"
+                    return
+                }
                 let snapshotDelegate = DelegateDrawProbeDelegate()
                 var snapshotCompletionRan = false
                 CATransaction.begin()
@@ -6264,6 +6273,41 @@ func installHarness() {
                 )
                 snapshotPathShadowLayer.shadowPath = snapshotShadowPath
                 snapshotRoot.addSublayer(snapshotPathShadowLayer)
+                snapshotCAFilterLayer.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40
+                )
+                snapshotCAFilterLayer.position = CGPoint(x: 330, y: 170)
+                snapshotCAFilterLayer.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotCAFilterLayer.filters = [
+                    CAFilter.colorInvert(),
+                ]
+                snapshotRoot.addSublayer(snapshotCAFilterLayer)
+                snapshotCoreImageFilterLayer.bounds =
+                    snapshotCAFilterLayer.bounds
+                snapshotCoreImageFilterLayer.position = CGPoint(
+                    x: 270,
+                    y: 170
+                )
+                snapshotCoreImageFilterLayer.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotCoreImageFilterLayer.filters = [
+                    snapshotCoreImageFilter,
+                ]
+                snapshotRoot.addSublayer(
+                    snapshotCoreImageFilterLayer
+                )
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6330,6 +6374,9 @@ func installHarness() {
                     snapshotShadowLayer.shadowColor
                 snapshotPathShadowLayer.shadowOffset = .zero
                 snapshotShadowPath.addRect(snapshotPathShadowLayer.bounds)
+                snapshotCAFilterLayer.filters = []
+                snapshotCoreImageFilter.isEnabled = false
+                snapshotCoreImageFilterLayer.filters = []
                 renderer.render(layer: snapshotRoot)
                 let snapshotCompletionRanAfterRender =
                     snapshotCompletionRan
@@ -6354,6 +6401,8 @@ func installHarness() {
                         CGPoint(x: 150, y: 190),
                         CGPoint(x: 225, y: 190),
                         CGPoint(x: 280, y: 190),
+                        CGPoint(x: 330, y: 130),
+                        CGPoint(x: 270, y: 130),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6574,6 +6623,66 @@ func installHarness() {
                             == frameFailuresBeforeSnapshotShadowFailure + 1
                         && renderer.lastFrameRenderFailure == nil
 
+                    let snapshotFilterFailureRoot = CALayer()
+                    let snapshotFilterFailureLayer = CALayer()
+                    guard let invalidSnapshotFilter = CIFilter(
+                        name: "CIColorInvert"
+                    ) else {
+                        ImmutableSnapshotProbeState.result =
+                            "error: invalid filter creation failed"
+                        return
+                    }
+                    invalidSnapshotFilter.setValue(
+                        "invalid",
+                        forKey: "inputUnsupported"
+                    )
+                    var snapshotFilterFailureCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        snapshotFilterFailureCompletionRan = true
+                    }
+                    snapshotFilterFailureRoot.bounds =
+                        snapshotRoot.bounds
+                    snapshotFilterFailureRoot.position =
+                        snapshotRoot.position
+                    snapshotFilterFailureRoot.backgroundColor =
+                        snapshotRoot.backgroundColor
+                    snapshotFilterFailureLayer.bounds =
+                        snapshotChild.bounds
+                    snapshotFilterFailureLayer.position =
+                        snapshotChild.position
+                    snapshotFilterFailureLayer.backgroundColor =
+                        snapshotChild.backgroundColor
+                    snapshotFilterFailureLayer.filters = [
+                        invalidSnapshotFilter,
+                    ]
+                    snapshotFilterFailureRoot.addSublayer(
+                        snapshotFilterFailureLayer
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeSnapshotFilterFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.render(layer: snapshotFilterFailureRoot)
+                    let snapshotFilterFailureWasTyped: Bool
+                    if case .committedSnapshotCaptureFailed(
+                        .invalidLayerFilter(
+                            .unsupportedCoreImageParameter(
+                                filter: "CIColorInvert",
+                                key: "inputUnsupported",
+                                valueType: "Swift.String"
+                            )
+                        )
+                    ) = renderer.lastFrameRenderFailure {
+                        snapshotFilterFailureWasTyped =
+                            renderer.frameRenderFailureCount
+                                == frameFailuresBeforeSnapshotFilterFailure + 1
+                    } else {
+                        snapshotFilterFailureWasTyped = false
+                    }
+                    let snapshotFilterFailureCompletionRemainedPending =
+                        !snapshotFilterFailureCompletionRan
+
                     let delegateFailureRoot = CALayer()
                     let invalidDelegate = DelegateDrawProbeDelegate()
                     let invalidDelegateLayer = CALayer()
@@ -6628,6 +6737,8 @@ func installHarness() {
                         + ",snapshotShadowFailureTyped=\(snapshotShadowFailureWasTyped)"
                         + ",snapshotShadowFailurePending=\(snapshotShadowFailureCompletionRemainedPending)"
                         + ",snapshotShadowFailureRecovered=\(snapshotShadowFailureRecovered)"
+                        + ",snapshotFilterFailureTyped=\(snapshotFilterFailureWasTyped)"
+                        + ",snapshotFilterFailurePending=\(snapshotFilterFailureCompletionRemainedPending)"
                         + ",delegateCaptured=\(delegateCapturedAtCommit)"
                         + ",snapshotPending=\(snapshotCompletionPendingBeforeRender)"
                         + ",snapshotCompleted=\(snapshotCompletionRanAfterRender)"
