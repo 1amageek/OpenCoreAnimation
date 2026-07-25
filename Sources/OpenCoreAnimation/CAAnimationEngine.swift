@@ -160,10 +160,13 @@ import JavaScriptKit
     public func displayLinkDidFire(_ displayLink: CADisplayLink) {
         updateDisplayLinkFrameRate(at: CACurrentMediaTime())
 
-        // Render the layer tree first using internal delegate
+        // Render only when committed model work, an unfinished animation, or
+        // renderer-owned asynchronous/simulation state requires a new frame.
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
             layoutRecursively(rootLayer)
-            delegate.render(layer: rootLayer)
+            if shouldRenderDisplayFrame(rootLayer, delegate: delegate) {
+                delegate.render(layer: rootLayer)
+            }
         }
 
         // Process animation completions after rendering
@@ -176,17 +179,66 @@ import JavaScriptKit
     ///
     /// - Parameter layer: The layer to process, along with all its sublayers.
     private func processAnimationsRecursively(_ layer: CALayer?) {
-        guard let layer = layer else { return }
+        guard let layer else { return }
+        var visited: Set<ObjectIdentifier> = []
+        processAnimationsRecursively(layer, visited: &visited)
+    }
+
+    private func processAnimationsRecursively(
+        _ layer: CALayer,
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(layer)).inserted else { return }
 
         // Process this layer's animations
         layer.processAnimationCompletions()
 
-        // Process sublayers
-        if let sublayers = layer.sublayers {
-            for sublayer in sublayers {
-                processAnimationsRecursively(sublayer)
+        if let mask = layer.mask {
+            processAnimationsRecursively(mask, visited: &visited)
+        }
+        for sublayer in layer.sublayers ?? [] {
+            processAnimationsRecursively(sublayer, visited: &visited)
+        }
+    }
+
+    private func shouldRenderDisplayFrame(
+        _ rootLayer: CALayer,
+        delegate: CARendererDelegate
+    ) -> Bool {
+        if rootLayer._subtreeDirtyCount > 0 {
+            return true
+        }
+        if delegate.requiresFrameWhenLayerTreeIsClean {
+            return true
+        }
+        var visited: Set<ObjectIdentifier> = []
+        return containsUnfinishedAnimation(rootLayer, visited: &visited)
+    }
+
+    private func containsUnfinishedAnimation(
+        _ layer: CALayer,
+        visited: inout Set<ObjectIdentifier>
+    ) -> Bool {
+        guard visited.insert(ObjectIdentifier(layer)).inserted else { return false }
+        var containsAnimation = false
+        layer.forEachAttachedAnimation { animation in
+            if !animation.isFinished {
+                containsAnimation = true
             }
         }
+        if containsAnimation {
+            return true
+        }
+        if let mask = layer.mask,
+           containsUnfinishedAnimation(mask, visited: &visited) {
+            return true
+        }
+        for sublayer in layer.sublayers ?? [] {
+            if containsUnfinishedAnimation(sublayer, visited: &visited) {
+                return true
+            }
+        }
+        return false
     }
 
     /// Resolves the highest-demand timing hints among animations active in the tree.
@@ -247,6 +299,22 @@ import JavaScriptKit
         into accumulator: inout FrameRateRangeAccumulator
     ) {
         guard let layer else { return }
+        var visited: Set<ObjectIdentifier> = []
+        collectActiveFrameRateRanges(
+            from: layer,
+            mediaTime: mediaTime,
+            into: &accumulator,
+            visited: &visited
+        )
+    }
+
+    private func collectActiveFrameRateRanges(
+        from layer: CALayer,
+        mediaTime: CFTimeInterval,
+        into accumulator: inout FrameRateRangeAccumulator,
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(layer)).inserted else { return }
         let localTime = layer.convertTime(mediaTime, from: nil)
 
         layer.forEachAttachedAnimation { animation in
@@ -258,11 +326,20 @@ import JavaScriptKit
             )
         }
 
+        if let mask = layer.mask {
+            collectActiveFrameRateRanges(
+                from: mask,
+                mediaTime: mediaTime,
+                into: &accumulator,
+                visited: &visited
+            )
+        }
         for sublayer in layer.sublayers ?? [] {
             collectActiveFrameRateRanges(
                 from: sublayer,
                 mediaTime: mediaTime,
-                into: &accumulator
+                into: &accumulator,
+                visited: &visited
             )
         }
     }

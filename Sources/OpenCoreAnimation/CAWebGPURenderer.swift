@@ -739,6 +739,22 @@ public final class CAWebGPURenderer: CARendererDelegate {
     @_spi(RendererDiagnostics)
     public private(set) var transitionRenderFailureCount: Int = 0
 
+    internal var requiresFrameWhenLayerTreeIsClean: Bool {
+        if !pendingTileDraws.isEmpty {
+            return true
+        }
+        return emitterLayerStates.values.contains { state in
+            guard let owner = state.owner else { return false }
+            if !state.particles.isEmpty {
+                return true
+            }
+            guard owner.birthRate > 0 else { return false }
+            return owner.emitterCells?.contains { cell in
+                cell.isEnabled && cell.birthRate > 0
+            } == true
+        }
+    }
+
     /// The most recent typed transition capture or filter failure.
     @_spi(RendererDiagnostics)
     public private(set) var lastTransitionRenderFailure: CATransitionRenderFailure?

@@ -59,6 +59,10 @@ import JavaScriptKit
     /// The size of the render target in pixels.
     var size: CGSize { get }
 
+    /// Whether renderer-owned asynchronous or simulation state requires a
+    /// frame even when the layer tree itself is clean and has no animations.
+    var requiresFrameWhenLayerTreeIsClean: Bool { get }
+
     // MARK: - Lifecycle
 
     /// Initializes the renderer asynchronously.
@@ -92,6 +96,10 @@ import JavaScriptKit
     ///   - width: The new width in pixels.
     ///   - height: The new height in pixels.
     func resize(width: Int, height: Int)
+}
+
+extension CARendererDelegate {
+    var requiresFrameWhenLayerTreeIsClean: Bool { false }
 }
 
 // MARK: - Factory

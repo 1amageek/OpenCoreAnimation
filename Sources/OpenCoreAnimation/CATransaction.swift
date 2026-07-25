@@ -593,6 +593,18 @@ public class CATransaction {
         commitImplicit()
     }
 
+    #if DEBUG
+    /// Delivers the currently scheduled implicit-commit callback synchronously.
+    ///
+    /// This is internal so transaction scheduling tests can exercise a callback
+    /// blocked by an explicit transaction without suspending while that
+    /// thread-local transaction level is open.
+    internal class func deliverScheduledImplicitCommitForTesting() {
+        let stack = getCurrentTransactionStack()
+        handleImplicitCommitCallback(generation: stack.implicitCommitGeneration)
+    }
+    #endif
+
     private class func cancelImplicitCommitSchedule(_ stack: CATransactionStack) {
         guard stack.implicitCommitScheduled else { return }
 

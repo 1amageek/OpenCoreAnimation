@@ -35,7 +35,7 @@ struct BrowserScheduling {
 
     @Test("Committing a blocking explicit transaction reschedules implicit work")
     @MainActor
-    func explicitTransactionReschedulesImplicitWork() async throws {
+    func explicitTransactionReschedulesImplicitWork() {
         CATransaction.flush()
         var completionCount = 0
 
@@ -43,11 +43,11 @@ struct BrowserScheduling {
             completionCount += 1
         }
         CATransaction.begin()
-        try await Task.sleep(for: .milliseconds(20))
+        CATransaction.deliverScheduledImplicitCommitForTesting()
         #expect(completionCount == 0)
 
         CATransaction.commit()
-        try await Task.sleep(for: .milliseconds(100))
+        CATransaction.deliverScheduledImplicitCommitForTesting()
         #expect(completionCount == 1)
     }
 }

@@ -815,8 +815,10 @@ stubs out actual GPU calls and records calls to a counter.
 
 ## 6. Phase 4 — Commit-driven rendering
 
-**Implementation checkpoint (2026-07-25).** R4.5 is implemented against the
-current live-tree renderer contract. R4.1–R4.4 remain design targets in the
+**Implementation checkpoint (2026-07-25).** R4.5 and the static-submit
+suppression slice of R4.3 are implemented against the current live-tree
+renderer contract. R4.1, R4.2, R4.4, snapshot-token decoupling, and
+active-subtree-only animation evaluation remain design targets in the
 subsections below; their pseudocode is not a claim that `CARenderSnapshot`
 already exists.
 
@@ -933,6 +935,17 @@ membership.
 
 ### 6.3 Commit-snapshot decoupling from `CADisplayLink` (R4.3)
 
+The current live-tree engine already suppresses a display-link submission when
+the root's subtree dirty count is zero, no unfinished animation exists in the
+layer or mask tree, and the renderer reports no pending tile or emitter work.
+Manual `renderFrame()` calls remain unconditional. This completes the static
+submission-decision slice, but the animation escape hatch is deliberately
+conservative: unfinished future animations also keep frames active, and the
+renderer still evaluates the live tree rather than only an active snapshot
+subtree.
+
+The snapshot-backed target design is:
+
 The renderer holds the latest snapshot:
 
 ```swift
@@ -1039,9 +1052,9 @@ callers (`CADisplayLink.displayLinkDidFire` direct →
 `renderer.render(layer:)`).
 
 That fallback and `pendingSnapshot` do not exist yet. Completion ordering in
-§6.5 is the only completed Phase 4 slice. The final snapshot acceptance test
-must prove that, when a committed snapshot exists, the renderer no longer
-reads mutable model state.
+§6.5 and the live-tree static submission decision in §6.3 are the completed
+Phase 4 slices. The final snapshot acceptance test must prove that, when a
+committed snapshot exists, the renderer no longer reads mutable model state.
 
 ### 6.7 Edge cases checklist
 
@@ -1060,8 +1073,8 @@ reads mutable model state.
 |---|---|---|---|
 | 4.1 | `commitProducesSnapshot` | After `CATransaction.commit()`, `pendingSnapshot != nil`, frame token incremented | Snapshot capture. |
 | 4.2 | `snapshotIsImmutableAcrossModelMutation` | Mutate model after commit → snapshot.presentationValues unchanged | Defensive copy. |
-| 4.3 | `cleanRenderWithoutCommitSkipsSubmit` | If no commit + no active animation, `MockRenderer.submitCount` does not increment frame-over-frame | R4.3. |
-| 4.4 | `liveAnimationForcesEvaluation` | When animation active, render evaluates presentation each frame regardless of token equality | R4.3 escape hatch. |
+| 4.3 | `cleanStaticTreeSkipsSubmit` | A clean display-link tick does not increment `MockRenderer.submitCount`; dirty and renderer-owned work do | R4.3 static decision — implemented. |
+| 4.4 | `liveAnimationForcesEvaluation` | When animation is active, render evaluates only the affected snapshot subtree regardless of token equality | R4.3 snapshot escape hatch — open. |
 | 4.5 | `nonAnimatedMutationCompletesAfterRendererSubmission` and related completion tests | Blocks remain pending through commit and fire only after renderer submit plus dirty clear; animation and callback-mutation obligations are also verified | R4.5 — implemented. |
 | 4.6 | `addAnimationDirtiesAndIsCapturedNextCommit` | Adding animation mid-commit appears in *next* snapshot, not current | R4.4. |
 

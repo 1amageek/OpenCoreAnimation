@@ -158,7 +158,10 @@ later phases are only effective once dirty propagation exists.
 
 | Requirement | State | Evidence boundary |
 |---|---|---|
-| R4.1–R4.4 | Open | The production renderers still consume the live layer tree; no immutable commit-owned render snapshot is claimed |
+| R4.1 | Open | The production renderers still consume the live layer tree; no immutable commit-owned render snapshot is claimed |
+| R4.2 | Open | Commit does not yet own the complete Layout → Display → Prepare → Commit sequence |
+| R4.3 | Partial | The animation engine skips display-link submission when the layer tree is clean, no unfinished animation exists in the layer/mask tree, and the renderer reports no pending tile or emitter work. Dirty trees, animations, and renderer-owned work submit; manual rendering remains unconditional. Active-subtree-only presentation evaluation and snapshot-token decoupling remain open |
+| R4.4 | Open | Animation ownership remains on the mutable model tree rather than an immutable render snapshot |
 | R4.5 | Implemented | Outermost commits associate completion coordinators with every mutated render root. Metal, WebGPU, and the shared renderer-test backends release the render obligation only after submit and recursive dirty clearing. Native behavior tests cover non-animated, animated, nested, hierarchy, detached-mask, and callback-mutation paths |
 
 ### Phase 5 — Drawcall-level optimizations
