@@ -40,6 +40,7 @@ interface OCA extends Harness {
     getShadowProbeResult: () => string;
     getDisplayLinkProbeResult: () => string;
     getTransactionSchedulingProbeResult: () => string;
+    getTransactionCompletionProbeResult: () => string;
     getEmitterProbeResult: () => string;
     getReplicatorProbeResult: () => string;
     getCompositionProbeResult: () => string;
@@ -93,6 +94,7 @@ interface OCA extends Harness {
     beginShadowProbe: () => void;
     beginDisplayLinkProbe: () => void;
     beginTransactionSchedulingProbe: () => void;
+    beginTransactionCompletionProbe: () => void;
     beginEmitterProbe: () => void;
     beginReplicatorProbe: () => void;
     removeTransition: () => void;
@@ -307,6 +309,14 @@ test.describe("OpenCoreAnimation smoke", () => {
             { timeout: 10_000 }
         ).toBe(
             "unavailable=true,unavailableRecovered=true,malformed=true,malformedRecovered=true,boundary=true,clearUnavailable=true,clearRecovered=true,explicitNested=true"
+        );
+
+        await h.beginTransactionCompletionProbe();
+        await expect.poll(
+            () => h.getTransactionCompletionProbeResult(),
+            { timeout: 10_000 }
+        ).toBe(
+            "pendingBeforeRender=true,completedAfterRender=true"
         );
 
         await h.exerciseUnsupportedTransitionFilter();

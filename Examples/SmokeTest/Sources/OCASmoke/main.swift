@@ -55,6 +55,7 @@ nonisolated(unsafe) var geometryFlipProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
 nonisolated(unsafe) var transactionSchedulingProbeResult: String = "pending"
+nonisolated(unsafe) var transactionCompletionProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
 nonisolated(unsafe) var replicatorProbeResult: String = "pending"
 nonisolated(unsafe) var compositionProbeResult: String = "pending"
@@ -213,6 +214,7 @@ public func setup() {
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
             transactionSchedulingProbeResult = "pending"
+            transactionCompletionProbeResult = "pending"
             emitterProbeResult = "pending"
             replicatorProbeResult = "pending"
             compositionProbeResult = "pending"
@@ -458,6 +460,9 @@ func installHarness() {
         })
         h.expose("getTransactionSchedulingProbeResult", returning: {
             .string(transactionSchedulingProbeResult)
+        })
+        h.expose("getTransactionCompletionProbeResult", returning: {
+            .string(transactionCompletionProbeResult)
         })
         h.expose("getEmitterProbeResult", returning: {
             .string(emitterProbeResult)
@@ -5600,6 +5605,37 @@ func installHarness() {
                 } catch {
                     transactionSchedulingProbeResult = "error: \(error)"
                 }
+            }
+        })
+        h.expose("beginTransactionCompletionProbe", action: {
+            Task { @MainActor in
+                guard let root = rootLayerRef else {
+                    transactionCompletionProbeResult = "error: root unavailable"
+                    return
+                }
+
+                transactionCompletionProbeResult = "running"
+                CATransaction.flush()
+                var didComplete = false
+                let probeLayer = CALayer()
+
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                CATransaction.setCompletionBlock {
+                    didComplete = true
+                    probeLayer.removeFromSuperlayer()
+                }
+                root.addSublayer(probeLayer)
+                CATransaction.commit()
+
+                let pendingBeforeRender = !didComplete
+                CAAnimationEngine.shared.renderFrame()
+                let completedAfterRender = didComplete
+                CAAnimationEngine.shared.renderFrame()
+
+                transactionCompletionProbeResult =
+                    "pendingBeforeRender=\(pendingBeforeRender),"
+                    + "completedAfterRender=\(completedAfterRender)"
             }
         })
         h.expose("beginDisplayLinkProbe", action: {

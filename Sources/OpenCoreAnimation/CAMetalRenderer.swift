@@ -150,6 +150,7 @@ public final class CAMetalRenderer: CARendererDelegate {
         // Mirror CAWebGPURenderer: clear after submit so any setter that
         // runs in the same tick re-marks for the NEXT frame, not this one.
         rootLayer.recursivelyClearDirtyAfterCommit()
+        rootLayer.completeTransactionsAfterRenderRecursively()
     }
 
     public func invalidate() {

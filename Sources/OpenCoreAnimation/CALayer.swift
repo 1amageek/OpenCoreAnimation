@@ -4837,6 +4837,52 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Test-only accessor for the `_needsDisplay` boolean axis (B7).
     internal var _needsDisplayForTest: Bool { _needsDisplay }
 
+    /// Completion coordinators waiting for this tree to reach a successful
+    /// renderer submission.
+    private var transactionCompletionsAfterRender: [CATransactionCompletionCoordinator] = []
+
+    /// The ordinary superlayer root used to associate a committed mutation
+    /// with a renderer. Detached mask roots remain independent and are drained
+    /// by the renderer's recursive mask traversal.
+    internal var transactionRenderRoot: CALayer {
+        var root = self
+        while let parent = root._superlayer {
+            root = parent
+        }
+        return root
+    }
+
+    internal func enqueueTransactionCompletionAfterRender(
+        _ coordinator: CATransactionCompletionCoordinator
+    ) {
+        guard !transactionCompletionsAfterRender.contains(where: { $0 === coordinator }) else {
+            return
+        }
+        transactionCompletionsAfterRender.append(coordinator)
+    }
+
+    /// Releases transaction completion blocks only after the renderer has
+    /// submitted the frame and cleared the committed dirty state.
+    internal func completeTransactionsAfterRenderRecursively() {
+        var visited: Set<ObjectIdentifier> = []
+        completeTransactionsAfterRenderRecursively(visited: &visited)
+    }
+
+    private func completeTransactionsAfterRenderRecursively(
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(self)).inserted else { return }
+        let completions = transactionCompletionsAfterRender
+        transactionCompletionsAfterRender.removeAll(keepingCapacity: true)
+        for coordinator in completions {
+            coordinator.renderSubmitted()
+        }
+        _maskForDirty?.completeTransactionsAfterRenderRecursively(visited: &visited)
+        _sublayersForDirty?.forEach {
+            $0.completeTransactionsAfterRenderRecursively(visited: &visited)
+        }
+    }
+
     /// Appends the layer to the layer's list of sublayers.
     open func addSublayer(_ layer: CALayer) {
         layer.removeFromSuperlayer()

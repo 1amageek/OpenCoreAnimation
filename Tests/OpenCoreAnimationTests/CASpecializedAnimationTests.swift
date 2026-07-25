@@ -3,29 +3,54 @@ import Testing
 
 @Suite("Specialized layer animation evaluation")
 struct CASpecializedAnimationTests {
-    private func setMidpoint(_ animation: CAAnimation, on layer: CALayer, key: String) {
+    private func setMidpoint(
+        _ animation: CAAnimation,
+        on layer: CALayer,
+        key: String,
+        evaluationTime: CFTimeInterval
+    ) {
         animation.duration = 2
         animation.fillMode = .both
         layer.add(animation, forKey: key)
-        setStoredAnimationBeginTime(CACurrentMediaTime() - 1, on: layer, forKey: key)
+        setStoredAnimationBeginTime(evaluationTime - 1, on: layer, forKey: key)
+    }
+
+    private func presentation<Layer: CALayer>(
+        of layer: Layer,
+        at evaluationTime: CFTimeInterval
+    ) -> Layer? {
+        CARenderTimeContext.$mediaTime.withValue(evaluationTime) {
+            layer.presentation()
+        }
     }
 
     @Test("text properties interpolate on the presentation layer")
     func textPropertiesInterpolate() {
         let layer = CATextLayer()
         layer.fontSize = 10
+        let evaluationTime = CACurrentMediaTime()
 
         let size = CABasicAnimation(keyPath: "fontSize")
         size.fromValue = CGFloat(10)
         size.toValue = CGFloat(30)
-        setMidpoint(size, on: layer, key: "fontSize")
+        setMidpoint(
+            size,
+            on: layer,
+            key: "fontSize",
+            evaluationTime: evaluationTime
+        )
 
         let color = CABasicAnimation(keyPath: "foregroundColor")
         color.fromValue = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
         color.toValue = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
-        setMidpoint(color, on: layer, key: "foregroundColor")
+        setMidpoint(
+            color,
+            on: layer,
+            key: "foregroundColor",
+            evaluationTime: evaluationTime
+        )
 
-        guard let presentation = layer.presentation() else {
+        guard let presentation = presentation(of: layer, at: evaluationTime) else {
             Issue.record("Expected text presentation layer")
             return
         }
@@ -36,18 +61,29 @@ struct CASpecializedAnimationTests {
     @Test("emitter geometry and rates interpolate")
     func emitterPropertiesInterpolate() {
         let layer = CAEmitterLayer()
+        let evaluationTime = CACurrentMediaTime()
 
         let position = CABasicAnimation(keyPath: "emitterPosition")
         position.fromValue = CGPoint(x: 0, y: 10)
         position.toValue = CGPoint(x: 20, y: 30)
-        setMidpoint(position, on: layer, key: "position")
+        setMidpoint(
+            position,
+            on: layer,
+            key: "position",
+            evaluationTime: evaluationTime
+        )
 
         let rate = CABasicAnimation(keyPath: "birthRate")
         rate.fromValue = Float(2)
         rate.toValue = Float(6)
-        setMidpoint(rate, on: layer, key: "rate")
+        setMidpoint(
+            rate,
+            on: layer,
+            key: "rate",
+            evaluationTime: evaluationTime
+        )
 
-        guard let presentation = layer.presentation() else {
+        guard let presentation = presentation(of: layer, at: evaluationTime) else {
             Issue.record("Expected emitter presentation layer")
             return
         }
@@ -59,23 +95,39 @@ struct CASpecializedAnimationTests {
     @Test("replicator transform, delay, and color offsets interpolate")
     func replicatorPropertiesInterpolate() {
         let layer = CAReplicatorLayer()
+        let evaluationTime = CACurrentMediaTime()
 
         let delay = CABasicAnimation(keyPath: "instanceDelay")
         delay.fromValue = CGFloat(0)
         delay.toValue = CGFloat(1)
-        setMidpoint(delay, on: layer, key: "delay")
+        setMidpoint(
+            delay,
+            on: layer,
+            key: "delay",
+            evaluationTime: evaluationTime
+        )
 
         let alpha = CABasicAnimation(keyPath: "instanceAlphaOffset")
         alpha.fromValue = Float(0)
         alpha.toValue = Float(-0.4)
-        setMidpoint(alpha, on: layer, key: "alpha")
+        setMidpoint(
+            alpha,
+            on: layer,
+            key: "alpha",
+            evaluationTime: evaluationTime
+        )
 
         let transform = CABasicAnimation(keyPath: "instanceTransform")
         transform.fromValue = CATransform3DIdentity
         transform.toValue = CATransform3DMakeTranslation(20, 0, 0)
-        setMidpoint(transform, on: layer, key: "transform")
+        setMidpoint(
+            transform,
+            on: layer,
+            key: "transform",
+            evaluationTime: evaluationTime
+        )
 
-        guard let presentation = layer.presentation() else {
+        guard let presentation = presentation(of: layer, at: evaluationTime) else {
             Issue.record("Expected replicator presentation layer")
             return
         }
@@ -92,12 +144,18 @@ struct CASpecializedAnimationTests {
         to.addRect(CGRect(x: 10, y: 0, width: 30, height: 20))
 
         let layer = CAShapeLayer()
+        let evaluationTime = CACurrentMediaTime()
         let animation = CABasicAnimation(keyPath: "path")
         animation.fromValue = from
         animation.toValue = to
-        setMidpoint(animation, on: layer, key: "path")
+        setMidpoint(
+            animation,
+            on: layer,
+            key: "path",
+            evaluationTime: evaluationTime
+        )
 
-        guard let bounds = layer.presentation()?.path?.boundingBox else {
+        guard let bounds = presentation(of: layer, at: evaluationTime)?.path?.boundingBox else {
             Issue.record("Expected interpolated shape path")
             return
         }

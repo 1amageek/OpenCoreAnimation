@@ -96,6 +96,7 @@ extension CALayer {
     /// (PERFORMANCE_DESIGN.md §3.5).
     internal func markDirty(_ flags: DirtyFlags) {
         if _isPresentationLayer { return }
+        CATransaction.registerMutation(layer: self)
         _contentRevision &+= 1
         let wasClean = _dirtyMask.isEmpty
         _dirtyMask.formUnion(flags)

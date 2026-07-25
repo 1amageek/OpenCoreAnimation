@@ -24,14 +24,26 @@ private struct CATransactionLevel {
     /// Explicit animations added while this transaction level is active.
     var pendingAnimations: [CAAnimation] = []
 
+    /// Layers whose committed model state must reach a renderer submission.
+    ///
+    /// This is independent of `pendingChanges`: mutations with disabled
+    /// actions, hierarchy edits, masks, and display invalidations still
+    /// participate in the transaction's render-completion contract.
+    var mutatedLayers: [ObjectIdentifier: CALayer] = [:]
+
     /// Completion coordinators created by nested transaction levels.
     var deferredCompletionCoordinators: [CATransactionCompletionCoordinator] = []
+
+    /// Render-submission obligations created by nested transaction levels.
+    var deferredRenderCommits: [CATransactionRenderCommit] = []
 }
 
 /// Tracks the animations associated with one transaction completion block.
 internal final class CATransactionCompletionCoordinator {
     private let block: () -> Void
     private var remainingAnimationCount = 0
+    private var remainingRenderSubmissionCount = 0
+    private var registeredRenderRoots: Set<ObjectIdentifier> = []
     private var isSealed = false
     private var didComplete = false
 
@@ -50,6 +62,22 @@ internal final class CATransactionCompletionCoordinator {
         completeIfReady()
     }
 
+    @discardableResult
+    internal func registerRenderSubmission(for root: CALayer) -> Bool {
+        guard !isSealed, !didComplete else { return false }
+        guard registeredRenderRoots.insert(ObjectIdentifier(root)).inserted else {
+            return false
+        }
+        remainingRenderSubmissionCount += 1
+        return true
+    }
+
+    internal func renderSubmitted() {
+        guard !didComplete, remainingRenderSubmissionCount > 0 else { return }
+        remainingRenderSubmissionCount -= 1
+        completeIfReady()
+    }
+
     internal func seal() {
         guard !isSealed else { return }
         isSealed = true
@@ -57,10 +85,22 @@ internal final class CATransactionCompletionCoordinator {
     }
 
     private func completeIfReady() {
-        guard isSealed, remainingAnimationCount == 0, !didComplete else { return }
+        guard isSealed,
+              remainingAnimationCount == 0,
+              remainingRenderSubmissionCount == 0,
+              !didComplete else {
+            return
+        }
         didComplete = true
         block()
     }
+}
+
+/// Associates one transaction completion with the exact model roots mutated
+/// inside that transaction level.
+private struct CATransactionRenderCommit {
+    let coordinator: CATransactionCompletionCoordinator
+    let layers: [CALayer]
 }
 
 /// Thread-local transaction stack storage.
@@ -85,6 +125,10 @@ private final class CATransactionStack {
 
     /// Completion coordinators associated with the change currently being applied.
     var applyingCompletionCoordinators: [CATransactionCompletionCoordinator] = []
+
+    /// Prevents mutations produced by a custom action during commit from
+    /// opening a second implicit transaction.
+    var isApplyingChange = false
 
     #if arch(wasm32)
     /// The one-shot callback and validated browser handle for the active commit request.
@@ -215,6 +259,13 @@ public class CATransaction {
         // Pop the current level
         var level = stack.levels.removeLast()
         let ownCoordinator = level.completionBlock.map(CATransactionCompletionCoordinator.init)
+        var renderCommits = level.deferredRenderCommits
+        if let ownCoordinator, !level.mutatedLayers.isEmpty {
+            renderCommits.append(CATransactionRenderCommit(
+                coordinator: ownCoordinator,
+                layers: Array(level.mutatedLayers.values)
+            ))
+        }
 
         if let ownCoordinator {
             for animation in level.pendingAnimations {
@@ -241,10 +292,15 @@ public class CATransaction {
                 guard let (key, change) = remainingChanges.first else { break }
                 remainingChanges.removeValue(forKey: key)
                 stack.applyingCompletionCoordinators = change.completionCoordinators
+                stack.isApplyingChange = true
                 applyChange(change)
+                stack.isApplyingChange = false
                 stack.applyingCompletionCoordinators = []
             }
 
+            for renderCommit in renderCommits {
+                enqueueRenderCommit(renderCommit)
+            }
             for coordinator in coordinatorsToSeal {
                 coordinator.seal()
             }
@@ -276,8 +332,27 @@ public class CATransaction {
                 }
             }
             stack.levels[outerIndex].pendingAnimations.append(contentsOf: level.pendingAnimations)
+            stack.levels[outerIndex].mutatedLayers.merge(level.mutatedLayers) {
+                current, _ in current
+            }
             stack.levels[outerIndex].deferredCompletionCoordinators.append(contentsOf: coordinatorsToSeal)
+            stack.levels[outerIndex].deferredRenderCommits.append(contentsOf: renderCommits)
             scheduleImplicitCommit()
+        }
+    }
+
+    /// Queues one completion coordinator on every distinct render-tree root
+    /// affected by the committed transaction.
+    private class func enqueueRenderCommit(_ renderCommit: CATransactionRenderCommit) {
+        var roots: [ObjectIdentifier: CALayer] = [:]
+        for layer in renderCommit.layers {
+            let root = layer.transactionRenderRoot
+            roots[ObjectIdentifier(root)] = root
+        }
+        for root in roots.values {
+            if renderCommit.coordinator.registerRenderSubmission(for: root) {
+                root.enqueueTransactionCompletionAfterRender(renderCommit.coordinator)
+            }
         }
     }
 
@@ -342,11 +417,6 @@ public class CATransaction {
 
         let stack = getCurrentTransactionStack()
 
-        // Check if actions are disabled in current transaction
-        if let currentLevel = stack.levels.last, currentLevel.disableActions {
-            return
-        }
-
         // Create an implicit transaction if none exists
         if stack.levels.isEmpty {
             beginImplicit()
@@ -354,6 +424,7 @@ public class CATransaction {
 
         guard let currentLevel = stack.levels.last else { return }
         let levelIndex = stack.levels.count - 1
+        stack.levels[levelIndex].mutatedLayers[ObjectIdentifier(layer)] = layer
 
         // Capture current transaction settings
         let capturedDuration = currentLevel.animationDuration
@@ -384,6 +455,40 @@ public class CATransaction {
             capturedDisableActions: capturedDisableActions,
             completionCoordinators: existingChange?.completionCoordinators ?? []
         )
+        scheduleImplicitCommit()
+    }
+
+    /// Records a model mutation even when it does not resolve a layer action.
+    ///
+    /// `markDirty(_:)` is the common entry point for hierarchy, mask, display,
+    /// and ordinary property changes, so tracking here prevents completion
+    /// blocks from running before those changes have reached a GPU submission.
+    internal class func registerMutation(layer: CALayer) {
+        guard !layer._isPresentationLayer else { return }
+        let stack = getCurrentTransactionStack()
+
+        // Changes produced while applying an already-committing action belong
+        // to the transaction currently being drained. Associate custom-action
+        // mutations with that transaction without opening a second implicit
+        // transaction.
+        if stack.isApplyingChange {
+            let root = layer.transactionRenderRoot
+            for coordinator in stack.applyingCompletionCoordinators {
+                if coordinator.registerRenderSubmission(for: root) {
+                    root.enqueueTransactionCompletionAfterRender(coordinator)
+                }
+            }
+            return
+        }
+
+        // Generic dirty marks supplement an existing transaction. Ordinary
+        // animatable setters call `registerChange`, which owns implicit
+        // transaction creation. A hierarchy/mask/display mutation made with
+        // no transaction has no completion coordinator to track and must not
+        // open an unrelated transaction scope.
+        guard !stack.levels.isEmpty else { return }
+        let levelIndex = stack.levels.count - 1
+        stack.levels[levelIndex].mutatedLayers[ObjectIdentifier(layer)] = layer
         scheduleImplicitCommit()
     }
 

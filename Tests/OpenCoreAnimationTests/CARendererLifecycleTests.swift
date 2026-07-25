@@ -24,6 +24,7 @@ struct CARendererLifecycleTests {
             renderCount += 1
             renderedOpacities.append(rootLayer._renderTimePresentation().opacity)
             rootLayer.recursivelyClearDirtyAfterCommit()
+            rootLayer.completeTransactionsAfterRenderRecursively()
         }
 
         func invalidate() {}

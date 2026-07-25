@@ -4287,6 +4287,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // SAME frame will mark it dirty for the NEXT frame, never for the one
         // that just left the renderer.
         rootLayer.recursivelyClearDirtyAfterCommit()
+        rootLayer.completeTransactionsAfterRenderRecursively()
 
         // Advance buffer pools, texture manager, and geometry cache to the next frame
         vertexBufferPool?.advanceFrame()

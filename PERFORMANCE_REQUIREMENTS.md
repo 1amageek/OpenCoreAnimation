@@ -69,9 +69,13 @@ server only ever sees committed snapshots — never half-mutated trees.
 
 ---
 
-## 2. Current state in OpenCoreAnimation
+## 2. Original implementation baseline
 
-### 2.1 Present and working
+This section records the baseline that motivated the requirements. It is not a
+current implementation-status claim. The dated checkpoint below and executable
+tests are authoritative for work completed since this document was written.
+
+### 2.1 Present at the baseline
 
 | Mechanism | Where | Note |
 |---|---|---|
@@ -84,7 +88,7 @@ server only ever sees committed snapshots — never half-mutated trees.
 | Triple-buffered uniform/vertex pool | `Rendering/WebGPU/Internal/BufferPool.swift` | `advanceFrame()` based |
 | Geometry tessellation cache | `Rendering/WebGPU/Internal/GeometryCache.swift` | path → vertex |
 
-### 2.2 Absent or stub
+### 2.2 Absent or stub at the baseline
 
 | Mechanism | Symptom |
 |---|---|
@@ -149,6 +153,13 @@ later phases are only effective once dirty propagation exists.
 | **R4.3** | `CADisplayLink`-driven `render()` is decoupled from commits: if no commit has happened since the last frame AND no live animation is in flight, the renderer reuses the previous command buffer's outputs (skip submit). Only when a live animation is in flight does the renderer re-evaluate `presentation()` for the affected subtree. | Implicit in the render-server design. |
 | **R4.4** | Animation list is held by the render snapshot, not the model tree. Adding an animation marks the layer dirty so the next commit captures it. | `CATransaction` Overview. |
 | **R4.5** | Implicit transaction completion blocks fire after the render snapshot's frame has been submitted, not at `commit()` return. | `setCompletionBlock(_:)` semantics. |
+
+#### Phase 4 implementation checkpoint — 2026-07-25
+
+| Requirement | State | Evidence boundary |
+|---|---|---|
+| R4.1–R4.4 | Open | The production renderers still consume the live layer tree; no immutable commit-owned render snapshot is claimed |
+| R4.5 | Implemented | Outermost commits associate completion coordinators with every mutated render root. Metal, WebGPU, and the shared renderer-test backends release the render obligation only after submit and recursive dirty clearing. Native behavior tests cover non-animated, animated, nested, hierarchy, detached-mask, and callback-mutation paths |
 
 ### Phase 5 — Drawcall-level optimizations
 

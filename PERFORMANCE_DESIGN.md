@@ -815,6 +815,11 @@ stubs out actual GPU calls and records calls to a counter.
 
 ## 6. Phase 4 — Commit-driven rendering
 
+**Implementation checkpoint (2026-07-25).** R4.5 is implemented against the
+current live-tree renderer contract. R4.1–R4.4 remain design targets in the
+subsections below; their pseudocode is not a claim that `CARenderSnapshot`
+already exists.
+
 ### 6.1 `CARenderSnapshot`
 
 ```swift
@@ -979,15 +984,33 @@ Mutations after capture do not affect the in-flight snapshot.
 
 ### 6.5 Completion blocks fire post-submit (R4.5)
 
-`CATransaction.setCompletionBlock(_:)` queues the block in the snapshot. The
-renderer fires it after `device.queue.submit` returns AND after dirty bits
-have been cleared (B6):
+`CATransaction.setCompletionBlock(_:)` creates a coordinator at commit time.
+The coordinator tracks two independent obligation sets:
+
+1. animations attached to the transaction;
+2. distinct render roots containing model mutations from that transaction.
+
+Nested levels merge their mutation roots and coordinators into the outer
+transaction. Property changes with disabled actions, hierarchy edits, masks,
+and explicit display invalidations all participate through the common dirty
+path. A custom `CAAction` that mutates another root while the outer commit is
+being applied registers that root with the coordinator without opening a
+second implicit transaction.
+
+The current Metal and WebGPU renderers release the render-root obligation only
+after command submission and dirty clearing:
 
 ```swift
 device.queue.submit([encoder.finish()])
 rootLayer.recursivelyClearDirtyAfterCommit()       // ① clear bits FIRST
-snapshot.completionBlocks.forEach { $0() }         // ② then user callbacks
+rootLayer.completeTransactionsAfterRenderRecursively() // ② then release blocks
 ```
+
+If a transaction has neither model mutations nor animations, sealing its
+coordinator completes it immediately. If a mutated root has not been submitted,
+the coordinator remains pending on that root. The future R4.1 snapshot will
+carry the same coordinator semantics; R4.5 does not depend on pretending that
+the snapshot already exists.
 
 **Why this order (B6 detail).** A completion block can legally mutate the
 layer graph — the canonical pattern is "fade-out animation finishes →
@@ -1007,22 +1030,25 @@ The tradeoff is that a misbehaving completion block that calls back into
 mutations". This is the same edge case Apple's QuartzCore exhibits and
 matches its documented behavior.
 
-### 6.6 Backwards-compatibility fallback
+### 6.6 Planned snapshot migration (R4.1–R4.4)
 
-Until every test path has been migrated, `pendingSnapshot == nil` (no commit
-happened) falls back to capturing live. This keeps existing callers
-(`CADisplayLink.displayLinkDidFire` direct → `renderer.render(layer:)`)
-green while the snapshot path is rolled out.
+The production renderer currently reads the live model/presentation tree. When
+R4.1–R4.4 are implemented, migration may temporarily permit
+`pendingSnapshot == nil` (no commit happened) to render live for existing
+callers (`CADisplayLink.displayLinkDidFire` direct →
+`renderer.render(layer:)`).
 
-When `pendingSnapshot != nil`, the live tree is no longer read by the
-renderer — proving snapshot fidelity is the Phase 4 acceptance test.
+That fallback and `pendingSnapshot` do not exist yet. Completion ordering in
+§6.5 is the only completed Phase 4 slice. The final snapshot acceptance test
+must prove that, when a committed snapshot exists, the renderer no longer
+reads mutable model state.
 
 ### 6.7 Edge cases checklist
 
 | Case | Handling |
 |---|---|
 | User calls `commit()` from inside `setCompletionBlock` | Implicit transaction reused; nested commits drain in order. |
-| Renderer is not yet attached when commit happens | `pendingSnapshot` accumulated; latest wins. |
+| Renderer is not yet attached when commit happens | R4.5 coordinator remains queued on each mutated root until that root is submitted. Snapshot accumulation remains part of open R4.1. |
 | Live animation finishes between snapshots | `activeAnimations` empty in next snapshot → R4.3 skip kicks in. |
 | Mutation during render | Mutates model layer; next commit picks up. In-flight snapshot unaffected (it holds copies). |
 
@@ -1036,7 +1062,7 @@ renderer — proving snapshot fidelity is the Phase 4 acceptance test.
 | 4.2 | `snapshotIsImmutableAcrossModelMutation` | Mutate model after commit → snapshot.presentationValues unchanged | Defensive copy. |
 | 4.3 | `cleanRenderWithoutCommitSkipsSubmit` | If no commit + no active animation, `MockRenderer.submitCount` does not increment frame-over-frame | R4.3. |
 | 4.4 | `liveAnimationForcesEvaluation` | When animation active, render evaluates presentation each frame regardless of token equality | R4.3 escape hatch. |
-| 4.5 | `completionBlockFiresAfterSubmit` | Block fires only after `submit` returns; ordering verified by counter | R4.5. |
+| 4.5 | `nonAnimatedMutationCompletesAfterRendererSubmission` and related completion tests | Blocks remain pending through commit and fire only after renderer submit plus dirty clear; animation and callback-mutation obligations are also verified | R4.5 — implemented. |
 | 4.6 | `addAnimationDirtiesAndIsCapturedNextCommit` | Adding animation mid-commit appears in *next* snapshot, not current | R4.4. |
 
 ---

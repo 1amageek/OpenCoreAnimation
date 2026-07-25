@@ -2,8 +2,12 @@ import Foundation
 import Testing
 @testable import OpenCoreAnimation
 
-@Suite("CATransaction completion behavior", .serialized)
-struct CATransactionCompletionTests {
+@Suite("CATransaction", .serialized)
+struct CATransactionTestSuites {}
+
+extension CATransactionTestSuites {
+@Suite("Completion behavior")
+struct CompletionBehavior {
     @Test("Completion is immediate when the transaction adds no animations")
     func noAnimationsCompletesAtCommit() {
         CATransaction.flush()
@@ -34,6 +38,8 @@ struct CATransactionCompletionTests {
         CATransaction.commit()
 
         #expect(completionCount == 0)
+        submitCommittedFrame(layer)
+        #expect(completionCount == 0)
         setStoredAnimationBeginTime(CACurrentMediaTime() - 2, on: layer, forKey: "opacity")
         layer.processAnimationCompletions()
         #expect(completionCount == 1)
@@ -54,6 +60,8 @@ struct CATransactionCompletionTests {
         layer.add(animation, forKey: "opacity")
         CATransaction.commit()
 
+        #expect(completionCount == 0)
+        submitCommittedFrame(layer)
         #expect(completionCount == 0)
         layer.removeAnimation(forKey: "opacity")
         #expect(completionCount == 1)
@@ -78,6 +86,8 @@ struct CATransactionCompletionTests {
         CATransaction.commit()
 
         #expect(completionCount == 0)
+        submitCommittedFrame(layer)
+        #expect(completionCount == 0)
         setStoredAnimationBeginTime(CACurrentMediaTime() - 2, on: layer, forKey: "group")
         layer.processAnimationCompletions()
         layer.processAnimationCompletions()
@@ -101,8 +111,117 @@ struct CATransactionCompletionTests {
 
         #expect(layer.animation(forKey: "opacity") != nil)
         #expect(completionCount == 0)
+        submitCommittedFrame(layer)
+        #expect(completionCount == 0)
         setStoredAnimationBeginTime(CACurrentMediaTime() - 2, on: layer, forKey: "opacity")
         layer.processAnimationCompletions()
         #expect(completionCount == 1)
+    }
+
+    @MainActor
+    @Test("Non-animated mutations complete after renderer submission and dirty clearing")
+    func nonAnimatedMutationCompletesAfterRendererSubmission() {
+        CATransaction.flush()
+        var events: [String] = []
+        let backend = TransactionSubmissionBackend {
+            events.append("submit")
+        }
+        let renderer = CARenderer(backend: backend)
+        let root = CALayer()
+        renderer.layer = root
+        renderer.bounds = CGRect(x: 0, y: 0, width: 32, height: 32)
+        var callbackObservedCleanTree = false
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            events.append("completion")
+            callbackObservedCleanTree = root._dirtyMask.isEmpty
+        }
+        root.opacity = 0.5
+        CATransaction.commit()
+
+        #expect(events.isEmpty)
+        renderer.beginFrame(atTime: CACurrentMediaTime(), timeStamp: nil)
+        renderer.addUpdate(renderer.bounds)
+        renderer.render()
+        renderer.endFrame()
+
+        #expect(events == ["submit", "completion"])
+        #expect(callbackObservedCleanTree)
+    }
+
+    @Test("Hierarchy and detached mask mutations share the submitted frame")
+    func hierarchyAndMaskMutationsCompleteAfterOneTreeSubmission() {
+        CATransaction.flush()
+        let root = CALayer()
+        let child = CALayer()
+        let mask = CALayer()
+        var completionCount = 0
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            completionCount += 1
+        }
+        root.addSublayer(child)
+        root.mask = mask
+        mask.opacity = 0.5
+        CATransaction.commit()
+
+        #expect(completionCount == 0)
+        submitCommittedFrame(root)
+        #expect(completionCount == 1)
+    }
+
+    @Test("Completion mutations remain dirty for the following commit")
+    func completionMutationSurvivesCommittedDirtyClear() {
+        CATransaction.flush()
+        let root = CALayer()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            root.position = CGPoint(x: 20, y: 30)
+        }
+        root.opacity = 0.5
+        CATransaction.commit()
+
+        submitCommittedFrame(root)
+
+        #expect(root.position == CGPoint(x: 20, y: 30))
+        #expect(root._dirtyMask.contains(.geometry))
+        #expect(root._subtreeDirtyCount == 1)
+        CATransaction.flush()
+    }
+}
+}
+
+private func submitCommittedFrame(_ rootLayer: CALayer) {
+    rootLayer.recursivelyClearDirtyAfterCommit()
+    rootLayer.completeTransactionsAfterRenderRecursively()
+}
+
+@MainActor
+private final class TransactionSubmissionBackend: CARendererDelegate {
+    var size = CGSize(width: 32, height: 32)
+    private let onSubmit: () -> Void
+
+    init(onSubmit: @escaping () -> Void) {
+        self.onSubmit = onSubmit
+    }
+
+    func initialize() async throws {}
+
+    func invalidate() {}
+
+    func resize(width: Int, height: Int) {
+        size = CGSize(width: width, height: height)
+    }
+
+    func render(layer rootLayer: CALayer) {
+        rootLayer.recursivelyClearDirtyAfterCommit()
+        onSubmit()
+        rootLayer.completeTransactionsAfterRenderRecursively()
     }
 }

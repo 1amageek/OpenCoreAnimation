@@ -1727,8 +1727,9 @@ struct CAAnimationGroupTests {
 
 // MARK: - CATransaction Tests
 
-@Suite("CATransaction Tests")
-struct CATransactionTests {
+extension CATransactionTestSuites {
+@Suite("Core behavior")
+struct CoreBehavior {
 
     @Test("Default animation duration")
     func defaultAnimationDuration() {
@@ -1854,6 +1855,7 @@ struct CATransactionTests {
 
         CATransaction.commit()
     }
+}
 }
 
 // MARK: - CAAction Tests

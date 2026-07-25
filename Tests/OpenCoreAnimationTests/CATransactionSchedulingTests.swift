@@ -1,8 +1,9 @@
 import Testing
 @_spi(RendererDiagnostics) @testable import OpenCoreAnimation
 
-@Suite("CATransaction browser scheduling", .serialized)
-struct CATransactionSchedulingTests {
+extension CATransactionTestSuites {
+@Suite("Browser scheduling")
+struct BrowserScheduling {
     @Test("Timer identifiers preserve the JavaScript safe-integer contract")
     func timerIdentifierValidation() {
         let maximum = CATransactionBrowserTimerIdentifierValidator.maximumSafeInteger
@@ -46,7 +47,8 @@ struct CATransactionSchedulingTests {
         #expect(completionCount == 0)
 
         CATransaction.commit()
-        try await Task.sleep(for: .milliseconds(20))
+        try await Task.sleep(for: .milliseconds(100))
         #expect(completionCount == 1)
     }
+}
 }

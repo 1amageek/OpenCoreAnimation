@@ -142,6 +142,7 @@ internal final class MockCARenderer: CARendererDelegate {
         rasterizationCache.evictToBudget()
         sink.frameDidEnd(frameToken: frameToken)
         rootLayer.recursivelyClearDirtyAfterCommit()
+        rootLayer.completeTransactionsAfterRenderRecursively()
     }
 
     internal func invalidate() {
