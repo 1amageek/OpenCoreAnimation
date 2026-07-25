@@ -5,7 +5,8 @@
 // exercise the CALayer → CAWebGPURenderer pipeline in headless Chromium.
 //
 // Builds with:
-//   swift build --product OCASmoke --swift-sdk swift-6.3.1-RELEASE_wasm -c release
+//   TOOLCHAINS=org.swift.64202607171a xcrun swift build --product OCASmoke
+//     --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm -c release
 // then copy .build/wasm32-unknown-wasip1/release/OCASmoke.wasm into
 // Examples/SmokeTest/web/ where server.mjs serves it.
 

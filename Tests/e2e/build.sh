@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # Build OCASmoke.wasm and stage it next to the HTML/JS loader.
 #
-# Uses Swift 6.3.1 because 6.2.3 deadlocks inside any @MainActor hop on WASM
-# (see root workspace memory: feedback_wasm_swift_version_mainactor).
+# Pins the compiler and WASM SDK to the same Swift 6.4 development snapshot.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SMOKE_DIR="$SCRIPT_DIR/../../Examples/SmokeTest"
-SDK="${OCA_SMOKE_SDK:-swift-6.3.1-RELEASE_wasm}"
+TOOLCHAIN="${OCA_SMOKE_TOOLCHAIN:-org.swift.64202607171a}"
+SDK="${OCA_SMOKE_SDK:-swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm}"
 
-echo "→ Building OCASmoke against SDK=$SDK"
+echo "→ Building OCASmoke against TOOLCHAIN=$TOOLCHAIN SDK=$SDK"
 cd "$SMOKE_DIR"
-swiftly run swift build --product OCASmoke --swift-sdk "$SDK" -c release
+TOOLCHAINS="$TOOLCHAIN" xcrun swift build \
+    --product OCASmoke \
+    --swift-sdk "$SDK" \
+    -c release
 
 BUILT_WASM="$SMOKE_DIR/.build/wasm32-unknown-wasip1/release/OCASmoke.wasm"
 JAVASCRIPTKIT_RUNTIME="$SMOKE_DIR/.build/checkouts/JavaScriptKit/Plugins/PackageToJS/Templates/runtime.mjs"

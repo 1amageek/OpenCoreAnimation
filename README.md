@@ -371,7 +371,8 @@ perl -e 'alarm 30; exec @ARGV' -- \
 ### WASM
 
 ```bash
-swiftly run swift build --swift-sdk swift-6.3.1-RELEASE_wasm
+TOOLCHAINS=org.swift.64202607171a xcrun swift build \
+  --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm
 cd Tests/e2e && npm test
 ```
 
