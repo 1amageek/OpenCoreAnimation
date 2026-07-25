@@ -241,6 +241,9 @@ struct CALayerArchivingTests {
         tiled.tileSize = CGSize(width: 128, height: 128)
 
         let scroll = CAScrollLayer()
+        #expect(!scroll.shouldArchiveValue(forKey: "masksToBounds"))
+        scroll.masksToBounds = false
+        #expect(scroll.shouldArchiveValue(forKey: "masksToBounds"))
         scroll.scrollMode = .horizontally
 
         let layersAndKeys: [(CALayer, [String])] = [

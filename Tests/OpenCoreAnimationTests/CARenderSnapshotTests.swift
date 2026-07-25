@@ -78,6 +78,64 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Base-only subclasses and scroll layers use immutable snapshots")
+    func baseOnlySubclassesUseSnapshots() throws {
+        let root = SnapshotBaseLayer()
+        root.backgroundColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        let scroll = CAScrollLayer()
+        scroll.bounds = CGRect(
+            x: 12,
+            y: 8,
+            width: 40,
+            height: 30
+        )
+        scroll.scrollMode = .horizontally
+        root.addSublayer(scroll)
+
+        let snapshot = try CARenderSnapshot.capture(
+            root,
+            frameToken: 45
+        )
+        let rootNode = snapshot.nodes[snapshot.rootIndex]
+        let scrollIndex = try #require(
+            rootNode.childIndices.first
+        )
+        let scrollNode = snapshot.nodes[scrollIndex]
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(scroll.masksToBounds)
+        #expect(
+            rootNode.presentationValues.backgroundColor
+                == SIMD4<Float>(0, 0, 1, 1)
+        )
+        #expect(
+            scrollNode.presentationValues.boundsOrigin
+                == SIMD2<Float>(12, 8)
+        )
+        #expect(scrollNode.presentationValues.masksToBounds)
+
+        root.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        scroll.bounds.origin = .zero
+        #expect(
+            rootNode.presentationValues.backgroundColor
+                == SIMD4<Float>(0, 0, 1, 1)
+        )
+        #expect(
+            scrollNode.presentationValues.boundsOrigin
+                == SIMD2<Float>(12, 8)
+        )
+    }
+
     @Test("Detached mask trees become value-owned snapshot nodes")
     func maskTreeIsCapturedByValue() throws {
         CATransaction.flush()
@@ -1081,6 +1139,7 @@ private final class SnapshotLayoutManager: CALayoutManager {
 }
 
 private final class SnapshotContentsToken {}
+private final class SnapshotBaseLayer: CALayer {}
 
 private final class SnapshotDrawingDelegate: CALayerDelegate {
     var leftColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)

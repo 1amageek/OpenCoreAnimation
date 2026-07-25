@@ -188,13 +188,25 @@ internal struct CARenderSnapshot: Sendable {
         modelLayer: CALayer,
         presentationLayer: CALayer
     ) -> CARenderSnapshotLiveTreeRequirement? {
-        if ObjectIdentifier(type(of: modelLayer)) != ObjectIdentifier(CALayer.self) {
+        if requiresSpecializedCapture(modelLayer) {
             return .specializedLayer
         }
         if presentationLayer._transitionRenderState != nil {
             return .transition
         }
         return nil
+    }
+
+    private static func requiresSpecializedCapture(
+        _ layer: CALayer
+    ) -> Bool {
+        layer is CATransformLayer
+            || layer is CAReplicatorLayer
+            || layer is CAEmitterLayer
+            || layer is CATiledLayer
+            || layer is CATextLayer
+            || layer is CAShapeLayer
+            || layer is CAGradientLayer
     }
 
     private static func presentationValues(

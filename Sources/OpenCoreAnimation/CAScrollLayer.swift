@@ -18,13 +18,15 @@ open class CAScrollLayer: CALayer {
 
     public required init() {
         super.init()
+        _initializeMasksToBounds(true)
     }
 
     /// Initializes a new scroll layer as a copy of the specified layer.
     public required init(layer: Any) {
         super.init(layer: layer)
+        _initializeMasksToBounds(true)
         if let scrollLayer = layer as? CAScrollLayer {
-            self.scrollMode = scrollLayer.scrollMode
+            self._scrollMode = scrollLayer.scrollMode
         }
     }
 
@@ -33,6 +35,8 @@ open class CAScrollLayer: CALayer {
         switch key {
         case "scrollMode":
             return CAScrollLayerScrollMode.both
+        case "masksToBounds":
+            return true
         default:
             return super.defaultValue(forKey: key)
         }
@@ -43,8 +47,14 @@ open class CAScrollLayer: CALayer {
     /// The scroll mode.
     ///
     /// Determines which directions the layer can be scrolled.
-    open var scrollMode: CAScrollLayerScrollMode = .both {
-        didSet { markDirty(.geometry) }
+    private var _scrollMode: CAScrollLayerScrollMode = .both
+    open var scrollMode: CAScrollLayerScrollMode {
+        get { _scrollMode }
+        set {
+            guard _scrollMode != newValue else { return }
+            _scrollMode = newValue
+            markDirty(.geometry)
+        }
     }
 
     /// Scroll to the specified point.
@@ -161,6 +171,7 @@ open class CAScrollLayer: CALayer {
     open override func shouldArchiveValue(forKey key: String) -> Bool {
         switch key {
         case "scrollMode": return scrollMode != .both
+        case "masksToBounds": return !masksToBounds
         default: return super.shouldArchiveValue(forKey: key)
         }
     }

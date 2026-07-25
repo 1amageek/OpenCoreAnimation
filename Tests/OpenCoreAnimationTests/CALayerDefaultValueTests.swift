@@ -140,5 +140,8 @@ struct CALayerDefaultValueTests {
         #expect(CATiledLayer.defaultValue(forKey: "levelsOfDetailBias") as? Int == 0)
         #expect(CATiledLayer.defaultValue(forKey: "tileSize") as? CGSize == CGSize(width: 256, height: 256))
         #expect(CAScrollLayer.defaultValue(forKey: "scrollMode") as? CAScrollLayerScrollMode == .both)
+        #expect(CAScrollLayer.defaultValue(forKey: "masksToBounds") as? Bool == true)
+        #expect(CAScrollLayer().masksToBounds)
+        #expect(CAScrollLayer(layer: CALayer()).masksToBounds)
     }
 }

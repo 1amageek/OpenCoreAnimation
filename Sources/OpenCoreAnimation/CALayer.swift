@@ -3632,6 +3632,12 @@ open class CALayer: CAMediaTiming, Hashable {
     }
 
     private var _masksToBounds: Bool = false
+
+    /// Sets a subclass-specific initial value without publishing a mutation.
+    internal func _initializeMasksToBounds(_ value: Bool) {
+        _masksToBounds = value
+    }
+
     /// A Boolean indicating whether sublayers are clipped to the layer's bounds. Animatable.
     open var masksToBounds: Bool {
         get { return _masksToBounds }

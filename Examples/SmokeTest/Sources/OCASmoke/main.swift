@@ -71,6 +71,8 @@ private enum ImmutableSnapshotProbeState {
     static var result: String = "pending"
 }
 
+final class SnapshotBaseProbeLayer: CALayer {}
+
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
         tileDrawCount += 1
@@ -6028,6 +6030,9 @@ func installHarness() {
                 let snapshotRasterizedLayer = CALayer()
                 let snapshotRasterizedChild = CALayer()
                 let snapshotRasterizedMask = CALayer()
+                let snapshotBaseSubclass = SnapshotBaseProbeLayer()
+                let snapshotScrollLayer = CAScrollLayer()
+                let snapshotScrollChild = CALayer()
                 guard let snapshotCoreImageFilter = CIFilter(
                     name: "CIColorInvert"
                 ), let snapshotCompositionFilter = CIFilter(
@@ -6409,6 +6414,44 @@ func installHarness() {
                 snapshotRasterizedLayer.mask =
                     snapshotRasterizedMask
                 snapshotRoot.addSublayer(snapshotRasterizedLayer)
+                snapshotBaseSubclass.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotBaseSubclass.position = CGPoint(
+                    x: 230,
+                    y: 230
+                )
+                snapshotBaseSubclass.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotRoot.addSublayer(snapshotBaseSubclass)
+                snapshotScrollLayer.bounds = CGRect(
+                    x: 10,
+                    y: 0,
+                    width: 40,
+                    height: 40
+                )
+                snapshotScrollLayer.position = CGPoint(
+                    x: 290,
+                    y: 230
+                )
+                snapshotScrollLayer.scrollMode = .horizontally
+                snapshotScrollChild.frame = CGRect(
+                    x: 10,
+                    y: 0,
+                    width: 80,
+                    height: 40
+                )
+                snapshotScrollChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotScrollLayer.addSublayer(snapshotScrollChild)
+                snapshotRoot.addSublayer(snapshotScrollLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6503,6 +6546,19 @@ func installHarness() {
                     blue: 1,
                     alpha: 1
                 )
+                snapshotBaseSubclass.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotScrollLayer.bounds.origin = .zero
+                snapshotScrollChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
                 renderer.render(layer: snapshotRoot)
                 let snapshotRasterizationScaleWasApplied =
                     renderer.explicitRasterizationCapturePixelSizes
@@ -6537,6 +6593,9 @@ func installHarness() {
                         CGPoint(x: 50, y: 70),
                         CGPoint(x: 110, y: 70),
                         CGPoint(x: 170, y: 70),
+                        CGPoint(x: 230, y: 70),
+                        CGPoint(x: 290, y: 70),
+                        CGPoint(x: 330, y: 70),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
