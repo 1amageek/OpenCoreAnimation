@@ -3947,6 +3947,22 @@ public final class CAWebGPURenderer: CARendererDelegate {
     public func render(layer rootLayer: CALayer) {
         lastContentsConversionError = nil
         lastContentsRenderFailure = nil
+        let committedState = rootLayer.pendingCommittedRenderState
+        let committedFrameToken: UInt64?
+        switch committedState {
+        case .captureFailure(_, let error):
+            recordFrameRenderFailure(
+                .committedSnapshotCaptureFailed(error)
+            )
+            return
+        case .snapshot(let snapshot):
+            committedFrameToken = snapshot.frameToken
+        case .requiresLiveAnimationEvaluation(let frameToken),
+             .requiresLiveTreePreparation(let frameToken):
+            committedFrameToken = frameToken
+        case nil:
+            committedFrameToken = nil
+        }
         guard let device else {
             recordFrameRenderFailure(.deviceUnavailable)
             return
@@ -4054,6 +4070,13 @@ public final class CAWebGPURenderer: CARendererDelegate {
             in: rootLayer,
             maximumTextureDimension: max(1, Int(device.limits.maxTextureDimension2D))
         )
+        let submittedRevisions: CARenderRevisionSnapshot
+        do {
+            submittedRevisions = try CARenderRevisionSnapshot.capture(rootLayer)
+        } catch {
+            recordFrameRenderFailure(.layerRevisionCaptureFailed(error))
+            return
+        }
 
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
@@ -4302,8 +4325,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Clearing here means subsequent setters that reach this layer in the
         // SAME frame will mark it dirty for the NEXT frame, never for the one
         // that just left the renderer.
-        rootLayer.recursivelyClearDirtyAfterCommit()
+        rootLayer.recursivelyClearDirtyAfterCommit(
+            matching: submittedRevisions
+        )
+        if let committedFrameToken {
+            rootLayer.acknowledgeCommittedRenderState(
+                frameToken: committedFrameToken
+            )
+        }
         rootLayer.completeTransactionsAfterRenderRecursively()
+        lastFrameRenderFailure = nil
 
         // Advance buffer pools, texture manager, and geometry cache to the next frame
         vertexBufferPool?.advanceFrame()

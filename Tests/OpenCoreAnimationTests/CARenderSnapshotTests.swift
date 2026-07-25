@@ -150,6 +150,51 @@ struct CARenderSnapshotTests {
         }
     }
 
+    @Test("Revision snapshots preserve later layer and detached-mask mutations")
+    func revisionSnapshotClearsOnlyCapturedMutations() throws {
+        let root = CALayer()
+        let child = CALayer()
+        let mask = CALayer()
+        root.addSublayer(child)
+        root.mask = mask
+
+        let submitted = try CARenderRevisionSnapshot.capture(root)
+        root.recursivelyClearDirtyAfterCommit(matching: submitted)
+        #expect(root._dirtyMask.isEmpty)
+        #expect(child._dirtyMask.isEmpty)
+        #expect(mask._dirtyMask.isEmpty)
+
+        let nextSubmitted = try CARenderRevisionSnapshot.capture(root)
+        child.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        mask.opacity = 0.5
+
+        root.recursivelyClearDirtyAfterCommit(matching: nextSubmitted)
+        #expect(root._dirtyMask.isEmpty)
+        #expect(child._dirtyMask.isEmpty == false)
+        #expect(mask._dirtyMask.isEmpty == false)
+    }
+
+    @Test("Revision capture rejects a cyclic detached-mask graph")
+    func revisionSnapshotRejectsMaskCycles() {
+        let root = CALayer()
+        let mask = CALayer()
+        root.mask = mask
+        mask.mask = root
+
+        #expect(throws: CARendererError.cyclicLayerHierarchy) {
+            try CARenderRevisionSnapshot.capture(root)
+        }
+
+        mask.mask = nil
+        root.mask = nil
+        CATransaction.flush()
+    }
+
     private func requireSendable<T: Sendable>(_ value: T) {
         _ = value
     }

@@ -226,6 +226,63 @@ internal struct CARenderSnapshot: Sendable {
     }
 }
 
+/// Captures the exact model revisions a live-tree renderer submitted.
+///
+/// This is a transitional frame-boundary contract for WebGPU while its
+/// complete immutable value/resource snapshot is implemented. It does not
+/// authorize the renderer to read mutable layer state after capture; it only
+/// prevents a successful submission from clearing later mutations.
+internal struct CARenderRevisionSnapshot: Sendable {
+    internal let capturedContentRevisions: [ObjectIdentifier: UInt64]
+
+    internal static func capture(
+        _ rootLayer: CALayer
+    ) throws(CARendererError) -> CARenderRevisionSnapshot {
+        var revisions: [ObjectIdentifier: UInt64] = [:]
+        var activePath: Set<ObjectIdentifier> = []
+        try captureNode(
+            rootLayer,
+            revisions: &revisions,
+            activePath: &activePath
+        )
+        return CARenderRevisionSnapshot(
+            capturedContentRevisions: revisions
+        )
+    }
+
+    private static func captureNode(
+        _ layer: CALayer,
+        revisions: inout [ObjectIdentifier: UInt64],
+        activePath: inout Set<ObjectIdentifier>
+    ) throws(CARendererError) {
+        let identity = ObjectIdentifier(layer)
+        guard activePath.insert(identity).inserted else {
+            throw .cyclicLayerHierarchy
+        }
+        defer {
+            activePath.remove(identity)
+        }
+
+        if revisions[identity] == nil {
+            revisions[identity] = layer._contentRevision
+        }
+        if let mask = layer._maskForDirty {
+            try captureNode(
+                mask,
+                revisions: &revisions,
+                activePath: &activePath
+            )
+        }
+        for sublayer in layer._sublayersForDirty ?? [] {
+            try captureNode(
+                sublayer,
+                revisions: &revisions,
+                activePath: &activePath
+            )
+        }
+    }
+}
+
 /// The exact state published by the outermost transaction for one render root.
 internal enum CACommittedRenderState: Sendable {
     case snapshot(CARenderSnapshot)

@@ -141,9 +141,26 @@ extension CALayer {
     internal func recursivelyClearDirtyAfterCommit(
         matching snapshot: CARenderSnapshot
     ) {
+        recursivelyClearDirtyAfterCommit(
+            matching: snapshot.capturedContentRevisions
+        )
+    }
+
+    /// Clears only state captured at the live renderer's frame boundary.
+    internal func recursivelyClearDirtyAfterCommit(
+        matching snapshot: CARenderRevisionSnapshot
+    ) {
+        recursivelyClearDirtyAfterCommit(
+            matching: snapshot.capturedContentRevisions
+        )
+    }
+
+    private func recursivelyClearDirtyAfterCommit(
+        matching capturedContentRevisions: [ObjectIdentifier: UInt64]
+    ) {
         var visited: Set<ObjectIdentifier> = []
         recursivelyClearDirtyAfterCommit(
-            matching: snapshot.capturedContentRevisions,
+            matching: capturedContentRevisions,
             visited: &visited
         )
     }

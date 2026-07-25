@@ -811,10 +811,13 @@ specialized-layer resources, or copied animation evaluators. Animated commits
 therefore publish an explicit `requiresLiveAnimationEvaluation` state instead
 of freezing their commit-time presentation. Layout-pending commits publish
 `requiresLiveTreePreparation` so pre-layout geometry is never accepted as a
-committed snapshot. Every committed state carries a generation token, and only
-the matching successful submission can acknowledge it. R4.1 and R4.2 remain
-partial; R4.4, commit-time layout preparation, full snapshot-token decoupling,
-and active-subtree-only animation evaluation remain open design targets below.
+committed snapshot. WebGPU now rejects typed committed capture failures instead
+of rendering them as success, captures layer and detached-mask revisions after
+delegate callbacks, clears only matching revisions after submission, and
+acknowledges only the committed generation with which the frame began. Every
+committed state carries that generation token. R4.1 and R4.2 remain partial;
+R4.4, commit-time layout preparation, full snapshot-token decoupling, and
+active-subtree-only animation evaluation remain open design targets below.
 
 ### 6.1 `CARenderSnapshot`
 
@@ -1052,12 +1055,13 @@ migration may temporarily permit
 callers (`CADisplayLink.displayLinkDidFire` direct →
 `renderer.render(layer:)`).
 
-The native pending state exists on each render root; WebGPU does not consume it
-yet. Completion ordering in §6.5, the live-tree static submission decision in
-§6.3, transaction-owned native static snapshots, revision-safe dirty clearing,
-and native frame-boundary mutation isolation are the completed Phase 4 slices.
-The final snapshot acceptance test must prove that every backend and animated
-frame no longer read mutable model state after commit.
+The pending state exists on each render root. WebGPU consumes capture failures
+and generation ownership but does not yet consume the snapshot's render values.
+Completion ordering in §6.5, the live-tree static submission decision in §6.3,
+transaction-owned native static snapshots, revision-safe dirty clearing on
+both backends, and native frame-boundary mutation isolation are the completed
+Phase 4 slices. The final snapshot acceptance test must prove that every
+backend and animated frame no longer read mutable model state after commit.
 
 ### 6.7 Edge cases checklist
 
