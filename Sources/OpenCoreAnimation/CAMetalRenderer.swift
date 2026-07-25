@@ -385,6 +385,13 @@ public final class CAMetalRenderer: CARendererDelegate {
             return .contentMask
         }
         if snapshot.nodes.contains(where: {
+            $0.presentationValues.allowsGroupOpacity
+                && $0.presentationValues.opacity < 1
+                && !$0.childIndices.isEmpty
+        }) {
+            return .groupOpacity
+        }
+        if snapshot.nodes.contains(where: {
             $0.presentationValues.imageContents != nil
         }) {
             return .imageContents

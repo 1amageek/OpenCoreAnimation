@@ -3,7 +3,6 @@ import Foundation
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
     case contents
-    case opacityGroup
     case shadow
     case filters
     case backdropComposition
@@ -38,6 +37,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let isGeometryFlipped: Bool
         internal let isDoubleSided: Bool
         internal let masksToBounds: Bool
+        internal let allowsGroupOpacity: Bool
         internal let opacity: Float
         internal let isHidden: Bool
         internal let cornerRadius: Float
@@ -184,11 +184,6 @@ internal struct CARenderSnapshot: Sendable {
            !(presentationLayer.contents is CGImage) {
             return .contents
         }
-        if presentationLayer.allowsGroupOpacity,
-           presentationLayer.opacity < 1,
-           modelLayer.sublayers?.isEmpty == false {
-            return .opacityGroup
-        }
         if presentationLayer.shadowOpacity > 0,
            presentationLayer.shadowColor != nil {
             return .shadow
@@ -311,6 +306,7 @@ internal struct CARenderSnapshot: Sendable {
             isGeometryFlipped: layer.isGeometryFlipped,
             isDoubleSided: layer.isDoubleSided,
             masksToBounds: layer.masksToBounds,
+            allowsGroupOpacity: layer.allowsGroupOpacity,
             opacity: layer.opacity,
             isHidden: layer.isHidden,
             cornerRadius: Float(layer.cornerRadius),

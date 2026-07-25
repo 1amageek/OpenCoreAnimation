@@ -516,13 +516,7 @@ public class CATransaction {
     /// Animated trees use an explicit transitional state until immutable
     /// animation evaluators are carried by CARenderSnapshot.
     private class func publishCommittedRenderStates(for layers: [CALayer]) {
-        var roots: [ObjectIdentifier: CALayer] = [:]
-        for layer in layers {
-            let root = layer.transactionRenderRoot
-            roots[ObjectIdentifier(root)] = root
-        }
-
-        for root in roots.values {
+        for root in minimalRenderRoots(for: layers) {
             let frameToken = CALayer.advanceFrameToken()
             root.prepareLayoutForRenderSnapshot()
             guard !root.hasUnfinishedAnimationsRecursively() else {
@@ -557,16 +551,50 @@ public class CATransaction {
     /// Queues one completion coordinator on every distinct render-tree root
     /// affected by the committed transaction.
     private class func enqueueRenderCommit(_ renderCommit: CATransactionRenderCommit) {
-        var roots: [ObjectIdentifier: CALayer] = [:]
-        for layer in renderCommit.layers {
-            let root = layer.transactionRenderRoot
-            roots[ObjectIdentifier(root)] = root
-        }
-        for root in roots.values {
+        for root in minimalRenderRoots(for: renderCommit.layers) {
             if renderCommit.coordinator.registerRenderSubmission(for: root) {
                 root.enqueueTransactionCompletionAfterRender(renderCommit.coordinator)
             }
         }
+    }
+
+    private class func minimalRenderRoots(
+        for layers: [CALayer]
+    ) -> [CALayer] {
+        var roots: [ObjectIdentifier: CALayer] = [:]
+        for layer in layers {
+            let root = layer.transactionRenderRoot
+            roots[ObjectIdentifier(root)] = root
+        }
+
+        let candidates = Array(roots.values)
+        return candidates.filter { candidate in
+            !candidates.contains { possibleOwner in
+                possibleOwner !== candidate
+                    && renderTree(
+                        rootedAt: possibleOwner,
+                        contains: candidate
+                    )
+            }
+        }
+    }
+
+    private class func renderTree(
+        rootedAt root: CALayer,
+        contains target: CALayer
+    ) -> Bool {
+        var pending = [root]
+        var visited: Set<ObjectIdentifier> = []
+        while let layer = pending.popLast() {
+            let identity = ObjectIdentifier(layer)
+            guard visited.insert(identity).inserted else { continue }
+            if layer === target { return true }
+            if let mask = layer.mask {
+                pending.append(mask)
+            }
+            pending.append(contentsOf: layer.sublayers ?? [])
+        }
+        return false
     }
 
     /// Commit all changes made during the current transaction while acquiring the appropriate locks.

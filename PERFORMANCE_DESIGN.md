@@ -832,16 +832,22 @@ request. Ordinary `CALayer.mask` trees are captured as value-owned snapshot
 nodes. WebGPU prepares nested content masks deepest-first, applies their alpha
 to full-viewport subtree captures, and destroys unsubmitted transient resources
 on typed encoding failure; retrying the same committed frame retains its
-completion obligation until successful submission. The snapshot does not yet
-own non-image contents, specialized-layer resources, effects, or copied
-animation evaluators. A static tree that needs those resources, a specialized
-layer, rasterization, transition state, or true group opacity publishes
+completion obligation until successful submission. True group opacity uses the
+same descendant-first snapshot composite graph, forces only the capture root's
+opacity to one, and reapplies that opacity once after overlapping descendants
+have been flattened. Distributed opacity remains a direct per-descendant path.
+Transaction root selection collapses detached masks that are reachable from
+another committed candidate root, so removing a mask after commit cannot strand
+an obligation on the old live-tree edge; unrelated roots remain independent.
+The snapshot does not yet own non-image contents, specialized-layer resources,
+effects, or copied animation evaluators. A static tree that needs those
+resources, a specialized layer, rasterization, or transition state publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents and
-content masks with the corresponding
-`unsupportedCommittedSnapshotFeature` value rather than dropping either
+content masks or group opacity with the corresponding
+`unsupportedCommittedSnapshotFeature` value rather than dropping any
 resource and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,
 including detached-mask trees and descendants introduced by layout callbacks.

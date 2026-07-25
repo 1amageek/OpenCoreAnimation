@@ -6006,6 +6006,16 @@ func installHarness() {
                 let nestedMaskedChild = CALayer()
                 let nestedSnapshotMask = CALayer()
                 let innerSnapshotMask = CALayer()
+                let snapshotOpacityGroup = CALayer()
+                let snapshotOpacityRed = CALayer()
+                let snapshotOpacityGreen = CALayer()
+                let distributedOpacityGroup = CALayer()
+                let distributedOpacityRed = CALayer()
+                let distributedOpacityGreen = CALayer()
+                let maskedOpacityGroup = CALayer()
+                let maskedOpacityRed = CALayer()
+                let maskedOpacityGreen = CALayer()
+                let opacityGroupMask = CALayer()
                 let snapshotDelegate = DelegateDrawProbeDelegate()
                 var snapshotCompletionRan = false
                 CATransaction.begin()
@@ -6147,6 +6157,62 @@ func installHarness() {
                 nestedSnapshotMask.mask = innerSnapshotMask
                 nestedMaskedChild.mask = nestedSnapshotMask
                 snapshotRoot.addSublayer(nestedMaskedChild)
+                snapshotOpacityGroup.bounds = maskedChild.bounds
+                snapshotOpacityGroup.position = CGPoint(x: 50, y: 110)
+                snapshotOpacityGroup.opacity = 0.5
+                snapshotOpacityGroup.allowsGroupOpacity = true
+                snapshotOpacityRed.frame = snapshotOpacityGroup.bounds
+                snapshotOpacityRed.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotOpacityGreen.frame = snapshotOpacityGroup.bounds
+                snapshotOpacityGreen.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotOpacityGroup.addSublayer(snapshotOpacityRed)
+                snapshotOpacityGroup.addSublayer(snapshotOpacityGreen)
+                snapshotRoot.addSublayer(snapshotOpacityGroup)
+                distributedOpacityGroup.bounds = maskedChild.bounds
+                distributedOpacityGroup.position = CGPoint(x: 100, y: 110)
+                distributedOpacityGroup.opacity = 0.5
+                distributedOpacityGroup.allowsGroupOpacity = false
+                distributedOpacityRed.frame = distributedOpacityGroup.bounds
+                distributedOpacityRed.backgroundColor =
+                    snapshotOpacityRed.backgroundColor
+                distributedOpacityGreen.frame =
+                    distributedOpacityGroup.bounds
+                distributedOpacityGreen.backgroundColor =
+                    snapshotOpacityGreen.backgroundColor
+                distributedOpacityGroup.addSublayer(distributedOpacityRed)
+                distributedOpacityGroup.addSublayer(distributedOpacityGreen)
+                snapshotRoot.addSublayer(distributedOpacityGroup)
+                maskedOpacityGroup.bounds = maskedChild.bounds
+                maskedOpacityGroup.position = CGPoint(x: 150, y: 110)
+                maskedOpacityGroup.opacity = 0.5
+                maskedOpacityGroup.allowsGroupOpacity = true
+                maskedOpacityRed.frame = maskedOpacityGroup.bounds
+                maskedOpacityRed.backgroundColor =
+                    snapshotOpacityRed.backgroundColor
+                maskedOpacityGreen.frame = maskedOpacityGroup.bounds
+                maskedOpacityGreen.backgroundColor =
+                    snapshotOpacityGreen.backgroundColor
+                maskedOpacityGroup.addSublayer(maskedOpacityRed)
+                maskedOpacityGroup.addSublayer(maskedOpacityGreen)
+                opacityGroupMask.frame = maskedOpacityGroup.bounds
+                opacityGroupMask.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 0.5
+                )
+                maskedOpacityGroup.mask = opacityGroupMask
+                snapshotRoot.addSublayer(maskedOpacityGroup)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6191,6 +6257,17 @@ func installHarness() {
                 )
                 nestedSnapshotMask.backgroundColor = snapshotMask.backgroundColor
                 innerSnapshotMask.backgroundColor = snapshotMask.backgroundColor
+                snapshotOpacityGroup.allowsGroupOpacity = false
+                snapshotOpacityGroup.opacity = 1
+                snapshotOpacityGreen.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                distributedOpacityGroup.opacity = 1
+                maskedOpacityGroup.opacity = 1
+                maskedOpacityGroup.mask = nil
                 renderer.render(layer: snapshotRoot)
                 let snapshotCompletionRanAfterRender =
                     snapshotCompletionRan
@@ -6210,6 +6287,9 @@ func installHarness() {
                         CGPoint(x: 290, y: 250),
                         CGPoint(x: 340, y: 250),
                         CGPoint(x: 340, y: 190),
+                        CGPoint(x: 50, y: 190),
+                        CGPoint(x: 100, y: 190),
+                        CGPoint(x: 150, y: 190),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()

@@ -12,6 +12,7 @@ import JavaScriptKit
 public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case imageContents
     case contentMask
+    case groupOpacity
 }
 
 /// Errors that can occur during renderer operations.

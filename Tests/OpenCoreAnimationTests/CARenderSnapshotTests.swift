@@ -141,8 +141,8 @@ struct CARenderSnapshotTests {
         #expect(snapshot.nodes[snapshot.rootIndex].maskIndex != nil)
     }
 
-    @Test("Only overlapping group opacity requires live resource capture")
-    func opacityRequirementsMatchCompositionSemantics() throws {
+    @Test("Group opacity becomes value-owned snapshot state")
+    func groupOpacityIsCapturedByValue() throws {
         let leaf = CALayer()
         leaf.opacity = 0.5
         let leafSnapshot = try CARenderSnapshot.capture(
@@ -168,7 +168,16 @@ struct CARenderSnapshotTests {
             groupedRoot,
             frameToken: 48
         )
-        #expect(groupedSnapshot.liveTreeRequirement == .opacityGroup)
+        #expect(groupedSnapshot.liveTreeRequirement == nil)
+        let groupedValues = groupedSnapshot.nodes[
+            groupedSnapshot.rootIndex
+        ].presentationValues
+        #expect(groupedValues.allowsGroupOpacity)
+        #expect(groupedValues.opacity == 0.5)
+        #expect(
+            groupedSnapshot.nodes[groupedSnapshot.rootIndex]
+                .childIndices.count == 1
+        )
     }
 
     @Test("CGImage contents become value-owned commit resources")
@@ -909,6 +918,34 @@ private final class SnapshotDisplayDelegate: CALayerDelegate {
 import Metal
 
 extension CARenderSnapshotTests {
+    @Test("Metal reports committed group opacity instead of distributing it")
+    func metalRejectsUnsupportedGroupOpacitySnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.opacity = 0.5
+        root.allowsGroupOpacity = true
+        root.addSublayer(CALayer())
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.groupOpacity))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
     @Test("Metal reports committed content masks instead of dropping them")
     func metalRejectsUnsupportedContentMaskSnapshot() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
