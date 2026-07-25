@@ -353,6 +353,11 @@ private struct SnapshotCompositeTarget {
     let parentMatrix: Matrix4x4
 }
 
+private struct SnapshotPreparedShadow {
+    let resources: ShadowLayerResources
+    let values: CARenderSnapshot.PresentationValues.Shadow
+}
+
 private final class CompositionLayerResources {
     let backdropTexture: GPUTexture
     let backdropView: GPUTextureView
@@ -1798,6 +1803,9 @@ private final class EmitterLayerState {
     private var snapshotCompositedNodes: [SnapshotCompositedNode?] = []
     private var snapshotCompositeCaptureRootNodeIndex: Int?
     private var snapshotCompositeCaptureSuppressesOpacity = false
+    private var snapshotPreparedShadows: [SnapshotPreparedShadow?] = []
+    private var snapshotSuppressesShadows = false
+    private var snapshotShadowCaptureRootNodeIndex: Int?
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCaptureCount: Int = 0
@@ -4297,6 +4305,31 @@ private final class EmitterLayerState {
             far: 1000
         )
         do {
+            let hasSnapshotShadows = snapshot.nodes.contains {
+                $0.presentationValues.shadow != nil
+            }
+            if hasSnapshotShadows {
+                snapshotSuppressesShadows = true
+                try prerenderSnapshotComposites(
+                    in: snapshot,
+                    projectionMatrix: projectionMatrix,
+                    depthTextureView: depthTextureView,
+                    encoder: encoder,
+                    device: device,
+                    bindGroup: bindGroup,
+                    pipeline: pipeline
+                )
+                snapshotSuppressesShadows = false
+                try prerenderSnapshotShadows(
+                    in: snapshot,
+                    projectionMatrix: projectionMatrix,
+                    depthTextureView: depthTextureView,
+                    encoder: encoder,
+                    device: device,
+                    bindGroup: bindGroup,
+                    pipeline: pipeline
+                )
+            }
             try prerenderSnapshotComposites(
                 in: snapshot,
                 projectionMatrix: projectionMatrix,
@@ -4325,6 +4358,15 @@ private final class EmitterLayerState {
                 )
             case .groupOpacity(let failure):
                 recordLayerFilterFailure(
+                    failure,
+                    for: LayerRenderKey(
+                        layer: snapshot.nodes[
+                            snapshot.rootIndex
+                        ].identity
+                    )
+                )
+            case .shadow(let failure):
+                recordShadowRenderFailure(
                     failure,
                     for: LayerRenderKey(
                         layer: snapshot.nodes[
@@ -4423,6 +4465,13 @@ private final class EmitterLayerState {
                 )
             case .groupOpacity(let failure):
                 recordLayerFilterFailure(
+                    failure,
+                    for: LayerRenderKey(
+                        layer: snapshot.nodes[snapshot.rootIndex].identity
+                    )
+                )
+            case .shadow(let failure):
+                recordShadowRenderFailure(
                     failure,
                     for: LayerRenderKey(
                         layer: snapshot.nodes[snapshot.rootIndex].identity
@@ -4549,6 +4598,9 @@ private final class EmitterLayerState {
         snapshotCompositedNodes.removeAll(keepingCapacity: true)
         snapshotCompositeCaptureRootNodeIndex = nil
         snapshotCompositeCaptureSuppressesOpacity = false
+        snapshotPreparedShadows.removeAll(keepingCapacity: true)
+        snapshotSuppressesShadows = false
+        snapshotShadowCaptureRootNodeIndex = nil
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: true)
     }
 
@@ -4572,6 +4624,9 @@ private final class EmitterLayerState {
         snapshotCompositedNodes.removeAll(keepingCapacity: true)
         snapshotCompositeCaptureRootNodeIndex = nil
         snapshotCompositeCaptureSuppressesOpacity = false
+        snapshotPreparedShadows.removeAll(keepingCapacity: true)
+        snapshotSuppressesShadows = false
+        snapshotShadowCaptureRootNodeIndex = nil
         isRenderingMainPass = false
     }
 
@@ -5647,6 +5702,351 @@ private final class EmitterLayerState {
         return array
     }
 
+    private func prerenderSnapshotShadows(
+        in snapshot: CARenderSnapshot,
+        projectionMatrix: Matrix4x4,
+        depthTextureView: GPUTextureView,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        snapshotPreparedShadows = Array(
+            repeating: nil,
+            count: snapshot.nodes.count
+        )
+        var targets: [SnapshotCompositeTarget] = []
+
+        func collect(
+            nodeIndex: Int,
+            parentMatrix: Matrix4x4
+        ) {
+            let node = snapshot.nodes[nodeIndex]
+            let values = node.presentationValues
+            guard !values.isHidden, values.opacity > 0 else { return }
+            let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
+            let sublayerMatrix = values.sublayerMatrix(
+                modelMatrix: modelMatrix
+            )
+            for childIndex in node.childIndices {
+                collect(
+                    nodeIndex: childIndex,
+                    parentMatrix: sublayerMatrix
+                )
+            }
+            if let maskIndex = node.maskIndex {
+                collect(
+                    nodeIndex: maskIndex,
+                    parentMatrix: modelMatrix
+                )
+            }
+            if values.shadow != nil {
+                targets.append(
+                    SnapshotCompositeTarget(
+                        nodeIndex: nodeIndex,
+                        parentMatrix: parentMatrix
+                    )
+                )
+            }
+        }
+
+        collect(
+            nodeIndex: snapshot.rootIndex,
+            parentMatrix: projectionMatrix
+        )
+        guard !targets.isEmpty else { return }
+        guard let bindGroupLayout,
+              let dummyGradientStopBuffer,
+              let shadowMaskPipeline,
+              let shadowBlurHorizontalPipeline,
+              let shadowBlurVerticalPipeline,
+              let shadowBindGroupLayout,
+              let blurSampler else {
+            throw .shadow(.rendererResourcesUnavailable)
+        }
+
+        for target in targets {
+            let node = snapshot.nodes[target.nodeIndex]
+            guard let shadow = node.presentationValues.shadow else {
+                continue
+            }
+            let resources = ShadowLayerResources(
+                device: device,
+                width: Int(size.width),
+                height: Int(size.height),
+                format: preferredFormat
+            )
+            transientRasterizationShadowResources.append(resources)
+
+            if let pathVertices = shadow.pathVertices {
+                let values = node.presentationValues
+                var uniforms = CARendererUniforms(
+                    mvpMatrix: values.modelMatrix(
+                        parentMatrix: target.parentMatrix
+                    ),
+                    opacity: 1,
+                    cornerRadius: values.cornerRadius,
+                    layerSize: values.boundsSize,
+                    cornerCurveExponent: values.cornerCurveExponent,
+                    cornerRadii: values.cornerRadii
+                )
+                device.queue.writeBuffer(
+                    resources.maskUniformBuffer,
+                    bufferOffset: 0,
+                    data: createFloat32Array(from: &uniforms)
+                )
+                let pathBindGroup = device.createBindGroup(
+                    descriptor: GPUBindGroupDescriptor(
+                        layout: bindGroupLayout,
+                        entries: [
+                            GPUBindGroupEntry(
+                                binding: 0,
+                                resource: .buffer(
+                                    resources.maskUniformBuffer,
+                                    offset: 0,
+                                    size: Self.alignedUniformSize
+                                )
+                            ),
+                            GPUBindGroupEntry(
+                                binding: 1,
+                                resource: .buffer(
+                                    dummyGradientStopBuffer,
+                                    offset: 0,
+                                    size: Self.gradientStopStride
+                                )
+                            ),
+                        ]
+                    )
+                )
+                var vertices = pathVertices.map {
+                    CARendererVertex(
+                        position: $0,
+                        texCoord: .zero,
+                        color: SIMD4<Float>(repeating: 1)
+                    )
+                }
+                let pathVertexBuffer = resources.ensureMaskVertexCapacity(
+                    vertices.count,
+                    device: device
+                )
+                if !vertices.isEmpty {
+                    device.queue.writeBuffer(
+                        pathVertexBuffer,
+                        bufferOffset: 0,
+                        data: createFloat32Array(from: &vertices)
+                    )
+                }
+                let pathPass = encoder.beginRenderPass(
+                    descriptor: GPURenderPassDescriptor(
+                        colorAttachments: [
+                            GPURenderPassColorAttachment(
+                                view: resources.maskView,
+                                clearValue: GPUColor(
+                                    r: 0,
+                                    g: 0,
+                                    b: 0,
+                                    a: 0
+                                ),
+                                loadOp: .clear,
+                                storeOp: .store
+                            )
+                        ]
+                    )
+                )
+                pathPass.setPipeline(shadowMaskPipeline)
+                pathPass.setBindGroup(
+                    0,
+                    bindGroup: pathBindGroup,
+                    dynamicOffsets: [0]
+                )
+                if !vertices.isEmpty {
+                    pathPass.setVertexBuffer(
+                        0,
+                        buffer: pathVertexBuffer,
+                        offset: 0
+                    )
+                    pathPass.draw(vertexCount: UInt32(vertices.count))
+                }
+                pathPass.end()
+            } else {
+                let capturePass = encoder.beginRenderPass(
+                    descriptor: GPURenderPassDescriptor(
+                        colorAttachments: [
+                            GPURenderPassColorAttachment(
+                                view: resources.maskView,
+                                clearValue: GPUColor(
+                                    r: 0,
+                                    g: 0,
+                                    b: 0,
+                                    a: 0
+                                ),
+                                loadOp: .clear,
+                                storeOp: .store
+                            )
+                        ],
+                        depthStencilAttachment:
+                            GPURenderPassDepthStencilAttachment(
+                                view: depthTextureView,
+                                depthClearValue: 0,
+                                depthLoadOp: .clear,
+                                depthStoreOp: .store,
+                                stencilClearValue: 0,
+                                stencilLoadOp: .clear,
+                                stencilStoreOp: .store
+                            )
+                    )
+                )
+                capturePass.setPipeline(pipeline)
+                capturePass.setViewport(
+                    x: 0,
+                    y: 0,
+                    width: Float(size.width),
+                    height: Float(size.height),
+                    minDepth: 0,
+                    maxDepth: 1
+                )
+                let previousSuppressesShadows = snapshotSuppressesShadows
+                snapshotSuppressesShadows = true
+                snapshotShadowCaptureRootNodeIndex = target.nodeIndex
+                do {
+                    try renderSnapshotNode(
+                        at: target.nodeIndex,
+                        in: snapshot,
+                        renderPass: capturePass,
+                        parentMatrix: target.parentMatrix,
+                        isRoot: false,
+                        device: device,
+                        bindGroup: bindGroup
+                    )
+                } catch {
+                    snapshotShadowCaptureRootNodeIndex = nil
+                    snapshotSuppressesShadows = previousSuppressesShadows
+                    capturePass.end()
+                    throw error
+                }
+                snapshotShadowCaptureRootNodeIndex = nil
+                snapshotSuppressesShadows = previousSuppressesShadows
+                capturePass.end()
+            }
+
+            var blurUniforms = BlurUniforms(
+                texelSize: SIMD2(
+                    1 / Float(size.width),
+                    1 / Float(size.height)
+                ),
+                blurRadius: shadow.radius * 0.5
+            )
+            device.queue.writeBuffer(
+                resources.blurUniformBuffer,
+                bufferOffset: 0,
+                data: createFloat32Array(from: &blurUniforms)
+            )
+            let horizontalBindGroup = device.createBindGroup(
+                descriptor: GPUBindGroupDescriptor(
+                    layout: shadowBindGroupLayout,
+                    entries: [
+                        GPUBindGroupEntry(
+                            binding: 0,
+                            resource: .buffer(
+                                resources.blurUniformBuffer,
+                                offset: 0,
+                                size: UInt64(
+                                    MemoryLayout<BlurUniforms>.stride
+                                )
+                            )
+                        ),
+                        GPUBindGroupEntry(
+                            binding: 1,
+                            resource: .textureView(resources.maskView)
+                        ),
+                        GPUBindGroupEntry(
+                            binding: 2,
+                            resource: .sampler(blurSampler)
+                        ),
+                    ]
+                )
+            )
+            let verticalBindGroup = device.createBindGroup(
+                descriptor: GPUBindGroupDescriptor(
+                    layout: shadowBindGroupLayout,
+                    entries: [
+                        GPUBindGroupEntry(
+                            binding: 0,
+                            resource: .buffer(
+                                resources.blurUniformBuffer,
+                                offset: 0,
+                                size: UInt64(
+                                    MemoryLayout<BlurUniforms>.stride
+                                )
+                            )
+                        ),
+                        GPUBindGroupEntry(
+                            binding: 1,
+                            resource: .textureView(
+                                resources.intermediateView
+                            )
+                        ),
+                        GPUBindGroupEntry(
+                            binding: 2,
+                            resource: .sampler(blurSampler)
+                        ),
+                    ]
+                )
+            )
+            let horizontalPass = encoder.beginRenderPass(
+                descriptor: GPURenderPassDescriptor(
+                    colorAttachments: [
+                        GPURenderPassColorAttachment(
+                            view: resources.intermediateView,
+                            clearValue: GPUColor(
+                                r: 0,
+                                g: 0,
+                                b: 0,
+                                a: 0
+                            ),
+                            loadOp: .clear,
+                            storeOp: .store
+                        )
+                    ]
+                )
+            )
+            horizontalPass.setPipeline(shadowBlurHorizontalPipeline)
+            horizontalPass.setBindGroup(
+                0,
+                bindGroup: horizontalBindGroup
+            )
+            horizontalPass.draw(vertexCount: 6)
+            horizontalPass.end()
+
+            let verticalPass = encoder.beginRenderPass(
+                descriptor: GPURenderPassDescriptor(
+                    colorAttachments: [
+                        GPURenderPassColorAttachment(
+                            view: resources.maskView,
+                            clearValue: GPUColor(
+                                r: 0,
+                                g: 0,
+                                b: 0,
+                                a: 0
+                            ),
+                            loadOp: .clear,
+                            storeOp: .store
+                        )
+                    ]
+                )
+            )
+            verticalPass.setPipeline(shadowBlurVerticalPipeline)
+            verticalPass.setBindGroup(0, bindGroup: verticalBindGroup)
+            verticalPass.draw(vertexCount: 6)
+            verticalPass.end()
+            snapshotPreparedShadows[target.nodeIndex] =
+                SnapshotPreparedShadow(
+                    resources: resources,
+                    values: shadow
+                )
+        }
+    }
+
     private func prerenderSnapshotComposites(
         in snapshot: CARenderSnapshot,
         projectionMatrix: Matrix4x4,
@@ -5761,8 +6161,7 @@ private final class EmitterLayerState {
                 maxDepth: 1
             )
             snapshotCompositeCaptureRootNodeIndex = target.nodeIndex
-            snapshotCompositeCaptureSuppressesOpacity =
-                requiresGroupOpacity
+            snapshotCompositeCaptureSuppressesOpacity = true
             do {
                 try renderSnapshotNode(
                     at: target.nodeIndex,
@@ -5892,9 +6291,10 @@ private final class EmitterLayerState {
                         CALayerFilterCompositeConfiguration(
                             opacity: currentEffectiveOpacity
                                 * (
-                                    compositedNode.kind == .groupOpacity
-                                        ? values.opacity
-                                        : 1
+                                    snapshotShadowCaptureRootNodeIndex
+                                        == nodeIndex
+                                        ? 1
+                                        : values.opacity
                                 ),
                             colorMultiplier: SIMD4<Float>(repeating: 1)
                         ),
@@ -5913,8 +6313,10 @@ private final class EmitterLayerState {
         }
 
         let opacityMultiplier: Float
-        if snapshotCompositeCaptureRootNodeIndex == nodeIndex,
-           snapshotCompositeCaptureSuppressesOpacity {
+        if snapshotShadowCaptureRootNodeIndex == nodeIndex {
+            opacityMultiplier = 1
+        } else if snapshotCompositeCaptureRootNodeIndex == nodeIndex,
+                  snapshotCompositeCaptureSuppressesOpacity {
             opacityMultiplier = 1
         } else {
             opacityMultiplier = values.opacity
@@ -5932,6 +6334,15 @@ private final class EmitterLayerState {
             if faceDirection < 0 {
                 return
             }
+        }
+        if !snapshotSuppressesShadows,
+           snapshotPreparedShadows.indices.contains(nodeIndex),
+           let preparedShadow = snapshotPreparedShadows[nodeIndex] {
+            try renderSnapshotShadow(
+                preparedShadow,
+                device: device,
+                renderPass: renderPass
+            )
         }
         if let backgroundColor = values.backgroundColor,
            values.boundsSize.x > 0,
@@ -6039,6 +6450,151 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
+    }
+
+    private func renderSnapshotShadow(
+        _ prepared: SnapshotPreparedShadow,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        let shadow = prepared.values
+        let viewportSize = SIMD2<Float>(
+            Float(size.width),
+            Float(size.height)
+        )
+        let compositeAlpha =
+            shadow.color.w * shadow.opacity * currentEffectiveOpacity
+        let compositeColor = SIMD4<Float>(
+            shadow.color.x,
+            shadow.color.y,
+            shadow.color.z,
+            compositeAlpha
+        )
+        guard viewportSize.x.isFinite,
+              viewportSize.y.isFinite,
+              viewportSize.x > 0,
+              viewportSize.y > 0,
+              compositeColor.x.isFinite,
+              compositeColor.y.isFinite,
+              compositeColor.z.isFinite,
+              compositeColor.w.isFinite,
+              shadow.offset.x.isFinite,
+              shadow.offset.y.isFinite else {
+            throw .shadow(.invalidCompositeViewport)
+        }
+        guard let vertexBuffer,
+              let blurSampler else {
+            throw .shadow(.rendererResourcesUnavailable)
+        }
+        let selectedPipeline: GPURenderPipeline
+        if maskNestingDepth > 0 {
+            guard let shadowCompositeStencilPipeline else {
+                throw .shadow(.compositeStencilPipelineUnavailable)
+            }
+            selectedPipeline = shadowCompositeStencilPipeline
+        } else {
+            guard let shadowCompositePipeline else {
+                throw .shadow(.rendererResourcesUnavailable)
+            }
+            selectedPipeline = shadowCompositePipeline
+        }
+        guard let restorationPipeline = pipeline else {
+            throw .shadow(.compositeRestorationPipelineUnavailable)
+        }
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(
+                position: SIMD2(0, 0),
+                texCoord: SIMD2(0, 1),
+                color: compositeColor
+            ),
+            CARendererVertex(
+                position: SIMD2(viewportSize.x, 0),
+                texCoord: SIMD2(1, 1),
+                color: compositeColor
+            ),
+            CARendererVertex(
+                position: SIMD2(0, viewportSize.y),
+                texCoord: SIMD2(0, 0),
+                color: compositeColor
+            ),
+            CARendererVertex(
+                position: SIMD2(viewportSize.x, 0),
+                texCoord: SIMD2(1, 1),
+                color: compositeColor
+            ),
+            CARendererVertex(
+                position: viewportSize,
+                texCoord: SIMD2(1, 0),
+                color: compositeColor
+            ),
+            CARendererVertex(
+                position: SIMD2(0, viewportSize.y),
+                texCoord: SIMD2(0, 0),
+                color: compositeColor
+            ),
+        ]
+        guard let allocation = allocateVertices(count: vertices.count) else {
+            throw .shadow(.vertexCapacityExceeded)
+        }
+        var uniforms = ShadowUniforms(
+            mvpMatrix: Matrix4x4.orthographic(
+                left: 0,
+                right: viewportSize.x,
+                bottom: 0,
+                top: viewportSize.y,
+                near: -1000,
+                far: 1000
+            ),
+            shadowColor: compositeColor,
+            shadowOffset: shadow.offset,
+            layerSize: viewportSize
+        )
+        let compositeBindGroup = device.createBindGroup(
+            descriptor: GPUBindGroupDescriptor(
+                layout: selectedPipeline.getBindGroupLayout(index: 0),
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .buffer(
+                            prepared.resources.compositeUniformBuffer,
+                            offset: 0,
+                            size: UInt64(
+                                MemoryLayout<ShadowUniforms>.stride
+                            )
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .textureView(
+                            prepared.resources.maskView
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 2,
+                        resource: .sampler(blurSampler)
+                    ),
+                ]
+            )
+        )
+        device.queue.writeBuffer(
+            prepared.resources.compositeUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: allocation.vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(0, bindGroup: compositeBindGroup)
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: allocation.vertexOffset
+        )
+        renderPass.draw(vertexCount: 6)
+        renderPass.setPipeline(restorationPipeline)
     }
 
     private func renderSnapshotContents(

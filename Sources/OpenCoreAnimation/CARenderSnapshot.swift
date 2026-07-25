@@ -3,7 +3,6 @@ import Foundation
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
     case contents
-    case shadow
     case filters
     case backdropComposition
     case rasterization
@@ -27,6 +26,14 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // capture.
 internal struct CARenderSnapshot: Sendable {
     internal struct PresentationValues: Sendable, Equatable {
+        internal struct Shadow: Sendable, Equatable {
+            internal let color: SIMD4<Float>
+            internal let opacity: Float
+            internal let radius: Float
+            internal let offset: SIMD2<Float>
+            internal let pathVertices: [SIMD2<Float>]?
+        }
+
         internal let bounds: CGRect
         internal let boundsSize: SIMD2<Float>
         internal let boundsOrigin: SIMD2<Float>
@@ -51,6 +58,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let preferredDynamicRange: CALayer.DynamicRange
         internal let contentsHeadroom: Float
         internal let imageContents: CAImageContentsSnapshot?
+        internal let shadow: Shadow?
     }
 
     internal struct Node: Sendable, Equatable {
@@ -184,10 +192,6 @@ internal struct CARenderSnapshot: Sendable {
            !(presentationLayer.contents is CGImage) {
             return .contents
         }
-        if presentationLayer.shadowOpacity > 0,
-           presentationLayer.shadowColor != nil {
-            return .shadow
-        }
         if presentationLayer.filters?.isEmpty == false {
             return .filters
         }
@@ -295,6 +299,58 @@ internal struct CARenderSnapshot: Sendable {
         } catch {
             throw .invalidLayerContents(error)
         }
+        let shadow: PresentationValues.Shadow?
+        if layer.shadowOpacity > 0, layer.shadowColor != nil {
+            let configuration: CAShadowRenderConfiguration
+            do {
+                configuration = try CAShadowRenderConfiguration(layer: layer)
+            } catch {
+                switch error {
+                case .invalidColor:
+                    throw .invalidLayerShadow(.invalidColor)
+                default:
+                    throw .invalidLayerShadow(.nonFiniteGeometry)
+                }
+            }
+            let pathVertices: [SIMD2<Float>]?
+            if let shadowPath = layer.shadowPath {
+                do {
+                    let vertices = try ShapeFillTessellator.triangles(
+                        for: shadowPath,
+                        rule: .nonZero
+                    ).map {
+                        SIMD2(Float($0.x), Float($0.y))
+                    }
+                    guard vertices.allSatisfy({
+                        $0.x.isFinite && $0.y.isFinite
+                    }) else {
+                        throw CARenderSnapshotShadowError
+                            .nonFiniteGeometry
+                    }
+                    pathVertices = vertices
+                } catch let error as CARenderSnapshotShadowError {
+                    throw .invalidLayerShadow(error)
+                } catch {
+                    throw .invalidLayerShadow(
+                        .pathTessellationFailed
+                    )
+                }
+            } else {
+                pathVertices = nil
+            }
+            shadow = PresentationValues.Shadow(
+                color: configuration.color,
+                opacity: configuration.opacity,
+                radius: configuration.radius,
+                offset: SIMD2(
+                    Float(configuration.offset.width),
+                    Float(configuration.offset.height)
+                ),
+                pathVertices: pathVertices
+            )
+        } else {
+            shadow = nil
+        }
         return PresentationValues(
             bounds: layer.bounds,
             boundsSize: SIMD2<Float>(boundsWidth, boundsHeight),
@@ -327,7 +383,8 @@ internal struct CARenderSnapshot: Sendable {
             toneMapMode: layer.toneMapMode,
             preferredDynamicRange: layer.preferredDynamicRange,
             contentsHeadroom: contentsHeadroom,
-            imageContents: imageContents
+            imageContents: imageContents,
+            shadow: shadow
         )
     }
 

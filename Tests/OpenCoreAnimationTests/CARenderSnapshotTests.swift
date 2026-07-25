@@ -180,6 +180,65 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Static shadow values and paths are captured by value")
+    func shadowIsCapturedByValue() throws {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 20, height: 10)
+        layer.shadowColor = CGColor(
+            red: 0.25,
+            green: 0.5,
+            blue: 0.75,
+            alpha: 0.8
+        )
+        layer.shadowOpacity = 0.6
+        layer.shadowRadius = 4
+        layer.shadowOffset = CGSize(width: 3, height: -2)
+        let path = CGMutablePath()
+        path.addRect(CGRect(x: 1, y: 2, width: 8, height: 4))
+        layer.shadowPath = path
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 49
+        )
+        let shadow = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.shadow
+        )
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(shadow.color == SIMD4<Float>(0.25, 0.5, 0.75, 0.8))
+        #expect(shadow.opacity == 0.6)
+        #expect(shadow.radius == 4)
+        #expect(shadow.offset == SIMD2<Float>(3, -2))
+        #expect(shadow.pathVertices?.count == 6)
+
+        path.addRect(CGRect(x: 0, y: 0, width: 20, height: 10))
+        layer.shadowColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        layer.shadowOpacity = 1
+        #expect(shadow.color == SIMD4<Float>(0.25, 0.5, 0.75, 0.8))
+        #expect(shadow.opacity == 0.6)
+        #expect(shadow.pathVertices?.count == 6)
+    }
+
+    @Test("Invalid visible shadows fail snapshot capture explicitly")
+    func invalidShadowCaptureIsTyped() {
+        let layer = CALayer()
+        layer.shadowOpacity = 1
+        layer.shadowRadius = .nan
+
+        #expect(throws: CARendererError.invalidLayerShadow(
+            .nonFiniteGeometry
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 50)
+        }
+    }
+
     @Test("CGImage contents become value-owned commit resources")
     func imageContentsAreCapturedByValue() throws {
         let layer = CALayer()
@@ -918,6 +977,38 @@ private final class SnapshotDisplayDelegate: CALayerDelegate {
 import Metal
 
 extension CARenderSnapshotTests {
+    @Test("Metal reports committed shadows instead of dropping them")
+    func metalRejectsUnsupportedShadowSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.shadowOpacity = 1
+        root.shadowColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.shadow))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
     @Test("Metal reports committed group opacity instead of distributing it")
     func metalRejectsUnsupportedGroupOpacitySnapshot() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())

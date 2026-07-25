@@ -839,14 +839,20 @@ have been flattened. Distributed opacity remains a direct per-descendant path.
 Transaction root selection collapses detached masks that are reachable from
 another committed candidate root, so removing a mask after commit cannot strand
 an obligation on the old live-tree edge; unrelated roots remain independent.
+Static shadows value-own converted color, opacity, radius, offset, and either
+the captured subtree silhouette or commit-time tessellated `shadowPath`
+vertices. Snapshot WebGPU prepares mask/group coverage without shadows,
+captures and blurs each shadow independently, then rebuilds subtree composites
+with shadows included. Mutable model colors, offsets, and paths are never read
+after commit, and failed prepasses retain the committed frame for retry.
 The snapshot does not yet own non-image contents, specialized-layer resources,
-effects, or copied animation evaluators. A static tree that needs those
-resources, a specialized layer, rasterization, or transition state publishes
+filter/backdrop effects, or copied animation evaluators. A static tree that
+needs those resources, a specialized layer, rasterization, or transition state publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
-The native Metal verification renderer rejects committed image contents and
-content masks or group opacity with the corresponding
+The native Metal verification renderer rejects committed image contents,
+content masks, group opacity, or shadows with the corresponding
 `unsupportedCommittedSnapshotFeature` value rather than dropping any
 resource and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,

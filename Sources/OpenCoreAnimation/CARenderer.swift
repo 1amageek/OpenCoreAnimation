@@ -13,6 +13,14 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case imageContents
     case contentMask
     case groupOpacity
+    case shadow
+}
+
+/// A shadow value that could not cross the immutable commit boundary.
+public enum CARenderSnapshotShadowError: Error, Equatable, Sendable {
+    case nonFiniteGeometry
+    case invalidColor
+    case pathTessellationFailed
 }
 
 /// Errors that can occur during renderer operations.
@@ -49,6 +57,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerContents(CAImageContentsSnapshotError)
     /// Delegate drawing could not produce an immutable bitmap at commit time.
     case invalidDelegateBackingStore(CADelegateBackingStoreError)
+    /// A visible shadow could not become an immutable renderer resource.
+    case invalidLayerShadow(CARenderSnapshotShadowError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

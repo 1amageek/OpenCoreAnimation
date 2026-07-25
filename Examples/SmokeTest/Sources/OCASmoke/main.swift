@@ -6016,6 +6016,9 @@ func installHarness() {
                 let maskedOpacityRed = CALayer()
                 let maskedOpacityGreen = CALayer()
                 let opacityGroupMask = CALayer()
+                let snapshotShadowLayer = CALayer()
+                let snapshotPathShadowLayer = CALayer()
+                let snapshotShadowPath = CGMutablePath()
                 let snapshotDelegate = DelegateDrawProbeDelegate()
                 var snapshotCompletionRan = false
                 CATransaction.begin()
@@ -6213,6 +6216,54 @@ func installHarness() {
                 )
                 maskedOpacityGroup.mask = opacityGroupMask
                 snapshotRoot.addSublayer(maskedOpacityGroup)
+                snapshotShadowLayer.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 20
+                )
+                snapshotShadowLayer.position = CGPoint(x: 200, y: 110)
+                snapshotShadowLayer.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotShadowLayer.shadowColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotShadowLayer.shadowOpacity = 1
+                snapshotShadowLayer.shadowRadius = 0
+                snapshotShadowLayer.shadowOffset = CGSize(
+                    width: 25,
+                    height: 0
+                )
+                snapshotRoot.addSublayer(snapshotShadowLayer)
+                snapshotPathShadowLayer.bounds =
+                    snapshotShadowLayer.bounds
+                snapshotPathShadowLayer.position = CGPoint(x: 260, y: 110)
+                snapshotPathShadowLayer.backgroundColor =
+                    snapshotShadowLayer.backgroundColor
+                snapshotPathShadowLayer.shadowColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotPathShadowLayer.shadowOpacity = 1
+                snapshotPathShadowLayer.shadowRadius = 0
+                snapshotPathShadowLayer.shadowOffset = CGSize(
+                    width: 25,
+                    height: 0
+                )
+                snapshotShadowPath.addRect(
+                    CGRect(x: 0, y: 0, width: 10, height: 20)
+                )
+                snapshotPathShadowLayer.shadowPath = snapshotShadowPath
+                snapshotRoot.addSublayer(snapshotPathShadowLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6268,6 +6319,17 @@ func installHarness() {
                 distributedOpacityGroup.opacity = 1
                 maskedOpacityGroup.opacity = 1
                 maskedOpacityGroup.mask = nil
+                snapshotShadowLayer.shadowColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotShadowLayer.shadowOffset = .zero
+                snapshotPathShadowLayer.shadowColor =
+                    snapshotShadowLayer.shadowColor
+                snapshotPathShadowLayer.shadowOffset = .zero
+                snapshotShadowPath.addRect(snapshotPathShadowLayer.bounds)
                 renderer.render(layer: snapshotRoot)
                 let snapshotCompletionRanAfterRender =
                     snapshotCompletionRan
@@ -6290,6 +6352,8 @@ func installHarness() {
                         CGPoint(x: 50, y: 190),
                         CGPoint(x: 100, y: 190),
                         CGPoint(x: 150, y: 190),
+                        CGPoint(x: 225, y: 190),
+                        CGPoint(x: 280, y: 190),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6467,6 +6531,49 @@ func installHarness() {
                             == frameFailuresBeforeSnapshotMaskFailure + 1
                         && renderer.lastFrameRenderFailure == nil
 
+                    let snapshotShadowFailureRoot = CALayer()
+                    var snapshotShadowFailureCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        snapshotShadowFailureCompletionRan = true
+                    }
+                    snapshotShadowFailureRoot.bounds = snapshotRoot.bounds
+                    snapshotShadowFailureRoot.position =
+                        snapshotRoot.position
+                    snapshotShadowFailureRoot.backgroundColor =
+                        snapshotRoot.backgroundColor
+                    snapshotShadowFailureRoot.shadowColor = CGColor(
+                        red: 0,
+                        green: 1,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    snapshotShadowFailureRoot.shadowOpacity = 1
+                    snapshotShadowFailureRoot.shadowRadius = 2
+                    CATransaction.commit()
+                    let frameFailuresBeforeSnapshotShadowFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.setNextCommittedSnapshotAllocationLimit(0)
+                    renderer.render(layer: snapshotShadowFailureRoot)
+                    let snapshotShadowFailureWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeSnapshotShadowFailure + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .solid(
+                                    .vertexCapacityExceeded(.background)
+                                )
+                            )
+                    let snapshotShadowFailureCompletionRemainedPending =
+                        !snapshotShadowFailureCompletionRan
+                    renderer.render(layer: snapshotShadowFailureRoot)
+                    let snapshotShadowFailureRecovered =
+                        snapshotShadowFailureCompletionRan
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeSnapshotShadowFailure + 1
+                        && renderer.lastFrameRenderFailure == nil
+
                     let delegateFailureRoot = CALayer()
                     let invalidDelegate = DelegateDrawProbeDelegate()
                     let invalidDelegateLayer = CALayer()
@@ -6518,6 +6625,9 @@ func installHarness() {
                         + ",snapshotMaskFailureTyped=\(snapshotMaskFailureWasTyped)"
                         + ",snapshotMaskFailurePending=\(snapshotMaskFailureCompletionRemainedPending)"
                         + ",snapshotMaskFailureRecovered=\(snapshotMaskFailureRecovered)"
+                        + ",snapshotShadowFailureTyped=\(snapshotShadowFailureWasTyped)"
+                        + ",snapshotShadowFailurePending=\(snapshotShadowFailureCompletionRemainedPending)"
+                        + ",snapshotShadowFailureRecovered=\(snapshotShadowFailureRecovered)"
                         + ",delegateCaptured=\(delegateCapturedAtCommit)"
                         + ",snapshotPending=\(snapshotCompletionPendingBeforeRender)"
                         + ",snapshotCompleted=\(snapshotCompletionRanAfterRender)"

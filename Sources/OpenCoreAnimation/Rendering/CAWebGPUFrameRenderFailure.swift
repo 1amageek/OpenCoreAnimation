@@ -7,6 +7,7 @@ public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
     case contents(CAContentsRenderFailure)
     case contentMask(CALayerFilterRenderFailure)
     case groupOpacity(CALayerFilterRenderFailure)
+    case shadow(CAShadowRenderFailure)
 }
 
 /// Describes why a WebGPU frame could not begin rendering.
