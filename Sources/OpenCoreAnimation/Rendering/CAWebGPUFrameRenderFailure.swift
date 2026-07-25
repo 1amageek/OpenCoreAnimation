@@ -1,5 +1,11 @@
 import Foundation
 
+@_spi(RendererDiagnostics)
+public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
+    case solid(CASolidRenderFailure)
+    case mask(CAMaskRenderFailure)
+}
+
 /// Describes why a WebGPU frame could not begin rendering.
 @_spi(RendererDiagnostics)
 public enum CAWebGPUFrameRenderFailure: Error, Equatable, Sendable {
@@ -14,6 +20,8 @@ public enum CAWebGPUFrameRenderFailure: Error, Equatable, Sendable {
     case layerFilterProcessorUnavailable
     case rasterizationCacheUnavailable
     case committedSnapshotCaptureFailed(CARendererError)
-    case committedSnapshotEncodingFailed(CASolidRenderFailure)
+    case committedSnapshotEncodingFailed(
+        CACommittedSnapshotEncodingFailure
+    )
     case layerRevisionCaptureFailed(CARendererError)
 }

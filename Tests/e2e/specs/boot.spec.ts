@@ -325,7 +325,7 @@ test.describe("OpenCoreAnimation smoke", () => {
             () => h.getImmutableSnapshotProbeResult(),
             { timeout: 10_000 }
         ).toBe(
-            "0,128,0,255;0,0,0,255,overflowTyped=true,overflowPending=true"
+            "0,128,0,255;0,0,0,255;255,255,0,255;0,0,0,255;0,0,0,255,overflowTyped=true,overflowPending=true,maskOverflowTyped=true,maskOverflowPending=true"
         );
 
         await h.exerciseUnsupportedTransitionFilter();

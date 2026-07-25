@@ -5,7 +5,6 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case contents
     case delegateBackingStore
     case mask
-    case clipping
     case opacityGroup
     case shadow
     case filters
@@ -21,8 +20,9 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 /// `CALayer`. This prevents mutations made after capture from changing the
 /// frame that is already being encoded.
 // FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot contains every value
-// consumed by CAMetalRenderer and by CAWebGPURenderer's common static solid-tree
-// path. Production WebGPU still uses the explicitly typed live-tree branches
+// consumed by CAMetalRenderer and by CAWebGPURenderer's static solid-tree path,
+// including nested rectangular and rounded clipping. Production WebGPU still
+// uses the explicitly typed live-tree branches
 // for resource-backed content, masks, specialized layers, animation evaluation,
 // and layout preparation. Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
@@ -39,6 +39,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let sublayerTransform: CATransform3D
         internal let isGeometryFlipped: Bool
         internal let isDoubleSided: Bool
+        internal let masksToBounds: Bool
         internal let opacity: Float
         internal let isHidden: Bool
         internal let cornerRadius: Float
@@ -165,9 +166,6 @@ internal struct CARenderSnapshot: Sendable {
         if presentationLayer.mask != nil {
             return .mask
         }
-        if presentationLayer.masksToBounds {
-            return .clipping
-        }
         if presentationLayer.allowsGroupOpacity,
            presentationLayer.opacity < 1,
            modelLayer.sublayers?.isEmpty == false {
@@ -284,6 +282,7 @@ internal struct CARenderSnapshot: Sendable {
             sublayerTransform: layer.sublayerTransform,
             isGeometryFlipped: layer.isGeometryFlipped,
             isDoubleSided: layer.isDoubleSided,
+            masksToBounds: layer.masksToBounds,
             opacity: layer.opacity,
             isHidden: layer.isHidden,
             cornerRadius: Float(layer.cornerRadius),

@@ -1457,8 +1457,16 @@ private final class EmitterLayerState {
     /// Transforms the layer's bounds corners through the model matrix and
     /// returns an axis-aligned bounding box in screen coordinates.
     private func calculateClipRect(layer: CALayer, modelMatrix: Matrix4x4) -> ClipRect {
-        let bounds = layer.bounds
+        calculateClipRect(
+            bounds: layer.bounds,
+            modelMatrix: modelMatrix
+        )
+    }
 
+    private func calculateClipRect(
+        bounds: CGRect,
+        modelMatrix: Matrix4x4
+    ) -> ClipRect {
         // Transform the four corners of the content area.
         // Rendering uses (0,0)-(bounds.width, bounds.height) via scaleMatrix.
         // bounds.origin only affects sublayer positioning (sublayerMatrix), not
@@ -4291,7 +4299,12 @@ private final class EmitterLayerState {
         } catch {
             isRenderingMainPass = false
             renderPass.end()
-            recordSolidRenderFailure(error)
+            switch error {
+            case .solid(let failure):
+                recordSolidRenderFailure(failure)
+            case .mask(let failure):
+                recordMaskRenderFailure(failure)
+            }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
             )
@@ -5579,7 +5592,7 @@ private final class EmitterLayerState {
         isRoot: Bool,
         device: GPUDevice,
         bindGroup: GPUBindGroup
-    ) throws(CASolidRenderFailure) {
+    ) throws(CACommittedSnapshotEncodingFailure) {
         let node = snapshot.nodes[nodeIndex]
         let values = node.presentationValues
         guard !values.isHidden, values.opacity > 0 else { return }
@@ -5618,16 +5631,63 @@ private final class EmitterLayerState {
             let sublayerMatrix = values.sublayerMatrix(
                 modelMatrix: modelMatrix
             )
-            for childIndex in node.childIndices {
-                try renderSnapshotNode(
-                    at: childIndex,
-                    in: snapshot,
-                    renderPass: renderPass,
-                    parentMatrix: sublayerMatrix,
-                    isRoot: false,
-                    device: device,
-                    bindGroup: bindGroup
+            let shouldClip = values.masksToBounds
+            if shouldClip {
+                let layerClipRect = calculateClipRect(
+                    bounds: values.bounds,
+                    modelMatrix: modelMatrix
                 )
+                clipRectStack.append(
+                    currentClipRect.intersection(with: layerClipRect)
+                )
+                applyScissorRect(renderPass)
+                do {
+                    try encodeBoundsClipToStencil(
+                        bounds: values.bounds,
+                        cornerRadius: CGFloat(values.cornerRadius),
+                        cornerCurveExponent: values.cornerCurveExponent,
+                        cornerRadii: values.cornerRadii,
+                        renderPass: renderPass,
+                        modelMatrix: modelMatrix,
+                        device: device
+                    )
+                } catch {
+                    _ = clipRectStack.popLast()
+                    applyScissorRect(renderPass)
+                    throw .mask(error)
+                }
+            }
+
+            var childFailure: CACommittedSnapshotEncodingFailure?
+            do {
+                for childIndex in node.childIndices {
+                    try renderSnapshotNode(
+                        at: childIndex,
+                        in: snapshot,
+                        renderPass: renderPass,
+                        parentMatrix: sublayerMatrix,
+                        isRoot: false,
+                        device: device,
+                        bindGroup: bindGroup
+                    )
+                }
+            } catch {
+                childFailure = error
+            }
+
+            if shouldClip {
+                do {
+                    try restoreStencilMask(renderPass: renderPass)
+                } catch {
+                    _ = clipRectStack.popLast()
+                    applyScissorRect(renderPass)
+                    throw .mask(error)
+                }
+                _ = clipRectStack.popLast()
+                applyScissorRect(renderPass)
+            }
+            if let childFailure {
+                throw childFailure
             }
         }
 
@@ -5655,21 +5715,26 @@ private final class EmitterLayerState {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4,
         bindGroup: GPUBindGroup
-    ) throws(CASolidRenderFailure) {
+    ) throws(CACommittedSnapshotEncodingFailure) {
         guard let vertexBuffer,
               let uniformBuffer else {
-            throw .resourcesUnavailable(context)
+            throw .solid(.resourcesUnavailable(context))
         }
-        let configuration = try CASolidRenderConfiguration(
-            bounds: values.bounds,
-            color: color,
-            opacity: currentEffectiveOpacity,
-            cornerRadius: CGFloat(values.cornerRadius),
-            cornerCurveExponent: values.cornerCurveExponent,
-            cornerRadii: values.cornerRadii,
-            borderWidth: CGFloat(borderWidth),
-            context: context
-        )
+        let configuration: CASolidRenderConfiguration
+        do {
+            configuration = try CASolidRenderConfiguration(
+                bounds: values.bounds,
+                color: color,
+                opacity: currentEffectiveOpacity,
+                cornerRadius: CGFloat(values.cornerRadius),
+                cornerCurveExponent: values.cornerCurveExponent,
+                cornerRadii: values.cornerRadii,
+                borderWidth: CGFloat(borderWidth),
+                context: context
+            )
+        } catch {
+            throw .solid(error)
+        }
 
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(configuration.size.x, 0, 0, 0),
@@ -5679,10 +5744,10 @@ private final class EmitterLayerState {
         ))
         let finalMatrix = modelMatrix * scaleMatrix
         guard matrixIsFinite(finalMatrix) else {
-            throw .invalidTransform(context)
+            throw .solid(.invalidTransform(context))
         }
         guard let selectedPipeline = stencilAwarePipeline() else {
-            throw .pipelineUnavailable(context)
+            throw .solid(.pipelineUnavailable(context))
         }
 
         var vertices: [CARendererVertex] = [
@@ -5720,7 +5785,7 @@ private final class EmitterLayerState {
         guard let (vertexOffset, uniformIndex) = allocateVertices(
             count: vertices.count
         ) else {
-            throw .vertexCapacityExceeded(context)
+            throw .solid(.vertexCapacityExceeded(context))
         }
 
         var uniforms = CARendererUniforms(
@@ -6518,6 +6583,7 @@ private final class EmitterLayerState {
         let previousClipStack = clipRectStack
         let previousOpacityStack = opacityStack
         let previousMaskNestingDepth = maskNestingDepth
+        let previousActiveStencilFrames = activeStencilFrames
         let previousStencilValue = currentStencilValue
 
         rasterizePrerenderRootLayer = layer
@@ -6538,6 +6604,7 @@ private final class EmitterLayerState {
         clipRectStack = previousClipStack
         opacityStack = previousOpacityStack
         maskNestingDepth = previousMaskNestingDepth
+        activeStencilFrames = previousActiveStencilFrames
         currentStencilValue = previousStencilValue
         capturePass.end()
 
@@ -7364,18 +7431,25 @@ private final class EmitterLayerState {
     /// Supports nesting: if still inside a parent mask, restores the stencil test
     /// pipeline with the parent's stencil reference value instead of fully disabling.
     private func clearStencilMask(renderPass: GPURenderPassEncoder) {
+        do {
+            try restoreStencilMask(renderPass: renderPass)
+        } catch {
+            recordMaskRenderFailure(error)
+        }
+    }
+
+    private func restoreStencilMask(
+        renderPass: GPURenderPassEncoder
+    ) throws(CAMaskRenderFailure) {
         guard stencilStateIsValid,
               maskNestingDepth > 0,
               currentStencilValue > 0,
               activeStencilFrames.count == maskNestingDepth,
               let frame = activeStencilFrames.last else {
-            recordMaskRenderFailure(
-                .invalidStencilState(
-                    depth: maskNestingDepth,
-                    reference: currentStencilValue
-                )
+            throw .invalidStencilState(
+                depth: maskNestingDepth,
+                reference: currentStencilValue
             )
-            return
         }
 
         let nextDepth = maskNestingDepth - 1
@@ -7390,13 +7464,11 @@ private final class EmitterLayerState {
               let decrementPipeline = frame.usesRoundedFragment
                 ? stencilRoundedDecrementPipeline
                 : stencilDecrementPipeline else {
-            recordMaskRenderFailure(.pipelineUnavailable(.restoration))
-            return
+            throw .pipelineUnavailable(.restoration)
         }
         guard let vertexBuffer,
               let bindGroup else {
-            recordMaskRenderFailure(.resourcesUnavailable(.restoration))
-            return
+            throw .resourcesUnavailable(.restoration)
         }
 
         renderPass.setPipeline(decrementPipeline)
@@ -7432,15 +7504,6 @@ private final class EmitterLayerState {
         modelMatrix: Matrix4x4,
         device: GPUDevice
     ) -> Bool {
-        guard let stencilWriteRoundedPipeline = stencilWriteRoundedPipeline,
-              let stencilTestPipeline = stencilTestPipeline,
-              let vertexBuffer = vertexBuffer,
-              let uniformBuffer = uniformBuffer,
-              let bindGroup = bindGroup,
-              pipeline != nil else {
-            recordMaskRenderFailure(.resourcesUnavailable(.roundedClip))
-            return false
-        }
         if let error = layer.cornerCurveRenderError {
             recordCornerCurveRenderFailure(.roundedClip(error))
             recordMaskRenderFailure(
@@ -7449,22 +7512,48 @@ private final class EmitterLayerState {
             return false
         }
 
-        let configuration: CAMaskRenderConfiguration
         do {
-            configuration = try CAMaskRenderConfiguration(
+            try encodeBoundsClipToStencil(
                 bounds: layer.bounds,
                 cornerRadius: layer.cornerRadius,
                 cornerCurveExponent: layer.cornerCurveRenderExponent
                     ?? Float(CornerCurveRenderConfiguration.circularExponent),
                 cornerRadii: layer.cornerRadiiComponents,
-                context: .roundedClip
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                device: device
             )
-        } catch let failure {
-            recordMaskRenderFailure(failure)
+            return true
+        } catch {
+            recordMaskRenderFailure(error)
             return false
         }
+    }
 
-        // Build transform that maps the unit quad to the layer bounds
+    private func encodeBoundsClipToStencil(
+        bounds: CGRect,
+        cornerRadius: CGFloat,
+        cornerCurveExponent: Float,
+        cornerRadii: SIMD4<Float>,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        device: GPUDevice
+    ) throws(CAMaskRenderFailure) {
+        guard let stencilWriteRoundedPipeline,
+              let stencilTestPipeline,
+              let vertexBuffer,
+              let uniformBuffer,
+              let bindGroup,
+              pipeline != nil else {
+            throw .resourcesUnavailable(.roundedClip)
+        }
+        let configuration = try CAMaskRenderConfiguration(
+            bounds: bounds,
+            cornerRadius: cornerRadius,
+            cornerCurveExponent: cornerCurveExponent,
+            cornerRadii: cornerRadii,
+            context: .roundedClip
+        )
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(configuration.size.x, 0, 0, 0),
             SIMD4<Float>(0, configuration.size.y, 0, 0),
@@ -7473,25 +7562,19 @@ private final class EmitterLayerState {
         ))
         let finalMatrix = modelMatrix * scaleMatrix
         guard matrixIsFinite(finalMatrix) else {
-            recordMaskRenderFailure(.invalidTransform(.roundedClip))
-            return false
+            throw .invalidTransform(.roundedClip)
         }
         guard stencilStateIsValid else {
-            recordMaskRenderFailure(
-                .invalidStencilState(
-                    depth: maskNestingDepth,
-                    reference: currentStencilValue
-                )
+            throw .invalidStencilState(
+                depth: maskNestingDepth,
+                reference: currentStencilValue
             )
-            return false
         }
         guard currentStencilValue < UInt32.max,
               maskNestingDepth < Int.max else {
-            recordMaskRenderFailure(.stencilReferenceOverflow(.roundedClip))
-            return false
+            throw .stencilReferenceOverflow(.roundedClip)
         }
 
-        // Create vertices for the quad
         let color = SIMD4<Float>(1, 1, 1, 1)
         var vertices: [CARendererVertex] = [
             CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
@@ -7503,17 +7586,14 @@ private final class EmitterLayerState {
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else {
-            recordMaskRenderFailure(.vertexCapacityExceeded(.roundedClip))
-            return false
+            throw .vertexCapacityExceeded(.roundedClip)
         }
         let (vertexOffset, layerIndex) = allocation
 
-        // Mutate stencil state only after every CPU-side prerequisite succeeds.
         currentStencilValue += 1
         renderPass.setPipeline(stencilWriteRoundedPipeline)
         renderPass.setStencilReference(currentStencilValue)
 
-        // Set uniforms with corner radius info for SDF calculation in the shader
         var uniforms = CARendererUniforms(
             mvpMatrix: finalMatrix,
             opacity: 1.0,
@@ -7545,7 +7625,6 @@ private final class EmitterLayerState {
         maskNestingDepth += 1
         renderPass.setPipeline(stencilTestPipeline)
         renderPass.setStencilReference(currentStencilValue)
-        return true
     }
 
     // MARK: - Replicator Layer Rendering
@@ -9847,6 +9926,7 @@ private final class EmitterLayerState {
         let previousClipStack = clipRectStack
         let previousOpacityStack = opacityStack
         let previousMaskNestingDepth = maskNestingDepth
+        let previousActiveStencilFrames = activeStencilFrames
         let previousStencilValue = currentStencilValue
 
         shadowCaptureRootLayer = layer
@@ -9865,6 +9945,7 @@ private final class EmitterLayerState {
         clipRectStack = previousClipStack
         opacityStack = previousOpacityStack
         maskNestingDepth = previousMaskNestingDepth
+        activeStencilFrames = previousActiveStencilFrames
         currentStencilValue = previousStencilValue
         contentRenderPass.end()
         if replicatorRenderFailureGeneration != replicatorFailureGenerationBeforeCapture,
@@ -10666,6 +10747,7 @@ private final class EmitterLayerState {
         let savedInstancePath = replicatorInstancePath
         let savedClipStack = clipRectStack
         let savedMaskDepth = maskNestingDepth
+        let savedActiveStencilFrames = activeStencilFrames
         let savedStencilValue = currentStencilValue
         let savedStopKey = compositionCaptureStopKey
         let savedDidReachStop = compositionCaptureDidReachStop
@@ -10702,6 +10784,7 @@ private final class EmitterLayerState {
         replicatorInstancePath = savedInstancePath
         clipRectStack = savedClipStack
         maskNestingDepth = savedMaskDepth
+        activeStencilFrames = savedActiveStencilFrames
         currentStencilValue = savedStencilValue
         compositionCaptureStopKey = savedStopKey
         compositionCaptureDidReachStop = savedDidReachStop
@@ -11155,6 +11238,7 @@ private final class EmitterLayerState {
                 let savedInstancePath = replicatorInstancePath
                 let savedClipStack = clipRectStack
                 let savedMaskDepth = maskNestingDepth
+                let savedActiveStencilFrames = activeStencilFrames
                 let savedStencilValue = currentStencilValue
                 let savedStopKey = compositionCaptureStopKey
                 let savedDidReachStop = compositionCaptureDidReachStop
@@ -11203,6 +11287,7 @@ private final class EmitterLayerState {
                 replicatorInstancePath = savedInstancePath
                 clipRectStack = savedClipStack
                 maskNestingDepth = savedMaskDepth
+                activeStencilFrames = savedActiveStencilFrames
                 currentStencilValue = savedStencilValue
                 compositionCaptureStopKey = savedStopKey
                 compositionCaptureDidReachStop = savedDidReachStop
@@ -11851,6 +11936,7 @@ private final class EmitterLayerState {
         let previousClipStack = clipRectStack
         let previousOpacityStack = opacityStack
         let previousMaskNestingDepth = maskNestingDepth
+        let previousActiveStencilFrames = activeStencilFrames
         let previousTransformDepthNesting = transformDepthNesting
         let previousStencilValue = currentStencilValue
 
@@ -11870,6 +11956,7 @@ private final class EmitterLayerState {
         clipRectStack = previousClipStack
         opacityStack = previousOpacityStack
         maskNestingDepth = previousMaskNestingDepth
+        activeStencilFrames = previousActiveStencilFrames
         transformDepthNesting = previousTransformDepthNesting
         currentStencilValue = previousStencilValue
 

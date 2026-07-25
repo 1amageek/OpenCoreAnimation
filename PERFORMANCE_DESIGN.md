@@ -816,11 +816,11 @@ failure and does not submit, clear captured dirty state, or release transaction
 completion. The snapshot does not yet own masks, resource-backed contents,
 specialized-layer resources, or copied animation evaluators. A static tree
 that needs masks, contents, delegates, effects, a specialized layer,
-rasterization, transition state, clipping, or group opacity publishes
+rasterization, transition state, or true group opacity publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
-claiming snapshot success. Backface policy and the captured transform are
-value-owned and evaluated by both static snapshot renderers. Animated commits
-similarly publish
+claiming snapshot success. Backface policy, clipping geometry, and the captured
+transform are value-owned and evaluated by both static snapshot renderers.
+Animated commits similarly publish
 `requiresLiveAnimationEvaluation`; layout-pending commits publish
 `requiresLiveTreePreparation`. WebGPU rejects typed committed capture failures,
 captures layer and detached-mask revisions after delegate callbacks, clears

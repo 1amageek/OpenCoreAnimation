@@ -5781,6 +5781,8 @@ func installHarness() {
                 let snapshotRoot = CALayer()
                 let snapshotChild = CALayer()
                 let backfaceChild = CALayer()
+                let clipParent = CALayer()
+                let clipChild = CALayer()
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 snapshotRoot.bounds = CGRect(
@@ -5822,6 +5824,30 @@ func installHarness() {
                 backfaceChild.transform = CATransform3DMakeScale(-1, 1, 1)
                 backfaceChild.isDoubleSided = false
                 snapshotRoot.addSublayer(backfaceChild)
+                clipParent.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40
+                )
+                clipParent.position = CGPoint(x: 150, y: 50)
+                clipParent.cornerRadius = 10
+                clipParent.masksToBounds = true
+                clipChild.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 40
+                )
+                clipChild.position = CGPoint(x: 20, y: 20)
+                clipChild.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                clipParent.addSublayer(clipChild)
+                snapshotRoot.addSublayer(clipParent)
                 CATransaction.commit()
 
                 snapshotChild.backgroundColor = CGColor(
@@ -5832,11 +5858,16 @@ func installHarness() {
                 )
                 snapshotChild.opacity = 1
                 backfaceChild.isDoubleSided = true
+                clipParent.masksToBounds = false
+                clipParent.cornerRadius = 0
                 renderer.render(layer: snapshotRoot)
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 50, y: 250),
                         CGPoint(x: 100, y: 250),
+                        CGPoint(x: 150, y: 250),
+                        CGPoint(x: 132, y: 268),
+                        CGPoint(x: 180, y: 250),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -5873,16 +5904,69 @@ func installHarness() {
                             == frameFailuresBeforeOverflow + 1
                         && renderer.lastFrameRenderFailure
                             == .committedSnapshotEncodingFailed(
-                                .vertexCapacityExceeded(.background)
+                                .solid(
+                                    .vertexCapacityExceeded(.background)
+                                )
                             )
                     let overflowCompletionRemainedPending =
                         !overflowCompletionRan
+
+                    let maskOverflowRoot = CALayer()
+                    var maskOverflowCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        maskOverflowCompletionRan = true
+                    }
+                    maskOverflowRoot.bounds = snapshotRoot.bounds
+                    maskOverflowRoot.position = snapshotRoot.position
+                    maskOverflowRoot.backgroundColor =
+                        snapshotRoot.backgroundColor
+                    for index in 0..<1024 {
+                        let child = CALayer()
+                        child.bounds = CGRect(
+                            x: 0,
+                            y: 0,
+                            width: 1,
+                            height: 1
+                        )
+                        child.position = CGPoint(
+                            x: CGFloat(index % 400),
+                            y: CGFloat(index / 400)
+                        )
+                        child.backgroundColor =
+                            snapshotChild.backgroundColor
+                        maskOverflowRoot.addSublayer(child)
+                    }
+                    let overflowingClip = CALayer()
+                    overflowingClip.bounds = clipParent.bounds
+                    overflowingClip.position = clipParent.position
+                    overflowingClip.masksToBounds = true
+                    overflowingClip.addSublayer(CALayer())
+                    maskOverflowRoot.addSublayer(overflowingClip)
+                    CATransaction.commit()
+                    let frameFailuresBeforeMaskOverflow =
+                        renderer.frameRenderFailureCount
+                    renderer.render(layer: maskOverflowRoot)
+                    let maskOverflowWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeMaskOverflow + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .mask(
+                                    .vertexCapacityExceeded(.roundedClip)
+                                )
+                            )
+                    let maskOverflowCompletionRemainedPending =
+                        !maskOverflowCompletionRan
                     ImmutableSnapshotProbeState.result =
                         pixels.map {
                             $0.map(String.init).joined(separator: ",")
                         }.joined(separator: ";")
                         + ",overflowTyped=\(overflowWasTyped)"
                         + ",overflowPending=\(overflowCompletionRemainedPending)"
+                        + ",maskOverflowTyped=\(maskOverflowWasTyped)"
+                        + ",maskOverflowPending=\(maskOverflowCompletionRemainedPending)"
                 } catch {
                     ImmutableSnapshotProbeState.result =
                         "error: snapshot readback failed: \(error)"

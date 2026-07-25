@@ -36,6 +36,7 @@ struct CARenderSnapshotTests {
         )
         root.cornerRadius = 4
         root.maskedCorners = [.layerMinXMinYCorner]
+        root.masksToBounds = true
         root.isGeometryFlipped = true
         root.toneMapMode = .never
         root.preferredDynamicRange = .high
@@ -57,6 +58,7 @@ struct CARenderSnapshotTests {
         #expect(values.borderWidth == 2)
         #expect(values.borderColor == SIMD4<Float>(0, 0, 1, 1))
         #expect(values.cornerRadii == SIMD4<Float>(4, 0, 0, 0))
+        #expect(values.masksToBounds)
         #expect(values.isGeometryFlipped)
         #expect(values.toneMapMode == .never)
         #expect(values.preferredDynamicRange == .high)
