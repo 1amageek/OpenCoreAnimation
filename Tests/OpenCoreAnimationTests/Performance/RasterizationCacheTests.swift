@@ -138,6 +138,35 @@ struct RasterizationCacheTests {
         #expect(cache.entry(effectKey)?.texture == StubTexture(id: 3))
     }
 
+    @Test func keyStoragePreservesEntriesThroughGrowthAndRemoval() {
+        var map = RasterizationCacheKeyMap<Int>()
+        let keys = (0..<128).map(RasterizationCacheKey.init(raw:))
+
+        for (index, key) in keys.enumerated() {
+            #expect(map.updateValue(index, forKey: key) == nil)
+        }
+        #expect(map.count == keys.count)
+        for (index, key) in keys.enumerated() {
+            #expect(map[key] == index)
+        }
+
+        for index in stride(from: 0, to: keys.count, by: 4) {
+            #expect(map.removeValue(forKey: keys[index]) == index)
+        }
+        for (index, key) in keys.enumerated() {
+            if index.isMultiple(of: 4) {
+                #expect(map[key] == nil)
+            } else {
+                #expect(map[key] == index)
+            }
+        }
+
+        map.removeAll(keepingCapacity: true)
+        #expect(map.isEmpty)
+        map[keys[0]] = 999
+        #expect(map[keys[0]] == 999)
+    }
+
     // C.3 — Inserting with a known per-pixel byte cost updates `bytes`.
     @Test func bytesAccountedOnInsert() {
         let cache = RasterizationCache<StubTexture>(maxBytes: 1_000_000)

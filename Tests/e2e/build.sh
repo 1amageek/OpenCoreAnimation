@@ -16,7 +16,14 @@ TOOLCHAINS="$TOOLCHAIN" xcrun swift build \
     --swift-sdk "$SDK" \
     -c release
 
-BUILT_WASM="$SMOKE_DIR/.build/wasm32-unknown-wasip1/release/OCASmoke.wasm"
+BIN_PATH="$(
+    TOOLCHAINS="$TOOLCHAIN" xcrun swift build \
+        --product OCASmoke \
+        --swift-sdk "$SDK" \
+        -c release \
+        --show-bin-path
+)"
+BUILT_WASM="$BIN_PATH/OCASmoke.wasm"
 JAVASCRIPTKIT_RUNTIME="$SMOKE_DIR/.build/checkouts/JavaScriptKit/Plugins/PackageToJS/Templates/runtime.mjs"
 if [[ ! -f "$BUILT_WASM" ]]; then
     echo "✗ Build succeeded but $BUILT_WASM is missing" >&2

@@ -137,16 +137,16 @@ open class CATiledLayer: CALayer {
     ///
     /// Keys are TileKey structs, values are CGImage representations of tiles.
     /// The renderer uses this cache to avoid re-rendering tiles unnecessarily.
-    internal var tileCache: [TileKey: CGImage] = [:]
+    internal var tileCache = CATileKeyMap<CGImage>()
 
     /// Media times at which cached tiles became available for display.
-    internal var tileFadeStartTimes: [TileKey: CFTimeInterval] = [:]
+    internal var tileFadeStartTimes = CATileKeyMap<CFTimeInterval>()
 
     /// Set of tiles currently being loaded.
-    internal var loadingTiles: Set<TileKey> = []
+    internal var loadingTiles = CATileKeySet()
 
     /// Cache generation associated with each in-flight tile request.
-    internal var loadingTileGenerations: [TileKey: UInt64] = [:]
+    internal var loadingTileGenerations = CATileKeyMap<UInt64>()
 
     /// Advances whenever cached content becomes invalid.
     internal private(set) var tileCacheGeneration: UInt64 = 0

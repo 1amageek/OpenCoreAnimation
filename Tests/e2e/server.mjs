@@ -49,6 +49,7 @@ async function serve(req, res) {
         res.writeHead(200, {
             "Content-Type": mime,
             "Content-Length": data.length,
+            "Cache-Control": "no-store",
             "Cross-Origin-Opener-Policy": "same-origin",
             "Cross-Origin-Embedder-Policy": "require-corp"
         });

@@ -20,15 +20,20 @@ open class CAValueFunction {
 
     /// Creates a new value function with the specified name.
     public init?(name: CAValueFunctionName) {
-        guard Self.supportedNames.contains(name) else { return nil }
+        guard Self.isSupported(name) else { return nil }
         self.name = name
     }
 
-    private static let supportedNames: Set<CAValueFunctionName> = [
-        .rotateX, .rotateY, .rotateZ,
-        .scale, .scaleX, .scaleY, .scaleZ,
-        .translate, .translateX, .translateY, .translateZ,
-    ]
+    private static func isSupported(_ name: CAValueFunctionName) -> Bool {
+        switch name {
+        case .rotateX, .rotateY, .rotateZ,
+             .scale, .scaleX, .scaleY, .scaleZ,
+             .translate, .translateX, .translateY, .translateZ:
+            return true
+        default:
+            return false
+        }
+    }
 
     internal var componentCount: Int {
         name == .scale || name == .translate ? 3 : 1

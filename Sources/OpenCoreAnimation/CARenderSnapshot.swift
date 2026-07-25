@@ -21,14 +21,14 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 /// The snapshot intentionally stores layer identity without retaining a
 /// `CALayer`. This prevents mutations made after capture from changing the
 /// frame that is already being encoded.
-// FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot currently contains
-// every value consumed by the production CAMetalRenderer path, while the WASM
-// CAWebGPURenderer still renders directly from CALayer. The active native path
-// captures this value in CAMetalRenderer.render(layer:). Phase 4 must not be
-// considered complete until WebGPU resources, masks, specialized layer state,
-// copied animation evaluators, and commit-time layout preparation are
-// represented here, the explicit live-evaluation commit states are removed,
-// and WebGPU no longer reads mutable model layers after capture.
+// FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot contains every value
+// consumed by CAMetalRenderer and by CAWebGPURenderer's common static solid-tree
+// path. Production WebGPU still uses the explicitly typed live-tree branches
+// for resource-backed content, masks, specialized layers, animation evaluation,
+// and layout preparation. Phase 4 must not be considered complete until those
+// values and resources are owned here, the live-tree commit states are removed,
+// and every WebGPU frame encodes without reading mutable model layers after
+// capture.
 internal struct CARenderSnapshot: Sendable {
     internal struct PresentationValues: Sendable, Equatable {
         internal let bounds: CGRect
@@ -38,6 +38,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let anchorOffset: SIMD3<Float>
         internal let transform: CATransform3D
         internal let sublayerTransform: CATransform3D
+        internal let isGeometryFlipped: Bool
         internal let opacity: Float
         internal let isHidden: Bool
         internal let cornerRadius: Float
@@ -47,6 +48,9 @@ internal struct CARenderSnapshot: Sendable {
         internal let backgroundColor: SIMD4<Float>?
         internal let borderWidth: Float
         internal let borderColor: SIMD4<Float>?
+        internal let toneMapMode: CALayer.ToneMapMode
+        internal let preferredDynamicRange: CALayer.DynamicRange
+        internal let contentsHeadroom: Float
     }
 
     internal struct Node: Sendable, Equatable {
@@ -206,6 +210,7 @@ internal struct CARenderSnapshot: Sendable {
               layer.opacity.isFinite,
               layer.cornerRadius.isFinite,
               layer.borderWidth.isFinite,
+              layer.contentsHeadroom.isFinite,
               isFinite(layer.transform),
               isFinite(layer.sublayerTransform) else {
             throw .nonFiniteLayerGeometry
@@ -235,6 +240,10 @@ internal struct CARenderSnapshot: Sendable {
         let borderWidth = Float(layer.borderWidth)
         guard borderWidth.isFinite, borderWidth >= 0 else {
             throw .invalidLayerBorderWidth
+        }
+        let contentsHeadroom = Float(layer.contentsHeadroom)
+        guard contentsHeadroom.isFinite else {
+            throw .nonFiniteLayerGeometry
         }
         let boundsWidth = Float(layer.bounds.width)
         let boundsHeight = Float(layer.bounds.height)
@@ -274,6 +283,7 @@ internal struct CARenderSnapshot: Sendable {
             anchorOffset: anchorOffset,
             transform: layer.transform,
             sublayerTransform: layer.sublayerTransform,
+            isGeometryFlipped: layer.isGeometryFlipped,
             opacity: layer.opacity,
             isHidden: layer.isHidden,
             cornerRadius: Float(layer.cornerRadius),
@@ -290,7 +300,10 @@ internal struct CARenderSnapshot: Sendable {
             borderColor: try colorComponents(
                 layer.borderColor,
                 failure: .invalidLayerBorderColor
-            )
+            ),
+            toneMapMode: layer.toneMapMode,
+            preferredDynamicRange: layer.preferredDynamicRange,
+            contentsHeadroom: contentsHeadroom
         )
     }
 

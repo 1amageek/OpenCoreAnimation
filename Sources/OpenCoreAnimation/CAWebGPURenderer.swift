@@ -2,7 +2,8 @@
 @_spi(SoftwareBitmapContext) import OpenCoreGraphics
 @_spi(WebGPUInterop) import OpenCoreImage
 import Foundation
-import JavaScriptKit
+import _CJavaScriptKit
+@_spi(JSObject_id) import JavaScriptKit
 import SwiftWebGPU
 
 private let caRendererAlignedUniformSize: UInt64 = {
@@ -85,7 +86,7 @@ public enum CADynamicRangeRenderFailure: Error, Equatable, Sendable {
 /// `ObjectIdentifier` would let those namespaces alias whenever an object
 /// address is reused, returning a stale `GPUTextureView`. Tagging the kind
 /// keeps the namespaces disjoint.
-fileprivate enum EmitterTextureSampling: CaseIterable, Hashable {
+internal enum EmitterTextureSampling: CaseIterable, Hashable {
     case nearestNearest
     case nearestLinear
     case nearestTrilinear
@@ -137,7 +138,39 @@ fileprivate enum EmitterTextureSampling: CaseIterable, Hashable {
     }
 }
 
-fileprivate enum TexturedCacheKey: Hashable {
+private struct EmitterTextureSamplerSet {
+    private var nearestNearest: GPUSampler?
+    private var nearestLinear: GPUSampler?
+    private var nearestTrilinear: GPUSampler?
+    private var linearNearest: GPUSampler?
+    private var linearLinear: GPUSampler?
+    private var linearTrilinear: GPUSampler?
+
+    subscript(sampling: EmitterTextureSampling) -> GPUSampler? {
+        get {
+            switch sampling {
+            case .nearestNearest: nearestNearest
+            case .nearestLinear: nearestLinear
+            case .nearestTrilinear: nearestTrilinear
+            case .linearNearest: linearNearest
+            case .linearLinear: linearLinear
+            case .linearTrilinear: linearTrilinear
+            }
+        }
+        set {
+            switch sampling {
+            case .nearestNearest: nearestNearest = newValue
+            case .nearestLinear: nearestLinear = newValue
+            case .nearestTrilinear: nearestTrilinear = newValue
+            case .linearNearest: linearNearest = newValue
+            case .linearLinear: linearLinear = newValue
+            case .linearTrilinear: linearTrilinear = newValue
+            }
+        }
+    }
+}
+
+internal enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier)
     case emitterImage(ObjectIdentifier, EmitterTextureSampling)
     case rasterizedLayer(LayerRenderKey, RasterizationCachePurpose)
@@ -236,9 +269,29 @@ private struct PreparedTransitionComposite {
     let finalMatrix: Matrix4x4
 }
 
-private enum EmitterBirthRemainderKey: Hashable {
+internal enum EmitterBirthRemainderKey: Hashable {
     case root(ObjectIdentifier)
     case child(parentBirthSequence: UInt64, cell: ObjectIdentifier)
+}
+
+internal struct TextTextureCacheKey: Hashable {
+    let text: String
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let fontSize: CGFloat
+    let contentsScale: CGFloat
+    let alignmentMode: CATextLayerAlignmentMode
+    let truncationMode: CATextLayerTruncationMode
+    let fontFamily: String
+    let red: Float
+    let green: Float
+    let blue: Float
+    let alpha: Float
+    let isWrapped: Bool
+
+    var byteCount: UInt64 {
+        UInt64(pixelWidth) * UInt64(pixelHeight) * 4
+    }
 }
 
 /// GPU resources owned by one filtered layer.
@@ -610,7 +663,7 @@ private struct PrerenderedShadow {
 private final class EmitterLayerState {
     weak var owner: CAEmitterLayer?
     var particles: [EmitterParticle] = []
-    var birthRemainders: [EmitterBirthRemainderKey: Float] = [:]
+    var birthRemainders = RendererCacheMap<Float>()
     var randomSource: EmitterRandomSource
     var configuredSeed: UInt32
     var lastUpdateTime: CFTimeInterval = 0
@@ -631,7 +684,7 @@ private final class EmitterLayerState {
 ///
 /// This is the primary renderer for OpenCoreAnimation in production.
 /// It conforms to the internal renderer-backend contract used by the animation engine.
-public final class CAWebGPURenderer: CARendererDelegate {
+@MainActor public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Constants
 
@@ -892,7 +945,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// Monotonic within a renderer lifetime so capture scopes observe every failure,
     /// even when the public diagnostic count is deduplicated by render key.
     private var replicatorRenderFailureGeneration: UInt64 = 0
-    private var reportedReplicatorRenderFailureKeys: Set<LayerRenderKey> = []
+    private var reportedReplicatorRenderFailureKeys = LayerRenderKeySet()
 
     /// Number of transform-layer depth groups rejected before rendering.
     @_spi(RendererDiagnostics)
@@ -1523,7 +1576,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private var textureSampler: GPUSampler?
 
     /// Samplers covering every supported CAEmitterCell magnification/minification pair.
-    private var emitterTextureSamplers: [EmitterTextureSampling: GPUSampler] = [:]
+    private var emitterTextureSamplers = EmitterTextureSamplerSet()
 
     /// Source-additive textured particle pipeline without stencil testing.
     private var emitterTexturedAdditivePipeline: GPURenderPipeline?
@@ -1573,19 +1626,19 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private var blurSampler: GPUSampler?
 
     /// Persistent viewport-sized resources keyed by layer identity and replicator path.
-    private var shadowLayerResources: [LayerRenderKey: ShadowLayerResources] = [:]
+    private var shadowLayerResources = LayerRenderKeyMap<ShadowLayerResources>()
 
     /// Shadow outputs available to the main pass this frame.
-    private var prerenderedShadows: [LayerRenderKey: PrerenderedShadow] = [:]
+    private var prerenderedShadows = LayerRenderKeyMap<PrerenderedShadow>()
 
     /// Shadow paths rejected during the current pre-render pass.
-    private var failedShadowRenderKeys: Set<LayerRenderKey> = []
+    private var failedShadowRenderKeys = LayerRenderKeySet()
 
     /// Active pre-render failures already counted for diagnostics.
-    private var reportedShadowRenderFailureKeys: Set<LayerRenderKey> = []
+    private var reportedShadowRenderFailureKeys = LayerRenderKeySet()
 
     /// Pre-rendered shadows whose final display composite is currently unavailable.
-    private var failedShadowDisplayKeys: Set<LayerRenderKey> = []
+    private var failedShadowDisplayKeys = LayerRenderKeySet()
 
     // MARK: - Filter Rendering (CAFilter)
 
@@ -1623,10 +1676,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private var filterOperationPipeline: GPURenderPipeline?
 
     /// Persistent viewport-sized resources keyed by layer identity and replicator path.
-    private var filterLayerResources: [LayerRenderKey: FilterLayerResources] = [:]
+    private var filterLayerResources = LayerRenderKeyMap<FilterLayerResources>()
 
     /// Filter outputs available to capture passes and the main pass this frame.
-    private var prerenderedFilters: [LayerRenderKey: PrerenderedFilter] = [:]
+    private var prerenderedFilters = LayerRenderKeyMap<PrerenderedFilter>()
 
     /// Executes Core Image layer filters on this renderer's GPU device.
     private var layerFilterProcessor: CIWebGPUFilterProcessor?
@@ -1638,24 +1691,24 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private var retiringLayerFilterExecutions: [CIWebGPUFilterExecution] = []
 
     /// Requested layer-filter paths whose configuration is currently not executable.
-    private var failedLayerFilterKeys: Set<LayerRenderKey> = []
+    private var failedLayerFilterKeys = LayerRenderKeySet()
 
     /// Prepared layer-filter textures whose final display composite is currently unavailable.
-    private var failedLayerFilterDisplayKeys: Set<LayerRenderKey> = []
+    private var failedLayerFilterDisplayKeys = LayerRenderKeySet()
 
     // MARK: - Backdrop Composition
 
-    private var compositionLayerResources: [LayerRenderKey: CompositionLayerResources] = [:]
-    private var prerenderedCompositions: [LayerRenderKey: PrerenderedComposition] = [:]
+    private var compositionLayerResources = LayerRenderKeyMap<CompositionLayerResources>()
+    private var prerenderedCompositions = LayerRenderKeyMap<PrerenderedComposition>()
     private var activeCompositionExecutions: [CIWebGPUFilterExecution] = []
     private var retiringCompositionExecutions: [CIWebGPUFilterExecution] = []
     private var compositionCaptureStopKey: LayerRenderKey?
     private var compositionCaptureDidReachStop = false
-    private var compositionCapturePassThroughKeys: Set<LayerRenderKey> = []
-    private var deferredCompositionRasterizationKeys: Set<LayerRenderKey> = []
+    private var compositionCapturePassThroughKeys = LayerRenderKeySet()
+    private var deferredCompositionRasterizationKeys = LayerRenderKeySet()
     private var capturesOnlyDeferredCompositionRasterizations = false
-    private var failedCompositionKeys: Set<LayerRenderKey> = []
-    private var failedCompositionDisplayKeys: Set<LayerRenderKey> = []
+    private var failedCompositionKeys = LayerRenderKeySet()
+    private var failedCompositionDisplayKeys = LayerRenderKeySet()
 
     /// Number of requested backdrop compositions rejected before GPU dispatch.
     @_spi(RendererDiagnostics)
@@ -1722,10 +1775,10 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// (or had a fresh cache hit) this frame, mapped to the texture used
     /// for compositing. Populated by `prerenderRasterizedLayers`,
     /// consumed by `renderLayer`, cleared after submit.
-    private var prerasterizedTextures: [LayerRenderKey: PrerasterizedTexture] = [:]
+    private var prerasterizedTextures = LayerRenderKeyMap<PrerasterizedTexture>()
 
     /// Per-frame capture failures that must not fall through to live subtree rendering.
-    private var failedRasterizationRenderKeys: Set<LayerRenderKey> = []
+    private var failedRasterizationRenderKeys = LayerRenderKeySet()
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCaptureCount: Int = 0
@@ -1759,7 +1812,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// layer's address be reused by a fresh `CGImage` (or vice versa) and
     /// return a stale view. See `TextureManager.swift` for the broader
     /// identity-ownership contract.
-    private var texturedTextureViewCache: [TexturedCacheKey: GPUTextureView] = [:]
+    private var texturedTextureViewCache = RendererCacheMap<GPUTextureView>()
 
     /// Per-frame cache of textured-content bind groups keyed by
     /// `TexturedCacheKey`.
@@ -1776,7 +1829,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     ///
     /// **Identity contract**: same disjoint-namespace tagging as
     /// `texturedTextureViewCache` above.
-    private var perFrameTexturedBindGroupCache: [TexturedCacheKey: GPUBindGroup] = [:]
+    private var perFrameTexturedBindGroupCache = RendererCacheMap<GPUBindGroup>()
 
     /// Persistent pool of JS `Float32Array`s keyed by element count.
     ///
@@ -2125,23 +2178,23 @@ public final class CAWebGPURenderer: CARendererDelegate {
         manager.onEvict = { [weak self] cgImage in
             guard let self = self else { return }
             let imageID = ObjectIdentifier(cgImage)
-            let viewKeys = self.texturedTextureViewCache.keys.filter {
+            let viewKeys = self.texturedTextureViewCache.texturedKeys.filter {
                 switch $0 {
                 case .image(let id), .emitterImage(let id, _): return id == imageID
                 default: return false
                 }
             }
-            let bindGroupKeys = self.perFrameTexturedBindGroupCache.keys.filter {
+            let bindGroupKeys = self.perFrameTexturedBindGroupCache.texturedKeys.filter {
                 switch $0 {
                 case .image(let id), .emitterImage(let id, _): return id == imageID
                 default: return false
                 }
             }
             for key in viewKeys {
-                self.texturedTextureViewCache.removeValue(forKey: key)
+                self.texturedTextureViewCache.removeValue(forTexturedKey: key)
             }
             for key in bindGroupKeys {
-                self.perFrameTexturedBindGroupCache.removeValue(forKey: key)
+                self.perFrameTexturedBindGroupCache.removeValue(forTexturedKey: key)
             }
         }
         textureManager = manager
@@ -2439,8 +2492,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
             lodMinClamp: 0,
             lodMaxClamp: 0
         ))
-        emitterTextureSamplers = Dictionary(uniqueKeysWithValues: EmitterTextureSampling.allCases.map {
-            sampling in
+        var samplers = EmitterTextureSamplerSet()
+        for sampling in EmitterTextureSampling.allCases {
             let sampler = device.createSampler(descriptor: GPUSamplerDescriptor(
                 addressModeU: .clampToEdge,
                 addressModeV: .clampToEdge,
@@ -2451,8 +2504,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 lodMinClamp: 0,
                 lodMaxClamp: sampling.usesMipmaps ? 32 : 0
             ))
-            return (sampling, sampler)
-        })
+            samplers[sampling] = sampler
+        }
+        emitterTextureSamplers = samplers
 
         // Create bind group layout with uniform, sampler, and texture
         texturedBindGroupLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
@@ -3767,6 +3821,94 @@ public final class CAWebGPURenderer: CARendererDelegate {
         return true
     }
 
+    private func prepareDynamicRangeOutput(
+        for snapshot: CARenderSnapshot
+    ) -> Bool {
+        let request: DynamicRangeRequest
+        do {
+            request = try dynamicRangeRequest(
+                at: snapshot.rootIndex,
+                in: snapshot
+            )
+        } catch {
+            recordDynamicRangeFailure(error)
+            return false
+        }
+
+        let wantsExtended = request.requiresExtendedOutput
+            || (request.prefersExtendedOutput
+                && supportsExtendedDynamicRangeOutput)
+        let requestedMode: GPUCanvasToneMappingMode = wantsExtended
+            ? .extended
+            : .standard
+        if requestedMode != canvasToneMappingMode {
+            guard configureCanvas(toneMappingMode: requestedMode) else {
+                recordDynamicRangeFailure(
+                    requestedMode == .extended
+                        ? .extendedCanvasUnavailable
+                        : .canvasConfigurationFailed
+                )
+                return false
+            }
+        }
+        if request.requiresExtendedOutput && !isExtendedDynamicRangeActive {
+            recordDynamicRangeFailure(.extendedCanvasUnavailable)
+            return false
+        }
+
+        lastDynamicRangeRenderFailure = nil
+        return true
+    }
+
+    private func dynamicRangeRequest(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot
+    ) throws(CADynamicRangeRenderFailure) -> DynamicRangeRequest {
+        let node = snapshot.nodes[nodeIndex]
+        let values = node.presentationValues
+        guard !values.isHidden, values.opacity > 0 else {
+            return DynamicRangeRequest()
+        }
+        guard values.toneMapMode == .automatic
+                || values.toneMapMode == .never
+                || values.toneMapMode == .ifSupported else {
+            throw .invalidToneMapMode(values.toneMapMode.rawValue)
+        }
+        guard values.preferredDynamicRange == .automatic
+                || values.preferredDynamicRange == .standard
+                || values.preferredDynamicRange == .constrainedHigh
+                || values.preferredDynamicRange == .high else {
+            throw .invalidPreferredDynamicRange(
+                values.preferredDynamicRange.rawValue
+            )
+        }
+        guard values.contentsHeadroom == 0
+                || values.contentsHeadroom >= 1 else {
+            throw .invalidContentsHeadroom(
+                CGFloat(values.contentsHeadroom)
+            )
+        }
+
+        let containsExtendedContent = values.contentsHeadroom > 1
+            || colorContainsExtendedComponents(values.backgroundColor)
+            || colorContainsExtendedComponents(values.borderColor)
+        let explicitlyRequestsHighRange =
+            values.preferredDynamicRange == .high
+            || values.preferredDynamicRange == .constrainedHigh
+        var request = DynamicRangeRequest(
+            requiresExtendedOutput: explicitlyRequestsHighRange
+                || (containsExtendedContent && values.toneMapMode == .never),
+            prefersExtendedOutput: containsExtendedContent
+                && values.preferredDynamicRange == .automatic
+        )
+        for childIndex in node.childIndices {
+            request.merge(
+                try dynamicRangeRequest(at: childIndex, in: snapshot)
+            )
+        }
+        return request
+    }
+
     private func dynamicRangeRequest(
         for layer: CALayer
     ) throws(CADynamicRangeRenderFailure) -> DynamicRangeRequest {
@@ -3841,6 +3983,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
         guard let components = color.components else { return false }
         let colorComponentCount = max(0, components.count - 1)
         return components.prefix(colorComponentCount).contains { $0 < 0 || $0 > 1 }
+    }
+
+    private func colorContainsExtendedComponents(
+        _ color: SIMD4<Float>?
+    ) -> Bool {
+        guard let color else { return false }
+        return color.x < 0 || color.x > 1
+            || color.y < 0 || color.y > 1
+            || color.z < 0 || color.z > 1
     }
 
     private func recordDynamicRangeFailure(_ failure: CADynamicRangeRenderFailure) {
@@ -3936,12 +4087,243 @@ public final class CAWebGPURenderer: CARendererDelegate {
                     identity.renderKey,
                     identity.purpose
                 )
-                self.texturedTextureViewCache.removeValue(forKey: cacheKey)
-                self.perFrameTexturedBindGroupCache.removeValue(forKey: cacheKey)
+                self.texturedTextureViewCache.removeValue(forTexturedKey: cacheKey)
+                self.perFrameTexturedBindGroupCache.removeValue(forTexturedKey: cacheKey)
             }
             texture.destroy()
         }
         rasterizationCache = cache
+    }
+
+    private func renderCommittedSnapshot(
+        _ snapshot: CARenderSnapshot,
+        rootLayer: CALayer,
+        device: GPUDevice,
+        context: GPUCanvasContext,
+        pipeline: GPURenderPipeline,
+        depthTextureView: GPUTextureView,
+        renderTarget: CARenderTargetConfiguration
+    ) {
+        guard snapshot.liveTreeRequirement == nil else {
+            recordFrameRenderFailure(
+                .committedSnapshotCaptureFailed(.renderingFailed(
+                    "An immutable snapshot retained a live-tree requirement"
+                ))
+            )
+            return
+        }
+        guard prepareDynamicRangeOutput(for: snapshot) else { return }
+        guard let bindGroup else {
+            recordFrameRenderFailure(.baseBindGroupUnavailable)
+            return
+        }
+
+        CALayer.advanceFrameToken()
+        resetFrameStateForCommittedSnapshot()
+
+        let currentTexture = context.getCurrentTexture()
+        let textureView = currentTexture.createView()
+        let encoder = device.createCommandEncoder()
+        let projectionMatrix = Matrix4x4.orthographic(
+            left: 0,
+            right: renderTarget.viewportSize.x,
+            bottom: 0,
+            top: renderTarget.viewportSize.y,
+            near: -1000,
+            far: 1000
+        )
+        let rootValues = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+        let clearColor: GPUColor
+        if rootValues.cornerRadius > 0 {
+            clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
+        } else if let color = rootValues.backgroundColor {
+            clearColor = GPUColor(
+                r: Double(color.x * color.w),
+                g: Double(color.y * color.w),
+                b: Double(color.z * color.w),
+                a: Double(color.w)
+            )
+        } else {
+            clearColor = GPUColor(r: 0, g: 0, b: 0, a: 1)
+        }
+
+        let renderPass = encoder.beginRenderPass(
+            descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: textureView,
+                        clearValue: clearColor,
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ],
+                depthStencilAttachment: GPURenderPassDepthStencilAttachment(
+                    view: depthTextureView,
+                    depthClearValue: 0,
+                    depthLoadOp: .clear,
+                    depthStoreOp: .store,
+                    stencilClearValue: 0,
+                    stencilLoadOp: .clear,
+                    stencilStoreOp: .store
+                )
+            )
+        )
+        renderPass.setPipeline(pipeline)
+        renderPass.setViewport(
+            x: 0,
+            y: 0,
+            width: Float(size.width),
+            height: Float(size.height),
+            minDepth: 0,
+            maxDepth: 1
+        )
+        do {
+            try renderSnapshotNode(
+                at: snapshot.rootIndex,
+                in: snapshot,
+                renderPass: renderPass,
+                parentMatrix: projectionMatrix,
+                isRoot: true,
+                device: device,
+                bindGroup: bindGroup
+            )
+        } catch {
+            isRenderingMainPass = false
+            renderPass.end()
+            recordSolidRenderFailure(error)
+            recordFrameRenderFailure(
+                .committedSnapshotEncodingFailed(error)
+            )
+            return
+        }
+        isRenderingMainPass = false
+        renderPass.end()
+
+        if droppedLayerCount > 0 {
+            print(
+                "[CAWebGPURenderer] \(droppedLayerCount) layer(s) dropped: "
+                + "buffer capacity exceeded (maxLayers=\(Self.maxLayers))"
+            )
+        }
+        device.queue.submit([encoder.finish()])
+        lastRenderedTexture = currentTexture
+
+        rootLayer.recursivelyClearDirtyAfterCommit(matching: snapshot)
+        rootLayer.acknowledgeCommittedRenderState(
+            frameToken: snapshot.frameToken
+        )
+        rootLayer.completeTransactionsAfterRenderRecursively()
+        lastFrameRenderFailure = nil
+        advanceFrameResources()
+    }
+
+    private func resetFrameStateForCommittedSnapshot() {
+        currentLayerIndex = 0
+        currentVertexOffset = 0
+        droppedLayerCount = 0
+        shapeFillDrawCount = 0
+        shapeFillVertexCount = 0
+        gradientStopByteOffset = 0
+        gradientStopOffsets.removeAll(keepingCapacity: true)
+        gradientBindGroup = nil
+        opacityStack.removeAll(keepingCapacity: true)
+        replicatorColorStack.removeAll(keepingCapacity: true)
+        replicatorTimeOffsetStack.removeAll(keepingCapacity: true)
+        replicatorInstancePath.removeAll(keepingCapacity: true)
+        reportedReplicatorRenderFailureKeys.removeAll(keepingCapacity: true)
+        transitionSuppressedLayer = nil
+        renderTargetSizeOverride = nil
+        activeTransitionSourceIDs.removeAll(keepingCapacity: true)
+        for capture in retiredTransitionCaptures {
+            capture.filterExecution?.invalidate()
+            capture.source.texture.destroy()
+            capture.target.texture.destroy()
+        }
+        retiredTransitionCaptures.removeAll(keepingCapacity: true)
+        for texture in retiredTransitionTextures {
+            texture.destroy()
+        }
+        retiredTransitionTextures.removeAll(keepingCapacity: true)
+        for texture in transientCaptureDepthTextures {
+            texture.destroy()
+        }
+        transientCaptureDepthTextures.removeAll(keepingCapacity: true)
+        for texture in transientRasterizationTextures {
+            texture.destroy()
+        }
+        transientRasterizationTextures.removeAll(keepingCapacity: true)
+        for resources in transientRasterizationFilterResources {
+            resources.destroy()
+        }
+        transientRasterizationFilterResources.removeAll(keepingCapacity: true)
+        for resources in transientRasterizationShadowResources {
+            resources.destroy()
+        }
+        transientRasterizationShadowResources.removeAll(keepingCapacity: true)
+        currentRootLayer = nil
+        filterPrerenderRootLayer = nil
+        contentMaskCaptureSuppressedRootLayer = nil
+        shadowCaptureRootLayer = nil
+        suppressShadowRendering = false
+        activeEmitterLayerIDs.removeAll(keepingCapacity: true)
+        clipRectStack.removeAll(keepingCapacity: true)
+        maskNestingDepth = 0
+        currentStencilValue = 0
+        prerenderedShadows.removeAll(keepingCapacity: true)
+        prerenderedFilters.removeAll(keepingCapacity: true)
+        for execution in retiringLayerFilterExecutions {
+            execution.invalidate()
+        }
+        for execution in activeLayerFilterExecutions {
+            execution.invalidate()
+        }
+        retiringLayerFilterExecutions.removeAll(keepingCapacity: true)
+        activeLayerFilterExecutions.removeAll(keepingCapacity: true)
+        prerenderedCompositions.removeAll(keepingCapacity: true)
+        for execution in retiringCompositionExecutions {
+            execution.invalidate()
+        }
+        for execution in activeCompositionExecutions {
+            execution.invalidate()
+        }
+        retiringCompositionExecutions.removeAll(keepingCapacity: true)
+        activeCompositionExecutions.removeAll(keepingCapacity: true)
+        compositionCaptureStopKey = nil
+        compositionCaptureDidReachStop = false
+        compositionCapturePassThroughKeys.removeAll(keepingCapacity: true)
+        deferredCompositionRasterizationKeys.removeAll(keepingCapacity: true)
+        capturesOnlyDeferredCompositionRasterizations = false
+        transformDepthNesting = 0
+        transformFlatteningCaptureCount = 0
+        explicitRasterizationCaptureCount = 0
+        explicitRasterizationCapturePixelSizes.removeAll(keepingCapacity: true)
+        transformFlatteningCompositeCount = 0
+        isRenderingMainPass = true
+        prerasterizedTextures.removeAll(keepingCapacity: true)
+        failedRasterizationRenderKeys.removeAll(keepingCapacity: true)
+        rasterizePrerenderRootLayer = nil
+        perFrameTexturedBindGroupCache.removeAll(keepingCapacity: true)
+    }
+
+    private func advanceFrameResources() {
+        vertexBufferPool?.advanceFrame()
+        uniformBufferPool?.advanceFrame()
+        gradientStopBufferPool?.advanceFrame()
+        textureManager?.advanceFrame()
+        geometryCache?.advanceFrame()
+        textureManager?.evictStale(olderThan: 300)
+        geometryCache?.evictStale(olderThan: 300)
+        rasterizationCache?.evictIdle(
+            currentFrame: CALayer._currentFrameToken,
+            olderThan: 6
+        )
+        rasterizationCache?.evictToBudget()
+        prerasterizedTextures.removeAll(keepingCapacity: true)
+        emitterLayerStates = emitterLayerStates.filter {
+            activeEmitterLayerIDs.contains($0.key)
+        }
     }
 
     public func render(layer rootLayer: CALayer) {
@@ -3997,6 +4379,18 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
         guard let depthTextureView else {
             recordFrameRenderFailure(.depthTextureViewUnavailable)
+            return
+        }
+        if case .snapshot(let snapshot) = committedState {
+            renderCommittedSnapshot(
+                snapshot,
+                rootLayer: rootLayer,
+                device: device,
+                context: context,
+                pipeline: pipeline,
+                depthTextureView: depthTextureView,
+                renderTarget: renderTarget
+            )
             return
         }
         guard let layerFilterProcessor else {
@@ -4081,6 +4475,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
+        maskNestingDepth = 0
+        currentStencilValue = 0
 
         // Reset per-frame shadow outputs; persistent resource ownership remains cached.
         prerenderedShadows.removeAll(keepingCapacity: true)
@@ -4337,30 +4733,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         rootLayer.completeTransactionsAfterRenderRecursively()
         lastFrameRenderFailure = nil
 
-        // Advance buffer pools, texture manager, and geometry cache to the next frame
-        vertexBufferPool?.advanceFrame()
-        uniformBufferPool?.advanceFrame()
-        gradientStopBufferPool?.advanceFrame()
-        textureManager?.advanceFrame()
-        geometryCache?.advanceFrame()
-
-        // Periodically evict stale resources (not used in last 300 frames = ~5 seconds at 60fps)
-        textureManager?.evictStale(olderThan: 300)
-        geometryCache?.evictStale(olderThan: 300)
-
-        // R3.4: drop rasterization entries that have sat idle longer
-        // than 6 frames (~100 ms @ 60 Hz) and any overflow above the
-        // viewport-derived byte budget. Idle eviction first so the
-        // budget pass operates on the trimmed live set.
-        rasterizationCache.evictIdle(
-            currentFrame: CALayer._currentFrameToken,
-            olderThan: 6
-        )
-        rasterizationCache.evictToBudget()
-        prerasterizedTextures.removeAll(keepingCapacity: true)
-        emitterLayerStates = emitterLayerStates.filter {
-            activeEmitterLayerIDs.contains($0.key)
-        }
+        advanceFrameResources()
     }
 
     /// Resolves ordinary CALayer delegate drawing before any shadow, filter,
@@ -4989,7 +5362,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         currentStencilValue = 0
 
         // Particle resources
-        emitterTextureSamplers.removeAll(keepingCapacity: false)
+        emitterTextureSamplers = EmitterTextureSamplerSet()
         emitterTexturedAdditivePipeline = nil
         emitterTexturedAdditiveStencilPipeline = nil
         emitterTexturedAdditiveDepthPipeline = nil
@@ -5051,15 +5424,24 @@ public final class CAWebGPURenderer: CARendererDelegate {
     /// count. WebGPU's `writeBuffer` copies the contents synchronously, so
     /// the next call may safely overwrite the array.
     private func createFloat32Array<T>(from data: inout T) -> JSObject {
-        let floatCount = MemoryLayout<T>.stride / 4
+        let byteCount = MemoryLayout<T>.stride
+        precondition(byteCount.isMultiple(of: MemoryLayout<Float32>.stride))
+        let floatCount = byteCount / MemoryLayout<Float32>.stride
         let array = stagingFloat32Array(floatCount: floatCount)
-        withUnsafeBytes(of: &data) { rawBytes in
-            let typed = rawBytes.bindMemory(to: Float32.self)
-            for i in 0..<floatCount {
-                array[i] = .number(Double(typed[i]))
+        return withUnsafeTemporaryAllocation(
+            byteCount: byteCount,
+            alignment: MemoryLayout<T>.alignment
+        ) { storage in
+            storage.initializeMemory(as: UInt8.self, repeating: 0)
+            withUnsafeBytes(of: &data) { source in
+                storage.copyMemory(from: source)
             }
+            let floats = UnsafeRawBufferPointer(storage).bindMemory(to: Float32.self)
+            for index in floats.indices {
+                array[index] = .number(Double(floats[index]))
+            }
+            return array
         }
-        return array
     }
 
     /// Writes an array of vertices into a pooled persistent JS `Float32Array`.
@@ -5083,6 +5465,188 @@ public final class CAWebGPURenderer: CARendererDelegate {
             array[index] = .number(Double(values[index]))
         }
         return array
+    }
+
+    private func renderSnapshotNode(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot,
+        renderPass: GPURenderPassEncoder,
+        parentMatrix: Matrix4x4,
+        isRoot: Bool,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup
+    ) throws(CASolidRenderFailure) {
+        let node = snapshot.nodes[nodeIndex]
+        let values = node.presentationValues
+        guard !values.isHidden, values.opacity > 0 else { return }
+
+        let effectiveOpacity = currentEffectiveOpacity * values.opacity
+        opacityStack.append(effectiveOpacity)
+        defer { _ = opacityStack.popLast() }
+
+        let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
+        if let backgroundColor = values.backgroundColor,
+           values.boundsSize.x > 0,
+           values.boundsSize.y > 0,
+           !isRoot || values.cornerRadius > 0 {
+            try renderSnapshotSolid(
+                values: values,
+                color: backgroundColor,
+                borderWidth: 0,
+                context: .background,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup
+            )
+        }
+
+        if !node.childIndices.isEmpty {
+            let sublayerMatrix = values.sublayerMatrix(
+                modelMatrix: modelMatrix
+            )
+            for childIndex in node.childIndices {
+                try renderSnapshotNode(
+                    at: childIndex,
+                    in: snapshot,
+                    renderPass: renderPass,
+                    parentMatrix: sublayerMatrix,
+                    isRoot: false,
+                    device: device,
+                    bindGroup: bindGroup
+                )
+            }
+        }
+
+        if values.borderWidth > 0,
+           let borderColor = values.borderColor {
+            try renderSnapshotSolid(
+                values: values,
+                color: borderColor,
+                borderWidth: values.borderWidth,
+                context: .border,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup
+            )
+        }
+    }
+
+    private func renderSnapshotSolid(
+        values: CARenderSnapshot.PresentationValues,
+        color: SIMD4<Float>,
+        borderWidth: Float,
+        context: CASolidRenderContext,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        bindGroup: GPUBindGroup
+    ) throws(CASolidRenderFailure) {
+        guard let vertexBuffer,
+              let uniformBuffer else {
+            throw .resourcesUnavailable(context)
+        }
+        let configuration = try CASolidRenderConfiguration(
+            bounds: values.bounds,
+            color: color,
+            opacity: currentEffectiveOpacity,
+            cornerRadius: CGFloat(values.cornerRadius),
+            cornerCurveExponent: values.cornerCurveExponent,
+            cornerRadii: values.cornerRadii,
+            borderWidth: CGFloat(borderWidth),
+            context: context
+        )
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(configuration.size.x, 0, 0, 0),
+            SIMD4<Float>(0, configuration.size.y, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = modelMatrix * scaleMatrix
+        guard matrixIsFinite(finalMatrix) else {
+            throw .invalidTransform(context)
+        }
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            throw .pipelineUnavailable(context)
+        }
+
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(
+                position: SIMD2(0, 0),
+                texCoord: SIMD2(0, 0),
+                color: configuration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 0),
+                color: configuration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 1),
+                color: configuration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 0),
+                color: configuration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 1),
+                texCoord: SIMD2(1, 1),
+                color: configuration.color
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 1),
+                color: configuration.color
+            ),
+        ]
+        guard let (vertexOffset, uniformIndex) = allocateVertices(
+            count: vertices.count
+        ) else {
+            throw .vertexCapacityExceeded(context)
+        }
+
+        var uniforms = CARendererUniforms(
+            mvpMatrix: finalMatrix,
+            opacity: configuration.opacity,
+            cornerRadius: configuration.cornerRadius,
+            layerSize: configuration.size,
+            borderWidth: configuration.borderWidth,
+            renderMode: context == .border ? 1 : 0,
+            edgeAntialiasingMask: values.edgeAntialiasingMask,
+            cornerCurveExponent: configuration.cornerCurveExponent,
+            cornerRadii: configuration.cornerRadii
+        )
+        let uniformOffset = UInt64(uniformIndex) * Self.alignedUniformSize
+        let uniformData = createFloat32Array(from: &uniforms)
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: uniformData
+        )
+        let vertexData = createFloat32Array(from: &vertices)
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: vertexData
+        )
+
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: bindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: vertexOffset
+        )
+        renderPass.draw(vertexCount: 6)
     }
 
     private func renderLayer(
@@ -5752,12 +6316,12 @@ public final class CAWebGPURenderer: CARendererDelegate {
         if let capture = transitionCaptures.removeValue(forKey: sourceID) {
             retiredTransitionCaptures.append(capture)
         }
-        texturedTextureViewCache.removeValue(forKey: .transitionSource(sourceID))
-        texturedTextureViewCache.removeValue(forKey: .transitionTarget(sourceID))
-        texturedTextureViewCache.removeValue(forKey: .transitionFilter(sourceID))
-        perFrameTexturedBindGroupCache.removeValue(forKey: .transitionSource(sourceID))
-        perFrameTexturedBindGroupCache.removeValue(forKey: .transitionTarget(sourceID))
-        perFrameTexturedBindGroupCache.removeValue(forKey: .transitionFilter(sourceID))
+        texturedTextureViewCache.removeValue(forTexturedKey: .transitionSource(sourceID))
+        texturedTextureViewCache.removeValue(forTexturedKey: .transitionTarget(sourceID))
+        texturedTextureViewCache.removeValue(forTexturedKey: .transitionFilter(sourceID))
+        perFrameTexturedBindGroupCache.removeValue(forTexturedKey: .transitionSource(sourceID))
+        perFrameTexturedBindGroupCache.removeValue(forTexturedKey: .transitionTarget(sourceID))
+        perFrameTexturedBindGroupCache.removeValue(forTexturedKey: .transitionFilter(sourceID))
     }
 
     private func captureTransitionParticipant(
@@ -6208,11 +6772,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
         key: TexturedCacheKey,
         texture: GPUTexture
     ) -> GPUTextureView {
-        if let cached = texturedTextureViewCache[key] {
+        if let cached = texturedTextureViewCache[textured: key] {
             return cached
         }
         let view = texture.createView()
-        texturedTextureViewCache[key] = view
+        texturedTextureViewCache[textured: key] = view
         return view
     }
 
@@ -7577,15 +8141,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
         uniformBuffer: GPUBuffer,
         uniformStride: UInt64
     ) -> GPUBindGroup {
-        if let cached = perFrameTexturedBindGroupCache[cacheKey] {
+        if let cached = perFrameTexturedBindGroupCache[textured: cacheKey] {
             return cached
         }
         let view: GPUTextureView
-        if let cachedView = texturedTextureViewCache[cacheKey] {
+        if let cachedView = texturedTextureViewCache[textured: cacheKey] {
             view = cachedView
         } else {
             view = gpuTexture.createView()
-            texturedTextureViewCache[cacheKey] = view
+            texturedTextureViewCache[textured: cacheKey] = view
         }
         let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
             layout: layout,
@@ -7607,7 +8171,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 )
             ]
         ))
-        perFrameTexturedBindGroupCache[cacheKey] = bindGroup
+        perFrameTexturedBindGroupCache[textured: cacheKey] = bindGroup
         return bindGroup
     }
 
@@ -7654,7 +8218,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         for level in 0..<mipLevelCount {
             device.queue.writeTexture(
                 destination: GPUImageCopyTexture(texture: texture, mipLevel: level),
-                data: createUint8Array(from: levelStorage.data),
+                data: try createUint8Array(from: levelStorage.data),
                 dataLayout: GPUImageDataLayout(
                     offset: 0,
                     bytesPerRow: UInt32(levelStorage.bytesPerRow),
@@ -7701,15 +8265,31 @@ public final class CAWebGPURenderer: CARendererDelegate {
         recordContentsRenderFailure(.imageConversion(error))
     }
 
-    /// Creates a JavaScript Uint8Array from Data.
+    /// Creates a copied JavaScript `Uint8Array` from owned `Data`.
     ///
-    /// Bulk-copies via `JSTypedArray<UInt8>(buffer:)` so a 32×32 RGBA texture
-    /// upload is one JS round-trip rather than 4096.
-    private func createUint8Array(from data: Data) -> JSObject {
+    /// `Data` owns initialized contiguous bytes for the closure duration. The
+    /// pointer does not escape: JavaScriptKit constructs a view over WASM memory
+    /// and synchronously calls `slice()` before returning. `UInt8` has unit
+    /// alignment and stride, and the checked `Int32` length is the exact byte
+    /// range copied. The explicit import avoids Swift 6.4 release-WASM's invalid
+    /// generic `TypedArrayElement` witness without introducing per-byte bridge
+    /// calls or retaining a view into growable WASM memory.
+    private func createUint8Array(
+        from data: Data
+    ) throws(CAImageContentsConversionError) -> JSObject {
+        guard let length = Int32(exactly: data.count) else {
+            throw .pixelStorageOverflow
+        }
+        guard let constructor = JSObject.global.Uint8Array.object else {
+            throw .conversionFailed
+        }
         return data.withUnsafeBytes { rawBytes -> JSObject in
-            let typed = rawBytes.bindMemory(to: UInt8.self)
-            let buffer = UnsafeBufferPointer<UInt8>(start: typed.baseAddress, count: data.count)
-            return JSTypedArray<UInt8>(buffer: buffer).jsObject
+            let reference = swjs_create_typed_array(
+                constructor.id,
+                rawBytes.baseAddress,
+                length
+            )
+            return JSObject(id: reference)
         }
     }
 
@@ -7756,28 +8336,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
     // MARK: - Text Layer Rendering
 
-    private struct TextTextureCacheKey: Hashable {
-        let text: String
-        let pixelWidth: Int
-        let pixelHeight: Int
-        let fontSize: CGFloat
-        let contentsScale: CGFloat
-        let alignmentMode: CATextLayerAlignmentMode
-        let truncationMode: CATextLayerTruncationMode
-        let fontFamily: String
-        let red: Float
-        let green: Float
-        let blue: Float
-        let alpha: Float
-        let isWrapped: Bool
-
-        var byteCount: UInt64 {
-            UInt64(pixelWidth) * UInt64(pixelHeight) * 4
-        }
-    }
-
     /// Cache for text textures to avoid recreating them every frame.
-    private var textTextureCache: [TextTextureCacheKey: GPUTexture] = [:]
+    private var textTextureCache = RendererCacheMap<GPUTexture>()
 
     /// LRU order for text textures. Dynamic labels can otherwise create one
     /// GPU texture per distinct string for the lifetime of the renderer.
@@ -7799,7 +8359,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     }
 
     private func cacheTextTexture(_ texture: GPUTexture, for key: TextTextureCacheKey) {
-        if let replacedTexture = textTextureCache.updateValue(texture, forKey: key) {
+        if let replacedTexture = textTextureCache.updateValue(texture, forTextKey: key) {
             replacedTexture.destroy()
             textTextureCacheByteCount -= min(textTextureCacheByteCount, key.byteCount)
         }
@@ -7809,7 +8369,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
                || textTextureCacheByteCount > maxTextTextureCacheBytes),
               let oldest = textTextureAccessOrder.first {
             textTextureAccessOrder.removeFirst()
-            if let removedTexture = textTextureCache.removeValue(forKey: oldest) {
+            if let removedTexture = textTextureCache.removeValue(forTextKey: oldest) {
                 removedTexture.destroy()
                 textTextureCacheByteCount -= min(textTextureCacheByteCount, oldest.byteCount)
             }
@@ -7932,7 +8492,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         // Check cache first
         let gpuTexture: GPUTexture
         let shouldCacheTexture: Bool
-        if let cached = textTextureCache[cacheKey] {
+        if let cached = textTextureCache[text: cacheKey] {
             touchTextTexture(cacheKey)
             gpuTexture = cached
             shouldCacheTexture = false
@@ -8802,11 +9362,11 @@ public final class CAWebGPURenderer: CARendererDelegate {
         guard !targets.isEmpty else {
             reportedShadowRenderFailureKeys.removeAll(keepingCapacity: true)
             failedShadowDisplayKeys.removeAll(keepingCapacity: true)
-            evictShadowResources(except: [])
+            evictShadowResources(except: LayerRenderKeySet())
             return
         }
 
-        let targetRenderKeys = Set(targets.lazy.map(\.renderKey))
+        let targetRenderKeys = LayerRenderKeySet(targets.map(\.renderKey))
         reportedShadowRenderFailureKeys.formIntersection(targetRenderKeys)
         failedShadowDisplayKeys.formIntersection(targetRenderKeys)
 
@@ -8826,7 +9386,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             return
         }
 
-        var activeRenderKeys: Set<LayerRenderKey> = []
+        var activeRenderKeys = LayerRenderKeySet()
         activeRenderKeys.reserveCapacity(targets.count)
 
         for target in targets {
@@ -9177,7 +9737,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         return visit(rootLayer)
     }
 
-    private func evictShadowResources(except activeRenderKeys: Set<LayerRenderKey>) {
+    private func evictShadowResources(except activeRenderKeys: LayerRenderKeySet) {
         let staleRenderKeys = shadowLayerResources.keys.filter { !activeRenderKeys.contains($0) }
         for renderKey in staleRenderKeys {
             shadowLayerResources.removeValue(forKey: renderKey)?.destroy()
@@ -9198,15 +9758,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
         projectionMatrix: Matrix4x4
     ) {
         var targets: [LayerPrepassTarget] = []
-        var visitedRenderKeys: Set<LayerRenderKey> = []
+        var visitedRenderKeys = LayerRenderKeySet()
         collectFilteredLayers(
             rootLayer,
             parentMatrix: projectionMatrix,
             visitedRenderKeys: &visitedRenderKeys,
             into: &targets
         )
-        var activeRenderKeys: Set<LayerRenderKey> = []
-        var failedRenderKeys: Set<LayerRenderKey> = []
+        var activeRenderKeys = LayerRenderKeySet()
+        var failedRenderKeys = LayerRenderKeySet()
 
         for target in targets {
             let filteredLayer = target.layer
@@ -9561,7 +10121,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         return stages
     }
 
-    private func evictFilterResources(except activeRenderKeys: Set<LayerRenderKey>) {
+    private func evictFilterResources(except activeRenderKeys: LayerRenderKeySet) {
         let staleRenderKeys = filterLayerResources.keys.filter {
             !activeRenderKeys.contains($0)
         }
@@ -10205,7 +10765,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             projectionMatrix: projectionMatrix,
             mainClearColor: GPUColor(r: 0, g: 0, b: 0, a: 0)
         )
-        var ancestorKeys: Set<LayerRenderKey> = []
+        var ancestorKeys = LayerRenderKeySet()
         for root in roots {
             var targets: [BackdropCompositionTarget] = []
             withPrepassContext(root.prepass) {
@@ -10232,7 +10792,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
         mainClearColor: GPUColor
     ) -> [BackdropCompositionRoot] {
         var detachedRoots: [BackdropCompositionRoot] = []
-        var visitedRootKeys: Set<LayerRenderKey> = []
+        var visitedRootKeys = LayerRenderKeySet()
 
         func visit(_ layer: CALayer, parentMatrix: Matrix4x4) {
             let presentation = renderPresentation(for: layer)
@@ -10297,8 +10857,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
             projectionMatrix: projectionMatrix,
             mainClearColor: clearColor
         )
-        var activeKeys: Set<LayerRenderKey> = []
-        var failedKeys: Set<LayerRenderKey> = []
+        var activeKeys = LayerRenderKeySet()
+        var failedKeys = LayerRenderKeySet()
 
         for root in roots {
             var targets: [BackdropCompositionTarget] = []
@@ -10459,7 +11019,9 @@ public final class CAWebGPURenderer: CARendererDelegate {
                 currentStencilValue = 0
                 compositionCaptureStopKey = key
                 compositionCaptureDidReachStop = false
-                compositionCapturePassThroughKeys = Set(compositionTarget.ancestorRenderKeys)
+                compositionCapturePassThroughKeys = LayerRenderKeySet(
+                    compositionTarget.ancestorRenderKeys
+                )
                 let replicatorFailureGenerationBeforeCapture =
                     replicatorRenderFailureGeneration
 
@@ -12263,7 +12825,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
     private func collectFilteredLayers(
         _ layer: CALayer,
         parentMatrix: Matrix4x4,
-        visitedRenderKeys: inout Set<LayerRenderKey>,
+        visitedRenderKeys: inout LayerRenderKeySet,
         into result: inout [LayerPrepassTarget]
     ) {
         let presentationLayer = renderPresentation(for: layer)
@@ -12870,7 +13432,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             state.configuredSeed = configuration.seed
         }
         let currentCellIDs = Set(emitterCells.map(ObjectIdentifier.init))
-        state.birthRemainders = state.birthRemainders.filter { key, _ in
+        state.birthRemainders = state.birthRemainders.filteringEmitterRemainders { key, _ in
             switch key {
             case .root(let cellID): return currentCellIDs.contains(cellID)
             case .child: return true
@@ -13049,7 +13611,7 @@ public final class CAWebGPURenderer: CARendererDelegate {
             state.particles.removeAll { !$0.isAlive }
             state.particles.append(contentsOf: childParticles)
             let liveBirthSequences = Set(state.particles.map(\.birthSequence))
-            state.birthRemainders = state.birthRemainders.filter { key, _ in
+            state.birthRemainders = state.birthRemainders.filteringEmitterRemainders { key, _ in
                 switch key {
                 case .root(let cellID): return currentCellIDs.contains(cellID)
                 case .child(let parentBirthSequence, _):
@@ -13138,14 +13700,15 @@ public final class CAWebGPURenderer: CARendererDelegate {
         }
         let birthRate = max(0, configuredBirthRate)
         let accumulated = birthRate * activeDelta
-            + state.birthRemainders[remainderKey, default: 0]
+            + (state.birthRemainders[emitterRemainder: remainderKey] ?? 0)
         guard accumulated.isFinite,
               accumulated >= 0,
               accumulated <= Float(Int.max) else {
             throw .invalidCellBirthRate
         }
         let particlesToSpawn = Int(accumulated.rounded(.down))
-        state.birthRemainders[remainderKey] = accumulated - Float(particlesToSpawn)
+        state.birthRemainders[emitterRemainder: remainderKey] =
+            accumulated - Float(particlesToSpawn)
         return particlesToSpawn
     }
 

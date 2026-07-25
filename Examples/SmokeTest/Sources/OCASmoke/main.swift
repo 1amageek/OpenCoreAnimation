@@ -66,6 +66,11 @@ nonisolated(unsafe) var cornerCurveProbeResult: String = "pending"
 nonisolated(unsafe) var dynamicRangeProbeResult: String = "pending"
 nonisolated(unsafe) var canvasValidationProbeResult: String = "pending"
 
+@MainActor
+private enum ImmutableSnapshotProbeState {
+    static var result: String = "pending"
+}
+
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
         tileDrawCount += 1
@@ -172,6 +177,90 @@ final class DisplayLinkProbeTarget: CADisplayLinkDelegate {
     }
 }
 
+private enum BrowserDelayError: Error {
+    case invalidDuration
+    case setTimeoutUnavailable
+}
+
+/// Owns one browser timer until its checked continuation resumes exactly once.
+@MainActor
+private final class BrowserDelayToken {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var timer: JSTimer?
+    private var callback: JSClosure?
+
+    init(
+        milliseconds: Int,
+        setTimeoutFunction: JSObject? = nil,
+        continuation: CheckedContinuation<Void, Never>
+    ) {
+        self.continuation = continuation
+        if let setTimeoutFunction {
+            let callback = JSClosure { [self] _ in
+                finish()
+                return .undefined
+            }
+            self.callback = callback
+            _ = setTimeoutFunction(
+                this: JSObject.global,
+                callback,
+                milliseconds
+            )
+        } else {
+            timer = JSTimer(millisecondsDelay: Double(milliseconds)) { [self] in
+                finish()
+            }
+        }
+    }
+
+    private func finish() {
+        guard let continuation else { return }
+        self.continuation = nil
+        timer = nil
+        callback = nil
+        continuation.resume()
+    }
+}
+
+/// Suspends through the browser event loop without Swift's reactor deadline
+/// executor, which is unavailable in the pinned Swift 6.4 WASM runtime.
+@MainActor
+private func browserDelay(
+    milliseconds: Int
+) async throws(BrowserDelayError) {
+    guard milliseconds >= 0, Double(milliseconds).isFinite else {
+        throw .invalidDuration
+    }
+    guard JSObject.global.setTimeout.function != nil else {
+        throw .setTimeoutUnavailable
+    }
+    await withCheckedContinuation { continuation in
+        _ = BrowserDelayToken(
+            milliseconds: milliseconds,
+            continuation: continuation
+        )
+    }
+}
+
+/// Uses a captured browser timer function so probes can replace the global
+/// timer API without also disabling their independent observation clock.
+@MainActor
+private func browserDelay(
+    milliseconds: Int,
+    using setTimeoutFunction: JSObject
+) async throws(BrowserDelayError) {
+    guard milliseconds >= 0, Double(milliseconds).isFinite else {
+        throw .invalidDuration
+    }
+    await withCheckedContinuation { continuation in
+        _ = BrowserDelayToken(
+            milliseconds: milliseconds,
+            setTimeoutFunction: setTimeoutFunction,
+            continuation: continuation
+        )
+    }
+}
+
 // MARK: - WASM entry point
 
 @_cdecl("setup")
@@ -215,6 +304,9 @@ public func setup() {
             displayLinkProbeResult = "pending"
             transactionSchedulingProbeResult = "pending"
             transactionCompletionProbeResult = "pending"
+            MainActor.assumeIsolated {
+                ImmutableSnapshotProbeState.result = "pending"
+            }
             emitterProbeResult = "pending"
             replicatorProbeResult = "pending"
             compositionProbeResult = "pending"
@@ -463,6 +555,12 @@ func installHarness() {
         })
         h.expose("getTransactionCompletionProbeResult", returning: {
             .string(transactionCompletionProbeResult)
+        })
+        h.expose("getImmutableSnapshotProbeResult", returning: {
+            let result = MainActor.assumeIsolated {
+                ImmutableSnapshotProbeState.result
+            }
+            return .string(result)
         })
         h.expose("getEmitterProbeResult", returning: {
             .string(emitterProbeResult)
@@ -5053,7 +5151,7 @@ func installHarness() {
 
                 engine.renderFrame()
                 do {
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let firstCount = renderer.activeParticleCount(for: first)
                     let secondCount = renderer.activeParticleCount(for: second)
@@ -5086,7 +5184,7 @@ func installHarness() {
 
                     firstEmitter.cell.emissionLatitude = .pi / 2
                     firstEmitter.cell.emissionLongitude = 0
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     firstEmitter.cell.birthRate = 0
                     secondEmitter.cell.birthRate = 0
@@ -5148,7 +5246,7 @@ func installHarness() {
                     root.addSublayer(sourceBlendEmitter.layer)
                     root.addSublayer(additiveBlendEmitter.layer)
                     engine.renderFrame()
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let blendPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 240, y: 170),
@@ -5196,7 +5294,7 @@ func installHarness() {
                     transientEmitterLayers.append(croppedEmitter.layer)
                     root.addSublayer(croppedEmitter.layer)
                     engine.renderFrame()
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let croppedPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 360, y: 170),
@@ -5259,7 +5357,7 @@ func installHarness() {
                     root.addSublayer(linearEmitter.layer)
                     root.addSublayer(trilinearEmitter.layer)
                     engine.renderFrame()
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let minificationPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 240, y: 170),
@@ -5301,7 +5399,7 @@ func installHarness() {
                     root.addSublayer(invisibleEmitter.layer)
                     root.addSublayer(unsupportedEmitter.layer)
                     engine.renderFrame()
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let invisibleMatches = renderer.activeParticleCount(for: invisibleEmitter.layer) == 1
                         && renderer.lastRenderedParticleSequences(for: invisibleEmitter.layer).isEmpty
@@ -5336,13 +5434,13 @@ func installHarness() {
                     transientEmitterLayers = [parentEmitter.layer]
                     root.addSublayer(parentEmitter.layer)
                     engine.renderFrame()
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let childWasDelayed = !renderer.activeParticleGenerations(
                         for: parentEmitter.layer
                     ).contains(1)
                     parentEmitter.cell.birthRate = 0
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let generations = renderer.activeParticleGenerations(for: parentEmitter.layer)
                     let positions = renderer.activeParticlePositions(for: parentEmitter.layer)
@@ -5394,7 +5492,7 @@ func installHarness() {
                     depthContainer.addSublayer(depthEmitter.layer)
                     root.addSublayer(depthContainer)
                     engine.renderFrame()
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let flattenedEmitterMatches = renderer.transformFlatteningCaptureCount == 1
                         && renderer.transformFlatteningCompositeCount == 1
@@ -5451,7 +5549,10 @@ func installHarness() {
                     CATransaction.setCompletionBlock {
                         unavailableCompletionCount += 1
                     }
-                    try await Task.sleep(for: .milliseconds(20))
+                    try await browserDelay(
+                        milliseconds: 20,
+                        using: originalSetTimeoutFunction
+                    )
                     let unavailableRejected =
                         unavailableCompletionCount == 0
                         && CATransaction.implicitCommitSchedulingFailureCount
@@ -5461,11 +5562,14 @@ func installHarness() {
 
                     browser.setTimeout = originalSetTimeout
                     CATransaction.setDisableActions(false)
-                    try await Task.sleep(for: .milliseconds(40))
+                    try await browserDelay(
+                        milliseconds: 40,
+                        using: originalSetTimeoutFunction
+                    )
                     let unavailableRecovered =
                         unavailableCompletionCount == 1
                         && CATransaction.implicitCommitSchedulingFailureCount
-                            == initialFailureCount + 1
+                            == 0
                         && CATransaction.lastImplicitCommitSchedulingFailure == nil
 
                     let malformedIdentifierSetTimeout = JSClosure { arguments in
@@ -5482,29 +5586,40 @@ func installHarness() {
                     installedTimerMocks.append(malformedIdentifierSetTimeout)
                     browser.setTimeout = malformedIdentifierSetTimeout.jsValue
 
+                    let malformedIdentifierInitialFailureCount =
+                        CATransaction.implicitCommitSchedulingFailureCount
                     var malformedIdentifierCompletionCount = 0
                     CATransaction.setCompletionBlock {
                         malformedIdentifierCompletionCount += 1
                     }
-                    try await Task.sleep(for: .milliseconds(20))
+                    try await browserDelay(
+                        milliseconds: 20,
+                        using: originalSetTimeoutFunction
+                    )
                     let malformedIdentifierRejected =
                         malformedIdentifierCompletionCount == 0
                         && CATransaction.implicitCommitSchedulingFailureCount
-                            == initialFailureCount + 2
+                            == malformedIdentifierInitialFailureCount + 1
                         && CATransaction.lastImplicitCommitSchedulingFailure
                             == .timerIdentifierUnavailable
 
                     browser.setTimeout = originalSetTimeout
                     CATransaction.setDisableActions(false)
-                    try await Task.sleep(for: .milliseconds(40))
+                    try await browserDelay(
+                        milliseconds: 40,
+                        using: originalSetTimeoutFunction
+                    )
                     let completionBeforeStaleTimer =
                         malformedIdentifierCompletionCount
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(
+                        milliseconds: 100,
+                        using: originalSetTimeoutFunction
+                    )
                     let malformedIdentifierRecovered =
                         completionBeforeStaleTimer == 1
                         && malformedIdentifierCompletionCount == 1
                         && CATransaction.implicitCommitSchedulingFailureCount
-                            == initialFailureCount + 2
+                            == 0
                         && CATransaction.lastImplicitCommitSchedulingFailure == nil
 
                     var clearedBoundaryIdentifier: Double?
@@ -5530,7 +5645,7 @@ func installHarness() {
                         clearedBoundaryIdentifier == maximumSafeTimerIdentifier
                         && boundaryIdentifierCompletionCount == 1
                         && CATransaction.implicitCommitSchedulingFailureCount
-                            == initialFailureCount + 2
+                            == 0
 
                     let delayedSetTimeout = JSClosure { arguments in
                         guard let callback = arguments.first?.function else {
@@ -5546,6 +5661,8 @@ func installHarness() {
                     browser.setTimeout = delayedSetTimeout.jsValue
                     browser.clearTimeout = .undefined
 
+                    let unavailableClearInitialFailureCount =
+                        CATransaction.implicitCommitSchedulingFailureCount
                     var unavailableClearCompletionCount = 0
                     CATransaction.setCompletionBlock {
                         unavailableClearCompletionCount += 1
@@ -5557,7 +5674,7 @@ func installHarness() {
                         unavailableClearRejected =
                             unavailableClearCompletionCount == 1
                             && CATransaction.implicitCommitSchedulingFailureCount
-                                == initialFailureCount + 3
+                                == unavailableClearInitialFailureCount + 1
                     } else {
                         unavailableClearRejected = false
                     }
@@ -5567,15 +5684,21 @@ func installHarness() {
                     CATransaction.setCompletionBlock {
                         unavailableClearCompletionCount += 1
                     }
-                    try await Task.sleep(for: .milliseconds(40))
+                    try await browserDelay(
+                        milliseconds: 40,
+                        using: originalSetTimeoutFunction
+                    )
                     let completionBeforeUncancellableTimer =
                         unavailableClearCompletionCount
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(
+                        milliseconds: 100,
+                        using: originalSetTimeoutFunction
+                    )
                     let unavailableClearRecovered =
                         completionBeforeUncancellableTimer == 2
                         && unavailableClearCompletionCount == 2
                         && CATransaction.implicitCommitSchedulingFailureCount
-                            == initialFailureCount + 3
+                            == 0
                         && CATransaction.lastImplicitCommitSchedulingFailure == nil
 
                     var blockedImplicitCompletionCount = 0
@@ -5583,11 +5706,17 @@ func installHarness() {
                         blockedImplicitCompletionCount += 1
                     }
                     CATransaction.begin()
-                    try await Task.sleep(for: .milliseconds(20))
+                    try await browserDelay(
+                        milliseconds: 20,
+                        using: originalSetTimeoutFunction
+                    )
                     let explicitTransactionBlockedImplicitCommit =
                         blockedImplicitCompletionCount == 0
                     CATransaction.commit()
-                    try await Task.sleep(for: .milliseconds(40))
+                    try await browserDelay(
+                        milliseconds: 40,
+                        using: originalSetTimeoutFunction
+                    )
                     let explicitTransactionRescheduledImplicitCommit =
                         explicitTransactionBlockedImplicitCommit
                         && blockedImplicitCompletionCount == 1
@@ -5636,6 +5765,111 @@ func installHarness() {
                 transactionCompletionProbeResult =
                     "pendingBeforeRender=\(pendingBeforeRender),"
                     + "completedAfterRender=\(completedAfterRender)"
+            }
+        })
+        h.expose("beginImmutableSnapshotProbe", action: {
+            Task { @MainActor in
+                ImmutableSnapshotProbeState.result = "running"
+                guard let renderer =
+                        CAAnimationEngine.shared.rendererBackend
+                        as? CAWebGPURenderer else {
+                    ImmutableSnapshotProbeState.result =
+                        "error: renderer unavailable"
+                    return
+                }
+
+                let snapshotRoot = CALayer()
+                let snapshotChild = CALayer()
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                snapshotRoot.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 400,
+                    height: 300
+                )
+                snapshotRoot.position = CGPoint(x: 200, y: 150)
+                snapshotRoot.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotChild.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40
+                )
+                snapshotChild.position = CGPoint(x: 50, y: 50)
+                snapshotChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotRoot.addSublayer(snapshotChild)
+                CATransaction.commit()
+
+                snapshotChild.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                renderer.render(layer: snapshotRoot)
+                do {
+                    let pixel = try await renderer.readbackPixel(
+                        x: 50,
+                        y: 250
+                    )
+                    CATransaction.flush()
+                    let overflowRoot = CALayer()
+                    var overflowCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        overflowCompletionRan = true
+                    }
+                    overflowRoot.bounds = snapshotRoot.bounds
+                    overflowRoot.position = snapshotRoot.position
+                    overflowRoot.backgroundColor = snapshotRoot.backgroundColor
+                    for index in 0...1024 {
+                        let child = CALayer()
+                        child.bounds = CGRect(
+                            x: 0,
+                            y: 0,
+                            width: 1,
+                            height: 1
+                        )
+                        child.position = CGPoint(
+                            x: CGFloat(index % 400),
+                            y: CGFloat(index / 400)
+                        )
+                        child.backgroundColor = snapshotChild.backgroundColor
+                        overflowRoot.addSublayer(child)
+                    }
+                    CATransaction.commit()
+                    let frameFailuresBeforeOverflow =
+                        renderer.frameRenderFailureCount
+                    renderer.render(layer: overflowRoot)
+                    let overflowWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeOverflow + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .vertexCapacityExceeded(.background)
+                            )
+                    let overflowCompletionRemainedPending =
+                        !overflowCompletionRan
+                    ImmutableSnapshotProbeState.result =
+                        pixel.map(String.init).joined(separator: ",")
+                        + ",overflowTyped=\(overflowWasTyped)"
+                        + ",overflowPending=\(overflowCompletionRemainedPending)"
+                } catch {
+                    ImmutableSnapshotProbeState.result =
+                        "error: snapshot readback failed: \(error)"
+                }
             }
         })
         h.expose("beginDisplayLinkProbe", action: {
@@ -5705,7 +5939,7 @@ func installHarness() {
                     browser.requestAnimationFrame = originalRequestAnimationFrame
                     unavailableRequestLink.isPaused = true
                     unavailableRequestLink.isPaused = false
-                    try await Task.sleep(for: .milliseconds(80))
+                    try await browserDelay(milliseconds: 80)
                     let unavailableRequestRecovered =
                         unavailableRequestTarget.callbackCount > 0
                         && unavailableRequestLink.schedulingFailureCount == 1
@@ -5760,10 +5994,10 @@ func installHarness() {
 
                     browser.cancelAnimationFrame = originalCancelAnimationFrame
                     unavailableCancelLink.isPaused = false
-                    try await Task.sleep(for: .milliseconds(80))
+                    try await browserDelay(milliseconds: 80)
                     let callbacksBeforeUncancellableDelivery =
                         unavailableCancelTarget.callbackCount
-                    try await Task.sleep(for: .milliseconds(80))
+                    try await browserDelay(milliseconds: 80)
                     let unavailableCancelRecovered =
                         callbacksBeforeUncancellableDelivery > 0
                         && unavailableCancelTarget.callbackCount
@@ -5791,7 +6025,7 @@ func installHarness() {
                         selector: Selector("displayLinkDidFire")
                     )
                     missingTimestampLink.add(to: .main, forMode: .default)
-                    try await Task.sleep(for: .milliseconds(60))
+                    try await browserDelay(milliseconds: 60)
                     let missingTimestampRejected =
                         missingTimestampTarget.callbackCount == 0
                         && missingTimestampLink.schedulingFailureCount == 1
@@ -5801,7 +6035,7 @@ func installHarness() {
                     browser.requestAnimationFrame = originalRequestAnimationFrame
                     missingTimestampLink.isPaused = true
                     missingTimestampLink.isPaused = false
-                    try await Task.sleep(for: .milliseconds(80))
+                    try await browserDelay(milliseconds: 80)
                     let missingTimestampRecovered =
                         missingTimestampTarget.callbackCount > 0
                         && missingTimestampLink.schedulingFailureCount == 1
@@ -5829,7 +6063,7 @@ func installHarness() {
                         selector: Selector("displayLinkDidFire")
                     )
                     invalidIdentifierLink.add(to: .main, forMode: .default)
-                    try await Task.sleep(for: .milliseconds(20))
+                    try await browserDelay(milliseconds: 20)
                     let invalidIdentifierRejected =
                         invalidIdentifierTarget.callbackCount == 0
                         && invalidIdentifierLink.schedulingFailureCount == 1
@@ -5839,10 +6073,10 @@ func installHarness() {
                     browser.requestAnimationFrame = originalRequestAnimationFrame
                     invalidIdentifierLink.isPaused = true
                     invalidIdentifierLink.isPaused = false
-                    try await Task.sleep(for: .milliseconds(80))
+                    try await browserDelay(milliseconds: 80)
                     let callbacksBeforeStaleDelivery =
                         invalidIdentifierTarget.callbackCount
-                    try await Task.sleep(for: .milliseconds(80))
+                    try await browserDelay(milliseconds: 80)
                     let invalidIdentifierRecovered =
                         callbacksBeforeStaleDelivery > 0
                         && invalidIdentifierTarget.callbackCount
@@ -5853,23 +6087,23 @@ func installHarness() {
 
                     displayLink.add(to: .main, forMode: .default)
                     displayLink.add(to: .main, forMode: .common)
-                    try await Task.sleep(for: .milliseconds(140))
+                    try await browserDelay(milliseconds: 140)
                     let initialCount = target.callbackCount
 
                     displayLink.isPaused = true
-                    try await Task.sleep(for: .milliseconds(80))
+                    try await browserDelay(milliseconds: 80)
                     let pausedCount = target.callbackCount
                     displayLink.isPaused = false
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     let resumedCount = target.callbackCount
 
                     displayLink.remove(from: .main, forMode: .default)
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     let retainedModeCount = target.callbackCount
 
                     displayLink.remove(from: .main, forMode: .common)
                     let stoppedCount = target.callbackCount
-                    try await Task.sleep(for: .milliseconds(100))
+                    try await browserDelay(milliseconds: 100)
                     let finalCount = target.callbackCount
 
                     displayLinkProbeResult = [
@@ -5911,7 +6145,7 @@ func installHarness() {
         h.expose("beginPixelReadback", action: {
             Task { @MainActor in
                 do {
-                    try await Task.sleep(for: .milliseconds(300))
+                    try await browserDelay(milliseconds: 300)
                 } catch {
                     pixelReadbackResult = "error: fade wait failed: \(error)"
                     return

@@ -95,7 +95,7 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
 
     private var target: AnyObject?
     private var selector: Selector
-    private var registrations: Set<Registration> = []
+    private var registrations: [Registration] = []
     private var isInvalidated = false
     private var pendingFrameCallback: JSOneshotClosure?
     private var animationFrameId: UInt32?
@@ -170,10 +170,13 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     open func add(to runloop: RunLoop, forMode mode: RunLoop.Mode) {
         guard !isInvalidated else { return }
         let wasRunning = isRunning
-        registrations.insert(Registration(
+        let registration = Registration(
             runLoopID: ObjectIdentifier(runloop),
             mode: mode
-        ))
+        )
+        if !registrations.contains(registration) {
+            registrations.append(registration)
+        }
         if !wasRunning && isRunning && !isPaused {
             startAnimationLoop()
         }
@@ -197,10 +200,11 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     ///   - mode: Identifies the registration to remove.
     open func remove(from runloop: RunLoop, forMode mode: RunLoop.Mode) {
         guard !isInvalidated else { return }
-        registrations.remove(Registration(
+        let registration = Registration(
             runLoopID: ObjectIdentifier(runloop),
             mode: mode
-        ))
+        )
+        registrations.removeAll { $0 == registration }
         if registrations.isEmpty {
             stopAnimationLoop()
         }

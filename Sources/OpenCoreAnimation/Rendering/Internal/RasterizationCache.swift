@@ -115,7 +115,7 @@ internal final class RasterizationCache<TextureRef> {
 
     // MARK: Storage
 
-    private var entries: [RasterizationCacheKey: RasterizedEntry<TextureRef>] = [:]
+    private var entries = RasterizationCacheKeyMap<RasterizedEntry<TextureRef>>()
 
     /// Called whenever the cache relinquishes ownership of a texture,
     /// including replacement and every eviction path. Renderers use this
@@ -206,7 +206,7 @@ internal final class RasterizationCache<TextureRef> {
     /// whole instance.
     internal func removeAll() {
         if let onEvict = onEvict {
-            for (key, entry) in entries {
+            entries.forEach { key, entry in
                 onEvict(key, entry.texture)
             }
         }
@@ -234,7 +234,9 @@ internal final class RasterizationCache<TextureRef> {
     internal func evictToBudget() {
         var live = bytes
         guard live > maxBytes else { return }
-        let ordered = entries.sorted { $0.value.lastUsedFrame < $1.value.lastUsedFrame }
+        let ordered = entries.sorted {
+            $0.value.lastUsedFrame < $1.value.lastUsedFrame
+        }
         for (key, entry) in ordered {
             if live <= maxBytes { break }
             remove(key)

@@ -36,6 +36,10 @@ struct CARenderSnapshotTests {
         )
         root.cornerRadius = 4
         root.maskedCorners = [.layerMinXMinYCorner]
+        root.isGeometryFlipped = true
+        root.toneMapMode = .never
+        root.preferredDynamicRange = .high
+        root.contentsHeadroom = 2
 
         let front = CALayer()
         front.zPosition = 2
@@ -52,6 +56,10 @@ struct CARenderSnapshotTests {
         #expect(values.borderWidth == 2)
         #expect(values.borderColor == SIMD4<Float>(0, 0, 1, 1))
         #expect(values.cornerRadii == SIMD4<Float>(4, 0, 0, 0))
+        #expect(values.isGeometryFlipped)
+        #expect(values.toneMapMode == .never)
+        #expect(values.preferredDynamicRange == .high)
+        #expect(values.contentsHeadroom == 2)
         #expect(
             rootNode.childIndices.map { snapshot.nodes[$0].identity }
                 == [ObjectIdentifier(back), ObjectIdentifier(front)]

@@ -41,12 +41,12 @@ private struct GeometryCacheEntry {
 /// // At end of frame
 /// cache.advanceFrame()
 /// ```
-public final class GeometryCache {
+@MainActor public final class GeometryCache {
 
     // MARK: - Properties
 
     /// Cache of tessellated geometry keyed by GeometryCacheKey.
-    private var cache: [GeometryCacheKey: GeometryCacheEntry] = [:]
+    private var cache = GeometryCacheKeyMap<GeometryCacheEntry>()
 
     /// Current frame number for LRU tracking.
     private var currentFrame: UInt64 = 0
@@ -186,7 +186,7 @@ public final class GeometryCache {
         let cutoffFrame = currentFrame > frameThreshold ? currentFrame - frameThreshold : 0
 
         var keysToRemove: [GeometryCacheKey] = []
-        for (key, entry) in cache {
+        cache.forEach { key, entry in
             if entry.lastAccessFrame < cutoffFrame {
                 keysToRemove.append(key)
             }
@@ -222,7 +222,7 @@ public final class GeometryCache {
         var oldestKey: GeometryCacheKey?
         var oldestFrame: UInt64 = .max
 
-        for (key, entry) in cache {
+        cache.forEach { key, entry in
             if entry.lastAccessFrame < oldestFrame {
                 oldestFrame = entry.lastAccessFrame
                 oldestKey = key

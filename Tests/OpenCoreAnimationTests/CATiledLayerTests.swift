@@ -122,6 +122,50 @@ struct CATiledLayerTests {
         #expect(copy.tileCache.isEmpty)
     }
 
+    @Test("Tile storage preserves keys through growth, replacement, and removal")
+    func tileStorageGrowthAndRemoval() {
+        var keys: [CATiledLayer.TileKey] = []
+        var keySet = CATileKeySet()
+        var keyMap = CATileKeyMap<Int>()
+
+        for index in 0..<128 {
+            let key = CATiledLayer.TileKey(
+                column: index % 17,
+                row: index / 17,
+                lodLevel: index % 5 - 2
+            )
+            keys.append(key)
+            #expect(keySet.insert(key).inserted)
+            #expect(keyMap.updateValue(index, forKey: key) == nil)
+        }
+
+        #expect(keySet.count == keys.count)
+        #expect(keyMap.count == keys.count)
+        for (index, key) in keys.enumerated() {
+            #expect(keySet.contains(key))
+            #expect(keyMap[key] == index)
+        }
+
+        for index in stride(from: 0, to: keys.count, by: 3) {
+            let key = keys[index]
+            #expect(keySet.remove(key) == key)
+            #expect(keyMap.removeValue(forKey: key) == index)
+            #expect(!keySet.contains(key))
+            #expect(keyMap[key] == nil)
+        }
+
+        let retainedKey = keys[1]
+        #expect(keyMap.updateValue(999, forKey: retainedKey) == 1)
+        #expect(keyMap[retainedKey] == 999)
+        keySet.removeAll(keepingCapacity: true)
+        keyMap.removeAll(keepingCapacity: true)
+        #expect(keySet.isEmpty)
+        #expect(keyMap.isEmpty)
+        #expect(keySet.insert(retainedKey).inserted)
+        keyMap[retainedKey] = 7
+        #expect(keyMap[retainedKey] == 7)
+    }
+
     private func makeImage() throws -> CGImage {
         let pixelData = Data([255, 0, 255, 255])
         let provider = CGDataProvider(data: pixelData)

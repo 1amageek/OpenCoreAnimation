@@ -806,14 +806,19 @@ through mutex-protected root storage. Per-node content revisions ensure an
 older submission clears only the dirty state it actually captured; native
 pixel readback proves both the committed pixel and preservation of a later
 model mutation. Capture failures remain typed committed state. Production
-WebGPU still reads the live tree, and the snapshot does not yet own its masks,
-specialized-layer resources, or copied animation evaluators. Common solid
-nodes now value-own background, border, corner geometry, antialiasing,
-transform, visibility, and stable z-ordered child indices. A static tree that
-needs masks, contents, delegates, effects, a specialized layer, rasterization,
-transition state, clipping, group opacity, or backface handling publishes
-`requiresLiveResourceCapture` with the exact first requirement instead of
-claiming snapshot success. Animated commits similarly publish
+WebGPU now encodes common static solid trees directly from the immutable
+snapshot. Those nodes value-own background, border, corner geometry,
+antialiasing, transforms, visibility, geometry orientation, dynamic-range
+policy, and stable z-ordered child indices. Chromium readback verifies that
+captured geometry and color reach the GPU without a post-capture `CALayer`
+read. Capacity or resource failure during that encoding remains a typed frame
+failure and does not submit, clear captured dirty state, or release transaction
+completion. The snapshot does not yet own masks, resource-backed contents,
+specialized-layer resources, or copied animation evaluators. A static tree
+that needs masks, contents, delegates, effects, a specialized layer,
+rasterization, transition state, clipping, group opacity, or backface handling
+publishes `requiresLiveResourceCapture` with the exact first requirement
+instead of claiming snapshot success. Animated commits similarly publish
 `requiresLiveAnimationEvaluation`; layout-pending commits publish
 `requiresLiveTreePreparation`. WebGPU rejects typed committed capture failures,
 captures layer and detached-mask revisions after delegate callbacks, clears
@@ -1015,8 +1020,9 @@ path. A custom `CAAction` that mutates another root while the outer commit is
 being applied registers that root with the coordinator without opening a
 second implicit transaction.
 
-The current Metal and WebGPU renderers release the render-root obligation only
-after command submission and dirty clearing:
+The Metal renderer, WebGPU immutable-solid path, and WebGPU typed live-tree
+paths release the render-root obligation only after command submission and
+dirty clearing:
 
 ```swift
 device.queue.submit([encoder.finish()])
@@ -1026,9 +1032,10 @@ rootLayer.completeTransactionsAfterRenderRecursively() // ② then release block
 
 If a transaction has neither model mutations nor animations, sealing its
 coordinator completes it immediately. If a mutated root has not been submitted,
-the coordinator remains pending on that root. Native static snapshots preserve
-the same coordinator semantics; animated and WebGPU submissions remain live-tree
-paths until the rest of R4.1 is implemented.
+the coordinator remains pending on that root. Native static snapshots and
+WebGPU common-solid snapshots preserve the same coordinator semantics;
+animated and resource-backed WebGPU submissions remain typed live-tree paths
+until the rest of R4.1 is implemented.
 
 **Why this order (B6 detail).** A completion block can legally mutate the
 layer graph — the canonical pattern is "fade-out animation finishes →
@@ -1050,22 +1057,24 @@ matches its documented behavior.
 
 ### 6.6 Planned snapshot migration (R4.1–R4.4)
 
-The production WebGPU renderer currently reads the live model/presentation
-tree. The native Metal backend consumes transaction-owned immutable value
-snapshots for static trees. Animated trees still require frame-time capture,
-and the richer WebGPU state is not yet implemented. As R4.1–R4.4 continue,
-migration may temporarily permit
+The production WebGPU renderer consumes transaction-owned immutable value
+snapshots for common static solid trees. The native Metal backend consumes
+those snapshots for every currently supported static tree. Animated trees and
+resource-backed or specialized WebGPU trees still require frame-time live-tree
+evaluation because the richer immutable resource state is not yet
+implemented. As R4.1–R4.4 continue, migration may temporarily permit
 `pendingSnapshot == nil` (no commit happened) to render live for existing
 callers (`CADisplayLink.displayLinkDidFire` direct →
 `renderer.render(layer:)`).
 
-The pending state exists on each render root. WebGPU consumes capture failures
-and generation ownership but does not yet consume the snapshot's render values.
-Completion ordering in §6.5, the live-tree static submission decision in §6.3,
-transaction-owned native static snapshots, revision-safe dirty clearing on
-both backends, and native frame-boundary mutation isolation are the completed
-Phase 4 slices. The final snapshot acceptance test must prove that every
-backend and animated frame no longer read mutable model state after commit.
+The pending state exists on each render root. WebGPU consumes capture failures,
+generation ownership, and common-solid snapshot render values. Completion
+ordering in §6.5, the live-tree static submission decision in §6.3,
+transaction-owned static snapshots, direct common-solid WebGPU encoding,
+revision-safe dirty clearing on both backends, and frame-boundary mutation
+isolation are completed Phase 4 slices. The final snapshot acceptance test must
+prove that resource-backed, specialized, and animated frames also stop reading
+mutable model state after commit.
 
 ### 6.7 Edge cases checklist
 

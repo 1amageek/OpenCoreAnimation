@@ -14,5 +14,6 @@ public enum CAWebGPUFrameRenderFailure: Error, Equatable, Sendable {
     case layerFilterProcessorUnavailable
     case rasterizationCacheUnavailable
     case committedSnapshotCaptureFailed(CARendererError)
+    case committedSnapshotEncodingFailed(CASolidRenderFailure)
     case layerRevisionCaptureFailed(CARendererError)
 }
