@@ -3,7 +3,6 @@ import Foundation
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
     case contents
-    case delegateBackingStore
     case mask
     case opacityGroup
     case shadow
@@ -23,11 +22,11 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
 // including nested rectangular and rounded clipping and ordinary CGImage
 // contents. Production WebGPU still uses explicitly typed live-tree branches
-// for non-image contents, delegate backing stores, masks, specialized layers,
-// animation evaluation, and layout preparation. Phase 4 must not be considered
-// complete until those values and resources are owned here, the live-tree commit
-// states are removed, and every WebGPU frame encodes without reading mutable
-// model layers after capture.
+// for non-image contents, masks, specialized layers, animation evaluation, and
+// layout preparation. Phase 4 must not be considered complete until those
+// values and resources are owned here, the live-tree commit states are removed,
+// and every WebGPU frame encodes without reading mutable model layers after
+// capture.
 internal struct CARenderSnapshot: Sendable {
     internal struct PresentationValues: Sendable, Equatable {
         internal let bounds: CGRect
@@ -110,6 +109,13 @@ internal struct CARenderSnapshot: Sendable {
             throw .cyclicLayerHierarchy
         }
 
+        do {
+            try layer.prepareDelegateBackingStore(
+                maximumPixelDimension: Int.max
+            )
+        } catch {
+            throw .invalidDelegateBackingStore(error)
+        }
         let contentRevision = layer._contentRevision
         let presentationLayer = layer._renderTimePresentation()
         if liveTreeRequirement == nil {
@@ -118,7 +124,10 @@ internal struct CARenderSnapshot: Sendable {
                 presentationLayer: presentationLayer
             )
         }
-        let values = try presentationValues(from: presentationLayer)
+        let values = try presentationValues(
+            from: presentationLayer,
+            delegateBackingStore: layer.delegateBackingStore
+        )
         let nodeIndex = nodes.count
         nodes.append(
             Node(
@@ -162,9 +171,6 @@ internal struct CARenderSnapshot: Sendable {
            !(presentationLayer.contents is CGImage) {
             return .contents
         }
-        if modelLayer.delegate != nil {
-            return .delegateBackingStore
-        }
         if presentationLayer.mask != nil {
             return .mask
         }
@@ -194,7 +200,8 @@ internal struct CARenderSnapshot: Sendable {
     }
 
     private static func presentationValues(
-        from layer: CALayer
+        from layer: CALayer,
+        delegateBackingStore: CADelegateBackingStore? = nil
     ) throws(CARendererError) -> PresentationValues {
         guard layer.bounds.origin.x.isFinite,
               layer.bounds.origin.y.isFinite,
@@ -276,7 +283,10 @@ internal struct CARenderSnapshot: Sendable {
         }
         let imageContents: CAImageContentsSnapshot?
         do {
-            imageContents = try captureImageContents(from: layer)
+            imageContents = try captureImageContents(
+                from: layer,
+                delegateBackingStore: delegateBackingStore
+            )
         } catch {
             throw .invalidLayerContents(error)
         }
@@ -316,9 +326,12 @@ internal struct CARenderSnapshot: Sendable {
     }
 
     private static func captureImageContents(
-        from layer: CALayer
+        from layer: CALayer,
+        delegateBackingStore: CADelegateBackingStore?
     ) throws(CAImageContentsSnapshotError) -> CAImageContentsSnapshot? {
-        guard let image = layer.contents as? CGImage else { return nil }
+        let image = delegateBackingStore?.image
+            ?? (layer.contents as? CGImage)
+        guard let image else { return nil }
         guard let sampling = CAContentsSampling(
             magnificationFilter: layer.magnificationFilter,
             minificationFilter: layer.minificationFilter
@@ -341,6 +354,9 @@ internal struct CARenderSnapshot: Sendable {
         }
         return CAImageContentsSnapshot(
             storage: storage,
+            origin: delegateBackingStore.map {
+                .delegateBackingStore($0.format.contentsFormat)
+            } ?? .layerContents,
             contentsRect: layer.contentsRect,
             contentsCenter: layer.contentsCenter,
             contentsScale: layer.contentsScale,

@@ -1052,7 +1052,7 @@ private final class EmitterLayerState {
     /// Number of live delegate-generated backing stores retained by the renderer.
     @_spi(RendererDiagnostics)
     public var activeDelegateBackingStoreCount: Int {
-        delegateBackingStores.count
+        activeDelegateBackingStoreLayerIDs.count
     }
 
     /// The preferred texture format.
@@ -1064,8 +1064,8 @@ private final class EmitterLayerState {
     /// The swap-chain texture most recently submitted for presentation.
     private var lastRenderedTexture: GPUTexture?
 
-    /// Software-rasterized backing stores for ordinary CALayer delegates.
-    private var delegateBackingStores: [ObjectIdentifier: CGImage] = [:]
+    /// Layer identities whose layer-owned delegate backing stores are active.
+    private var activeDelegateBackingStoreLayerIDs: Set<ObjectIdentifier> = []
 
     /// The canvas element (JavaScript object).
     private let canvas: JSObject
@@ -4464,11 +4464,18 @@ private final class EmitterLayerState {
         let committedFrameToken: UInt64?
         switch committedState {
         case .captureFailure(_, let error):
+            synchronizeDelegateBackingStoreDiagnostics(in: rootLayer)
+            if case .invalidDelegateBackingStore(let backingStoreError) = error {
+                delegateDrawFailureCount += 1
+                lastDelegateBackingStoreError = backingStoreError
+                lastDelegateBackingStoreFormat = nil
+            }
             recordFrameRenderFailure(
                 .committedSnapshotCaptureFailed(error)
             )
             return
         case .snapshot(let snapshot):
+            synchronizeDelegateBackingStoreDiagnostics(in: snapshot)
             committedFrameToken = snapshot.frameToken
         case .requiresLiveAnimationEvaluation(let frameToken),
              .requiresLiveTreePreparation(let frameToken),
@@ -4593,10 +4600,18 @@ private final class EmitterLayerState {
         suppressShadowRendering = false
         activeEmitterLayerIDs.removeAll(keepingCapacity: true)
         collectEmitterLayerIDs(rootLayer, into: &activeEmitterLayerIDs)
-        updateDelegateBackingStores(
-            in: rootLayer,
-            maximumTextureDimension: max(1, Int(device.limits.maxTextureDimension2D))
-        )
+        do {
+            try updateDelegateBackingStores(
+                in: rootLayer,
+                maximumTextureDimension: max(
+                    1,
+                    Int(device.limits.maxTextureDimension2D)
+                )
+            )
+        } catch {
+            recordFrameRenderFailure(.delegateBackingStoreFailed(error))
+            return
+        }
         let submittedRevisions: CARenderRevisionSnapshot
         do {
             submittedRevisions = try CARenderRevisionSnapshot.capture(rootLayer)
@@ -4874,225 +4889,95 @@ private final class EmitterLayerState {
     private func updateDelegateBackingStores(
         in rootLayer: CALayer,
         maximumTextureDimension: Int
+    ) throws(CADelegateBackingStoreError) {
+        var visited: Set<ObjectIdentifier> = []
+        var activeBackingStoreLayerIDs: Set<ObjectIdentifier> = []
+
+        func visit(
+            _ layer: CALayer
+        ) throws(CADelegateBackingStoreError) {
+            let identifier = ObjectIdentifier(layer)
+            guard visited.insert(identifier).inserted else { return }
+            try layer.prepareDelegateBackingStore(
+                maximumPixelDimension: maximumTextureDimension
+            )
+            if let backingStore = layer.delegateBackingStore {
+                activeBackingStoreLayerIDs.insert(identifier)
+                lastDelegateBackingStoreError = nil
+                lastDelegateBackingStoreFormat =
+                    backingStore.format.contentsFormat
+            }
+            if let mask = layer.mask {
+                try visit(mask)
+            }
+            for sublayer in layer.sublayers ?? [] {
+                try visit(sublayer)
+            }
+        }
+
+        do {
+            try visit(rootLayer)
+            activeDelegateBackingStoreLayerIDs =
+                activeBackingStoreLayerIDs
+        } catch {
+            activeDelegateBackingStoreLayerIDs =
+                activeBackingStoreLayerIDs
+            delegateDrawFailureCount += 1
+            lastDelegateBackingStoreError = error
+            lastDelegateBackingStoreFormat = nil
+            throw error
+        }
+    }
+
+    private func synchronizeDelegateBackingStoreDiagnostics(
+        in snapshot: CARenderSnapshot
+    ) {
+        var identifiers: Set<ObjectIdentifier> = []
+        var lastFormat: CALayerContentsFormat?
+        for node in snapshot.nodes {
+            guard case .delegateBackingStore(let format)? =
+                    node.presentationValues.imageContents?.origin else {
+                continue
+            }
+            identifiers.insert(node.identity)
+            lastFormat = format
+        }
+        activeDelegateBackingStoreLayerIDs = identifiers
+        if let lastFormat {
+            lastDelegateBackingStoreError = nil
+            lastDelegateBackingStoreFormat = lastFormat
+        } else {
+            lastDelegateBackingStoreFormat = nil
+        }
+    }
+
+    private func synchronizeDelegateBackingStoreDiagnostics(
+        in rootLayer: CALayer
     ) {
         var visited: Set<ObjectIdentifier> = []
-        var activeLayerIDs: Set<ObjectIdentifier> = []
+        var identifiers: Set<ObjectIdentifier> = []
+        var lastFormat: CALayerContentsFormat?
 
         func visit(_ layer: CALayer) {
             let identifier = ObjectIdentifier(layer)
             guard visited.insert(identifier).inserted else { return }
-            activeLayerIDs.insert(identifier)
-
-            if layer.needsDisplay(), supportsDelegateBackingStore(for: layer) {
-                updateDelegateBackingStore(
-                    for: layer,
-                    identifier: identifier,
-                    maximumTextureDimension: maximumTextureDimension
-                )
-            } else if layer._dirtyMask.contains(.contents) {
-                // An explicit contents assignment supersedes the previously
-                // rasterized delegate backing store.
-                delegateBackingStores.removeValue(forKey: identifier)
+            if let backingStore = layer.delegateBackingStore {
+                identifiers.insert(identifier)
+                lastFormat = backingStore.format.contentsFormat
             }
             if let mask = layer.mask {
                 visit(mask)
             }
-            for sublayer in layer.sublayers ?? [] {
-                visit(sublayer)
+            for child in layer.sublayers ?? [] {
+                visit(child)
             }
         }
 
         visit(rootLayer)
-        delegateBackingStores = delegateBackingStores.filter {
-            activeLayerIDs.contains($0.key)
+        activeDelegateBackingStoreLayerIDs = identifiers
+        if let lastFormat {
+            lastDelegateBackingStoreFormat = lastFormat
         }
-    }
-
-    private func supportsDelegateBackingStore(for layer: CALayer) -> Bool {
-        !(layer is CATiledLayer)
-            && !(layer is CATransformLayer)
-            && !(layer is CAEmitterLayer)
-            && !(layer is CATextLayer)
-            && !(layer is CAShapeLayer)
-            && !(layer is CAGradientLayer)
-    }
-
-    private func updateDelegateBackingStore(
-        for layer: CALayer,
-        identifier: ObjectIdentifier,
-        maximumTextureDimension: Int
-    ) {
-        guard let displayInvalidation = layer.pendingDisplayInvalidation else { return }
-        let revisionBeforeDisplay = layer._contentRevision
-        layer.displayIfNeeded()
-        if layer._contentRevision != revisionBeforeDisplay {
-            delegateBackingStores.removeValue(forKey: identifier)
-            return
-        }
-
-        guard let delegate = layer.delegate else {
-            delegateBackingStores.removeValue(forKey: identifier)
-            return
-        }
-        let bounds = layer.bounds
-        let scale = layer.contentsScale
-        guard bounds.width.isFinite,
-              bounds.height.isFinite,
-              bounds.width > 0,
-              bounds.height > 0,
-              scale.isFinite,
-              scale > 0 else {
-            rejectDelegateBackingStore(identifier: identifier, error: .invalidGeometry)
-            return
-        }
-
-        let pixelWidthValue = ceil(bounds.width * scale)
-        let pixelHeightValue = ceil(bounds.height * scale)
-        let maximumDimension = CGFloat(maximumTextureDimension)
-        guard pixelWidthValue.isFinite,
-              pixelHeightValue.isFinite,
-              pixelWidthValue <= maximumDimension,
-              pixelHeightValue <= maximumDimension else {
-            let reportedWidth = pixelWidthValue.isFinite && pixelWidthValue <= CGFloat(Int.max)
-                ? Int(pixelWidthValue)
-                : Int.max
-            let reportedHeight = pixelHeightValue.isFinite && pixelHeightValue <= CGFloat(Int.max)
-                ? Int(pixelHeightValue)
-                : Int.max
-            rejectDelegateBackingStore(
-                identifier: identifier,
-                error: .dimensionsExceedTextureLimit(
-                    width: reportedWidth,
-                    height: reportedHeight,
-                    maximum: maximumTextureDimension
-                )
-            )
-            return
-        }
-        let pixelWidth = Int(pixelWidthValue)
-        let pixelHeight = Int(pixelHeightValue)
-        let backingStoreFormat: CADelegateBackingStoreFormat
-        do {
-            backingStoreFormat = try CADelegateBackingStoreFormat.resolve(
-                contentsFormat: layer.contentsFormat,
-                contentsHeadroom: layer.contentsHeadroom
-            )
-        } catch {
-            rejectDelegateBackingStore(identifier: identifier, error: error)
-            return
-        }
-
-        let colorSpace: CGColorSpace
-        let bitmapInfo: CGBitmapInfo
-        switch backingStoreFormat {
-        case .rgba8Uint:
-            colorSpace = .deviceRGB
-            bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-        case .rgba16Float:
-            guard let extendedColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB) else {
-                rejectDelegateBackingStore(identifier: identifier, error: .extendedColorSpaceUnavailable)
-                return
-            }
-            colorSpace = extendedColorSpace
-            bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-                .union(.floatComponents)
-                .union(.byteOrder16Little)
-        case .gray8Uint:
-            colorSpace = .deviceGray
-            bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue)
-        }
-        guard let context = CGContext(
-            softwareData: nil,
-            width: pixelWidth,
-            height: pixelHeight,
-            bitsPerComponent: backingStoreFormat.bitsPerComponent,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo
-        ) else {
-            rejectDelegateBackingStore(identifier: identifier, error: .contextCreationFailed)
-            return
-        }
-        if backingStoreFormat == .rgba16Float,
-           layer.contentsHeadroom > 1,
-           !context.setEDRTargetHeadroom(Float(layer.contentsHeadroom)) {
-            rejectDelegateBackingStore(
-                identifier: identifier,
-                error: .extendedHeadroomRejected(layer.contentsHeadroom)
-            )
-            return
-        }
-
-        let invalidationRect: CGRect
-        switch displayInvalidation {
-        case .full:
-            invalidationRect = bounds
-        case .partial(let requestedRect):
-            invalidationRect = requestedRect.intersection(bounds)
-            if let previousImage = delegateBackingStores[identifier],
-               previousImage.width == pixelWidth,
-               previousImage.height == pixelHeight,
-               previousImage.bitsPerComponent == backingStoreFormat.bitsPerComponent,
-               previousImage.bitsPerPixel == backingStoreFormat.bitsPerPixel,
-               previousImage.bytesPerRow == context.bytesPerRow,
-               previousImage.colorSpace == colorSpace,
-               previousImage.bitmapInfo == bitmapInfo,
-               let previousData = previousImage.data,
-               previousData.count >= context.bytesPerRow * pixelHeight,
-               let destination = CGBitmapContextGetData(context) {
-                // Partial redraw must preserve untouched pixels. The copy is
-                // required because CGImage snapshots are immutable while the
-                // new CGContext needs independent mutable storage.
-                previousData.withUnsafeBytes { source in
-                    if let sourceAddress = source.baseAddress {
-                        destination.copyMemory(
-                            from: sourceAddress,
-                            byteCount: context.bytesPerRow * pixelHeight
-                        )
-                    }
-                }
-            }
-        }
-
-        let hasDrawableInvalidation = invalidationRect.origin.x.isFinite
-            && invalidationRect.origin.y.isFinite
-            && invalidationRect.width.isFinite
-            && invalidationRect.height.isFinite
-            && invalidationRect.width > 0
-            && invalidationRect.height > 0
-        if hasDrawableInvalidation {
-            context.scaleBy(x: scale, y: scale)
-            if layer.contentsAreFlipped() {
-                context.translateBy(x: -bounds.minX, y: -bounds.minY)
-            } else {
-                // CGImage row zero is the top row, while OpenCoreAnimation's
-                // default layer geometry is Y-up. Write logical Y=0 into the
-                // final bitmap row so textured display preserves that contract.
-                context.translateBy(x: -bounds.minX, y: bounds.maxY)
-                context.scaleBy(x: 1, y: -1)
-            }
-            context.clip(to: invalidationRect)
-            context.clear(invalidationRect)
-            delegate.layerWillDraw(layer)
-            layer.draw(in: context)
-        }
-        guard let image = context.makeImage() else {
-            rejectDelegateBackingStore(identifier: identifier, error: .snapshotFailed)
-            return
-        }
-        delegateBackingStores[identifier] = image
-        lastDelegateBackingStoreError = nil
-        lastDelegateBackingStoreFormat = backingStoreFormat.contentsFormat
-    }
-
-    private func rejectDelegateBackingStore(
-        identifier: ObjectIdentifier,
-        error: CADelegateBackingStoreError
-    ) {
-        delegateBackingStores.removeValue(forKey: identifier)
-        delegateDrawFailureCount += 1
-        lastDelegateBackingStoreError = error
-        lastDelegateBackingStoreFormat = nil
     }
 
     private func collectEmitterLayerIDs(
@@ -5345,7 +5230,7 @@ private final class EmitterLayerState {
         shapeFillVertexCount = 0
         rasterizationFailureCount = 0
         lastRasterizationRenderFailure = nil
-        delegateBackingStores.removeAll(keepingCapacity: false)
+        activeDelegateBackingStoreLayerIDs.removeAll(keepingCapacity: false)
         delegateDrawFailureCount = 0
         depthTextureView = nil
         lastRenderedTexture = nil
@@ -6583,7 +6468,7 @@ private final class EmitterLayerState {
                   let colors = gradientLayer.colors, !colors.isEmpty {
             renderGradientLayer(gradientLayer, device: device, renderPass: renderPass,
                               modelMatrix: modelMatrix)
-        } else if let contents = delegateBackingStores[ObjectIdentifier(layer)] {
+        } else if let contents = layer.delegateBackingStore?.image {
             renderContentsLayer(presentationLayer, contents: contents, device: device,
                                renderPass: renderPass, modelMatrix: modelMatrix)
         } else if let contents = presentationLayer.contents as? CGImage {

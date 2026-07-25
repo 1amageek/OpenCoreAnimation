@@ -2889,13 +2889,6 @@ func installHarness() {
                 root.addSublayer(layer)
 
                 let invalidLayer = CALayer()
-                invalidLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
-                invalidLayer.position = CGPoint(x: 280, y: 140)
-                invalidLayer.zPosition = 100
-                invalidLayer.contentsScale = .infinity
-                invalidLayer.delegate = delegate
-                invalidLayer.setNeedsDisplay()
-                root.addSublayer(invalidLayer)
 
                 let displayLayer = CALayer()
                 displayLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
@@ -2931,7 +2924,6 @@ func installHarness() {
                     let initialReadback = try await renderer.readbackPixels(
                         at: samplePoints + verticalSamplePoints + [
                             CGPoint(x: 220, y: 160),
-                            CGPoint(x: 280, y: 160),
                         ]
                     )
                     let initialPixels = Array(initialReadback.prefix(samplePoints.count))
@@ -2939,7 +2931,6 @@ func installHarness() {
                         initialReadback.dropFirst(samplePoints.count).prefix(verticalSamplePoints.count)
                     )
                     let displayPixel = initialReadback[4]
-                    let invalidPixel = initialReadback[5]
                     delegate.usesSwappedColors = true
                     layer.setNeedsDisplay(CGRect(
                         x: layer.bounds.minX,
@@ -2959,7 +2950,52 @@ func installHarness() {
                         && displayDelegate.drawCount == 0
                         && displayPixel == [0, 0, 255, 255]
                     let retainedOneBackingStore = renderer.activeDelegateBackingStoreCount == 1
+
+                    var invalidCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidCompletionRan = true
+                    }
+                    invalidLayer.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    invalidLayer.position = CGPoint(x: 280, y: 140)
+                    invalidLayer.zPosition = 100
+                    invalidLayer.contentsScale = .infinity
+                    invalidLayer.delegate = delegate
+                    invalidLayer.setNeedsDisplay()
+                    root.addSublayer(invalidLayer)
+                    CATransaction.commit()
+                    let delegateFailuresBeforeInvalid =
+                        renderer.delegateDrawFailureCount
+                    let frameFailuresBeforeInvalid =
+                        renderer.frameRenderFailureCount
+                    engine.renderFrame()
+                    let firstFailureWasTyped =
+                        renderer.delegateDrawFailureCount
+                            == delegateFailuresBeforeInvalid + 1
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeInvalid + 1
+                        && renderer.lastFrameRenderFailure
+                            == .delegateBackingStoreFailed(.invalidGeometry)
+                        && !invalidCompletionRan
+                    engine.renderFrame()
                     let failed = renderer.delegateDrawFailureCount
+                        - delegateFailuresBeforeInvalid
+                    let rejectedInvalidFrame =
+                        firstFailureWasTyped
+                        && failed == 2
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeInvalid + 2
+                        && renderer.lastFrameRenderFailure
+                            == .delegateBackingStoreFailed(.invalidGeometry)
+                        && !invalidCompletionRan
+                    invalidLayer.removeFromSuperlayer()
+                    engine.renderFrame()
 
                     layer.contents = displayImage
                     engine.renderFrame()
@@ -2984,7 +3020,7 @@ func installHarness() {
                         + ",retained=\(retainedOneBackingStore)"
                         + ",replaced=\(explicitContentsReplacedBackingStore)"
                         + ",released=\(releasedBackingStore)"
-                        + ",rejected=\(invalidPixel == [0, 0, 0, 255])"
+                        + ",rejected=\(rejectedInvalidFrame)"
                         + ",failures=\(failed)"
                 } catch {
                     restoreScene()
@@ -3069,11 +3105,20 @@ func installHarness() {
                     let grayFormat = renderer.lastDelegateBackingStoreFormat?.rawValue ?? "nil"
 
                     let failureCountBefore = renderer.delegateDrawFailureCount
+                    let frameFailureCountBefore =
+                        renderer.frameRenderFailureCount
                     formatDelegate.color = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
                     activeLayer?.contentsFormat = CALayerContentsFormat(rawValue: "FutureFormat")
                     engine.renderFrame()
                     let rejectedUnknown: Bool
-                    if case .unsupportedContentsFormat("FutureFormat")? = renderer.lastDelegateBackingStoreError {
+                    if case .unsupportedContentsFormat("FutureFormat")? =
+                            renderer.lastDelegateBackingStoreError,
+                       renderer.frameRenderFailureCount
+                            == frameFailureCountBefore + 1,
+                       renderer.lastFrameRenderFailure
+                            == .delegateBackingStoreFailed(
+                                .unsupportedContentsFormat("FutureFormat")
+                            ) {
                         rejectedUnknown = true
                     } else {
                         rejectedUnknown = false
@@ -3175,6 +3220,8 @@ func installHarness() {
                     transformDepthProbeResult = "error: transform depth dependencies unavailable"
                     return
                 }
+                let frameFailuresAtProbeStart =
+                    renderer.frameRenderFailureCount
 
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
@@ -3714,7 +3761,7 @@ func installHarness() {
                         + ",rasterFailure=\(hasTypedRasterizationFailure)"
                         + ",depthFailures=\(depthFailuresBeforeInvalidProjection)"
                         + ",depthTyped=\(invalidProjectionWasRejected)"
-                        + ",frameFailures=\(frameFailuresBeforeInvalidResize)"
+                        + ",frameFailures=\(frameFailuresBeforeInvalidResize - frameFailuresAtProbeStart)"
                         + ",resizeTyped=\(invalidResizeWasRejected)"
                 } catch {
                     crossingGroup.removeFromSuperlayer()
@@ -5814,6 +5861,8 @@ func installHarness() {
                     return
                 }
                 let imageChild = CALayer()
+                let delegateChild = CALayer()
+                let snapshotDelegate = DelegateDrawProbeDelegate()
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 snapshotRoot.bounds = CGRect(
@@ -5893,6 +5942,17 @@ func installHarness() {
                 imageChild.minificationFilterBias = 2
                 imageChild.isOpaque = true
                 snapshotRoot.addSublayer(imageChild)
+                delegateChild.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40
+                )
+                delegateChild.position = CGPoint(x: 280, y: 50)
+                delegateChild.delegate = snapshotDelegate
+                delegateChild.setNeedsDisplay()
+                snapshotRoot.addSublayer(delegateChild)
+                delegateChild.layoutIfNeeded()
                 CATransaction.commit()
 
                 snapshotChild.backgroundColor = CGColor(
@@ -5913,7 +5973,12 @@ func installHarness() {
                     height: 1
                 )
                 imageChild.magnificationFilter = .linear
+                snapshotDelegate.usesSwappedColors = true
+                delegateChild.setNeedsDisplay()
                 renderer.render(layer: snapshotRoot)
+                let delegateCapturedAtCommit =
+                    snapshotDelegate.willDrawCount == 1
+                    && snapshotDelegate.drawCount == 1
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 50, y: 250),
@@ -5923,6 +5988,8 @@ func installHarness() {
                         CGPoint(x: 180, y: 250),
                         CGPoint(x: 210, y: 250),
                         CGPoint(x: 230, y: 250),
+                        CGPoint(x: 270, y: 250),
+                        CGPoint(x: 290, y: 250),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6042,6 +6109,46 @@ func installHarness() {
                             )
                     let contentsOverflowCompletionRemainedPending =
                         !contentsOverflowCompletionRan
+
+                    let delegateFailureRoot = CALayer()
+                    let invalidDelegate = DelegateDrawProbeDelegate()
+                    let invalidDelegateLayer = CALayer()
+                    var delegateFailureCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        delegateFailureCompletionRan = true
+                    }
+                    delegateFailureRoot.bounds = snapshotRoot.bounds
+                    delegateFailureRoot.position = snapshotRoot.position
+                    delegateFailureRoot.backgroundColor =
+                        snapshotRoot.backgroundColor
+                    invalidDelegateLayer.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 10,
+                        height: 10
+                    )
+                    invalidDelegateLayer.contentsScale = .infinity
+                    invalidDelegateLayer.delegate = invalidDelegate
+                    invalidDelegateLayer.setNeedsDisplay()
+                    delegateFailureRoot.addSublayer(invalidDelegateLayer)
+                    invalidDelegateLayer.layoutIfNeeded()
+                    CATransaction.commit()
+                    let frameFailuresBeforeDelegateFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.render(layer: delegateFailureRoot)
+                    let delegateFailureWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeDelegateFailure + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidDelegateBackingStore(
+                                    .invalidGeometry
+                                )
+                            )
+                    let delegateFailureCompletionRemainedPending =
+                        !delegateFailureCompletionRan
                     ImmutableSnapshotProbeState.result =
                         pixels.map {
                             $0.map(String.init).joined(separator: ",")
@@ -6052,6 +6159,9 @@ func installHarness() {
                         + ",maskOverflowPending=\(maskOverflowCompletionRemainedPending)"
                         + ",contentsOverflowTyped=\(contentsOverflowWasTyped)"
                         + ",contentsOverflowPending=\(contentsOverflowCompletionRemainedPending)"
+                        + ",delegateCaptured=\(delegateCapturedAtCommit)"
+                        + ",delegateFailureTyped=\(delegateFailureWasTyped)"
+                        + ",delegateFailurePending=\(delegateFailureCompletionRemainedPending)"
                 } catch {
                     ImmutableSnapshotProbeState.result =
                         "error: snapshot readback failed: \(error)"

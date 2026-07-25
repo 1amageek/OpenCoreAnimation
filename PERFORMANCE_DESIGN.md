@@ -815,11 +815,23 @@ crop, center, scale, gravity, sampling filters, mip bias, and opacity policy.
 Chromium readback verifies that captured geometry, color, and image bytes reach
 the GPU without a post-capture `CALayer` or source-image read. Capacity or
 resource failure during that encoding remains a typed frame failure and does
-not submit, clear captured dirty state, or release transaction completion. The
-snapshot does not yet own masks, non-image contents, delegate backing stores,
-specialized-layer resources, or copied animation evaluators. A static tree
-that needs those resources, effects, a specialized layer, rasterization,
-transition state, or true group opacity publishes
+not submit, clear captured dirty state, or release transaction completion.
+Ordinary delegate drawing now produces a layer-owned immutable bitmap during
+commit preparation. Layers without a delegate retain their independent display
+invalidation instead of having snapshot preparation consume it. Partial redraw
+copies only the prior immutable pixels required to seed the new mutable
+context; the resulting image then crosses the same value-owned contents
+boundary. A delegate `display(_:)` assignment supersedes that software store,
+while a reentrant invalidation remains pending for the next frame. Explicit
+contents releases the store. Row stride and total storage size use checked
+arithmetic before bitmap allocation; preparation failure publishes a typed
+committed capture or live-frame failure without submitting a partial frame.
+The failed invalidation is restored, so retries cannot silently submit missing
+pixels and a corrected configuration can recover through the original redraw
+request. The snapshot does not yet own masks, non-image contents,
+specialized-layer resources, or copied animation evaluators. A static tree that
+needs those resources, effects, a specialized layer, rasterization, transition
+state, or true group opacity publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.

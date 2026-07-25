@@ -345,6 +345,224 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Delegate drawing becomes a value-owned image snapshot")
+    func delegateDrawingBecomesImageSnapshot() throws {
+        let delegate = SnapshotDrawingDelegate()
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 56
+        )
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(contents.origin == .delegateBackingStore(.RGBA8Uint))
+        #expect(contents.storage.data == Data([
+            255, 0, 0, 255,
+            0, 255, 0, 255,
+        ]))
+        #expect(delegate.willDrawCount == 1)
+        #expect(delegate.drawCount == 1)
+        #expect(!layer.needsDisplay())
+
+        let repeatedSnapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 57
+        )
+        #expect(
+            repeatedSnapshot.nodes[repeatedSnapshot.rootIndex]
+                .presentationValues.imageContents?.origin
+                == .delegateBackingStore(.RGBA8Uint)
+        )
+        #expect(delegate.drawCount == 1)
+    }
+
+    @Test("Partial delegate redraw preserves untouched committed pixels")
+    func partialDelegateRedrawPreservesPixels() throws {
+        let delegate = SnapshotDrawingDelegate()
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+        _ = try CARenderSnapshot.capture(layer, frameToken: 58)
+
+        delegate.leftColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        layer.setNeedsDisplay(CGRect(x: 0, y: 0, width: 1, height: 1))
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 59
+        )
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+
+        #expect(contents.storage.data == Data([
+            0, 0, 255, 255,
+            0, 255, 0, 255,
+        ]))
+        #expect(delegate.drawCount == 2)
+    }
+
+    @Test("Delegate display contents supersede the software backing store")
+    func delegateDisplayContentsTakePriority() throws {
+        let image = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [0, 0, 255, 255]
+        )
+        let delegate = SnapshotDisplayDelegate(image: image)
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 60
+        )
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+
+        #expect(contents.origin == .layerContents)
+        #expect(contents.storage.data == Data([0, 0, 255, 255]))
+        #expect(delegate.displayCount == 1)
+        #expect(delegate.drawCount == 0)
+        #expect(layer.delegateBackingStore == nil)
+    }
+
+    @Test("Delegate display re-invalidation remains pending after current drawing")
+    func delegateDisplayReinvalidationRemainsPending() throws {
+        let delegate = SnapshotDrawingDelegate()
+        delegate.invalidatesDuringDisplay = true
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 61
+        )
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+
+        #expect(contents.origin == .delegateBackingStore(.RGBA8Uint))
+        #expect(delegate.drawCount == 1)
+        #expect(layer.needsDisplay())
+    }
+
+    @Test("Invalid delegate geometry fails snapshot capture explicitly")
+    func invalidDelegateGeometryFailsCapture() throws {
+        let delegate = SnapshotDrawingDelegate()
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+        layer.contentsScale = .infinity
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
+        #expect(throws: CARendererError.invalidDelegateBackingStore(
+            .invalidGeometry
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 61)
+        }
+        #expect(layer.delegateBackingStore == nil)
+        #expect(layer.needsDisplay())
+
+        layer.contentsScale = 1
+        _ = try CARenderSnapshot.capture(layer, frameToken: 62)
+        #expect(layer.delegateBackingStore != nil)
+        #expect(!layer.needsDisplay())
+    }
+
+    @Test("Delegate storage overflow fails before bitmap allocation")
+    func delegateStorageOverflowFailsBeforeAllocation() {
+        let delegate = SnapshotDrawingDelegate()
+        let overflowingWidth = 1 << (Int.bitWidth - 5)
+        let layer = CALayer()
+        layer.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: CGFloat(overflowingWidth),
+            height: 1
+        )
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
+        #expect(throws: CARendererError.invalidDelegateBackingStore(
+            .pixelStorageSizeOverflow(
+                width: overflowingWidth,
+                height: 1,
+                bitsPerPixel: 32
+            )
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 62)
+        }
+        #expect(layer.delegateBackingStore == nil)
+    }
+
+    @Test("Unknown delegate storage format fails snapshot capture explicitly")
+    func unknownDelegateStorageFailsCapture() {
+        let delegate = SnapshotDrawingDelegate()
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+        layer.contentsFormat = CALayerContentsFormat(rawValue: "future")
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
+        #expect(throws: CARendererError.invalidDelegateBackingStore(
+            .unsupportedContentsFormat("future")
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 62)
+        }
+        #expect(layer.delegateBackingStore == nil)
+    }
+
+    @Test("Explicit contents release an older delegate backing store")
+    func explicitContentsReleaseDelegateBackingStore() throws {
+        let delegate = SnapshotDrawingDelegate()
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+        _ = try CARenderSnapshot.capture(layer, frameToken: 63)
+        #expect(layer.delegateBackingStore != nil)
+
+        layer.contents = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 255, 0, 255]
+        )
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 64
+        )
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+
+        #expect(layer.delegateBackingStore == nil)
+        #expect(contents.origin == .layerContents)
+        #expect(contents.storage.data == Data([255, 255, 0, 255]))
+    }
+
     @Test("Animated commits request explicit live evaluation until evaluators are immutable")
     func animatedCommitPublishesExplicitEvaluationState() {
         CATransaction.flush()
@@ -553,6 +771,62 @@ private final class SnapshotLayoutManager: CALayoutManager {
 }
 
 private final class SnapshotContentsToken {}
+
+private final class SnapshotDrawingDelegate: CALayerDelegate {
+    var leftColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+    var rightColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+    var invalidatesDuringDisplay = false
+    private(set) var willDrawCount = 0
+    private(set) var drawCount = 0
+
+    func display(_ layer: CALayer) {
+        if invalidatesDuringDisplay {
+            layer.setNeedsDisplay()
+        }
+    }
+
+    func layerWillDraw(_ layer: CALayer) {
+        willDrawCount += 1
+    }
+
+    func draw(_ layer: CALayer, in context: CGContext) {
+        drawCount += 1
+        let halfWidth = layer.bounds.width / 2
+        context.setFillColor(leftColor)
+        context.fill(CGRect(
+            x: layer.bounds.minX,
+            y: layer.bounds.minY,
+            width: halfWidth,
+            height: layer.bounds.height
+        ))
+        context.setFillColor(rightColor)
+        context.fill(CGRect(
+            x: layer.bounds.minX + halfWidth,
+            y: layer.bounds.minY,
+            width: halfWidth,
+            height: layer.bounds.height
+        ))
+    }
+}
+
+private final class SnapshotDisplayDelegate: CALayerDelegate {
+    let image: CGImage
+    private(set) var displayCount = 0
+    private(set) var drawCount = 0
+
+    init(image: CGImage) {
+        self.image = image
+    }
+
+    func display(_ layer: CALayer) {
+        displayCount += 1
+        layer.contents = image
+    }
+
+    func draw(_ layer: CALayer, in context: CGContext) {
+        drawCount += 1
+    }
+}
 
 #if canImport(Metal)
 import Metal

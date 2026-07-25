@@ -3530,15 +3530,21 @@ open class CALayer: CAMediaTiming, Hashable {
     /// The layer's delegate object.
     open weak var delegate: (any CALayerDelegate)?
 
+    /// The last immutable bitmap produced by ordinary delegate drawing.
+    internal var delegateBackingStore: CADelegateBackingStore?
+
     // MARK: - Providing the Layer's Content
 
     /// An object that provides the contents of the layer. Animatable.
     private var _contents: Any?
+    internal var _contentsAssignmentGeneration: UInt64 = 0
     open var contents: Any? {
         get { _contents }
         set {
             let oldValue = _contents
             _contents = newValue
+            _contentsAssignmentGeneration &+= 1
+            delegateBackingStore = nil
             markDirty(.contents)
             if Self.needsDisplay(forKey: "contents") { setNeedsDisplay() }
             CATransaction.registerChange(layer: self, keyPath: "contents", oldValue: oldValue, newValue: newValue)
@@ -5066,6 +5072,24 @@ open class CALayer: CAMediaTiming, Hashable {
             return .full
         }
         return .partial(_displayInvalidationRect ?? .null)
+    }
+
+    internal func restorePendingDisplayInvalidation(
+        _ invalidation: DisplayInvalidation
+    ) {
+        _needsDisplay = true
+        switch invalidation {
+        case .full:
+            _needsFullDisplay = true
+            _displayInvalidationRect = nil
+        case .partial(let rect):
+            guard !_needsFullDisplay else { return }
+            if let existing = _displayInvalidationRect {
+                _displayInvalidationRect = existing.union(rect)
+            } else {
+                _displayInvalidationRect = rect
+            }
+        }
     }
 
     /// Marks the layer's contents as needing to be updated.

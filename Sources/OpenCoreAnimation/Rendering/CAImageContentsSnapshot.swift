@@ -6,7 +6,13 @@ import Foundation
 /// The renderer therefore consumes only immutable, tightly packed storage and
 /// never retains or reads the source `CGImage` after the commit boundary.
 internal struct CAImageContentsSnapshot: Equatable, Hashable, Sendable {
+    internal enum Origin: Equatable, Hashable, Sendable {
+        case layerContents
+        case delegateBackingStore(CALayerContentsFormat)
+    }
+
     internal let storage: CGImageTextureStorage
+    internal let origin: Origin
     internal let contentsRect: CGRect
     internal let contentsCenter: CGRect
     internal let contentsScale: CGFloat

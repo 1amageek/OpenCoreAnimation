@@ -45,6 +45,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerCornerGeometry
     /// Layer image contents could not be captured into immutable renderer storage.
     case invalidLayerContents(CAImageContentsSnapshotError)
+    /// Delegate drawing could not produce an immutable bitmap at commit time.
+    case invalidDelegateBackingStore(CADelegateBackingStoreError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.
