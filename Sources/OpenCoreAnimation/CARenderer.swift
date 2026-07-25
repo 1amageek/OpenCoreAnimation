@@ -130,10 +130,14 @@ internal enum CARenderTimeContext {
     private func automaticUpdateRegion(at mediaTime: CFTimeInterval) -> CGRect {
         guard let layer, !Self.isNull(bounds) else { return Self.nullRect }
         let scheduling = animationSchedule(in: layer, at: mediaTime)
-        guard layer._subtreeDirtyCount > 0 || scheduling.hasActiveAnimation else {
+        guard layer._subtreeDirtyCount > 0
+            || scheduling.hasActiveAnimation
+            || scheduling.hasTerminalAnimation else {
             return Self.nullRect
         }
-        if scheduling.hasActiveAnimation || layerTreeHasUnboundedEffects(layer) {
+        if scheduling.hasActiveAnimation
+            || scheduling.hasTerminalAnimation
+            || layerTreeHasUnboundedEffects(layer) {
             return bounds
         }
         let currentExtent = layerTreeExtent(layer)
@@ -158,13 +162,31 @@ internal enum CARenderTimeContext {
     }
 
     private func layerTreeHasUnboundedEffects(_ rootLayer: CALayer) -> Bool {
-        if rootLayer.shadowOpacity > 0
-            || !(rootLayer.filters?.isEmpty ?? true)
-            || rootLayer.compositingFilter != nil
-            || !(rootLayer.backgroundFilters?.isEmpty ?? true) {
+        var visited: Set<ObjectIdentifier> = []
+        return layerTreeHasUnboundedEffects(rootLayer, visited: &visited)
+    }
+
+    private func layerTreeHasUnboundedEffects(
+        _ layer: CALayer,
+        visited: inout Set<ObjectIdentifier>
+    ) -> Bool {
+        guard visited.insert(ObjectIdentifier(layer)).inserted else { return false }
+        if layer.shadowOpacity > 0
+            || !(layer.filters?.isEmpty ?? true)
+            || layer.compositingFilter != nil
+            || !(layer.backgroundFilters?.isEmpty ?? true) {
             return true
         }
-        return (rootLayer.sublayers ?? []).contains { layerTreeHasUnboundedEffects($0) }
+        if let mask = layer.mask,
+           layerTreeHasUnboundedEffects(mask, visited: &visited) {
+            return true
+        }
+        for child in layer.sublayers ?? [] {
+            if layerTreeHasUnboundedEffects(child, visited: &visited) {
+                return true
+            }
+        }
+        return false
     }
 
     private func nextAnimationTime(
@@ -177,11 +199,18 @@ internal enum CARenderTimeContext {
     private func animationSchedule(
         in rootLayer: CALayer,
         at mediaTime: CFTimeInterval
-    ) -> (hasActiveAnimation: Bool, nextTime: CFTimeInterval) {
+    ) -> (
+        hasActiveAnimation: Bool,
+        hasTerminalAnimation: Bool,
+        nextTime: CFTimeInterval
+    ) {
         var active = false
+        var terminal = false
         var nextTime = CFTimeInterval.infinity
+        var visited: Set<ObjectIdentifier> = []
 
         func visit(_ layer: CALayer) {
+            guard visited.insert(ObjectIdentifier(layer)).inserted else { return }
             let parentTime = layer.convertTime(mediaTime, from: nil)
             var futureBeginTimes: [CFTimeInterval] = []
             layer.forEachAttachedAnimation { animation in
@@ -202,7 +231,8 @@ internal enum CARenderTimeContext {
                 case .before:
                     futureBeginTimes.append(animation.beginTime)
                 case .after:
-                    break
+                    terminal = true
+                    nextTime = min(nextTime, mediaTime)
                 }
             }
             for beginTime in futureBeginTimes {
@@ -211,26 +241,53 @@ internal enum CARenderTimeContext {
                     nextTime = min(nextTime, globalBeginTime)
                 }
             }
+            if let mask = layer.mask {
+                visit(mask)
+            }
             for child in layer.sublayers ?? [] {
                 visit(child)
             }
         }
 
         visit(rootLayer)
-        return (active, nextTime)
+        return (active, terminal, nextTime)
     }
 
     private func layoutRecursively(_ layer: CALayer) {
+        var visited: Set<ObjectIdentifier> = []
+        layoutRecursively(layer, visited: &visited)
+    }
+
+    private func layoutRecursively(
+        _ layer: CALayer,
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(layer)).inserted else { return }
         layer.layoutIfNeeded()
+        if let mask = layer.mask {
+            layoutRecursively(mask, visited: &visited)
+        }
         for child in layer.sublayers ?? [] {
-            layoutRecursively(child)
+            layoutRecursively(child, visited: &visited)
         }
     }
 
     private func processAnimationCompletionsRecursively(_ layer: CALayer) {
+        var visited: Set<ObjectIdentifier> = []
+        processAnimationCompletionsRecursively(layer, visited: &visited)
+    }
+
+    private func processAnimationCompletionsRecursively(
+        _ layer: CALayer,
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(layer)).inserted else { return }
         layer.processAnimationCompletions()
+        if let mask = layer.mask {
+            processAnimationCompletionsRecursively(mask, visited: &visited)
+        }
         for child in layer.sublayers ?? [] {
-            processAnimationCompletionsRecursively(child)
+            processAnimationCompletionsRecursively(child, visited: &visited)
         }
     }
 

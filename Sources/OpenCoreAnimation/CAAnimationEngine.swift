@@ -433,9 +433,21 @@ import JavaScriptKit
     /// Resolves pending layout from parent to child before presentation values
     /// are captured by the renderer.
     private func layoutRecursively(_ layer: CALayer) {
+        var visited: Set<ObjectIdentifier> = []
+        layoutRecursively(layer, visited: &visited)
+    }
+
+    private func layoutRecursively(
+        _ layer: CALayer,
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(layer)).inserted else { return }
         layer.layoutIfNeeded()
+        if let mask = layer.mask {
+            layoutRecursively(mask, visited: &visited)
+        }
         for sublayer in layer.sublayers ?? [] {
-            layoutRecursively(sublayer)
+            layoutRecursively(sublayer, visited: &visited)
         }
     }
 

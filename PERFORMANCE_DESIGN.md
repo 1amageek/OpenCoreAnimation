@@ -944,7 +944,9 @@ link re-evaluates timing and resumes submission on entry to an active interval.
 An unprocessed terminal interval requests one final frame before completion.
 Manual `renderFrame()` calls remain unconditional. This completes the
 live-tree submission-decision slice, but the renderer still evaluates the
-complete live tree rather than only an active snapshot subtree.
+complete live tree rather than only an active snapshot subtree. The explicit
+`CARenderer` uses the same active/terminal distinction and traverses detached
+masks for layout, scheduling, effect discovery, and completion.
 
 The snapshot-backed target design is:
 

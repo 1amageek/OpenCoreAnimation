@@ -30,6 +30,14 @@ struct CARendererLifecycleTests {
         func invalidate() {}
     }
 
+    private final class RecordingLayoutManager: CALayoutManager {
+        private(set) var layoutCount = 0
+
+        func layoutSublayers(of layer: CALayer) {
+            layoutCount += 1
+        }
+    }
+
     @Test("Frame regions are discovered, unioned, rendered, and released")
     func updateLifecycle() {
         let backend = RecordingBackend()
@@ -106,6 +114,64 @@ struct CARendererLifecycleTests {
         renderer.beginFrame(atTime: start + 4, timeStamp: nil)
         #expect(renderer.nextFrameTime() == .infinity)
         renderer.endFrame()
+    }
+
+    @Test("Mask animations participate in scheduling and terminal rendering")
+    func maskAnimationScheduling() {
+        let backend = RecordingBackend()
+        let renderer = CARenderer(backend: backend)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
+        root.position = CGPoint(x: 20, y: 10)
+        let mask = CALayer()
+        mask.bounds = root.bounds
+        mask.position = root.position
+        root.mask = mask
+        renderer.layer = root
+        renderer.bounds = root.bounds
+
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.beginTime = 20
+        animation.duration = 1
+        mask.add(animation, forKey: "mask-opacity")
+
+        renderer.beginFrame(atTime: 19, timeStamp: nil)
+        #expect(renderer.nextFrameTime() == 20)
+        renderer.render()
+        renderer.endFrame()
+
+        setStoredAnimationBeginTime(17, on: mask, forKey: "mask-opacity")
+        renderer.beginFrame(atTime: 19, timeStamp: nil)
+        #expect(renderer.nextFrameTime() == 19)
+        #expect(renderer.updateBounds() == root.bounds)
+        renderer.render()
+        renderer.endFrame()
+
+        #expect(mask.animation(forKey: "mask-opacity") == nil)
+    }
+
+    @Test("Mask trees complete pending layout before explicit rendering")
+    func maskLayout() {
+        let backend = RecordingBackend()
+        let renderer = CARenderer(backend: backend)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
+        root.position = CGPoint(x: 20, y: 10)
+        let mask = CALayer()
+        let layoutManager = RecordingLayoutManager()
+        mask.layoutManager = layoutManager
+        root.mask = mask
+        renderer.layer = root
+        renderer.bounds = root.bounds
+
+        renderer.beginFrame(atTime: 1, timeStamp: nil)
+        renderer.render()
+        renderer.endFrame()
+
+        #expect(layoutManager.layoutCount == 1)
+        #expect(!mask.needsLayout())
     }
 
     @Test("Update bounds include overflowing descendants and their previous pixels")

@@ -141,6 +141,20 @@ struct CAAnimationEngineFrameActivityTests {
         #expect(mask.animation(forKey: "mask-opacity") == nil)
     }
 
+    @Test("Mask trees complete pending layout before display-link rendering")
+    func maskLayoutParticipatesInEngineTraversal() {
+        let fixture = makeFixture()
+        let mask = CALayer()
+        let layoutManager = FrameActivityLayoutManager()
+        mask.layoutManager = layoutManager
+        fixture.root.mask = mask
+
+        fixture.fireDisplayLink()
+
+        #expect(layoutManager.layoutCount == 1)
+        #expect(!mask.needsLayout())
+    }
+
     private func makeFixture() -> EngineFrameFixture {
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 32, height: 32)
@@ -196,5 +210,13 @@ private final class FrameActivityRenderer: CARendererDelegate {
         hasPendingFrameWork = false
         rootLayer.recursivelyClearDirtyAfterCommit()
         rootLayer.completeTransactionsAfterRenderRecursively()
+    }
+}
+
+private final class FrameActivityLayoutManager: CALayoutManager {
+    private(set) var layoutCount = 0
+
+    func layoutSublayers(of layer: CALayer) {
+        layoutCount += 1
     }
 }
