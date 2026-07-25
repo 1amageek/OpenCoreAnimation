@@ -14,7 +14,8 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot contains every value
 // consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
 // including nested rectangular and rounded clipping, ordinary CGImage
-// contents, layer filter execution plans, and backdrop composition plans.
+// contents, layer filter and backdrop-composition plans, gradient inputs,
+// tessellated shape geometry, and validated text configuration.
 // Production WebGPU still uses explicitly typed live-tree branches for
 // specialized layers, transitions, and animation evaluation.
 // Phase 4 must not be considered complete until those
@@ -41,6 +42,10 @@ internal struct CARenderSnapshot: Sendable {
             internal let stroke: Primitive?
         }
 
+        internal struct Text: Sendable, Equatable {
+            internal let configuration: CATextRenderConfiguration?
+        }
+
         internal let bounds: CGRect
         internal let boundsSize: SIMD2<Float>
         internal let boundsOrigin: SIMD2<Float>
@@ -50,6 +55,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let sublayerTransform: CATransform3D
         internal let isGeometryFlipped: Bool
         internal let isDoubleSided: Bool
+        internal let isOpaque: Bool
         internal let masksToBounds: Bool
         internal let allowsGroupOpacity: Bool
         internal let shouldRasterize: Bool
@@ -73,6 +79,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let backgroundFilters: [CARenderSnapshotFilterStage]
         internal let gradient: GradientRenderConfiguration?
         internal let shape: Shape?
+        internal let text: Text?
         internal let shadow: Shadow?
     }
 
@@ -216,7 +223,6 @@ internal struct CARenderSnapshot: Sendable {
             || layer is CAReplicatorLayer
             || layer is CAEmitterLayer
             || layer is CATiledLayer
-            || layer is CATextLayer
     }
 
     private static func presentationValues(
@@ -312,7 +318,7 @@ internal struct CARenderSnapshot: Sendable {
             throw .nonFiniteLayerGeometry
         }
         let imageContents: CAImageContentsSnapshot?
-        if layer is CAShapeLayer {
+        if layer is CAShapeLayer || layer is CATextLayer {
             imageContents = nil
         } else {
             do {
@@ -422,6 +428,7 @@ internal struct CARenderSnapshot: Sendable {
             gradient = nil
         }
         let shape = try captureShape(from: layer)
+        let text = try captureText(from: layer)
         return PresentationValues(
             bounds: layer.bounds,
             boundsSize: SIMD2<Float>(boundsWidth, boundsHeight),
@@ -432,6 +439,7 @@ internal struct CARenderSnapshot: Sendable {
             sublayerTransform: layer.sublayerTransform,
             isGeometryFlipped: layer.isGeometryFlipped,
             isDoubleSided: layer.isDoubleSided,
+            isOpaque: layer.isOpaque,
             masksToBounds: layer.masksToBounds,
             allowsGroupOpacity: layer.allowsGroupOpacity,
             shouldRasterize: layer.shouldRasterize,
@@ -462,8 +470,52 @@ internal struct CARenderSnapshot: Sendable {
             backgroundFilters: backgroundFilters,
             gradient: gradient,
             shape: shape,
+            text: text,
             shadow: shadow
         )
+    }
+
+    private static func captureText(
+        from layer: CALayer
+    ) throws(CARendererError) -> PresentationValues.Text? {
+        guard let textLayer = layer as? CATextLayer else {
+            return nil
+        }
+        guard textLayer.string != nil else {
+            return PresentationValues.Text(configuration: nil)
+        }
+        do {
+            return PresentationValues.Text(
+                configuration: try CATextRenderConfiguration(
+                    layer: textLayer
+                )
+            )
+        } catch {
+            throw .invalidLayerText(textError(from: error))
+        }
+    }
+
+    private static func textError(
+        from error: CATextRenderConfigurationError
+    ) -> CARenderSnapshotTextError {
+        switch error {
+        case .unsupportedStringValue:
+            return .unsupportedStringValue
+        case .unsupportedFontValue:
+            return .unsupportedFontValue
+        case .invalidFontSize:
+            return .invalidFontSize
+        case .invalidContentsScale:
+            return .invalidContentsScale
+        case .invalidBounds:
+            return .invalidBounds
+        case .invalidForegroundColor:
+            return .invalidForegroundColor
+        case .unsupportedAlignmentMode(let value):
+            return .unsupportedAlignmentMode(value)
+        case .unsupportedTruncationMode(let value):
+            return .unsupportedTruncationMode(value)
+        }
     }
 
     private static func captureShape(

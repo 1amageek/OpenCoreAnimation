@@ -4087,6 +4087,9 @@ private final class EmitterLayerState {
             ) == true
             || colorContainsExtendedComponents(values.shape?.fill?.color)
             || colorContainsExtendedComponents(values.shape?.stroke?.color)
+            || colorContainsExtendedComponents(
+                values.text?.configuration?.foregroundRGBA
+            )
         let explicitlyRequestsHighRange =
             values.preferredDynamicRange == .high
             || values.preferredDynamicRange == .constrainedHigh
@@ -4438,6 +4441,8 @@ private final class EmitterLayerState {
                 recordGradientRenderFailure(failure)
             case .shape(let failure):
                 recordShapeRenderFailure(failure)
+            case .text(let failure):
+                recordTextRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4534,6 +4539,8 @@ private final class EmitterLayerState {
                 recordGradientRenderFailure(failure)
             case .shape(let failure):
                 recordShapeRenderFailure(failure)
+            case .text(let failure):
+                recordTextRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -7599,7 +7606,28 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
-        if let shape = values.shape {
+        if let text = values.text {
+            if let configuration = text.configuration {
+                do {
+                    try renderText(
+                        configuration,
+                        isOpaque: values.isOpaque,
+                        masksToBounds: values.masksToBounds,
+                        cornerRadius: CGFloat(values.cornerRadius),
+                        cornerCurveExponent:
+                            values.cornerCurveExponent,
+                        cornerRadii: values.cornerRadii,
+                        edgeAntialiasingMask:
+                            values.edgeAntialiasingMask,
+                        device: device,
+                        renderPass: renderPass,
+                        modelMatrix: modelMatrix
+                    )
+                } catch {
+                    throw .text(error)
+                }
+            }
+        } else if let shape = values.shape {
             try renderSnapshotShape(
                 shape,
                 values: values,
@@ -11458,9 +11486,67 @@ private final class EmitterLayerState {
         do {
             configuration = try CATextRenderConfiguration(layer: textLayer)
         } catch {
-            recordTextRenderFailure(error)
+            recordTextRenderFailure(textRenderFailure(from: error))
             return
         }
+        do {
+            try renderText(
+                configuration,
+                isOpaque: textLayer.isOpaque,
+                masksToBounds: textLayer.masksToBounds,
+                cornerRadius: textLayer.cornerRadius,
+                cornerCurveExponent:
+                    textLayer.cornerCurveRenderExponent
+                    ?? Float(
+                        CornerCurveRenderConfiguration.circularExponent
+                    ),
+                cornerRadii: textLayer.cornerRadiiComponents,
+                edgeAntialiasingMask:
+                    textLayer.edgeAntialiasingMaskValue,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+        } catch {
+            recordTextRenderFailure(error)
+        }
+    }
+
+    private func textRenderFailure(
+        from error: CATextRenderConfigurationError
+    ) -> CATextRenderFailure {
+        switch error {
+        case .unsupportedStringValue:
+            return .unsupportedStringValue
+        case .unsupportedFontValue:
+            return .unsupportedFontValue
+        case .invalidFontSize:
+            return .invalidFontSize
+        case .invalidContentsScale:
+            return .invalidContentsScale
+        case .invalidBounds:
+            return .invalidBounds
+        case .invalidForegroundColor:
+            return .invalidForegroundColor
+        case .unsupportedAlignmentMode(let value):
+            return .unsupportedAlignmentMode(value)
+        case .unsupportedTruncationMode(let value):
+            return .unsupportedTruncationMode(value)
+        }
+    }
+
+    private func renderText(
+        _ configuration: CATextRenderConfiguration,
+        isOpaque: Bool,
+        masksToBounds: Bool,
+        cornerRadius: CGFloat,
+        cornerCurveExponent: Float,
+        cornerRadii: SIMD4<Float>,
+        edgeAntialiasingMask: Float,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CATextRenderFailure) {
         let text = configuration.text
         guard !text.isEmpty else {
             return
@@ -11475,9 +11561,10 @@ private final class EmitterLayerState {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let pipeline = pipeline,
-              let selectedPipeline = selectTexturedPipeline(for: textLayer) else {
-            recordTextRenderFailure(.rendererResourcesUnavailable)
-            return
+              let selectedPipeline = selectTexturedPipeline(
+                blendEnabled: !(isOpaque && currentEffectiveOpacity >= 1)
+              ) else {
+            throw .rendererResourcesUnavailable
         }
         let maximumTextureDimension = max(1, Int(device.limits.maxTextureDimension2D))
         let scaledWidth = logicalSize.width * configuration.contentsScale
@@ -11488,14 +11575,12 @@ private final class EmitterLayerState {
               scaledHeight > 0,
               scaledWidth <= CGFloat(maximumTextureDimension),
               scaledHeight <= CGFloat(maximumTextureDimension) else {
-            recordTextRenderFailure(.textureDimensionsUnsupported)
-            return
+            throw .textureDimensionsUnsupported
         }
         let pixelWidth = Int(ceil(scaledWidth))
         let pixelHeight = Int(ceil(scaledHeight))
         guard UInt64(pixelWidth) * UInt64(pixelHeight) * 4 <= maxTextTextureCacheBytes else {
-            recordTextRenderFailure(.textureDimensionsUnsupported)
-            return
+            throw .textureDimensionsUnsupported
         }
 
         let quadConfiguration: CATextQuadRenderConfiguration
@@ -11504,15 +11589,13 @@ private final class EmitterLayerState {
                 bounds: configuration.bounds,
                 color: currentReplicatorColor,
                 opacity: currentEffectiveOpacity,
-                masksToBounds: textLayer.masksToBounds,
-                cornerRadius: textLayer.cornerRadius,
-                cornerCurveExponent: textLayer.cornerCurveRenderExponent
-                    ?? Float(CornerCurveRenderConfiguration.circularExponent),
-                cornerRadii: textLayer.cornerRadiiComponents
+                masksToBounds: masksToBounds,
+                cornerRadius: cornerRadius,
+                cornerCurveExponent: cornerCurveExponent,
+                cornerRadii: cornerRadii
             )
         } catch let failure {
-            recordTextRenderFailure(failure)
-            return
+            throw failure
         }
 
         let scaleMatrix = Matrix4x4(columns: (
@@ -11523,8 +11606,7 @@ private final class EmitterLayerState {
         ))
         let finalMatrix = modelMatrix * scaleMatrix
         guard matrixIsFinite(finalMatrix) else {
-            recordTextRenderFailure(.invalidTransform)
-            return
+            throw .invalidTransform
         }
 
         var vertices: [CARendererVertex] = [
@@ -11538,8 +11620,7 @@ private final class EmitterLayerState {
         ]
         guard availableVertexAllocationSize(count: vertices.count) != nil else {
             droppedLayerCount += 1
-            recordTextRenderFailure(.vertexCapacityExceeded)
-            return
+            throw .vertexCapacityExceeded
         }
 
         // Create cache key based on text content and properties.
@@ -11567,8 +11648,7 @@ private final class EmitterLayerState {
             offscreenCanvas.height = .number(Double(pixelHeight))
 
             guard let ctx = offscreenCanvas.getContext("2d").object else {
-                recordTextRenderFailure(.canvas2DUnavailable)
-                return
+                throw .canvas2DUnavailable
             }
 
             // The layer background is rendered by the normal background pass.
@@ -11604,10 +11684,9 @@ private final class EmitterLayerState {
             case .justified, .natural:
                 ctx.textAlign = .string("start")
             default:
-                recordTextRenderFailure(
-                    .unsupportedAlignmentMode(configuration.alignmentMode.rawValue)
+                throw .unsupportedAlignmentMode(
+                    configuration.alignmentMode.rawValue
                 )
-                return
             }
 
             ctx.textBaseline = .string("top")
@@ -11650,20 +11729,17 @@ private final class EmitterLayerState {
                 _ = ctx.fillText!(displayedText, x, Double(configuration.fontSize * 0.1))
             }
             if textMeasurementFailureDetected {
-                recordTextRenderFailure(.textMeasurementUnavailable)
-                return
+                throw .textMeasurementUnavailable
             }
 
             // Get image data from canvas
             // Reset the transform because getImageData uses untransformed pixel coordinates.
             _ = ctx.resetTransform!()
             guard let imageData = ctx.getImageData!(0, 0, pixelWidth, pixelHeight).object else {
-                recordTextRenderFailure(.imageDataUnavailable)
-                return
+                throw .imageDataUnavailable
             }
             guard let dataArray = imageData.data.object else {
-                recordTextRenderFailure(.imageDataStorageUnavailable)
-                return
+                throw .imageDataStorageUnavailable
             }
 
             // Create WebGPU texture
@@ -11695,8 +11771,7 @@ private final class EmitterLayerState {
             if shouldCacheTexture {
                 gpuTexture.destroy()
             }
-            recordTextRenderFailure(.vertexCapacityExceeded)
-            return
+            throw .vertexCapacityExceeded
         }
         let (vertexOffset, layerIndex) = allocation
         if shouldCacheTexture {
@@ -11725,7 +11800,7 @@ private final class EmitterLayerState {
             cornerRadius: quadConfiguration.cornerRadius,
             layerSize: quadConfiguration.size,
             cornerRadii: quadConfiguration.cornerRadii,
-            edgeAntialiasingMask: textLayer.edgeAntialiasingMaskValue,
+            edgeAntialiasingMask: edgeAntialiasingMask,
             cornerCurveExponent: quadConfiguration.cornerCurveExponent
         )
 

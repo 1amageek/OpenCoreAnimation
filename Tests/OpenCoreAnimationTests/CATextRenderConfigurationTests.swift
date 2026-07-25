@@ -48,13 +48,13 @@ struct CATextRenderConfigurationTests {
     func unsupportedValues() {
         let layer = CATextLayer()
         layer.string = 42
-        #expect(throws: CATextRenderFailure.unsupportedStringValue) {
+        #expect(throws: CATextRenderConfigurationError.unsupportedStringValue) {
             try CATextRenderConfiguration(layer: layer)
         }
 
         layer.string = "Text"
         layer.font = 42
-        #expect(throws: CATextRenderFailure.unsupportedFontValue) {
+        #expect(throws: CATextRenderConfigurationError.unsupportedFontValue) {
             try CATextRenderConfiguration(layer: layer)
         }
     }
@@ -64,36 +64,42 @@ struct CATextRenderConfigurationTests {
         let layer = CATextLayer()
         layer.string = "Text"
         layer.fontSize = .nan
-        #expect(throws: CATextRenderFailure.invalidFontSize) {
+        #expect(throws: CATextRenderConfigurationError.invalidFontSize) {
             try CATextRenderConfiguration(layer: layer)
         }
 
         layer.fontSize = CGFloat.greatestFiniteMagnitude
-        #expect(throws: CATextRenderFailure.invalidFontSize) {
+        #expect(throws: CATextRenderConfigurationError.invalidFontSize) {
             try CATextRenderConfiguration(layer: layer)
         }
 
         layer.fontSize = 12
         layer.contentsScale = 0
-        #expect(throws: CATextRenderFailure.invalidContentsScale) {
+        #expect(throws: CATextRenderConfigurationError.invalidContentsScale) {
             try CATextRenderConfiguration(layer: layer)
         }
 
         layer.contentsScale = 1
         layer.bounds = CGRect(x: 0, y: 0, width: CGFloat.infinity, height: 20)
-        #expect(throws: CATextRenderFailure.invalidBounds) {
+        #expect(throws: CATextRenderConfigurationError.invalidBounds) {
             try CATextRenderConfiguration(layer: layer)
         }
 
         layer.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
         layer.alignmentMode = CATextLayerAlignmentMode(rawValue: "future-alignment")
-        #expect(throws: CATextRenderFailure.unsupportedAlignmentMode("future-alignment")) {
+        #expect(
+            throws: CATextRenderConfigurationError
+                .unsupportedAlignmentMode("future-alignment")
+        ) {
             try CATextRenderConfiguration(layer: layer)
         }
 
         layer.alignmentMode = .left
         layer.truncationMode = CATextLayerTruncationMode(rawValue: "future-truncation")
-        #expect(throws: CATextRenderFailure.unsupportedTruncationMode("future-truncation")) {
+        #expect(
+            throws: CATextRenderConfigurationError
+                .unsupportedTruncationMode("future-truncation")
+        ) {
             try CATextRenderConfiguration(layer: layer)
         }
     }

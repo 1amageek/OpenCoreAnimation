@@ -423,9 +423,15 @@ public final class CAMetalRenderer: CARendererDelegate {
             return .gradient
         }
         if snapshot.nodes.contains(where: {
-            $0.presentationValues.shape != nil
+            $0.presentationValues.shape?.fill != nil
+                || $0.presentationValues.shape?.stroke != nil
         }) {
             return .shape
+        }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.text?.configuration?.text.isEmpty == false
+        }) {
+            return .text
         }
         return nil
     }

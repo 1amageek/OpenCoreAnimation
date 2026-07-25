@@ -13,6 +13,7 @@ public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
     case shadow(CAShadowRenderFailure)
     case gradient(CAGradientRenderFailure)
     case shape(CAShapeRenderFailure)
+    case text(CATextRenderFailure)
 }
 
 /// Describes why a WebGPU frame could not begin rendering.

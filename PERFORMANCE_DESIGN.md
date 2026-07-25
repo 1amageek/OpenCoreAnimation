@@ -809,7 +809,9 @@ model mutation. Capture failures remain typed committed state. Production
 WebGPU now encodes common static trees directly from the immutable snapshot.
 Those nodes value-own background, border, corner geometry, antialiasing,
 transforms, visibility, geometry orientation, dynamic-range policy, stable
-z-ordered child indices, and ordinary `CGImage` contents. Image capture converts
+z-ordered child indices, ordinary `CGImage` contents, gradient inputs,
+commit-time tessellated shape geometry, and validated `CATextLayer`
+configuration. Image capture converts
 the source into immutable tightly packed storage at commit time and preserves
 crop, center, scale, gravity, sampling filters, mip bias, and opacity policy.
 Chromium readback verifies that captured geometry, color, and image bytes reach
@@ -843,18 +845,22 @@ Static shadows value-own converted color, opacity, radius, offset, and either
 the captured subtree silhouette or commit-time tessellated `shadowPath`
 vertices. Snapshot WebGPU prepares mask/group coverage without shadows,
 captures and blurs each shadow independently, then rebuilds subtree composites
-with shadows included. Mutable model colors, offsets, and paths are never read
-after commit, and failed prepasses retain the committed frame for retry.
-The snapshot does not yet own non-image contents, specialized-layer resources,
-filter/backdrop effects, or copied animation evaluators. A static tree that
-needs those resources, a specialized layer, rasterization, or transition state publishes
+with shadows included. Mutable model colors, offsets, paths, text, and text
+styles are never read after commit, and failed prepasses retain the committed
+frame for retry. Text configuration failures are rejected during capture,
+while Canvas, texture, and vertex-capacity failures retain their exact
+frame-time reason and the committed frame for retry. The snapshot does not yet
+own non-image contents, transform/replicator/emitter/tiled specialized-layer
+resources, or copied animation evaluators. A static tree that needs those
+resources, a remaining specialized layer, or transition state publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents,
-content masks, group opacity, or shadows with the corresponding
-`unsupportedCommittedSnapshotFeature` value rather than dropping any
-resource and reporting a successful frame.
+content masks, group opacity, rasterization, filters, backdrop composition,
+shadows, gradients, shapes, and text with the corresponding
+`unsupportedCommittedSnapshotFeature` value rather than dropping any resource
+and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,
 including detached-mask trees and descendants introduced by layout callbacks.
 Animated commits still publish `requiresLiveAnimationEvaluation`. WebGPU rejects
@@ -1096,9 +1102,10 @@ matches its documented behavior.
 ### 6.6 Planned snapshot migration (R4.1–R4.4)
 
 The production WebGPU renderer consumes transaction-owned immutable value
-snapshots for common static trees, including ordinary `CGImage` contents. The
-native Metal backend consumes each snapshot feature it supports and reports a
-typed unsupported-feature error for committed image contents. Animated trees
+snapshots for common static trees, including ordinary `CGImage` contents,
+gradients, shapes, and text configuration. The native Metal backend consumes
+each snapshot feature it supports and reports a typed unsupported-feature
+error for every unimplemented committed resource category. Animated trees
 and remaining resource-backed or specialized WebGPU trees still require
 frame-time live-tree evaluation because their richer immutable resource state
 is not yet implemented. As R4.1–R4.4 continue, migration may temporarily permit

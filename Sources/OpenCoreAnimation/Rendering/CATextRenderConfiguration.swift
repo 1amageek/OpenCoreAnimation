@@ -1,7 +1,19 @@
 import Foundation
 
+/// Describes why a text layer cannot become renderer-independent input.
+internal enum CATextRenderConfigurationError: Error, Equatable, Sendable {
+    case unsupportedStringValue
+    case unsupportedFontValue
+    case invalidFontSize
+    case invalidContentsScale
+    case invalidBounds
+    case invalidForegroundColor
+    case unsupportedAlignmentMode(String)
+    case unsupportedTruncationMode(String)
+}
+
 /// Validated, renderer-independent text input.
-internal struct CATextRenderConfiguration {
+internal struct CATextRenderConfiguration: Equatable, Sendable {
     let text: String
     let fontFamily: String
     let cssFontFamily: String
@@ -14,7 +26,7 @@ internal struct CATextRenderConfiguration {
     let isWrapped: Bool
     let lineHeight: CGFloat
 
-    init(layer: CATextLayer) throws(CATextRenderFailure) {
+    init(layer: CATextLayer) throws(CATextRenderConfigurationError) {
         guard let text = layer.string as? String else {
             throw .unsupportedStringValue
         }

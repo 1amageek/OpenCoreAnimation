@@ -19,6 +19,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case shadow
     case gradient
     case shape
+    case text
 }
 
 /// A layer filter value that could not cross the immutable commit boundary.
@@ -70,6 +71,18 @@ public enum CARenderSnapshotShapeError: Error, Equatable, Sendable {
     case invalidStrokeColor
 }
 
+/// Text content that could not cross the immutable commit boundary.
+public enum CARenderSnapshotTextError: Error, Equatable, Sendable {
+    case unsupportedStringValue
+    case unsupportedFontValue
+    case invalidFontSize
+    case invalidContentsScale
+    case invalidBounds
+    case invalidForegroundColor
+    case unsupportedAlignmentMode(String)
+    case unsupportedTruncationMode(String)
+}
+
 /// Errors that can occur during renderer operations.
 public enum CARendererError: Error, Equatable, Sendable {
     /// The GPU/graphics device is not available.
@@ -118,6 +131,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerGradient(CARenderSnapshotGradientError)
     /// A shape layer could not become immutable tessellated values.
     case invalidLayerShape(CARenderSnapshotShapeError)
+    /// A text layer could not become immutable renderer input.
+    case invalidLayerText(CARenderSnapshotTextError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

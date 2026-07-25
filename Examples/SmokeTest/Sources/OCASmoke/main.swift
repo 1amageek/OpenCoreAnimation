@@ -1371,19 +1371,31 @@ func installHarness() {
                     ])
 
                     let invalidLayer = CATextLayer()
-                    invalidLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 20)
-                    invalidLayer.position = CGPoint(x: 200, y: 100)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    invalidLayer.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 20
+                    )
+                    invalidLayer.position = CGPoint(x: 20, y: 10)
                     invalidLayer.string = "invalid"
                     invalidLayer.font = "monospace"
                     invalidLayer.fontSize = 12
-                    invalidLayer.opacity = .infinity
-                    root.addSublayer(invalidLayer)
+                    CATransaction.commit()
                     let failureCountBeforeInvalid = renderer.textRenderFailureCount
-                    engine.renderFrame()
+                    renderer.setNextCommittedSnapshotAllocationLimit(0)
+                    renderer.render(layer: invalidLayer)
                     let typedFailure = renderer.textRenderFailureCount
                             - failureCountBeforeInvalid == 1
-                        && renderer.lastTextRenderFailure == .invalidOpacity(.infinity)
-                    invalidLayer.removeFromSuperlayer()
+                        && renderer.lastTextRenderFailure
+                            == .vertexCapacityExceeded
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .text(.vertexCapacityExceeded)
+                            )
+                    renderer.render(layer: invalidLayer)
 
                     restoreScene()
 
@@ -6036,6 +6048,7 @@ func installHarness() {
                 let snapshotGradientLayer = CAGradientLayer()
                 let snapshotShapeLayer = CAShapeLayer()
                 let snapshotShapePath = CGMutablePath()
+                let snapshotTextLayer = CATextLayer()
                 guard let snapshotCoreImageFilter = CIFilter(
                     name: "CIColorInvert"
                 ), let snapshotCompositionFilter = CIFilter(
@@ -6493,6 +6506,22 @@ func installHarness() {
                     alpha: 1
                 )
                 snapshotRoot.addSublayer(snapshotShapeLayer)
+                snapshotTextLayer.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotTextLayer.position = CGPoint(
+                    x: 150,
+                    y: 170
+                )
+                snapshotTextLayer.string = "█"
+                snapshotTextLayer.font = "monospace"
+                snapshotTextLayer.fontSize = 30
+                snapshotTextLayer.foregroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotRoot.addSublayer(snapshotTextLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6624,6 +6653,13 @@ func installHarness() {
                     blue: 0,
                     alpha: 1
                 )
+                snapshotTextLayer.string = ""
+                snapshotTextLayer.foregroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
                 renderer.render(layer: snapshotRoot)
                 let snapshotRasterizationScaleWasApplied =
                     renderer.explicitRasterizationCapturePixelSizes
@@ -6663,6 +6699,7 @@ func installHarness() {
                         CGPoint(x: 320, y: 70),
                         CGPoint(x: 350, y: 70),
                         CGPoint(x: 210, y: 130),
+                        CGPoint(x: 140, y: 120),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6824,6 +6861,44 @@ func installHarness() {
                         shapeOverflowCompletionRan
                         && renderer.frameRenderFailureCount
                             == frameFailuresBeforeShapeOverflow + 1
+                        && renderer.lastFrameRenderFailure == nil
+
+                    let textOverflowRoot = CATextLayer()
+                    var textOverflowCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        textOverflowCompletionRan = true
+                    }
+                    textOverflowRoot.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    textOverflowRoot.position = CGPoint(x: 20, y: 20)
+                    textOverflowRoot.string = "█"
+                    textOverflowRoot.font = "monospace"
+                    textOverflowRoot.fontSize = 30
+                    CATransaction.commit()
+                    let frameFailuresBeforeTextOverflow =
+                        renderer.frameRenderFailureCount
+                    renderer.setNextCommittedSnapshotAllocationLimit(0)
+                    renderer.render(layer: textOverflowRoot)
+                    let textOverflowWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeTextOverflow + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .text(.vertexCapacityExceeded)
+                            )
+                    let textOverflowCompletionRemainedPending =
+                        !textOverflowCompletionRan
+                    renderer.render(layer: textOverflowRoot)
+                    let textOverflowRecovered =
+                        textOverflowCompletionRan
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeTextOverflow + 1
                         && renderer.lastFrameRenderFailure == nil
 
                     let snapshotMaskFailureRoot = CALayer()
@@ -7171,6 +7246,9 @@ func installHarness() {
                         + ",shapeOverflowTyped=\(shapeOverflowWasTyped)"
                         + ",shapeOverflowPending=\(shapeOverflowCompletionRemainedPending)"
                         + ",shapeOverflowRecovered=\(shapeOverflowRecovered)"
+                        + ",textOverflowTyped=\(textOverflowWasTyped)"
+                        + ",textOverflowPending=\(textOverflowCompletionRemainedPending)"
+                        + ",textOverflowRecovered=\(textOverflowRecovered)"
                         + ",snapshotMaskFailureTyped=\(snapshotMaskFailureWasTyped)"
                         + ",snapshotMaskFailurePending=\(snapshotMaskFailureCompletionRemainedPending)"
                         + ",snapshotMaskFailureRecovered=\(snapshotMaskFailureRecovered)"

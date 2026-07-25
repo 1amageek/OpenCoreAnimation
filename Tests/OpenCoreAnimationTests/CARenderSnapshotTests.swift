@@ -319,6 +319,126 @@ struct CARenderSnapshotTests {
         }
     }
 
+    @Test("Text layout and style become immutable snapshot values")
+    func textValuesUseSnapshots() throws {
+        let text = CATextLayer()
+        text.bounds = CGRect(x: 2, y: 3, width: 80, height: 24)
+        text.string = "Committed"
+        text.font = "Snapshot Sans"
+        text.fontSize = 18
+        text.contentsScale = 2
+        text.foregroundColor = CGColor(
+            red: 0,
+            green: 1,
+            blue: 1,
+            alpha: 0.5
+        )
+        text.alignmentMode = .center
+        text.truncationMode = .middle
+        text.isWrapped = true
+
+        let snapshot = try CARenderSnapshot.capture(
+            text,
+            frameToken: 53
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+        let capturedText = try #require(values.text)
+        let configuration = try #require(
+            capturedText.configuration
+        )
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(configuration.text == "Committed")
+        #expect(configuration.fontFamily == "Snapshot Sans")
+        #expect(configuration.fontSize == 18)
+        #expect(configuration.contentsScale == 2)
+        #expect(
+            configuration.foregroundRGBA
+                == SIMD4<Float>(0, 1, 1, 0.5)
+        )
+        #expect(configuration.bounds == text.bounds)
+        #expect(configuration.alignmentMode == .center)
+        #expect(configuration.truncationMode == .middle)
+        #expect(configuration.isWrapped)
+
+        text.string = "Mutated"
+        text.font = "Other"
+        text.fontSize = 30
+        text.contentsScale = 1
+        text.foregroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        text.alignmentMode = .right
+        text.truncationMode = .end
+        text.isWrapped = false
+
+        #expect(configuration.text == "Committed")
+        #expect(configuration.fontFamily == "Snapshot Sans")
+        #expect(configuration.fontSize == 18)
+        #expect(configuration.contentsScale == 2)
+        #expect(
+            configuration.foregroundRGBA
+                == SIMD4<Float>(0, 1, 1, 0.5)
+        )
+        #expect(configuration.alignmentMode == .center)
+        #expect(configuration.truncationMode == .middle)
+        #expect(configuration.isWrapped)
+    }
+
+    @Test("An empty text foreground does not fall back to image contents")
+    func emptyTextDoesNotFallBackToImageContents() throws {
+        let text = CATextLayer()
+        text.contents = SnapshotContentsToken()
+
+        let snapshot = try CARenderSnapshot.capture(
+            text,
+            frameToken: 54
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+        let capturedText = try #require(values.text)
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(capturedText.configuration == nil)
+        #expect(values.imageContents == nil)
+    }
+
+    @Test("Invalid text values fail immutable capture with exact reasons")
+    func invalidTextFailsCapture() {
+        let text = CATextLayer()
+        text.string = 42
+
+        #expect(throws: CARendererError.invalidLayerText(
+            .unsupportedStringValue
+        )) {
+            try CARenderSnapshot.capture(text, frameToken: 55)
+        }
+
+        text.string = "Text"
+        text.font = 42
+        #expect(throws: CARendererError.invalidLayerText(
+            .unsupportedFontValue
+        )) {
+            try CARenderSnapshot.capture(text, frameToken: 56)
+        }
+
+        text.font = "sans-serif"
+        text.alignmentMode = CATextLayerAlignmentMode(
+            rawValue: "future-alignment"
+        )
+        #expect(throws: CARendererError.invalidLayerText(
+            .unsupportedAlignmentMode("future-alignment")
+        )) {
+            try CARenderSnapshot.capture(text, frameToken: 57)
+        }
+    }
+
     @Test("Detached mask trees become value-owned snapshot nodes")
     func maskTreeIsCapturedByValue() throws {
         CATransaction.flush()
@@ -1655,6 +1775,34 @@ extension CARenderSnapshotTests {
 
         #expect(renderer.lastRenderError
             == .unsupportedCommittedSnapshotFeature(.shape))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed text instead of dropping it")
+    func metalRejectsUnsupportedTextSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 16,
+            height: 16,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(
+            descriptor: descriptor
+        ))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CATextLayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.position = CGPoint(x: 8, y: 8)
+        root.string = "Text"
+        root.font = "sans-serif"
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.text))
         #expect(renderer.lastCommandBuffer == nil)
     }
 
