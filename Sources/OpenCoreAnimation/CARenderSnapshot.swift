@@ -61,6 +61,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let compositingFilter:
             CARenderSnapshotCompositingFilter?
         internal let backgroundFilters: [CARenderSnapshotFilterStage]
+        internal let gradient: GradientRenderConfiguration?
         internal let shadow: Shadow?
     }
 
@@ -206,7 +207,6 @@ internal struct CARenderSnapshot: Sendable {
             || layer is CATiledLayer
             || layer is CATextLayer
             || layer is CAShapeLayer
-            || layer is CAGradientLayer
     }
 
     private static func presentationValues(
@@ -387,6 +387,26 @@ internal struct CARenderSnapshot: Sendable {
         } else {
             shadow = nil
         }
+        let gradient: GradientRenderConfiguration?
+        if let gradientLayer = layer as? CAGradientLayer,
+           let colors = gradientLayer.colors,
+           !colors.isEmpty {
+            do {
+                gradient = try GradientRenderConfiguration(
+                    type: gradientLayer.type,
+                    colors: colors,
+                    locations: gradientLayer.locations,
+                    startPoint: gradientLayer.startPoint,
+                    endPoint: gradientLayer.endPoint
+                )
+            } catch {
+                throw .invalidLayerGradient(
+                    snapshotGradientError(from: error)
+                )
+            }
+        } else {
+            gradient = nil
+        }
         return PresentationValues(
             bounds: layer.bounds,
             boundsSize: SIMD2<Float>(boundsWidth, boundsHeight),
@@ -425,8 +445,35 @@ internal struct CARenderSnapshot: Sendable {
             filters: filters,
             compositingFilter: compositingFilter,
             backgroundFilters: backgroundFilters,
+            gradient: gradient,
             shadow: shadow
         )
+    }
+
+    private static func snapshotGradientError(
+        from error: GradientRenderConfigurationError
+    ) -> CARenderSnapshotGradientError {
+        switch error {
+        case .unsupportedType(let value):
+            return .unsupportedType(value)
+        case .nonFiniteGeometry:
+            return .nonFiniteGeometry
+        case .invalidColor(let index):
+            return .invalidColor(index: index)
+        case .invalidColorComponents(let index):
+            return .invalidColorComponents(index: index)
+        case .invalidLocationCount(let expected, let actual):
+            return .invalidLocationCount(
+                expected: expected,
+                actual: actual
+            )
+        case .nonFiniteLocation(let index):
+            return .nonFiniteLocation(index: index)
+        case .locationOutOfRange(let index):
+            return .locationOutOfRange(index: index)
+        case .locationsNotMonotonic(let index):
+            return .locationsNotMonotonic(index: index)
+        }
     }
 
     private static func captureImageContents(

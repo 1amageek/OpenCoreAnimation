@@ -19,7 +19,7 @@ struct GradientRenderConfigurationTests {
         #expect(axial.renderMode == 2)
         #expect(radial.renderMode == 3)
         #expect(conic.renderMode == 4)
-        #expect(axial.colors.count == 2)
+        #expect(axial.colorCount == 2)
     }
 
     @Test("Missing locations are distributed across every color stop")
@@ -51,7 +51,6 @@ struct GradientRenderConfigurationTests {
             colors: [CGColor(gray: 0.25, alpha: 0.5)]
         )
 
-        #expect(result.colors.first?.colorSpace == .deviceRGB)
         #expect(result.colorComponents == [SIMD4<Float>(0.25, 0.25, 0.25, 0.5)])
     }
 
@@ -72,7 +71,7 @@ struct GradientRenderConfigurationTests {
             type: .axial,
             colors: Array(repeating: red as Any, count: 257)
         )
-        #expect(manyStops.colors.count == 257)
+        #expect(manyStops.colorCount == 257)
         #expect(manyStops.locations.count == 257)
         #expect(manyStops.locations.last == 1)
         #expect(throws: GradientRenderConfigurationError.nonFiniteGeometry) {

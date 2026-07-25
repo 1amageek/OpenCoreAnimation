@@ -4082,6 +4082,9 @@ private final class EmitterLayerState {
         let containsExtendedContent = values.contentsHeadroom > 1
             || colorContainsExtendedComponents(values.backgroundColor)
             || colorContainsExtendedComponents(values.borderColor)
+            || values.gradient?.colorComponents.contains(
+                where: colorContainsExtendedComponents
+            ) == true
         let explicitlyRequestsHighRange =
             values.preferredDynamicRange == .high
             || values.preferredDynamicRange == .constrainedHigh
@@ -4429,6 +4432,8 @@ private final class EmitterLayerState {
                         ].identity
                     )
                 )
+            case .gradient(let failure):
+                recordGradientRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4521,6 +4526,8 @@ private final class EmitterLayerState {
                         layer: snapshot.nodes[snapshot.rootIndex].identity
                     )
                 )
+            case .gradient(let failure):
+                recordGradientRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -7586,7 +7593,16 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
-        if let imageContents = values.imageContents {
+        if let gradient = values.gradient {
+            try renderSnapshotGradient(
+                gradient,
+                identity: node.identity,
+                values: values,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+        } else if let imageContents = values.imageContents {
             do {
                 try renderSnapshotContents(
                     imageContents,
@@ -7677,6 +7693,93 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
+    }
+
+    private func renderSnapshotGradient(
+        _ configuration: GradientRenderConfiguration,
+        identity: ObjectIdentifier,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        guard let vertexBuffer,
+              let uniformBuffer else {
+            throw .gradient(.rendererResourcesUnavailable)
+        }
+        let stopBinding: (stopOffset: UInt32, bindGroup: GPUBindGroup)
+        do {
+            stopBinding = try gradientStopBinding(
+                for: identity,
+                configuration: configuration,
+                device: device
+            )
+        } catch {
+            throw .gradient(error)
+        }
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            throw .mask(.pipelineUnavailable(.activeStencil))
+        }
+        renderPass.setPipeline(selectedPipeline)
+
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(values.boundsSize.x, 0, 0, 0),
+            SIMD4<Float>(0, values.boundsSize.y, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        var uniforms = CARendererUniforms(
+            mvpMatrix: modelMatrix * scaleMatrix,
+            opacity: currentEffectiveOpacity,
+            cornerRadius: values.cornerRadius,
+            layerSize: values.boundsSize,
+            borderWidth: 0,
+            renderMode: configuration.renderMode,
+            gradientStartPoint: configuration.startPoint,
+            gradientEndPoint: configuration.endPoint,
+            gradientColorCount: Float(configuration.colorCount),
+            gradientColorMultiplier: currentReplicatorColor,
+            gradientStopOffset: Float(stopBinding.stopOffset),
+            edgeAntialiasingMask: values.edgeAntialiasingMask,
+            cornerCurveExponent: values.cornerCurveExponent,
+            cornerRadii: values.cornerRadii
+        )
+        let dummyColor = SIMD4<Float>(repeating: 1)
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: dummyColor),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: dummyColor),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: dummyColor),
+            CARendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: dummyColor),
+            CARendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: dummyColor),
+            CARendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: dummyColor),
+        ]
+        guard let (vertexOffset, layerIndex) = allocateVertices(
+            count: vertices.count
+        ) else {
+            throw .gradient(.vertexCapacityExceeded)
+        }
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+        renderPass.setBindGroup(
+            0,
+            bindGroup: stopBinding.bindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: vertexOffset
+        )
+        renderPass.draw(vertexCount: 6)
     }
 
     private func renderSnapshotPreparedComposition(
@@ -11884,7 +11987,7 @@ private final class EmitterLayerState {
     }
 
     private func gradientStopBinding(
-        for gradientLayer: CAGradientLayer,
+        for identifier: ObjectIdentifier,
         configuration: GradientRenderConfiguration,
         device: GPUDevice
     ) throws(CAGradientRenderFailure) -> (
@@ -11897,18 +12000,17 @@ private final class EmitterLayerState {
             throw .rendererResourcesUnavailable
         }
 
-        let identifier = ObjectIdentifier(gradientLayer)
         if let stopOffset = gradientStopOffsets[identifier],
            let gradientBindGroup {
             return (stopOffset, gradientBindGroup)
         }
 
-        let (byteCount, byteCountOverflow) = UInt64(configuration.colors.count)
+        let (byteCount, byteCountOverflow) = UInt64(configuration.colorCount)
             .multipliedReportingOverflow(by: Self.gradientStopStride)
         let (requiredCapacity, capacityOverflow) = gradientStopByteOffset
             .addingReportingOverflow(byteCount)
         guard !byteCountOverflow else {
-            throw .stopByteCountOverflow(colorCount: configuration.colors.count)
+            throw .stopByteCountOverflow(colorCount: configuration.colorCount)
         }
         guard !capacityOverflow else {
             throw .stopCapacityOverflow(
@@ -12018,7 +12120,7 @@ private final class EmitterLayerState {
         let stopBinding: (stopOffset: UInt32, bindGroup: GPUBindGroup)
         do {
             stopBinding = try gradientStopBinding(
-                for: gradientLayer,
+                for: ObjectIdentifier(gradientLayer),
                 configuration: configuration,
                 device: device
             )
@@ -12053,9 +12155,9 @@ private final class EmitterLayerState {
             layerSize: SIMD2<Float>(Float(gradientLayer.bounds.width), Float(gradientLayer.bounds.height)),
             borderWidth: 0,
             renderMode: configuration.renderMode,
-            gradientStartPoint: SIMD2<Float>(Float(gradientLayer.startPoint.x), Float(gradientLayer.startPoint.y)),
-            gradientEndPoint: SIMD2<Float>(Float(gradientLayer.endPoint.x), Float(gradientLayer.endPoint.y)),
-            gradientColorCount: Float(configuration.colors.count),
+            gradientStartPoint: configuration.startPoint,
+            gradientEndPoint: configuration.endPoint,
+            gradientColorCount: Float(configuration.colorCount),
             gradientColorMultiplier: currentReplicatorColor,
             gradientStopOffset: Float(stopBinding.stopOffset),
             edgeAntialiasingMask: gradientLayer.edgeAntialiasingMaskValue,

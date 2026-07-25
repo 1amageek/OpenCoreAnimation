@@ -6033,6 +6033,7 @@ func installHarness() {
                 let snapshotBaseSubclass = SnapshotBaseProbeLayer()
                 let snapshotScrollLayer = CAScrollLayer()
                 let snapshotScrollChild = CALayer()
+                let snapshotGradientLayer = CAGradientLayer()
                 guard let snapshotCoreImageFilter = CIFilter(
                     name: "CIColorInvert"
                 ), let snapshotCompositionFilter = CIFilter(
@@ -6452,6 +6453,27 @@ func installHarness() {
                 )
                 snapshotScrollLayer.addSublayer(snapshotScrollChild)
                 snapshotRoot.addSublayer(snapshotScrollLayer)
+                snapshotGradientLayer.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotGradientLayer.position = CGPoint(
+                    x: 350,
+                    y: 230
+                )
+                snapshotGradientLayer.colors = [
+                    CGColor(
+                        red: 0,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    ),
+                    CGColor(
+                        red: 0,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    ),
+                ]
+                snapshotRoot.addSublayer(snapshotGradientLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6559,6 +6581,20 @@ func installHarness() {
                     blue: 1,
                     alpha: 1
                 )
+                snapshotGradientLayer.colors = [
+                    CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 0,
+                        alpha: 1
+                    ),
+                    CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 0,
+                        alpha: 1
+                    ),
+                ]
                 renderer.render(layer: snapshotRoot)
                 let snapshotRasterizationScaleWasApplied =
                     renderer.explicitRasterizationCapturePixelSizes
@@ -6595,7 +6631,8 @@ func installHarness() {
                         CGPoint(x: 170, y: 70),
                         CGPoint(x: 230, y: 70),
                         CGPoint(x: 290, y: 70),
-                        CGPoint(x: 330, y: 70),
+                        CGPoint(x: 320, y: 70),
+                        CGPoint(x: 350, y: 70),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()

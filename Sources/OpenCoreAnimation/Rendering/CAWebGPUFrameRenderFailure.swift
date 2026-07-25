@@ -11,6 +11,7 @@ public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
     case filter(CALayerFilterRenderFailure)
     case backdropComposition(CACompositionFilterRenderFailure)
     case shadow(CAShadowRenderFailure)
+    case gradient(CAGradientRenderFailure)
 }
 
 /// Describes why a WebGPU frame could not begin rendering.

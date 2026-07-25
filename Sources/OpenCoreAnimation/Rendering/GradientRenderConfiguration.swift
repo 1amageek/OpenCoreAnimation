@@ -1,10 +1,15 @@
 import Foundation
 
-struct GradientRenderConfiguration {
+struct GradientRenderConfiguration: Equatable, Sendable {
     let renderMode: Float
-    let colors: [CGColor]
     let colorComponents: [SIMD4<Float>]
     let locations: [Float]
+    let startPoint: SIMD2<Float>
+    let endPoint: SIMD2<Float>
+
+    var colorCount: Int {
+        colorComponents.count
+    }
 
     init(
         type: CAGradientLayerType,
@@ -16,8 +21,6 @@ struct GradientRenderConfiguration {
         renderMode = try Self.renderMode(for: type)
         try Self.validateGeometry(startPoint: startPoint, endPoint: endPoint)
 
-        var validatedColors: [CGColor] = []
-        validatedColors.reserveCapacity(colorValues.count)
         var validatedColorComponents: [SIMD4<Float>] = []
         validatedColorComponents.reserveCapacity(colorValues.count)
         for (index, value) in colorValues.enumerated() {
@@ -45,11 +48,11 @@ struct GradientRenderConfiguration {
                   floatComponents.w.isFinite else {
                 throw GradientRenderConfigurationError.invalidColorComponents(index: index)
             }
-            validatedColors.append(converted)
             validatedColorComponents.append(floatComponents)
         }
-        colors = validatedColors
         colorComponents = validatedColorComponents
+        self.startPoint = SIMD2(Float(startPoint.x), Float(startPoint.y))
+        self.endPoint = SIMD2(Float(endPoint.x), Float(endPoint.y))
 
         if let locationValues {
             guard locationValues.count == colorValues.count else {

@@ -136,6 +136,63 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Gradient stops and geometry become immutable snapshot values")
+    func gradientValuesUseSnapshots() throws {
+        let gradient = CAGradientLayer()
+        gradient.bounds = CGRect(x: 0, y: 0, width: 40, height: 30)
+        gradient.colors = [
+            CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+            CGColor(red: 0, green: 0, blue: 1, alpha: 1),
+        ]
+        gradient.locations = [0.25, 0.75]
+        gradient.startPoint = CGPoint(x: 0.1, y: 0.2)
+        gradient.endPoint = CGPoint(x: 0.8, y: 0.9)
+
+        let snapshot = try CARenderSnapshot.capture(
+            gradient,
+            frameToken: 46
+        )
+        let configuration = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.gradient
+        )
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(configuration.colorComponents == [
+            SIMD4<Float>(1, 0, 0, 1),
+            SIMD4<Float>(0, 0, 1, 1),
+        ])
+        #expect(configuration.locations == [0.25, 0.75])
+        #expect(configuration.startPoint == SIMD2<Float>(0.1, 0.2))
+        #expect(configuration.endPoint == SIMD2<Float>(0.8, 0.9))
+
+        gradient.colors = [
+            CGColor(red: 0, green: 1, blue: 0, alpha: 1),
+        ]
+        gradient.locations = nil
+        gradient.startPoint = .zero
+        gradient.endPoint = .zero
+        #expect(configuration.colorCount == 2)
+        #expect(configuration.locations == [0.25, 0.75])
+        #expect(configuration.startPoint == SIMD2<Float>(0.1, 0.2))
+        #expect(configuration.endPoint == SIMD2<Float>(0.8, 0.9))
+    }
+
+    @Test("Invalid gradients fail immutable capture explicitly")
+    func invalidGradientFailsCapture() {
+        let gradient = CAGradientLayer()
+        gradient.colors = [
+            CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+        ]
+        gradient.type = CAGradientLayerType(rawValue: "future")
+
+        #expect(throws: CARendererError.invalidLayerGradient(
+            .unsupportedType("future")
+        )) {
+            try CARenderSnapshot.capture(gradient, frameToken: 47)
+        }
+    }
+
     @Test("Detached mask trees become value-owned snapshot nodes")
     func maskTreeIsCapturedByValue() throws {
         CATransaction.flush()
@@ -1409,6 +1466,34 @@ extension CARenderSnapshotTests {
 
         #expect(renderer.lastRenderError
             == .unsupportedCommittedSnapshotFeature(.imageContents))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed gradients instead of dropping them")
+    func metalRejectsUnsupportedGradientSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(descriptor: descriptor))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CAGradientLayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.position = CGPoint(x: 1, y: 0.5)
+        root.colors = [
+            CGColor(red: 1, green: 0, blue: 0, alpha: 1),
+            CGColor(red: 0, green: 0, blue: 1, alpha: 1),
+        ]
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.gradient))
         #expect(renderer.lastCommandBuffer == nil)
     }
 

@@ -92,7 +92,14 @@ extension CAGradientLayer: CALayerContextRenderable {
             throw Self.contextRenderError(for: error)
         }
         guard let gradient = CGGradient(
-            colors: configuration.colors,
+            colors: configuration.colorComponents.map {
+                CGColor(
+                    red: CGFloat($0.x),
+                    green: CGFloat($0.y),
+                    blue: CGFloat($0.z),
+                    alpha: CGFloat($0.w)
+                )
+            },
             locations: configuration.locations.map { CGFloat($0) }
         ) else {
             throw .gradientCreationFailed

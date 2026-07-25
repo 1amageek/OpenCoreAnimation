@@ -417,6 +417,11 @@ public final class CAMetalRenderer: CARendererDelegate {
         }) {
             return .imageContents
         }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.gradient != nil
+        }) {
+            return .gradient
+        }
         return nil
     }
 
