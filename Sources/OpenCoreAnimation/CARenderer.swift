@@ -32,6 +32,12 @@ public enum CARendererError: Error, Equatable, Sendable {
     case nonFiniteLayerGeometry
     /// A layer background color cannot be converted to finite device-RGB components.
     case invalidLayerBackgroundColor
+    /// A layer border color cannot be converted to finite device-RGB components.
+    case invalidLayerBorderColor
+    /// A layer border width cannot be represented by the renderer.
+    case invalidLayerBorderWidth
+    /// A layer corner curve or radius cannot be represented by the renderer.
+    case invalidLayerCornerGeometry
     /// A pixel readback coordinate was non-integral or outside the texture.
     case invalidReadbackCoordinate(x: CGFloat, y: CGFloat, width: Int, height: Int)
     /// A mapped WebGPU readback byte was absent or not representable as UInt8.

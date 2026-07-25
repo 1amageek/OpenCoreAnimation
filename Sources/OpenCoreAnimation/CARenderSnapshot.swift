@@ -1,5 +1,20 @@
 import Foundation
 
+internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
+    case specializedLayer
+    case contents
+    case delegateBackingStore
+    case mask
+    case clipping
+    case opacityGroup
+    case shadow
+    case filters
+    case backdropComposition
+    case rasterization
+    case transition
+    case backfaceCulling
+}
+
 /// An immutable, value-owned view of the presentation state required by a
 /// renderer for one frame.
 ///
@@ -26,7 +41,12 @@ internal struct CARenderSnapshot: Sendable {
         internal let opacity: Float
         internal let isHidden: Bool
         internal let cornerRadius: Float
+        internal let cornerCurveExponent: Float
+        internal let cornerRadii: SIMD4<Float>
+        internal let edgeAntialiasingMask: Float
         internal let backgroundColor: SIMD4<Float>?
+        internal let borderWidth: Float
+        internal let borderColor: SIMD4<Float>?
     }
 
     internal struct Node: Sendable, Equatable {
@@ -42,6 +62,7 @@ internal struct CARenderSnapshot: Sendable {
     internal let rootBounds: CGRect
     internal let rootContentsScale: CGFloat
     internal let capturedContentRevisions: [ObjectIdentifier: UInt64]
+    internal let liveTreeRequirement: CARenderSnapshotLiveTreeRequirement?
 
     internal static func capture(
         _ rootLayer: CALayer,
@@ -49,10 +70,12 @@ internal struct CARenderSnapshot: Sendable {
     ) throws(CARendererError) -> CARenderSnapshot {
         var nodes: [Node] = []
         var visited: Set<ObjectIdentifier> = []
+        var liveTreeRequirement: CARenderSnapshotLiveTreeRequirement?
         let rootIndex = try captureNode(
             rootLayer,
             nodes: &nodes,
-            visited: &visited
+            visited: &visited,
+            liveTreeRequirement: &liveTreeRequirement
         )
         var capturedContentRevisions: [ObjectIdentifier: UInt64] = [:]
         capturedContentRevisions.reserveCapacity(nodes.count)
@@ -65,14 +88,16 @@ internal struct CARenderSnapshot: Sendable {
             frameToken: frameToken,
             rootBounds: rootLayer.bounds,
             rootContentsScale: rootLayer.contentsScale,
-            capturedContentRevisions: capturedContentRevisions
+            capturedContentRevisions: capturedContentRevisions,
+            liveTreeRequirement: liveTreeRequirement
         )
     }
 
     private static func captureNode(
         _ layer: CALayer,
         nodes: inout [Node],
-        visited: inout Set<ObjectIdentifier>
+        visited: inout Set<ObjectIdentifier>,
+        liveTreeRequirement: inout CARenderSnapshotLiveTreeRequirement?
     ) throws(CARendererError) -> Int {
         let identity = ObjectIdentifier(layer)
         guard visited.insert(identity).inserted else {
@@ -81,6 +106,12 @@ internal struct CARenderSnapshot: Sendable {
 
         let contentRevision = layer._contentRevision
         let presentationLayer = layer._renderTimePresentation()
+        if liveTreeRequirement == nil {
+            liveTreeRequirement = requiredLiveTreeFeature(
+                modelLayer: layer,
+                presentationLayer: presentationLayer
+            )
+        }
         let values = try presentationValues(from: presentationLayer)
         let nodeIndex = nodes.count
         nodes.append(
@@ -94,12 +125,13 @@ internal struct CARenderSnapshot: Sendable {
 
         var childIndices: [Int] = []
         childIndices.reserveCapacity(layer.sublayers?.count ?? 0)
-        for child in layer.sublayers ?? [] {
+        for child in layer.sortedSublayers() {
             childIndices.append(
                 try captureNode(
                     child,
                     nodes: &nodes,
-                    visited: &visited
+                    visited: &visited,
+                    liveTreeRequirement: &liveTreeRequirement
                 )
             )
         }
@@ -111,6 +143,51 @@ internal struct CARenderSnapshot: Sendable {
             childIndices: childIndices
         )
         return nodeIndex
+    }
+
+    private static func requiredLiveTreeFeature(
+        modelLayer: CALayer,
+        presentationLayer: CALayer
+    ) -> CARenderSnapshotLiveTreeRequirement? {
+        if ObjectIdentifier(type(of: modelLayer)) != ObjectIdentifier(CALayer.self) {
+            return .specializedLayer
+        }
+        if presentationLayer.contents != nil {
+            return .contents
+        }
+        if modelLayer.delegate != nil {
+            return .delegateBackingStore
+        }
+        if presentationLayer.mask != nil {
+            return .mask
+        }
+        if presentationLayer.masksToBounds {
+            return .clipping
+        }
+        if presentationLayer.opacity < 1 {
+            return .opacityGroup
+        }
+        if presentationLayer.shadowOpacity > 0,
+           presentationLayer.shadowColor != nil {
+            return .shadow
+        }
+        if presentationLayer.filters?.isEmpty == false {
+            return .filters
+        }
+        if presentationLayer.compositingFilter != nil
+            || presentationLayer.backgroundFilters?.isEmpty == false {
+            return .backdropComposition
+        }
+        if presentationLayer.shouldRasterize {
+            return .rasterization
+        }
+        if presentationLayer._transitionRenderState != nil {
+            return .transition
+        }
+        if !presentationLayer.isDoubleSided {
+            return .backfaceCulling
+        }
+        return nil
     }
 
     private static func presentationValues(
@@ -128,9 +205,36 @@ internal struct CARenderSnapshot: Sendable {
               layer.anchorPointZ.isFinite,
               layer.opacity.isFinite,
               layer.cornerRadius.isFinite,
+              layer.borderWidth.isFinite,
               isFinite(layer.transform),
               isFinite(layer.sublayerTransform) else {
             throw .nonFiniteLayerGeometry
+        }
+        guard layer.cornerRadius >= 0 else {
+            throw .invalidLayerCornerGeometry
+        }
+        let cornerCurveExponent: Float
+        do {
+            cornerCurveExponent = Float(
+                try CornerCurveRenderConfiguration(
+                    curve: layer.cornerCurve
+                ).exponent
+            )
+        } catch {
+            throw .invalidLayerCornerGeometry
+        }
+        let cornerRadii = cornerRadiiComponents(from: layer)
+        guard cornerCurveExponent.isFinite,
+              cornerCurveExponent > 0,
+              cornerRadii.x.isFinite,
+              cornerRadii.y.isFinite,
+              cornerRadii.z.isFinite,
+              cornerRadii.w.isFinite else {
+            throw .invalidLayerCornerGeometry
+        }
+        let borderWidth = Float(layer.borderWidth)
+        guard borderWidth.isFinite, borderWidth >= 0 else {
+            throw .invalidLayerBorderWidth
         }
         let boundsWidth = Float(layer.bounds.width)
         let boundsHeight = Float(layer.bounds.height)
@@ -173,12 +277,39 @@ internal struct CARenderSnapshot: Sendable {
             opacity: layer.opacity,
             isHidden: layer.isHidden,
             cornerRadius: Float(layer.cornerRadius),
-            backgroundColor: try colorComponents(layer.backgroundColor)
+            cornerCurveExponent: cornerCurveExponent,
+            cornerRadii: cornerRadii,
+            edgeAntialiasingMask: layer.allowsEdgeAntialiasing
+                ? Float(layer.edgeAntialiasingMask.rawValue & 0xF)
+                : 0,
+            backgroundColor: try colorComponents(
+                layer.backgroundColor,
+                failure: .invalidLayerBackgroundColor
+            ),
+            borderWidth: borderWidth,
+            borderColor: try colorComponents(
+                layer.borderColor,
+                failure: .invalidLayerBorderColor
+            )
+        )
+    }
+
+    private static func cornerRadiiComponents(
+        from layer: CALayer
+    ) -> SIMD4<Float> {
+        let radius = Float(layer.cornerRadius)
+        guard radius > 0 else { return .zero }
+        return SIMD4<Float>(
+            layer.maskedCorners.contains(.layerMinXMinYCorner) ? radius : 0,
+            layer.maskedCorners.contains(.layerMaxXMinYCorner) ? radius : 0,
+            layer.maskedCorners.contains(.layerMinXMaxYCorner) ? radius : 0,
+            layer.maskedCorners.contains(.layerMaxXMaxYCorner) ? radius : 0
         )
     }
 
     private static func colorComponents(
-        _ color: CGColor?
+        _ color: CGColor?,
+        failure: CARendererError
     ) throws(CARendererError) -> SIMD4<Float>? {
         guard let color else { return nil }
         guard let converted = color.converted(
@@ -189,7 +320,7 @@ internal struct CARenderSnapshot: Sendable {
         let components = converted.components,
         components.count == 4,
         components.allSatisfy(\.isFinite) else {
-            throw .invalidLayerBackgroundColor
+            throw failure
         }
         let result = SIMD4<Float>(
             Float(components[0]),
@@ -201,7 +332,7 @@ internal struct CARenderSnapshot: Sendable {
               result.y.isFinite,
               result.z.isFinite,
               result.w.isFinite else {
-            throw .invalidLayerBackgroundColor
+            throw failure
         }
         return result
     }
@@ -289,6 +420,14 @@ internal enum CACommittedRenderState: Sendable {
     case captureFailure(frameToken: UInt64, error: CARendererError)
     case requiresLiveAnimationEvaluation(frameToken: UInt64)
     case requiresLiveTreePreparation(frameToken: UInt64)
+    // FIXME(INCOMPLETE_IMPLEMENTATION): Static trees using this feature still
+    // reach production WebGPU through the live-tree renderer. This branch must
+    // not be treated as snapshot success until the named resource category is
+    // value-owned by CARenderSnapshot and encoded without CALayer reads.
+    case requiresLiveResourceCapture(
+        frameToken: UInt64,
+        requirement: CARenderSnapshotLiveTreeRequirement
+    )
 
     internal var frameToken: UInt64 {
         switch self {
@@ -296,7 +435,8 @@ internal enum CACommittedRenderState: Sendable {
             snapshot.frameToken
         case .captureFailure(let frameToken, _),
              .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveTreePreparation(let frameToken):
+             .requiresLiveTreePreparation(let frameToken),
+             .requiresLiveResourceCapture(let frameToken, _):
             frameToken
         }
     }

@@ -807,17 +807,21 @@ older submission clears only the dirty state it actually captured; native
 pixel readback proves both the committed pixel and preservation of a later
 model mutation. Capture failures remain typed committed state. Production
 WebGPU still reads the live tree, and the snapshot does not yet own its masks,
-specialized-layer resources, or copied animation evaluators. Animated commits
-therefore publish an explicit `requiresLiveAnimationEvaluation` state instead
-of freezing their commit-time presentation. Layout-pending commits publish
-`requiresLiveTreePreparation` so pre-layout geometry is never accepted as a
-committed snapshot. WebGPU now rejects typed committed capture failures instead
-of rendering them as success, captures layer and detached-mask revisions after
-delegate callbacks, clears only matching revisions after submission, and
-acknowledges only the committed generation with which the frame began. Every
-committed state carries that generation token. R4.1 and R4.2 remain partial;
-R4.4, commit-time layout preparation, full snapshot-token decoupling, and
-active-subtree-only animation evaluation remain open design targets below.
+specialized-layer resources, or copied animation evaluators. Common solid
+nodes now value-own background, border, corner geometry, antialiasing,
+transform, visibility, and stable z-ordered child indices. A static tree that
+needs masks, contents, delegates, effects, a specialized layer, rasterization,
+transition state, clipping, group opacity, or backface handling publishes
+`requiresLiveResourceCapture` with the exact first requirement instead of
+claiming snapshot success. Animated commits similarly publish
+`requiresLiveAnimationEvaluation`; layout-pending commits publish
+`requiresLiveTreePreparation`. WebGPU rejects typed committed capture failures,
+captures layer and detached-mask revisions after delegate callbacks, clears
+only matching revisions after submission, and acknowledges only the committed
+generation with which the frame began. Every committed state carries that
+generation token. R4.1 and R4.2 remain partial; R4.4, commit-time layout
+preparation, full snapshot-token decoupling, and active-subtree-only animation
+evaluation remain open design targets below.
 
 ### 6.1 `CARenderSnapshot`
 

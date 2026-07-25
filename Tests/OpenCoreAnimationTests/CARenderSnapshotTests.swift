@@ -24,6 +24,59 @@ struct CARenderSnapshotTests {
             == SIMD4<Float>(0, 1, 0, 1))
     }
 
+    @Test("Common solid state and z-ordered hierarchy are value-owned")
+    func commonSolidStateIsCaptured() throws {
+        let root = CALayer()
+        root.borderWidth = 2
+        root.borderColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        root.cornerRadius = 4
+        root.maskedCorners = [.layerMinXMinYCorner]
+
+        let front = CALayer()
+        front.zPosition = 2
+        let back = CALayer()
+        back.zPosition = -1
+        root.addSublayer(front)
+        root.addSublayer(back)
+
+        let snapshot = try CARenderSnapshot.capture(root, frameToken: 45)
+        let rootNode = snapshot.nodes[snapshot.rootIndex]
+        let values = rootNode.presentationValues
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(values.borderWidth == 2)
+        #expect(values.borderColor == SIMD4<Float>(0, 0, 1, 1))
+        #expect(values.cornerRadii == SIMD4<Float>(4, 0, 0, 0))
+        #expect(
+            rootNode.childIndices.map { snapshot.nodes[$0].identity }
+                == [ObjectIdentifier(back), ObjectIdentifier(front)]
+        )
+    }
+
+    @Test("Static resources remain an explicit live-tree state")
+    func unsupportedStaticResourceIsExplicit() {
+        CATransaction.flush()
+        let root = CALayer()
+        let mask = CALayer()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        root.mask = mask
+        CATransaction.commit()
+
+        guard case .requiresLiveResourceCapture(_, let requirement) =
+                root.pendingCommittedRenderState else {
+            Issue.record("Expected an explicit live-resource capture state")
+            return
+        }
+        #expect(requirement == .mask)
+    }
+
     @Test("Animated commits request explicit live evaluation until evaluators are immutable")
     func animatedCommitPublishesExplicitEvaluationState() {
         CATransaction.flush()

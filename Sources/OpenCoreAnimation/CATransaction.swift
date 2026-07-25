@@ -541,7 +541,16 @@ public class CATransaction {
                     root,
                     frameToken: frameToken
                 )
-                root.publishCommittedRenderState(.snapshot(snapshot))
+                if let requirement = snapshot.liveTreeRequirement {
+                    root.publishCommittedRenderState(
+                        .requiresLiveResourceCapture(
+                            frameToken: frameToken,
+                            requirement: requirement
+                        )
+                    )
+                } else {
+                    root.publishCommittedRenderState(.snapshot(snapshot))
+                }
             } catch {
                 root.publishCommittedRenderState(
                     .captureFailure(frameToken: frameToken, error: error)

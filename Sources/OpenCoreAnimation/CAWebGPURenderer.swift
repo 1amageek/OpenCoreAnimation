@@ -3958,7 +3958,8 @@ public final class CAWebGPURenderer: CARendererDelegate {
         case .snapshot(let snapshot):
             committedFrameToken = snapshot.frameToken
         case .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveTreePreparation(let frameToken):
+             .requiresLiveTreePreparation(let frameToken),
+             .requiresLiveResourceCapture(let frameToken, _):
             committedFrameToken = frameToken
         case nil:
             committedFrameToken = nil
