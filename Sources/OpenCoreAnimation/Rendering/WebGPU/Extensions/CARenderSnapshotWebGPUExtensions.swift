@@ -6,6 +6,12 @@ extension CARenderSnapshot.PresentationValues {
         parentMatrix: Matrix4x4 = .identity
     ) -> Matrix4x4 {
         var matrix = parentMatrix
+        if !CATransform3DIsIdentity(
+            replicatorInstanceTransform
+        ) {
+            matrix =
+                matrix * replicatorInstanceTransform.matrix4x4
+        }
         matrix = matrix * Matrix4x4(translation: position)
         if !CATransform3DIsIdentity(transform) {
             matrix = matrix * transform.matrix4x4

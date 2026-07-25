@@ -382,6 +382,11 @@ public final class CAMetalRenderer: CARendererDelegate {
         in snapshot: CARenderSnapshot
     ) -> CARenderSnapshotFeature? {
         if snapshot.nodes.contains(where: {
+            $0.presentationValues.replicator != nil
+        }) {
+            return .replicatorInstances
+        }
+        if snapshot.nodes.contains(where: {
             $0.presentationValues.isTransformLayer
         }) {
             return .transformDepth
@@ -578,6 +583,12 @@ private extension CARenderSnapshot.PresentationValues {
         parentMatrix: simd_float4x4 = matrix_identity_float4x4
     ) -> simd_float4x4 {
         var matrix = parentMatrix
+        if !CATransform3DIsIdentity(
+            replicatorInstanceTransform
+        ) {
+            matrix =
+                matrix * replicatorInstanceTransform.simdMatrix
+        }
         let positionTranslation = simd_float4x4(translation: position)
         matrix = matrix * positionTranslation
         if !CATransform3DIsIdentity(transform) {

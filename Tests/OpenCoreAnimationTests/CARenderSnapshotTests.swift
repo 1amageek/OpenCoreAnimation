@@ -228,6 +228,299 @@ struct CARenderSnapshotTests {
         #expect(node.childIndices.count == 2)
     }
 
+    @Test("Replicator instances become independent immutable subtrees")
+    func replicatorInstancesUseSnapshots() throws {
+        let replicator = CAReplicatorLayer()
+        replicator.instanceCount = 3
+        replicator.instanceDelay = 0.25
+        replicator.instanceTransform =
+            CATransform3DMakeTranslation(12, 0, 0)
+        replicator.instanceColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        replicator.instanceRedOffset = -0.5
+        replicator.instanceGreenOffset = 0.5
+
+        let source = CALayer()
+        source.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8
+        )
+        source.backgroundColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 1,
+            alpha: 1
+        )
+        let descendant = CALayer()
+        descendant.bounds = source.bounds
+        source.addSublayer(descendant)
+        replicator.addSublayer(source)
+
+        let snapshot = try CARenderSnapshot.capture(
+            replicator,
+            frameToken: 47
+        )
+        let root = snapshot.nodes[snapshot.rootIndex]
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(snapshot.nodes.count == 7)
+        #expect(root.presentationValues.replicator != nil)
+        #expect(root.replicatorSourceChildCount == 1)
+        #expect(root.childIndices.count == 3)
+
+        let instances = root.childIndices.map {
+            snapshot.nodes[$0]
+        }
+        #expect(instances.allSatisfy {
+            $0.identity == ObjectIdentifier(source)
+        })
+        #expect(
+            instances.map {
+                $0.presentationValues
+                    .replicatorInstanceTransform.m41
+            } == [0, 12, 24]
+        )
+        #expect(
+            instances.map {
+                $0.presentationValues
+                    .effectiveReplicatorColor
+            } == [
+                SIMD4<Float>(1, 0, 0, 1),
+                SIMD4<Float>(0.5, 0.5, 0, 1),
+                SIMD4<Float>(0, 1, 0, 1),
+            ]
+        )
+        #expect(
+            instances.map {
+                $0.presentationValues
+                    .effectiveReplicatorTimeOffset
+            } == [0, 0.25, 0.5]
+        )
+        #expect(
+            instances.map {
+                snapshot.nodes[$0.childIndices[0]]
+                    .presentationValues
+                    .effectiveReplicatorColor
+            } == instances.map {
+                $0.presentationValues
+                    .effectiveReplicatorColor
+            }
+        )
+
+        replicator.instanceCount = 0
+        replicator.instanceTransform = CATransform3DIdentity
+        replicator.instanceColor = nil
+        source.backgroundColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        source.removeFromSuperlayer()
+
+        #expect(root.childIndices.count == 3)
+        #expect(
+            instances.map {
+                $0.presentationValues
+                    .replicatorInstanceTransform.m41
+            } == [0, 12, 24]
+        )
+        #expect(
+            instances[0].presentationValues.backgroundColor
+                == SIMD4<Float>(1, 1, 1, 1)
+        )
+    }
+
+    @Test("Nested replicator snapshots compose inherited instance values")
+    func nestedReplicatorInstancesUseSnapshots() throws {
+        let outer = CAReplicatorLayer()
+        outer.instanceCount = 2
+        outer.instanceDelay = 0.5
+        outer.instanceTransform =
+            CATransform3DMakeTranslation(10, 0, 0)
+        outer.instanceColor = CGColor(
+            red: 1,
+            green: 0.5,
+            blue: 1,
+            alpha: 1
+        )
+
+        let inner = CAReplicatorLayer()
+        inner.instanceCount = 2
+        inner.instanceDelay = 0.25
+        inner.instanceTransform =
+            CATransform3DMakeTranslation(3, 0, 0)
+        inner.instanceColor = CGColor(
+            red: 0.5,
+            green: 1,
+            blue: 1,
+            alpha: 1
+        )
+        inner.addSublayer(CALayer())
+        outer.addSublayer(inner)
+
+        let snapshot = try CARenderSnapshot.capture(
+            outer,
+            frameToken: 48
+        )
+        let outerNode = snapshot.nodes[snapshot.rootIndex]
+        let innerInstances = outerNode.childIndices.map {
+            snapshot.nodes[$0]
+        }
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(innerInstances.count == 2)
+        #expect(
+            innerInstances.map {
+                $0.presentationValues
+                    .replicatorInstanceTransform.m41
+            } == [0, 10]
+        )
+        #expect(
+            innerInstances.map {
+                $0.presentationValues
+                    .effectiveReplicatorTimeOffset
+            } == [0, 0.5]
+        )
+        #expect(
+            innerInstances.allSatisfy {
+                $0.presentationValues.effectiveReplicatorColor
+                    == SIMD4<Float>(1, 0.5, 1, 1)
+            }
+        )
+
+        let sourceInstances = innerInstances.map { innerNode in
+            innerNode.childIndices.map {
+                snapshot.nodes[$0]
+            }
+        }
+        #expect(
+            sourceInstances.map {
+                $0.map {
+                    $0.presentationValues
+                        .replicatorInstanceTransform.m41
+                }
+            } == [[0, 3], [0, 3]]
+        )
+        #expect(
+            sourceInstances.map {
+                $0.map {
+                    $0.presentationValues
+                        .effectiveReplicatorTimeOffset
+                }
+            } == [[0, 0.25], [0.5, 0.75]]
+        )
+        #expect(
+            sourceInstances
+                .flatMap { $0 }
+                .allSatisfy {
+                    $0.presentationValues
+                        .effectiveReplicatorColor
+                        == SIMD4<Float>(0.5, 0.5, 1, 1)
+                }
+        )
+    }
+
+    @Test("Depth-preserving replicators capture only their container contract")
+    func depthPreservingReplicatorUsesSnapshots() throws {
+        let replicator = CAReplicatorLayer()
+        replicator.preservesDepth = true
+        replicator.instanceCount = 1
+        let image = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 255, 255, 255]
+        )
+        let delegate = SnapshotDisplayDelegate(image: image)
+        replicator.delegate = delegate
+        replicator.setNeedsDisplay()
+        replicator.contents = SnapshotContentsToken()
+        replicator.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        replicator.borderWidth = .nan
+        replicator.cornerRadius = .nan
+        replicator.contentsHeadroom = .nan
+        replicator.filters = [SnapshotContentsToken()]
+        replicator.mask = CALayer()
+
+        let first = CALayer()
+        first.zPosition = 4
+        let second = CALayer()
+        second.zPosition = -2
+        replicator.addSublayer(first)
+        replicator.addSublayer(second)
+
+        let snapshot = try CARenderSnapshot.capture(
+            replicator,
+            frameToken: 48
+        )
+        let node = snapshot.nodes[snapshot.rootIndex]
+        let values = node.presentationValues
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(values.replicator?.preservesDepth == true)
+        #expect(values.backgroundColor == nil)
+        #expect(values.borderWidth == 0)
+        #expect(values.imageContents == nil)
+        #expect(values.filters.isEmpty)
+        #expect(values.shadow == nil)
+        #expect(node.maskIndex == nil)
+        #expect(delegate.displayCount == 0)
+        #expect(node.replicatorSourceChildCount == 2)
+        #expect(
+            node.childIndices.map {
+                snapshot.nodes[$0].identity
+            } == [
+                ObjectIdentifier(first),
+                ObjectIdentifier(second),
+            ]
+        )
+    }
+
+    @Test("Invalid replicator input fails immutable capture exactly")
+    func invalidReplicatorCaptureFails() {
+        let replicator = CAReplicatorLayer()
+        replicator.instanceCount =
+            CAReplicatorRenderConfiguration
+                .maximumInstanceCount + 1
+        #expect(throws: CARendererError.invalidLayerReplicator(
+            .instanceCountExceedsRendererCapacity(
+                actual:
+                    CAReplicatorRenderConfiguration
+                        .maximumInstanceCount + 1,
+                maximum:
+                    CAReplicatorRenderConfiguration
+                        .maximumInstanceCount
+            )
+        )) {
+            try CARenderSnapshot.capture(
+                replicator,
+                frameToken: 49
+            )
+        }
+
+        replicator.instanceCount = 2
+        replicator.instanceDelay = .nan
+        #expect(throws: CARendererError.invalidLayerReplicator(
+            .nonFiniteInstanceDelay
+        )) {
+            try CARenderSnapshot.capture(
+                replicator,
+                frameToken: 50
+            )
+        }
+    }
+
     @Test("Gradient stops and geometry become immutable snapshot values")
     func gradientValuesUseSnapshots() throws {
         let gradient = CAGradientLayer()
@@ -1923,6 +2216,36 @@ extension CARenderSnapshotTests {
         #expect(renderer.lastRenderError
             == .unsupportedCommittedSnapshotFeature(
                 .transformDepth
+            ))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed replicator instances instead of omitting them")
+    func metalRejectsUnsupportedReplicatorSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 16,
+            height: 16,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(
+            descriptor: descriptor
+        ))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CAReplicatorLayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.position = CGPoint(x: 8, y: 8)
+        root.instanceCount = 2
+        root.addSublayer(CALayer())
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(
+                .replicatorInstances
             ))
         #expect(renderer.lastCommandBuffer == nil)
     }

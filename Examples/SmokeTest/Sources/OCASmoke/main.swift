@@ -6051,6 +6051,8 @@ func installHarness() {
                 let snapshotTextLayer = CATextLayer()
                 let snapshotTransformLayer = CATransformLayer()
                 let snapshotTransformChild = CALayer()
+                let snapshotReplicatorLayer = CAReplicatorLayer()
+                let snapshotReplicatorChild = CALayer()
                 guard let snapshotCoreImageFilter = CIFilter(
                     name: "CIColorInvert"
                 ), let snapshotCompositionFilter = CIFilter(
@@ -6556,6 +6558,39 @@ func installHarness() {
                     snapshotTransformChild
                 )
                 snapshotRoot.addSublayer(snapshotTransformLayer)
+                snapshotReplicatorLayer.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotReplicatorLayer.position = CGPoint(
+                    x: 30,
+                    y: 170
+                )
+                snapshotReplicatorLayer.instanceCount = 2
+                snapshotReplicatorLayer.instanceTransform =
+                    CATransform3DMakeTranslation(20, 0, 0)
+                snapshotReplicatorLayer.instanceRedOffset = -1
+                snapshotReplicatorLayer.instanceBlueOffset = -1
+                snapshotReplicatorChild.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 10
+                )
+                snapshotReplicatorChild.position = CGPoint(
+                    x: 10,
+                    y: 20
+                )
+                snapshotReplicatorChild.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotReplicatorLayer.addSublayer(
+                    snapshotReplicatorChild
+                )
+                snapshotRoot.addSublayer(
+                    snapshotReplicatorLayer
+                )
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6710,6 +6745,15 @@ func installHarness() {
                     blue: 1,
                     alpha: 1
                 )
+                snapshotReplicatorLayer.instanceCount = 0
+                snapshotReplicatorLayer.instanceTransform =
+                    CATransform3DIdentity
+                snapshotReplicatorChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
                 renderer.render(layer: snapshotRoot)
                 let snapshotRasterizationScaleWasApplied =
                     renderer.explicitRasterizationCapturePixelSizes
@@ -6752,6 +6796,8 @@ func installHarness() {
                         CGPoint(x: 140, y: 120),
                         CGPoint(x: 90, y: 130),
                         CGPoint(x: 75, y: 130),
+                        CGPoint(x: 20, y: 130),
+                        CGPoint(x: 40, y: 130),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -7024,6 +7070,147 @@ func installHarness() {
                         transformFailureCompletionRan
                         && renderer.frameRenderFailureCount
                             == frameFailuresBeforeTransformFailure + 1
+                        && renderer.lastFrameRenderFailure == nil
+
+                    let replicatorFailureRoot =
+                        CAReplicatorLayer()
+                    let replicatorFailureChild = CALayer()
+                    var replicatorFailureCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        replicatorFailureCompletionRan = true
+                    }
+                    replicatorFailureRoot.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    replicatorFailureRoot.position = CGPoint(
+                        x: 20,
+                        y: 20
+                    )
+                    replicatorFailureRoot.instanceCount = 2
+                    replicatorFailureRoot.instanceDelay = .nan
+                    replicatorFailureChild.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 10,
+                        height: 10
+                    )
+                    replicatorFailureChild.position = CGPoint(
+                        x: 5,
+                        y: 5
+                    )
+                    replicatorFailureChild.backgroundColor =
+                        snapshotTransformChild.backgroundColor
+                    replicatorFailureRoot.addSublayer(
+                        replicatorFailureChild
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeReplicatorFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.render(layer: replicatorFailureRoot)
+                    let replicatorFailureWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeReplicatorFailure
+                                + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerReplicator(
+                                    .nonFiniteInstanceDelay
+                                )
+                            )
+                    let replicatorFailureCompletionRemainedPending =
+                        !replicatorFailureCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    replicatorFailureRoot.instanceDelay = 0
+                    CATransaction.commit()
+                    renderer.render(layer: replicatorFailureRoot)
+                    let replicatorFailureRecovered =
+                        replicatorFailureCompletionRan
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeReplicatorFailure
+                                + 1
+                        && renderer.lastFrameRenderFailure == nil
+
+                    let replicatorDepthFailureRoot =
+                        CAReplicatorLayer()
+                    let replicatorDepthFailureChild = CALayer()
+                    var replicatorDepthFailureCompletionRan =
+                        false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        replicatorDepthFailureCompletionRan = true
+                    }
+                    replicatorDepthFailureRoot.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    replicatorDepthFailureRoot.position = CGPoint(
+                        x: 20,
+                        y: 20
+                    )
+                    replicatorDepthFailureRoot.instanceCount = 2
+                    replicatorDepthFailureRoot.preservesDepth = true
+                    replicatorDepthFailureChild.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 10,
+                        height: 10
+                    )
+                    replicatorDepthFailureChild.position = CGPoint(
+                        x: 5,
+                        y: 5
+                    )
+                    replicatorDepthFailureChild.backgroundColor =
+                        snapshotTransformChild.backgroundColor
+                    replicatorDepthFailureChild.transform =
+                        invalidDepthTransform
+                    replicatorDepthFailureRoot.addSublayer(
+                        replicatorDepthFailureChild
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeReplicatorDepthFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.render(
+                        layer: replicatorDepthFailureRoot
+                    )
+                    let replicatorDepthFailureWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeReplicatorDepthFailure
+                                + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .replicator(
+                                    .invalidProjectedDepth(
+                                        instanceIndex: 0,
+                                        sublayerIndex: 0,
+                                        reason:
+                                            .zeroHomogeneousCoordinate
+                                    )
+                                )
+                            )
+                    let replicatorDepthFailureCompletionRemainedPending =
+                        !replicatorDepthFailureCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    replicatorDepthFailureChild.transform =
+                        CATransform3DIdentity
+                    CATransaction.commit()
+                    renderer.render(
+                        layer: replicatorDepthFailureRoot
+                    )
+                    let replicatorDepthFailureRecovered =
+                        replicatorDepthFailureCompletionRan
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeReplicatorDepthFailure
+                                + 1
                         && renderer.lastFrameRenderFailure == nil
 
                     let snapshotMaskFailureRoot = CALayer()
@@ -7377,6 +7564,12 @@ func installHarness() {
                         + ",transformFailureTyped=\(transformFailureWasTyped)"
                         + ",transformFailurePending=\(transformFailureCompletionRemainedPending)"
                         + ",transformFailureRecovered=\(transformFailureRecovered)"
+                        + ",replicatorFailureTyped=\(replicatorFailureWasTyped)"
+                        + ",replicatorFailurePending=\(replicatorFailureCompletionRemainedPending)"
+                        + ",replicatorFailureRecovered=\(replicatorFailureRecovered)"
+                        + ",replicatorDepthFailureTyped=\(replicatorDepthFailureWasTyped)"
+                        + ",replicatorDepthFailurePending=\(replicatorDepthFailureCompletionRemainedPending)"
+                        + ",replicatorDepthFailureRecovered=\(replicatorDepthFailureRecovered)"
                         + ",snapshotMaskFailureTyped=\(snapshotMaskFailureWasTyped)"
                         + ",snapshotMaskFailurePending=\(snapshotMaskFailureCompletionRemainedPending)"
                         + ",snapshotMaskFailureRecovered=\(snapshotMaskFailureRecovered)"

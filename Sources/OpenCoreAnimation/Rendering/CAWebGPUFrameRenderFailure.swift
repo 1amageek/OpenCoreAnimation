@@ -15,6 +15,7 @@ public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
     case shape(CAShapeRenderFailure)
     case text(CATextRenderFailure)
     case transformDepth(CATransformDepthRenderFailure)
+    case replicator(CAReplicatorRenderFailure)
 }
 
 /// Describes why a WebGPU frame could not begin rendering.

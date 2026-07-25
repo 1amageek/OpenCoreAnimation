@@ -17,7 +17,7 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // contents, layer filter and backdrop-composition plans, gradient inputs,
 // tessellated shape geometry, and validated text configuration.
 // Production WebGPU still uses explicitly typed live-tree branches for
-// replicator, emitter, and tiled layers, transitions, and animation evaluation.
+// emitter and tiled layers, transitions, and animation evaluation.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -46,6 +46,14 @@ internal struct CARenderSnapshot: Sendable {
             internal let configuration: CATextRenderConfiguration?
         }
 
+        internal let replicator:
+            CAReplicatorRenderConfiguration?
+        internal private(set) var replicatorInstanceTransform:
+            CATransform3D
+        internal private(set) var effectiveReplicatorColor:
+            SIMD4<Float>
+        internal private(set) var effectiveReplicatorTimeOffset:
+            CFTimeInterval
         internal let bounds: CGRect
         internal let boundsSize: SIMD2<Float>
         internal let boundsOrigin: SIMD2<Float>
@@ -82,6 +90,41 @@ internal struct CARenderSnapshot: Sendable {
         internal let shape: Shape?
         internal let text: Text?
         internal let shadow: Shadow?
+
+        internal func applyingReplicatorInstance(
+            transform: CATransform3D?,
+            color: SIMD4<Float>,
+            timeOffset: CFTimeInterval,
+            instanceIndex: Int
+        ) throws(CAReplicatorRenderFailure) -> Self {
+            var result = self
+            if let transform {
+                let combinedTransform = CATransform3DConcat(
+                    transform,
+                    result.replicatorInstanceTransform
+                )
+                guard CAReplicatorRenderConfiguration.isFinite(
+                    combinedTransform
+                ) else {
+                    throw .cumulativeTransformOverflow(
+                        instanceIndex: instanceIndex
+                    )
+                }
+                result.replicatorInstanceTransform =
+                    combinedTransform
+            }
+            result.effectiveReplicatorColor *= color
+            let combinedTimeOffset =
+                result.effectiveReplicatorTimeOffset + timeOffset
+            guard combinedTimeOffset.isFinite else {
+                throw .instanceTimeOffsetOverflow(
+                    instanceIndex: instanceIndex
+                )
+            }
+            result.effectiveReplicatorTimeOffset =
+                combinedTimeOffset
+            return result
+        }
     }
 
     internal struct Node: Sendable, Equatable {
@@ -90,6 +133,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let presentationValues: PresentationValues
         internal let childIndices: [Int]
         internal let maskIndex: Int?
+        internal let replicatorSourceChildCount: Int?
     }
 
     internal let nodes: [Node]
@@ -140,7 +184,10 @@ internal struct CARenderSnapshot: Sendable {
             throw .cyclicLayerHierarchy
         }
 
-        if !(layer is CATransformLayer) {
+        let isDepthContainer =
+            layer is CATransformLayer
+            || (layer as? CAReplicatorLayer)?.preservesDepth == true
+        if !isDepthContainer {
             do {
                 try layer.prepareDelegateBackingStore(
                     maximumPixelDimension: Int.max
@@ -168,12 +215,13 @@ internal struct CARenderSnapshot: Sendable {
                 contentRevision: contentRevision,
                 presentationValues: values,
                 childIndices: [],
-                maskIndex: nil
+                maskIndex: nil,
+                replicatorSourceChildCount: nil
             )
         )
 
         var childIndices: [Int] = []
-        let orderedChildren = layer is CATransformLayer
+        let orderedChildren = isDepthContainer
             ? layer.sublayers ?? []
             : layer.sortedSublayers()
         childIndices.reserveCapacity(orderedChildren.count)
@@ -187,8 +235,21 @@ internal struct CARenderSnapshot: Sendable {
                 )
             )
         }
+        if let replicator = values.replicator {
+            do {
+                childIndices = try expandedReplicatorChildren(
+                    sourceChildIndices: childIndices,
+                    configuration: replicator,
+                    nodes: &nodes
+                )
+            } catch {
+                throw .invalidLayerReplicator(
+                    snapshotReplicatorError(from: error)
+                )
+            }
+        }
         let maskIndex: Int?
-        if !(layer is CATransformLayer), let mask = layer.mask {
+        if !isDepthContainer, let mask = layer.mask {
             maskIndex = try captureNode(
                 mask,
                 nodes: &nodes,
@@ -204,9 +265,151 @@ internal struct CARenderSnapshot: Sendable {
             contentRevision: contentRevision,
             presentationValues: values,
             childIndices: childIndices,
-            maskIndex: maskIndex
+            maskIndex: maskIndex,
+            replicatorSourceChildCount:
+                values.replicator == nil
+                    ? nil
+                    : orderedChildren.count
         )
         return nodeIndex
+    }
+
+    private static func expandedReplicatorChildren(
+        sourceChildIndices: [Int],
+        configuration: CAReplicatorRenderConfiguration,
+        nodes: inout [Node]
+    ) throws(CAReplicatorRenderFailure) -> [Int] {
+        guard configuration.instanceCount > 0,
+              !sourceChildIndices.isEmpty else {
+            return []
+        }
+
+        var instanceChildIndices: [[Int]] = []
+        instanceChildIndices.reserveCapacity(
+            configuration.instanceCount
+        )
+        instanceChildIndices.append(sourceChildIndices)
+        if configuration.instanceCount > 1 {
+            for _ in 1..<configuration.instanceCount {
+                instanceChildIndices.append(
+                    sourceChildIndices.map {
+                        cloneSubtree(at: $0, nodes: &nodes)
+                    }
+                )
+            }
+        }
+
+        var cumulativeTransform = CATransform3DIdentity
+        var expandedChildIndices: [Int] = []
+        for instanceIndex in 0..<configuration.instanceCount {
+            let color = try configuration.color(
+                at: instanceIndex
+            )
+            let timeOffset = try configuration.timeOffset(
+                at: instanceIndex
+            )
+            for childIndex in instanceChildIndices[instanceIndex] {
+                try applyReplicatorInstance(
+                    to: childIndex,
+                    rootTransform: cumulativeTransform,
+                    color: color,
+                    timeOffset: timeOffset,
+                    instanceIndex: instanceIndex,
+                    nodes: &nodes
+                )
+                expandedChildIndices.append(childIndex)
+            }
+            if instanceIndex + 1 < configuration.instanceCount {
+                cumulativeTransform =
+                    try configuration.nextTransform(
+                        after: cumulativeTransform,
+                        nextInstanceIndex: instanceIndex + 1
+                    )
+            }
+        }
+        return expandedChildIndices
+    }
+
+    private static func cloneSubtree(
+        at sourceIndex: Int,
+        nodes: inout [Node]
+    ) -> Int {
+        let source = nodes[sourceIndex]
+        let cloneIndex = nodes.count
+        nodes.append(
+            Node(
+                identity: source.identity,
+                contentRevision: source.contentRevision,
+                presentationValues: source.presentationValues,
+                childIndices: [],
+                maskIndex: nil,
+                replicatorSourceChildCount:
+                    source.replicatorSourceChildCount
+            )
+        )
+        let childIndices = source.childIndices.map {
+            cloneSubtree(at: $0, nodes: &nodes)
+        }
+        let maskIndex = source.maskIndex.map {
+            cloneSubtree(at: $0, nodes: &nodes)
+        }
+        nodes[cloneIndex] = Node(
+            identity: source.identity,
+            contentRevision: source.contentRevision,
+            presentationValues: source.presentationValues,
+            childIndices: childIndices,
+            maskIndex: maskIndex,
+            replicatorSourceChildCount:
+                source.replicatorSourceChildCount
+        )
+        return cloneIndex
+    }
+
+    private static func applyReplicatorInstance(
+        to nodeIndex: Int,
+        rootTransform: CATransform3D,
+        color: SIMD4<Float>,
+        timeOffset: CFTimeInterval,
+        instanceIndex: Int,
+        nodes: inout [Node]
+    ) throws(CAReplicatorRenderFailure) {
+        let source = nodes[nodeIndex]
+        let values = try source.presentationValues
+            .applyingReplicatorInstance(
+                transform: rootTransform,
+                color: color,
+                timeOffset: timeOffset,
+                instanceIndex: instanceIndex
+            )
+        nodes[nodeIndex] = Node(
+            identity: source.identity,
+            contentRevision: source.contentRevision,
+            presentationValues: values,
+            childIndices: source.childIndices,
+            maskIndex: source.maskIndex,
+            replicatorSourceChildCount:
+                source.replicatorSourceChildCount
+        )
+        for childIndex in source.childIndices {
+            try applyReplicatorInstance(
+                to: childIndex,
+                rootTransform: CATransform3DIdentity,
+                color: color,
+                timeOffset: timeOffset,
+                instanceIndex: instanceIndex,
+                nodes: &nodes
+            )
+        }
+        if let maskIndex = source.maskIndex {
+            try applyReplicatorInstance(
+                to: maskIndex,
+                rootTransform: CATransform3DIdentity,
+                color: color,
+                timeOffset: timeOffset,
+                instanceIndex: instanceIndex,
+                nodes: &nodes
+            )
+        }
     }
 
     private static func requiredLiveTreeFeature(
@@ -225,9 +428,74 @@ internal struct CARenderSnapshot: Sendable {
     private static func requiresSpecializedCapture(
         _ layer: CALayer
     ) -> Bool {
-        layer is CAReplicatorLayer
-            || layer is CAEmitterLayer
+        layer is CAEmitterLayer
             || layer is CATiledLayer
+    }
+
+    private static func snapshotReplicatorError(
+        from error: CAReplicatorRenderFailure
+    ) -> CARenderSnapshotReplicatorError {
+        switch error {
+        case .instanceCountExceedsRendererCapacity(
+            let actual,
+            let maximum
+        ):
+            return .instanceCountExceedsRendererCapacity(
+                actual: actual,
+                maximum: maximum
+            )
+        case .nonFiniteInstanceDelay:
+            return .nonFiniteInstanceDelay
+        case .nonFiniteInstanceTransform:
+            return .nonFiniteInstanceTransform
+        case .invalidInstanceColor:
+            return .invalidInstanceColor
+        case .nonFiniteInstanceColorOffset:
+            return .nonFiniteInstanceColorOffset
+        case .instanceTimeOffsetOverflow(let instanceIndex):
+            return .instanceTimeOffsetOverflow(
+                instanceIndex: instanceIndex
+            )
+        case .instanceColorOverflow(let instanceIndex):
+            return .instanceColorOverflow(
+                instanceIndex: instanceIndex
+            )
+        case .cumulativeTransformOverflow(let instanceIndex):
+            return .cumulativeTransformOverflow(
+                instanceIndex: instanceIndex
+            )
+        case .depthResourcesUnavailable:
+            return .depthResourcesUnavailable
+        case .invalidDepthNesting(let depth):
+            return .invalidDepthNesting(depth)
+        case .depthNestingOverflow:
+            return .depthNestingOverflow
+        case .invalidProjectedDepth(
+            let instanceIndex,
+            let sublayerIndex,
+            let reason
+        ):
+            return .invalidProjectedDepth(
+                instanceIndex: instanceIndex,
+                sublayerIndex: sublayerIndex,
+                reason: snapshotProjectedDepthError(
+                    from: reason
+                )
+            )
+        }
+    }
+
+    private static func snapshotProjectedDepthError(
+        from error: CAProjectedDepthError
+    ) -> CARenderSnapshotProjectedDepthError {
+        switch error {
+        case .nonFiniteHomogeneousCoordinate(let z, let w):
+            return .nonFiniteHomogeneousCoordinate(z: z, w: w)
+        case .zeroHomogeneousCoordinate:
+            return .zeroHomogeneousCoordinate
+        case .nonFiniteNormalizedDepth:
+            return .nonFiniteNormalizedDepth
+        }
     }
 
     private static func presentationValues(
@@ -235,6 +503,25 @@ internal struct CARenderSnapshot: Sendable {
         delegateBackingStore: CADelegateBackingStore? = nil
     ) throws(CARendererError) -> PresentationValues {
         let isTransformLayer = layer is CATransformLayer
+        let replicator: CAReplicatorRenderConfiguration?
+        if let replicatorLayer = layer as? CAReplicatorLayer {
+            do {
+                replicator = try CAReplicatorRenderConfiguration(
+                    layer: replicatorLayer,
+                    maximumInstanceCount:
+                        CAReplicatorRenderConfiguration
+                            .maximumInstanceCount
+                )
+            } catch {
+                throw .invalidLayerReplicator(
+                    snapshotReplicatorError(from: error)
+                )
+            }
+        } else {
+            replicator = nil
+        }
+        let isDepthContainer =
+            isTransformLayer || replicator?.preservesDepth == true
         guard layer.bounds.origin.x.isFinite,
               layer.bounds.origin.y.isFinite,
               layer.bounds.width.isFinite,
@@ -250,7 +537,7 @@ internal struct CARenderSnapshot: Sendable {
               isFinite(layer.sublayerTransform) else {
             throw .nonFiniteLayerGeometry
         }
-        if !isTransformLayer {
+        if !isDepthContainer {
             guard layer.cornerRadius.isFinite,
                   layer.borderWidth.isFinite,
                   layer.contentsHeadroom.isFinite else {
@@ -260,7 +547,7 @@ internal struct CARenderSnapshot: Sendable {
                 throw .invalidLayerCornerGeometry
             }
         }
-        if !isTransformLayer, layer.shouldRasterize {
+        if !isDepthContainer, layer.shouldRasterize {
             guard layer.rasterizationScale.isFinite,
                   layer.rasterizationScale > 0 else {
                 throw .invalidLayerRasterization(
@@ -271,7 +558,7 @@ internal struct CARenderSnapshot: Sendable {
             }
         }
         let cornerCurveExponent: Float
-        if isTransformLayer {
+        if isDepthContainer {
             cornerCurveExponent = Float(
                 CornerCurveRenderConfiguration.circularExponent
             )
@@ -286,7 +573,7 @@ internal struct CARenderSnapshot: Sendable {
                 throw .invalidLayerCornerGeometry
             }
         }
-        let cornerRadii = isTransformLayer
+        let cornerRadii = isDepthContainer
             ? SIMD4<Float>.zero
             : cornerRadiiComponents(from: layer)
         guard cornerCurveExponent.isFinite,
@@ -297,13 +584,13 @@ internal struct CARenderSnapshot: Sendable {
               cornerRadii.w.isFinite else {
             throw .invalidLayerCornerGeometry
         }
-        let borderWidth = isTransformLayer
+        let borderWidth = isDepthContainer
             ? 0
             : Float(layer.borderWidth)
         guard borderWidth.isFinite, borderWidth >= 0 else {
             throw .invalidLayerBorderWidth
         }
-        let contentsHeadroom = isTransformLayer
+        let contentsHeadroom = isDepthContainer
             ? 0
             : Float(layer.contentsHeadroom)
         guard contentsHeadroom.isFinite else {
@@ -340,7 +627,7 @@ internal struct CARenderSnapshot: Sendable {
             throw .nonFiniteLayerGeometry
         }
         let imageContents: CAImageContentsSnapshot?
-        if isTransformLayer
+        if isDepthContainer
             || layer is CAShapeLayer
             || layer is CATextLayer {
             imageContents = nil
@@ -357,7 +644,7 @@ internal struct CARenderSnapshot: Sendable {
         let filters: [CARenderSnapshotFilterStage]
         let compositingFilter: CARenderSnapshotCompositingFilter?
         let backgroundFilters: [CARenderSnapshotFilterStage]
-        if isTransformLayer {
+        if isDepthContainer {
             filters = []
             compositingFilter = nil
             backgroundFilters = []
@@ -387,7 +674,7 @@ internal struct CARenderSnapshot: Sendable {
             }
         }
         let shadow: PresentationValues.Shadow?
-        if !isTransformLayer,
+        if !isDepthContainer,
            layer.shadowOpacity > 0,
            layer.shadowColor != nil {
             let configuration: CAShadowRenderConfiguration
@@ -463,6 +750,12 @@ internal struct CARenderSnapshot: Sendable {
         let shape = try captureShape(from: layer)
         let text = try captureText(from: layer)
         return PresentationValues(
+            replicator: replicator,
+            replicatorInstanceTransform:
+                CATransform3DIdentity,
+            effectiveReplicatorColor:
+                SIMD4<Float>(repeating: 1),
+            effectiveReplicatorTimeOffset: 0,
             bounds: layer.bounds,
             boundsSize: SIMD2<Float>(boundsWidth, boundsHeight),
             boundsOrigin: boundsOrigin,
@@ -473,43 +766,43 @@ internal struct CARenderSnapshot: Sendable {
             isTransformLayer: isTransformLayer,
             isGeometryFlipped: layer.isGeometryFlipped,
             isDoubleSided:
-                isTransformLayer ? true : layer.isDoubleSided,
-            isOpaque: isTransformLayer ? false : layer.isOpaque,
+                isDepthContainer ? true : layer.isDoubleSided,
+            isOpaque: isDepthContainer ? false : layer.isOpaque,
             masksToBounds:
-                isTransformLayer ? false : layer.masksToBounds,
+                isDepthContainer ? false : layer.masksToBounds,
             allowsGroupOpacity:
-                isTransformLayer ? false : layer.allowsGroupOpacity,
+                isDepthContainer ? false : layer.allowsGroupOpacity,
             shouldRasterize:
-                isTransformLayer ? false : layer.shouldRasterize,
+                isDepthContainer ? false : layer.shouldRasterize,
             rasterizationScale:
-                isTransformLayer ? 1 : layer.rasterizationScale,
+                isDepthContainer ? 1 : layer.rasterizationScale,
             opacity: layer.opacity,
             isHidden: layer.isHidden,
             cornerRadius:
-                isTransformLayer ? 0 : Float(layer.cornerRadius),
+                isDepthContainer ? 0 : Float(layer.cornerRadius),
             cornerCurveExponent: cornerCurveExponent,
             cornerRadii: cornerRadii,
-            edgeAntialiasingMask: !isTransformLayer
+            edgeAntialiasingMask: !isDepthContainer
                 && layer.allowsEdgeAntialiasing
                 ? Float(layer.edgeAntialiasingMask.rawValue & 0xF)
                 : 0,
-            backgroundColor: isTransformLayer
+            backgroundColor: isDepthContainer
                 ? nil
                 : try colorComponents(
                     layer.backgroundColor,
                     failure: .invalidLayerBackgroundColor
                 ),
             borderWidth: borderWidth,
-            borderColor: isTransformLayer
+            borderColor: isDepthContainer
                 ? nil
                 : try colorComponents(
                     layer.borderColor,
                     failure: .invalidLayerBorderColor
                 ),
             toneMapMode:
-                isTransformLayer ? .automatic : layer.toneMapMode,
+                isDepthContainer ? .automatic : layer.toneMapMode,
             preferredDynamicRange:
-                isTransformLayer
+                isDepthContainer
                     ? .automatic
                     : layer.preferredDynamicRange,
             contentsHeadroom: contentsHeadroom,

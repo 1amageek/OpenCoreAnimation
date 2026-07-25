@@ -702,7 +702,8 @@ private final class EmitterLayerState {
     // MARK: - Constants
 
     /// Maximum number of layers that can be rendered per frame.
-    private static let maxLayers = 1024
+    private static let maxLayers =
+        CAReplicatorRenderConfiguration.maximumInstanceCount
 
     /// Size of aligned uniform data per layer.
     private static var alignedUniformSize: UInt64 {
@@ -4445,6 +4446,8 @@ private final class EmitterLayerState {
                 recordTextRenderFailure(failure)
             case .transformDepth(let failure):
                 recordTransformDepthRenderFailure(failure)
+            case .replicator(let failure):
+                recordCommittedReplicatorRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4545,6 +4548,8 @@ private final class EmitterLayerState {
                 recordTextRenderFailure(failure)
             case .transformDepth(let failure):
                 recordTransformDepthRenderFailure(failure)
+            case .replicator(let failure):
+                recordCommittedReplicatorRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -7494,6 +7499,16 @@ private final class EmitterLayerState {
         let node = snapshot.nodes[nodeIndex]
         let values = node.presentationValues
         guard !values.isHidden, values.opacity > 0 else { return }
+        replicatorColorStack.append(
+            values.effectiveReplicatorColor
+        )
+        replicatorTimeOffsetStack.append(
+            values.effectiveReplicatorTimeOffset
+        )
+        defer {
+            _ = replicatorTimeOffsetStack.popLast()
+            _ = replicatorColorStack.popLast()
+        }
 
         if snapshotCompositionCaptureDidReachStop {
             return
@@ -7579,6 +7594,17 @@ private final class EmitterLayerState {
         let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
         if values.isTransformLayer {
             try renderSnapshotTransformLayerSublayers(
+                node,
+                in: snapshot,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                device: device,
+                bindGroup: bindGroup
+            )
+            return
+        }
+        if values.replicator?.preservesDepth == true {
+            try renderSnapshotDepthPreservingReplicatorSublayers(
                 node,
                 in: snapshot,
                 renderPass: renderPass,
@@ -8012,22 +8038,34 @@ private final class EmitterLayerState {
             Float(size.width),
             Float(size.height)
         )
-        let compositeAlpha =
-            shadow.color.w * shadow.opacity * currentEffectiveOpacity
-        let compositeColor = SIMD4<Float>(
+        let replicatorColor = currentReplicatorColor
+        guard replicatorColor.x.isFinite,
+              replicatorColor.y.isFinite,
+              replicatorColor.z.isFinite,
+              replicatorColor.w.isFinite else {
+            throw .shadow(
+                .invalidReplicatorColor(replicatorColor)
+            )
+        }
+        let sourceColor = SIMD4<Float>(
             shadow.color.x,
             shadow.color.y,
             shadow.color.z,
-            compositeAlpha
+            shadow.color.w
+                * shadow.opacity
+                * currentEffectiveOpacity
         )
+        let compositeColor = sourceColor * replicatorColor
+        guard compositeColor.x.isFinite,
+              compositeColor.y.isFinite,
+              compositeColor.z.isFinite,
+              compositeColor.w.isFinite else {
+            throw .shadow(.compositeColorOverflow)
+        }
         guard viewportSize.x.isFinite,
               viewportSize.y.isFinite,
               viewportSize.x > 0,
               viewportSize.y > 0,
-              compositeColor.x.isFinite,
-              compositeColor.y.isFinite,
-              compositeColor.z.isFinite,
-              compositeColor.w.isFinite,
               shadow.offset.x.isFinite,
               shadow.offset.y.isFinite else {
             throw .shadow(.invalidCompositeViewport)
@@ -8559,7 +8597,7 @@ private final class EmitterLayerState {
         do {
             configuration = try CASolidRenderConfiguration(
                 bounds: values.bounds,
-                color: color,
+                color: replicatedColor(color),
                 opacity: currentEffectiveOpacity,
                 cornerRadius: CGFloat(values.cornerRadius),
                 cornerCurveExponent: values.cornerCurveExponent,
@@ -10478,6 +10516,18 @@ private final class EmitterLayerState {
         if reportedReplicatorRenderFailureKeys.insert(key).inserted {
             replicatorRenderFailureCount += 1
         }
+    }
+
+    private func recordCommittedReplicatorRenderFailure(
+        _ failure: CAReplicatorRenderFailure
+    ) {
+        if replicatorRenderFailureGeneration == .max {
+            replicatorRenderFailureGeneration = 0
+        } else {
+            replicatorRenderFailureGeneration += 1
+        }
+        lastReplicatorRenderFailure = failure
+        replicatorRenderFailureCount += 1
     }
 
     /// Renders the sublayers of a CAReplicatorLayer with instance transformations.
@@ -16698,6 +16748,120 @@ private final class EmitterLayerState {
         projectedChildren.sort { lhs, rhs in
             lhs.depth == rhs.depth
                 ? lhs.index < rhs.index
+                : lhs.depth < rhs.depth
+        }
+        return projectedChildren.map(\.nodeIndex)
+    }
+
+    private func renderSnapshotDepthPreservingReplicatorSublayers(
+        _ node: CARenderSnapshot.Node,
+        in snapshot: CARenderSnapshot,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        guard !node.childIndices.isEmpty else { return }
+        let sublayerMatrix = node.presentationValues.sublayerMatrix(
+            modelMatrix: modelMatrix
+        )
+        let orderedChildIndices: [Int]
+        do {
+            orderedChildIndices =
+                try depthOrderedSnapshotReplicatorChildIndices(
+                    of: node,
+                    in: snapshot,
+                    parentMatrix: sublayerMatrix
+                )
+        } catch {
+            throw .replicator(error)
+        }
+
+        let configuration: CADepthGroupRenderConfiguration
+        do {
+            configuration = try CADepthGroupRenderConfiguration(
+                currentNestingDepth: transformDepthNesting
+            )
+        } catch {
+            throw .replicator(
+                .depthGroupStateFailure(error)
+            )
+        }
+        if configuration.requiresDepthClear {
+            guard let depthClearPipeline else {
+                throw .replicator(
+                    .depthResourcesUnavailable
+                )
+            }
+            renderPass.setPipeline(depthClearPipeline)
+            renderPass.draw(vertexCount: 3)
+        }
+        let previousNestingDepth = transformDepthNesting
+        transformDepthNesting = configuration.enteredNestingDepth
+        defer {
+            transformDepthNesting = previousNestingDepth
+        }
+
+        for childIndex in orderedChildIndices {
+            try renderSnapshotNode(
+                at: childIndex,
+                in: snapshot,
+                renderPass: renderPass,
+                parentMatrix: sublayerMatrix,
+                isRoot: false,
+                device: device,
+                bindGroup: bindGroup
+            )
+        }
+    }
+
+    private func depthOrderedSnapshotReplicatorChildIndices(
+        of node: CARenderSnapshot.Node,
+        in snapshot: CARenderSnapshot,
+        parentMatrix: Matrix4x4
+    ) throws(CAReplicatorRenderFailure) -> [Int] {
+        let sourceChildCount =
+            node.replicatorSourceChildCount ?? 0
+        guard sourceChildCount > 0 else { return [] }
+        var projectedChildren:
+            [(order: Int, nodeIndex: Int, depth: Float)] = []
+        projectedChildren.reserveCapacity(
+            node.childIndices.count
+        )
+        for (order, childIndex) in
+            node.childIndices.enumerated() {
+            let values =
+                snapshot.nodes[childIndex].presentationValues
+            let matrix = values.modelMatrix(
+                parentMatrix: parentMatrix
+            )
+            let center = SIMD4<Float>(
+                values.boundsSize.x * 0.5,
+                values.boundsSize.y * 0.5,
+                0,
+                1
+            )
+            let projected = matrix * center
+            let depth: Float
+            do {
+                depth = try CAProjectedDepth.resolve(
+                    z: projected.z,
+                    w: projected.w
+                )
+            } catch {
+                throw .invalidProjectedDepth(
+                    instanceIndex: order / sourceChildCount,
+                    sublayerIndex: order % sourceChildCount,
+                    reason: error
+                )
+            }
+            projectedChildren.append(
+                (order, childIndex, depth)
+            )
+        }
+        projectedChildren.sort { lhs, rhs in
+            lhs.depth == rhs.depth
+                ? lhs.order < rhs.order
                 : lhs.depth < rhs.depth
         }
         return projectedChildren.map(\.nodeIndex)

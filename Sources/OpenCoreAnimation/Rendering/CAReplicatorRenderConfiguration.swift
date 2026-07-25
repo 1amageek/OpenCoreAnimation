@@ -33,7 +33,9 @@ public enum CAReplicatorRenderFailure: Error, Equatable, Sendable {
 }
 
 /// Validated, renderer-independent replicator input.
-internal struct CAReplicatorRenderConfiguration {
+internal struct CAReplicatorRenderConfiguration: Equatable, Sendable {
+    internal static let maximumInstanceCount = 1024
+
     let instanceCount: Int
     let preservesDepth: Bool
     let instanceDelay: CFTimeInterval

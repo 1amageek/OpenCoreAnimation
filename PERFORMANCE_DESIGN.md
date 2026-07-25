@@ -854,16 +854,24 @@ frame for retry. Text configuration failures are rejected during capture,
 while Canvas, texture, and vertex-capacity failures retain their exact
 frame-time reason and the committed frame for retry. Transform depth projection,
 depth-group state, and depth-clear failures likewise retain their exact
-frame-time reason and the committed frame for retry. The snapshot does not yet
-own non-image contents, replicator/emitter/tiled specialized-layer resources,
-or copied animation evaluators. A static tree that needs those
+frame-time reason and the committed frame for retry. Replicator capture expands
+each instance into an independent copy-on-write node subtree. Every expanded
+node owns its absolute inherited color and time offset, while each source root
+owns the cumulative instance transform that precedes its ordinary layer model
+transform. Unique node indices keep filter, mask, shadow, rasterization, and
+backdrop resources instance-local without retaining a model layer or a dynamic
+replicator path. Depth-preserving instances validate every projected center
+before clearing depth state, then draw in stable far-to-near order. Capture and
+frame failures retain exact typed instance and source-sublayer locations for
+retry. The snapshot does not yet own non-image contents, emitter/tiled
+specialized-layer resources, or copied animation evaluators. A static tree that needs those
 resources, a remaining specialized layer, or transition state publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents,
 content masks, group opacity, rasterization, filters, backdrop composition,
-shadows, gradients, shapes, text, and transform depth with the corresponding
+shadows, gradients, shapes, text, transform depth, and replicator instances with the corresponding
 `unsupportedCommittedSnapshotFeature` value rather than dropping any resource
 and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,

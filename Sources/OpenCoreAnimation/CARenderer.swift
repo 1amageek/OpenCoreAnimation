@@ -21,6 +21,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case shape
     case text
     case transformDepth
+    case replicatorInstances
 }
 
 /// A layer filter value that could not cross the immutable commit boundary.
@@ -84,6 +85,38 @@ public enum CARenderSnapshotTextError: Error, Equatable, Sendable {
     case unsupportedTruncationMode(String)
 }
 
+/// Projected depth that could not cross the immutable commit boundary.
+public enum CARenderSnapshotProjectedDepthError:
+    Error, Equatable, Sendable {
+    case nonFiniteHomogeneousCoordinate(z: Float, w: Float)
+    case zeroHomogeneousCoordinate
+    case nonFiniteNormalizedDepth
+}
+
+/// Replicator input that could not cross the immutable commit boundary.
+public enum CARenderSnapshotReplicatorError:
+    Error, Equatable, Sendable {
+    case instanceCountExceedsRendererCapacity(
+        actual: Int,
+        maximum: Int
+    )
+    case nonFiniteInstanceDelay
+    case nonFiniteInstanceTransform
+    case invalidInstanceColor
+    case nonFiniteInstanceColorOffset
+    case instanceTimeOffsetOverflow(instanceIndex: Int)
+    case instanceColorOverflow(instanceIndex: Int)
+    case cumulativeTransformOverflow(instanceIndex: Int)
+    case depthResourcesUnavailable
+    case invalidDepthNesting(Int)
+    case depthNestingOverflow
+    case invalidProjectedDepth(
+        instanceIndex: Int,
+        sublayerIndex: Int,
+        reason: CARenderSnapshotProjectedDepthError
+    )
+}
+
 /// Errors that can occur during renderer operations.
 public enum CARendererError: Error, Equatable, Sendable {
     /// The GPU/graphics device is not available.
@@ -134,6 +167,10 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerShape(CARenderSnapshotShapeError)
     /// A text layer could not become immutable renderer input.
     case invalidLayerText(CARenderSnapshotTextError)
+    /// A replicator layer could not become immutable instance values.
+    case invalidLayerReplicator(
+        CARenderSnapshotReplicatorError
+    )
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.
