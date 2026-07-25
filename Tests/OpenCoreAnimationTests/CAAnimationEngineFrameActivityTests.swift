@@ -19,8 +19,8 @@ struct CAAnimationEngineFrameActivityTests {
         #expect(fixture.renderer.renderCount == 2)
     }
 
-    @Test("Unfinished animations keep display-link rendering active")
-    func unfinishedAnimationRequiresFrames() {
+    @Test("Future animations skip clean frames until their active interval")
+    func futureAnimationSkipsCleanFrames() {
         let fixture = makeFixture()
         fixture.fireDisplayLink()
 
@@ -37,7 +37,52 @@ struct CAAnimationEngineFrameActivityTests {
         fixture.fireDisplayLink()
         fixture.fireDisplayLink()
 
+        #expect(fixture.renderer.renderCount == 2)
+
+        setStoredAnimationBeginTime(
+            fixture.root.convertTime(CACurrentMediaTime() - 0.5, from: nil),
+            on: fixture.root,
+            forKey: "future-opacity"
+        )
+        fixture.fireDisplayLink()
+
         #expect(fixture.renderer.renderCount == 3)
+    }
+
+    @Test("Progressing animations keep display-link rendering active")
+    func progressingAnimationRequiresFrames() {
+        let fixture = makeFixture()
+        fixture.fireDisplayLink()
+
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = Float(1)
+        animation.toValue = Float(0)
+        animation.duration = 60
+        fixture.root.add(animation, forKey: "active-opacity")
+
+        fixture.fireDisplayLink()
+        fixture.fireDisplayLink()
+
+        #expect(fixture.renderer.renderCount == 3)
+    }
+
+    @Test("Paused animations skip clean display-link frames")
+    func pausedAnimationSkipsCleanFrames() {
+        let fixture = makeFixture()
+        fixture.fireDisplayLink()
+
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = Float(1)
+        animation.toValue = Float(0)
+        animation.duration = 60
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        fixture.root.add(animation, forKey: "paused-opacity")
+
+        fixture.fireDisplayLink()
+        fixture.fireDisplayLink()
+
+        #expect(fixture.renderer.renderCount == 2)
     }
 
     @Test("Renderer-owned work can request a clean-tree frame")

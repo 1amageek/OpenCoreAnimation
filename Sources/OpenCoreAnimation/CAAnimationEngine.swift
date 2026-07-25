@@ -158,13 +158,18 @@ import JavaScriptKit
     /// `.forwards` fill mode animations render their final frame
     /// before being removed.
     public func displayLinkDidFire(_ displayLink: CADisplayLink) {
-        updateDisplayLinkFrameRate(at: CACurrentMediaTime())
+        let mediaTime = CACurrentMediaTime()
+        updateDisplayLinkFrameRate(at: mediaTime)
 
-        // Render only when committed model work, an unfinished animation, or
+        // Render only when committed model work, a progressing/final animation, or
         // renderer-owned asynchronous/simulation state requires a new frame.
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
             layoutRecursively(rootLayer)
-            if shouldRenderDisplayFrame(rootLayer, delegate: delegate) {
+            if shouldRenderDisplayFrame(
+                rootLayer,
+                delegate: delegate,
+                mediaTime: mediaTime
+            ) {
                 delegate.render(layer: rootLayer)
             }
         }
@@ -203,7 +208,8 @@ import JavaScriptKit
 
     private func shouldRenderDisplayFrame(
         _ rootLayer: CALayer,
-        delegate: CARendererDelegate
+        delegate: CARendererDelegate,
+        mediaTime: CFTimeInterval
     ) -> Bool {
         if rootLayer._subtreeDirtyCount > 0 {
             return true
@@ -212,29 +218,58 @@ import JavaScriptKit
             return true
         }
         var visited: Set<ObjectIdentifier> = []
-        return containsUnfinishedAnimation(rootLayer, visited: &visited)
+        return containsAnimationRequiringFrame(
+            rootLayer,
+            mediaTime: mediaTime,
+            visited: &visited
+        )
     }
 
-    private func containsUnfinishedAnimation(
+    private func containsAnimationRequiringFrame(
         _ layer: CALayer,
+        mediaTime: CFTimeInterval,
         visited: inout Set<ObjectIdentifier>
     ) -> Bool {
         guard visited.insert(ObjectIdentifier(layer)).inserted else { return false }
-        var containsAnimation = false
+        let parentTime = layer.convertTime(mediaTime, from: nil)
+        var requiresFrame = false
         layer.forEachAttachedAnimation { animation in
-            if !animation.isFinished {
-                containsAnimation = true
+            guard !animation.isFinished else { return }
+            let duration = animation.durationOrFallback(animation.effectiveBaseDuration)
+            let timing = CAMediaTimingEvaluator.evaluate(
+                animation,
+                parentTime: parentTime,
+                duration: duration
+            )
+            guard timing.isValid else { return }
+            switch timing.phase {
+            case .before:
+                break
+            case .active:
+                if animation.speed != 0 {
+                    requiresFrame = true
+                }
+            case .after:
+                requiresFrame = true
             }
         }
-        if containsAnimation {
+        if requiresFrame {
             return true
         }
         if let mask = layer.mask,
-           containsUnfinishedAnimation(mask, visited: &visited) {
+           containsAnimationRequiringFrame(
+               mask,
+               mediaTime: mediaTime,
+               visited: &visited
+           ) {
             return true
         }
         for sublayer in layer.sublayers ?? [] {
-            if containsUnfinishedAnimation(sublayer, visited: &visited) {
+            if containsAnimationRequiringFrame(
+                sublayer,
+                mediaTime: mediaTime,
+                visited: &visited
+            ) {
                 return true
             }
         }

@@ -936,13 +936,15 @@ membership.
 ### 6.3 Commit-snapshot decoupling from `CADisplayLink` (R4.3)
 
 The current live-tree engine already suppresses a display-link submission when
-the root's subtree dirty count is zero, no unfinished animation exists in the
-layer or mask tree, and the renderer reports no pending tile or emitter work.
-Manual `renderFrame()` calls remain unconditional. This completes the static
-submission-decision slice, but the animation escape hatch is deliberately
-conservative: unfinished future animations also keep frames active, and the
-renderer still evaluates the live tree rather than only an active snapshot
-subtree.
+the root's subtree dirty count is zero, no progressing or unprocessed terminal
+animation exists in the layer or mask tree, and the renderer reports no pending
+tile or emitter work. Future and paused animations stay idle after the dirty
+frame that captured their committed presentation; the always-running display
+link re-evaluates timing and resumes submission on entry to an active interval.
+An unprocessed terminal interval requests one final frame before completion.
+Manual `renderFrame()` calls remain unconditional. This completes the
+live-tree submission-decision slice, but the renderer still evaluates the
+complete live tree rather than only an active snapshot subtree.
 
 The snapshot-backed target design is:
 
