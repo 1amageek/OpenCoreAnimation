@@ -5415,6 +5415,35 @@ func installHarness() {
         h.expose("beginDisplayLinkProbe", action: {
             Task { @MainActor in
                 displayLinkProbeResult = "running"
+                let browser = JSObject.global
+                let originalRequestAnimationFrame = browser.requestAnimationFrame
+                let originalCancelAnimationFrame = browser.cancelAnimationFrame
+                guard let performance = browser.performance.object else {
+                    displayLinkProbeResult = "error: performance unavailable"
+                    return
+                }
+                let originalPerformanceNow = performance.now
+                let engine = CAAnimationEngine.shared
+                let shouldResumeEngine = engine.isRunning
+                if shouldResumeEngine {
+                    engine.pause()
+                }
+                var installedRequestMocks: [JSClosure] = []
+                defer {
+                    browser.requestAnimationFrame = originalRequestAnimationFrame
+                    browser.cancelAnimationFrame = originalCancelAnimationFrame
+                    performance.now = originalPerformanceNow
+                    _ = installedRequestMocks
+                    if shouldResumeEngine {
+                        engine.resume()
+                    }
+                }
+
+                guard let originalRequest = originalRequestAnimationFrame.function else {
+                    displayLinkProbeResult = "error: requestAnimationFrame unavailable"
+                    return
+                }
+
                 let target = DisplayLinkProbeTarget()
                 let displayLink = CADisplayLink(
                     target: target,
@@ -5425,10 +5454,179 @@ func installHarness() {
                     maximum: 60,
                     preferred: 30
                 )
-                displayLink.add(to: .main, forMode: .default)
-                displayLink.add(to: .main, forMode: .common)
 
                 do {
+                    performance.now = .undefined
+                    let mediaTimeRejected = CACurrentMediaTime().isNaN
+                    performance.now = originalPerformanceNow
+                    let recoveredMediaTime = CACurrentMediaTime()
+                    let mediaTimeRecovered =
+                        recoveredMediaTime.isFinite && recoveredMediaTime >= 0
+
+                    browser.requestAnimationFrame = .undefined
+                    let unavailableRequestTarget = DisplayLinkProbeTarget()
+                    let unavailableRequestLink = CADisplayLink(
+                        target: unavailableRequestTarget,
+                        selector: Selector("displayLinkDidFire")
+                    )
+                    unavailableRequestLink.add(to: .main, forMode: .default)
+                    let unavailableRequestRejected =
+                        unavailableRequestTarget.callbackCount == 0
+                        && unavailableRequestLink.schedulingFailureCount == 1
+                        && unavailableRequestLink.lastSchedulingFailure
+                            == .requestAnimationFrameUnavailable
+
+                    browser.requestAnimationFrame = originalRequestAnimationFrame
+                    unavailableRequestLink.isPaused = true
+                    unavailableRequestLink.isPaused = false
+                    try await Task.sleep(for: .milliseconds(80))
+                    let unavailableRequestRecovered =
+                        unavailableRequestTarget.callbackCount > 0
+                        && unavailableRequestLink.schedulingFailureCount == 1
+                        && unavailableRequestLink.lastSchedulingFailure == nil
+                    unavailableRequestLink.invalidate()
+
+                    var cancelledBoundaryIdentifier: Double?
+                    let boundaryIdentifierRequest = JSClosure { _ in
+                        .number(4_294_967_295)
+                    }
+                    let boundaryIdentifierCancel = JSClosure { arguments in
+                        cancelledBoundaryIdentifier = arguments.first?.number
+                        return .undefined
+                    }
+                    installedRequestMocks.append(boundaryIdentifierRequest)
+                    installedRequestMocks.append(boundaryIdentifierCancel)
+                    browser.requestAnimationFrame = boundaryIdentifierRequest.jsValue
+                    browser.cancelAnimationFrame = boundaryIdentifierCancel.jsValue
+
+                    let boundaryIdentifierTarget = DisplayLinkProbeTarget()
+                    let boundaryIdentifierLink = CADisplayLink(
+                        target: boundaryIdentifierTarget,
+                        selector: Selector("displayLinkDidFire")
+                    )
+                    boundaryIdentifierLink.add(to: .main, forMode: .default)
+                    boundaryIdentifierLink.isPaused = true
+                    let boundaryIdentifierPreserved =
+                        cancelledBoundaryIdentifier == 4_294_967_295
+                        && boundaryIdentifierLink.schedulingFailureCount == 0
+                        && boundaryIdentifierLink.lastSchedulingFailure == nil
+                    boundaryIdentifierLink.invalidate()
+
+                    browser.requestAnimationFrame = originalRequestAnimationFrame
+                    browser.cancelAnimationFrame = originalCancelAnimationFrame
+                    let unavailableCancelTarget = DisplayLinkProbeTarget()
+                    let unavailableCancelLink = CADisplayLink(
+                        target: unavailableCancelTarget,
+                        selector: Selector("displayLinkDidFire")
+                    )
+                    unavailableCancelLink.add(to: .main, forMode: .default)
+                    browser.cancelAnimationFrame = .undefined
+                    unavailableCancelLink.isPaused = true
+                    let unavailableCancelRejected: Bool
+                    if case .cancelAnimationFrameUnavailable =
+                        unavailableCancelLink.lastSchedulingFailure {
+                        unavailableCancelRejected =
+                            unavailableCancelTarget.callbackCount == 0
+                            && unavailableCancelLink.schedulingFailureCount == 1
+                    } else {
+                        unavailableCancelRejected = false
+                    }
+
+                    browser.cancelAnimationFrame = originalCancelAnimationFrame
+                    unavailableCancelLink.isPaused = false
+                    try await Task.sleep(for: .milliseconds(80))
+                    let callbacksBeforeUncancellableDelivery =
+                        unavailableCancelTarget.callbackCount
+                    try await Task.sleep(for: .milliseconds(80))
+                    let unavailableCancelRecovered =
+                        callbacksBeforeUncancellableDelivery > 0
+                        && unavailableCancelTarget.callbackCount
+                            > callbacksBeforeUncancellableDelivery
+                        && unavailableCancelLink.schedulingFailureCount == 1
+                        && unavailableCancelLink.lastSchedulingFailure == nil
+                    unavailableCancelLink.invalidate()
+
+                    let missingTimestampTarget = DisplayLinkProbeTarget()
+                    let missingTimestampRequest = JSClosure { arguments in
+                        guard let callback = arguments.first?.function else {
+                            return .undefined
+                        }
+                        let delivery = JSOneshotClosure { _ in
+                            _ = callback()
+                            return .undefined
+                        }
+                        return originalRequest(delivery)
+                    }
+                    installedRequestMocks.append(missingTimestampRequest)
+                    browser.requestAnimationFrame = missingTimestampRequest.jsValue
+
+                    let missingTimestampLink = CADisplayLink(
+                        target: missingTimestampTarget,
+                        selector: Selector("displayLinkDidFire")
+                    )
+                    missingTimestampLink.add(to: .main, forMode: .default)
+                    try await Task.sleep(for: .milliseconds(60))
+                    let missingTimestampRejected =
+                        missingTimestampTarget.callbackCount == 0
+                        && missingTimestampLink.schedulingFailureCount == 1
+                        && missingTimestampLink.lastSchedulingFailure
+                            == .frameTimestampUnavailable
+
+                    browser.requestAnimationFrame = originalRequestAnimationFrame
+                    missingTimestampLink.isPaused = true
+                    missingTimestampLink.isPaused = false
+                    try await Task.sleep(for: .milliseconds(80))
+                    let missingTimestampRecovered =
+                        missingTimestampTarget.callbackCount > 0
+                        && missingTimestampLink.schedulingFailureCount == 1
+                        && missingTimestampLink.lastSchedulingFailure == nil
+                    missingTimestampLink.invalidate()
+
+                    let invalidIdentifierTarget = DisplayLinkProbeTarget()
+                    let invalidIdentifierRequest = JSClosure { arguments in
+                        guard let callback = arguments.first?.function,
+                              let setTimeout = browser.setTimeout.function else {
+                            return .undefined
+                        }
+                        let delayedDelivery = JSOneshotClosure { _ in
+                            _ = callback(browser.performance.now())
+                            return .undefined
+                        }
+                        _ = setTimeout(delayedDelivery, 120)
+                        return .string("invalid-request-identifier")
+                    }
+                    installedRequestMocks.append(invalidIdentifierRequest)
+                    browser.requestAnimationFrame = invalidIdentifierRequest.jsValue
+
+                    let invalidIdentifierLink = CADisplayLink(
+                        target: invalidIdentifierTarget,
+                        selector: Selector("displayLinkDidFire")
+                    )
+                    invalidIdentifierLink.add(to: .main, forMode: .default)
+                    try await Task.sleep(for: .milliseconds(20))
+                    let invalidIdentifierRejected =
+                        invalidIdentifierTarget.callbackCount == 0
+                        && invalidIdentifierLink.schedulingFailureCount == 1
+                        && invalidIdentifierLink.lastSchedulingFailure
+                            == .requestIdentifierUnavailable
+
+                    browser.requestAnimationFrame = originalRequestAnimationFrame
+                    invalidIdentifierLink.isPaused = true
+                    invalidIdentifierLink.isPaused = false
+                    try await Task.sleep(for: .milliseconds(80))
+                    let callbacksBeforeStaleDelivery =
+                        invalidIdentifierTarget.callbackCount
+                    try await Task.sleep(for: .milliseconds(80))
+                    let invalidIdentifierRecovered =
+                        callbacksBeforeStaleDelivery > 0
+                        && invalidIdentifierTarget.callbackCount
+                            > callbacksBeforeStaleDelivery
+                        && invalidIdentifierLink.schedulingFailureCount == 1
+                        && invalidIdentifierLink.lastSchedulingFailure == nil
+                    invalidIdentifierLink.invalidate()
+
+                    displayLink.add(to: .main, forMode: .default)
+                    displayLink.add(to: .main, forMode: .common)
                     try await Task.sleep(for: .milliseconds(140))
                     let initialCount = target.callbackCount
 
@@ -5456,6 +5654,17 @@ func installHarness() {
                         "cadence=\(target.timingIsValid && target.selectedIntervalExceedsRefreshDuration)",
                         "paused=\(pausedCount == initialCount)",
                         "resumed=\(resumedCount > pausedCount)",
+                        "timestampRejected=\(missingTimestampRejected)",
+                        "timestampRecovered=\(missingTimestampRecovered)",
+                        "identifierRejected=\(invalidIdentifierRejected)",
+                        "identifierRecovered=\(invalidIdentifierRecovered)",
+                        "mediaTimeRejected=\(mediaTimeRejected)",
+                        "mediaTimeRecovered=\(mediaTimeRecovered)",
+                        "requestUnavailable=\(unavailableRequestRejected)",
+                        "requestRecovered=\(unavailableRequestRecovered)",
+                        "boundaryIdentifier=\(boundaryIdentifierPreserved)",
+                        "cancelUnavailable=\(unavailableCancelRejected)",
+                        "cancelRecovered=\(unavailableCancelRecovered)",
                     ].joined(separator: ",")
                 } catch {
                     displayLinkProbeResult = "error: \(error)"

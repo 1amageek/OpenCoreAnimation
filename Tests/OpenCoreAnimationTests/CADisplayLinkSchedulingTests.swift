@@ -1,5 +1,5 @@
 import Testing
-@testable import OpenCoreAnimation
+@_spi(RendererDiagnostics) @testable import OpenCoreAnimation
 
 @Suite("CADisplayLink scheduling")
 @MainActor
@@ -56,6 +56,46 @@ struct CADisplayLinkSchedulingTests {
             maximum: .nan,
             preferred: -.infinity
         ).effectiveFrameRate == nil)
+    }
+
+    @Test("Browser frame timestamps retain exact validation failures")
+    func browserTimestampValidation() {
+        #expect(CADisplayLinkBrowserValueValidator.timestamp(milliseconds: 2_500)
+            == .success(2.5))
+        #expect(CADisplayLinkBrowserValueValidator.timestamp(milliseconds: nil)
+            == .failure(.frameTimestampUnavailable))
+        #expect(CADisplayLinkBrowserValueValidator.timestamp(milliseconds: .nan)
+            == .failure(.frameTimestampNonFinite))
+        #expect(CADisplayLinkBrowserValueValidator.timestamp(milliseconds: -.infinity)
+            == .failure(.frameTimestampNonFinite))
+        #expect(CADisplayLinkBrowserValueValidator.timestamp(milliseconds: -1)
+            == .failure(.frameTimestampNegative(-1)))
+    }
+
+    @Test("Browser request identifiers accept zero and reject malformed values")
+    func browserRequestIdentifierValidation() {
+        #expect(CADisplayLinkBrowserValueValidator.requestIdentifier(0) == .success(0))
+        #expect(CADisplayLinkBrowserValueValidator.requestIdentifier(4_294_967_295)
+            == .success(4_294_967_295))
+        #expect(CADisplayLinkBrowserValueValidator.requestIdentifier(nil)
+            == .failure(.requestIdentifierUnavailable))
+        #expect(CADisplayLinkBrowserValueValidator.requestIdentifier(.infinity)
+            == .failure(.requestIdentifierNonFinite))
+        #expect(CADisplayLinkBrowserValueValidator.requestIdentifier(-1)
+            == .failure(.requestIdentifierNegative(-1)))
+        #expect(CADisplayLinkBrowserValueValidator.requestIdentifier(1.5)
+            == .failure(.requestIdentifierFractional(1.5)))
+        #expect(CADisplayLinkBrowserValueValidator.requestIdentifier(4_294_967_296)
+            == .failure(.requestIdentifierOutOfRange(4_294_967_296)))
+    }
+
+    @Test("Native scheduling diagnostics remain empty")
+    func nativeSchedulingDiagnostics() {
+        let target = NoopTarget()
+        let link = CADisplayLink(target: target, selector: Selector(""))
+
+        #expect(link.schedulingFailureCount == 0)
+        #expect(link.lastSchedulingFailure == nil)
     }
 
     @Test("Mode registrations are removed independently")

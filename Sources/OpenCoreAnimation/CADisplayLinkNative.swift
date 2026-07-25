@@ -35,6 +35,14 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     /// The time value associated with the next frame that was displayed.
     open private(set) var targetTimestamp: CFTimeInterval = 0
 
+    /// The number of browser scheduling failures. Native test delivery never increments this value.
+    @_spi(RendererDiagnostics)
+    public private(set) var schedulingFailureCount = 0
+
+    /// The most recent browser scheduling failure. Native test delivery leaves this value unset.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastSchedulingFailure: CADisplayLinkSchedulingFailure?
+
     /// A Boolean value that indicates whether the system suspends the display link's notifications to the target.
     open var isPaused: Bool = false {
         didSet {

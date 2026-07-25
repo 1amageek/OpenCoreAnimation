@@ -40,6 +40,14 @@ public protocol CAMediaTiming {
 
 // MARK: - CACurrentMediaTime
 
+internal func validatedMediaTime(milliseconds: Double?) -> CFTimeInterval {
+    guard case .success(let timestamp) =
+        CADisplayLinkBrowserValueValidator.timestamp(milliseconds: milliseconds) else {
+        return .nan
+    }
+    return timestamp
+}
+
 #if arch(wasm32)
 import JavaScriptKit
 
@@ -48,12 +56,11 @@ import JavaScriptKit
 /// This uses JavaScript's `performance.now()` API which returns a high-resolution
 /// timestamp in milliseconds, which is then converted to seconds.
 public func CACurrentMediaTime() -> CFTimeInterval {
-    let performance = JSObject.global.performance
-    // FIXME(INCOMPLETE_IMPLEMENTATION): A malformed browser `performance.now()` result is still
-    // converted to a successful zero timestamp on the production WASM media-time path. Completion
-    // requires an explicit invalid-time result and behavior tests proving callers do not advance.
-    let milliseconds = performance.now().number ?? 0
-    return milliseconds / 1000.0
+    guard let performance = JSObject.global.performance.object,
+          let now = performance.now.function else {
+        return .nan
+    }
+    return validatedMediaTime(milliseconds: now(this: performance).number)
 }
 
 #else

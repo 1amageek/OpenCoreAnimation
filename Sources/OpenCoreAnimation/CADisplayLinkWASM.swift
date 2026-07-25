@@ -52,6 +52,14 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     /// The time value associated with the next frame that was displayed.
     open private(set) var targetTimestamp: CFTimeInterval = 0
 
+    /// The number of browser scheduling failures observed by this display link.
+    @_spi(RendererDiagnostics)
+    public private(set) var schedulingFailureCount = 0
+
+    /// The most recent browser scheduling failure, cleared when a new loop starts.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastSchedulingFailure: CADisplayLinkSchedulingFailure?
+
     /// A Boolean value that indicates whether the system suspends the display link's notifications to the target.
     open var isPaused: Bool = false {
         didSet {
@@ -89,8 +97,10 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     private var selector: Selector
     private var registrations: Set<Registration> = []
     private var isInvalidated = false
-    private var animationFrameCallback: JSClosure?
-    private var animationFrameId: Int = 0
+    private var pendingFrameCallback: JSOneshotClosure?
+    private var animationFrameId: UInt32?
+    private var animationLoopGeneration: UInt64 = 0
+    private var uncancellableFrameCallbacks: [UInt64: JSOneshotClosure] = [:]
 
     private var isRunning: Bool {
         !isInvalidated && !registrations.isEmpty
@@ -200,25 +210,36 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
 
     private func startAnimationLoop() {
         stopAnimationLoop()
-
-        animationFrameCallback = JSClosure { [weak self] arguments in
-            // FIXME(INCOMPLETE_IMPLEMENTATION): A malformed requestAnimationFrame timestamp still
-            // fires the production display-link callback with fabricated time zero. Completion
-            // requires typed scheduling failure and tests proving the delegate is not invoked.
-            let timestampMilliseconds = arguments[0].number ?? 0
-            MainActor.assumeIsolated {
-                self?.handleAnimationFrame(timestampMilliseconds: timestampMilliseconds)
-            }
-            return .undefined
-        }
-
+        lastSchedulingFailure = nil
         requestNextFrame()
     }
 
-    private func handleAnimationFrame(timestampMilliseconds: Double) {
+    private func handleAnimationFrame(
+        arguments: [JSValue],
+        generation: UInt64
+    ) {
+        uncancellableFrameCallbacks.removeValue(forKey: generation)
+
+        guard generation == animationLoopGeneration else {
+            return
+        }
+        pendingFrameCallback = nil
+        animationFrameId = nil
+        guard lastSchedulingFailure == nil else { return }
+
+        switch CADisplayLinkBrowserValueValidator.timestamp(
+            milliseconds: arguments.first?.number
+        ) {
+        case .success(let timestamp):
+            handleAnimationFrame(timestamp: timestamp)
+        case .failure(let failure):
+            recordSchedulingFailure(failure)
+        }
+    }
+
+    private func handleAnimationFrame(timestamp currentTimestamp: CFTimeInterval) {
         guard isRunning && !isPaused else { return }
 
-        let currentTimestamp = timestampMilliseconds / 1000.0
         if let previousRefreshTimestamp {
             let measuredDuration = currentTimestamp - previousRefreshTimestamp
             if measuredDuration.isFinite, measuredDuration > 0 {
@@ -259,24 +280,58 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     }
 
     private func requestNextFrame() {
-        guard let callback = animationFrameCallback else { return }
-        let result = JSObject.global.requestAnimationFrame!(callback)
-        // FIXME(INCOMPLETE_IMPLEMENTATION): A malformed requestAnimationFrame return value still
-        // stores a fabricated identifier on the production scheduling path. Completion requires
-        // explicit failure state and tests proving no uncancellable identifier is retained.
-        animationFrameId = Int(result.number ?? 0)
+        guard pendingFrameCallback == nil else { return }
+        guard let requestAnimationFrame = JSObject.global.requestAnimationFrame.function else {
+            recordSchedulingFailure(.requestAnimationFrameUnavailable)
+            return
+        }
+
+        let generation = animationLoopGeneration
+        let callback = JSOneshotClosure { [weak self] arguments in
+            MainActor.assumeIsolated {
+                self?.handleAnimationFrame(arguments: arguments, generation: generation)
+            }
+            return .undefined
+        }
+        pendingFrameCallback = callback
+        let result = requestAnimationFrame(callback)
+
+        switch CADisplayLinkBrowserValueValidator.requestIdentifier(result.number) {
+        case .success(let identifier):
+            animationFrameId = identifier
+        case .failure(let failure):
+            pendingFrameCallback = nil
+            uncancellableFrameCallbacks[generation] = callback
+            recordSchedulingFailure(failure)
+        }
     }
 
     private func stopAnimationLoop() {
-        if animationFrameId != 0 {
-            _ = JSObject.global.cancelAnimationFrame!(animationFrameId)
-            animationFrameId = 0
+        let stoppedGeneration = animationLoopGeneration
+        animationLoopGeneration &+= 1
+
+        if let animationFrameId, let callback = pendingFrameCallback {
+            if let cancelAnimationFrame = JSObject.global.cancelAnimationFrame.function {
+                _ = cancelAnimationFrame(animationFrameId)
+                callback.release()
+            } else {
+                uncancellableFrameCallbacks[stoppedGeneration] = callback
+                recordSchedulingFailure(
+                    .cancelAnimationFrameUnavailable(identifier: animationFrameId)
+                )
+            }
         }
-        animationFrameCallback = nil
+        animationFrameId = nil
+        pendingFrameCallback = nil
         previousRefreshTimestamp = nil
         refreshIntervalSamples.removeAll(keepingCapacity: true)
         lastDispatchedTimestamp = 0
         hasDispatchedFrame = false
+    }
+
+    private func recordSchedulingFailure(_ failure: CADisplayLinkSchedulingFailure) {
+        schedulingFailureCount += 1
+        lastSchedulingFailure = failure
     }
 }
 

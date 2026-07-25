@@ -17,6 +17,16 @@ struct CAMediaTimingValidationTests {
         }
     }
 
+    @Test("Browser media-time conversion rejects unavailable and invalid values")
+    func browserMediaTimeValidation() {
+        #expect(validatedMediaTime(milliseconds: 1_250) == 1.25)
+        #expect(validatedMediaTime(milliseconds: 0) == 0)
+        #expect(validatedMediaTime(milliseconds: nil).isNaN)
+        #expect(validatedMediaTime(milliseconds: .nan).isNaN)
+        #expect(validatedMediaTime(milliseconds: .infinity).isNaN)
+        #expect(validatedMediaTime(milliseconds: -1).isNaN)
+    }
+
     @Test("Every non-finite timing input produces an invalid result")
     func evaluatorRejectsNonFiniteInputs() {
         for field in 0..<7 {
