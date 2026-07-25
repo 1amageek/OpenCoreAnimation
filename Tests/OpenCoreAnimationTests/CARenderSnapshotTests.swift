@@ -43,6 +43,7 @@ struct CARenderSnapshotTests {
 
         let front = CALayer()
         front.zPosition = 2
+        front.isDoubleSided = false
         let back = CALayer()
         back.zPosition = -1
         root.addSublayer(front)
@@ -60,6 +61,15 @@ struct CARenderSnapshotTests {
         #expect(values.toneMapMode == .never)
         #expect(values.preferredDynamicRange == .high)
         #expect(values.contentsHeadroom == 2)
+        let frontIndex = try #require(
+            rootNode.childIndices.first {
+                snapshot.nodes[$0].identity == ObjectIdentifier(front)
+            }
+        )
+        #expect(
+            !snapshot.nodes[frontIndex]
+                .presentationValues.isDoubleSided
+        )
         #expect(
             rootNode.childIndices.map { snapshot.nodes[$0].identity }
                 == [ObjectIdentifier(back), ObjectIdentifier(front)]
@@ -83,6 +93,36 @@ struct CARenderSnapshotTests {
             return
         }
         #expect(requirement == .mask)
+    }
+
+    @Test("Only overlapping group opacity requires live resource capture")
+    func opacityRequirementsMatchCompositionSemantics() throws {
+        let leaf = CALayer()
+        leaf.opacity = 0.5
+        let leafSnapshot = try CARenderSnapshot.capture(
+            leaf,
+            frameToken: 46
+        )
+        #expect(leafSnapshot.liveTreeRequirement == nil)
+
+        let distributedRoot = CALayer()
+        distributedRoot.opacity = 0.5
+        distributedRoot.allowsGroupOpacity = false
+        distributedRoot.addSublayer(CALayer())
+        let distributedSnapshot = try CARenderSnapshot.capture(
+            distributedRoot,
+            frameToken: 47
+        )
+        #expect(distributedSnapshot.liveTreeRequirement == nil)
+
+        let groupedRoot = CALayer()
+        groupedRoot.opacity = 0.5
+        groupedRoot.addSublayer(CALayer())
+        let groupedSnapshot = try CARenderSnapshot.capture(
+            groupedRoot,
+            frameToken: 48
+        )
+        #expect(groupedSnapshot.liveTreeRequirement == .opacityGroup)
     }
 
     @Test("Animated commits request explicit live evaluation until evaluators are immutable")
@@ -154,6 +194,7 @@ struct CARenderSnapshotTests {
         let child = CALayer()
         child.bounds = CGRect(x: 0, y: 0, width: 4, height: 4)
         child.position = CGPoint(x: 2, y: 2)
+        child.isDoubleSided = false
         root.addSublayer(child)
 
         let snapshot = try CARenderSnapshot.capture(root, frameToken: 41)
@@ -161,6 +202,7 @@ struct CARenderSnapshotTests {
 
         root.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
         root.bounds = CGRect(x: 0, y: 0, width: 32, height: 32)
+        child.isDoubleSided = true
         child.removeFromSuperlayer()
 
         let rootNode = snapshot.nodes[snapshot.rootIndex]
@@ -174,6 +216,7 @@ struct CARenderSnapshotTests {
             height: 16
         ))
         #expect(rootNode.presentationValues.backgroundColor == SIMD4<Float>(0, 1, 0, 1))
+        #expect(!snapshot.nodes[1].presentationValues.isDoubleSided)
     }
 
     @Test("Gray colors are converted to device RGB instead of becoming transparent")

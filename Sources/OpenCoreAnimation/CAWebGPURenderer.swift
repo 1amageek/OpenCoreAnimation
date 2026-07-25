@@ -5485,6 +5485,15 @@ private final class EmitterLayerState {
         defer { _ = opacityStack.popLast() }
 
         let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
+        if !values.isDoubleSided {
+            let firstColumn = modelMatrix.columns.0
+            let secondColumn = modelMatrix.columns.1
+            let faceDirection = firstColumn.x * secondColumn.y
+                - firstColumn.y * secondColumn.x
+            if faceDirection < 0 {
+                return
+            }
+        }
         if let backgroundColor = values.backgroundColor,
            values.boundsSize.x > 0,
            values.boundsSize.y > 0,

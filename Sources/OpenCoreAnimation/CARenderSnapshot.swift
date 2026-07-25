@@ -12,7 +12,6 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case backdropComposition
     case rasterization
     case transition
-    case backfaceCulling
 }
 
 /// An immutable, value-owned view of the presentation state required by a
@@ -39,6 +38,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let transform: CATransform3D
         internal let sublayerTransform: CATransform3D
         internal let isGeometryFlipped: Bool
+        internal let isDoubleSided: Bool
         internal let opacity: Float
         internal let isHidden: Bool
         internal let cornerRadius: Float
@@ -168,7 +168,9 @@ internal struct CARenderSnapshot: Sendable {
         if presentationLayer.masksToBounds {
             return .clipping
         }
-        if presentationLayer.opacity < 1 {
+        if presentationLayer.allowsGroupOpacity,
+           presentationLayer.opacity < 1,
+           modelLayer.sublayers?.isEmpty == false {
             return .opacityGroup
         }
         if presentationLayer.shadowOpacity > 0,
@@ -187,9 +189,6 @@ internal struct CARenderSnapshot: Sendable {
         }
         if presentationLayer._transitionRenderState != nil {
             return .transition
-        }
-        if !presentationLayer.isDoubleSided {
-            return .backfaceCulling
         }
         return nil
     }
@@ -284,6 +283,7 @@ internal struct CARenderSnapshot: Sendable {
             transform: layer.transform,
             sublayerTransform: layer.sublayerTransform,
             isGeometryFlipped: layer.isGeometryFlipped,
+            isDoubleSided: layer.isDoubleSided,
             opacity: layer.opacity,
             isHidden: layer.isHidden,
             cornerRadius: Float(layer.cornerRadius),

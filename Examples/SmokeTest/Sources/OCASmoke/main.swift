@@ -5780,6 +5780,7 @@ func installHarness() {
 
                 let snapshotRoot = CALayer()
                 let snapshotChild = CALayer()
+                let backfaceChild = CALayer()
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 snapshotRoot.bounds = CGRect(
@@ -5808,7 +5809,19 @@ func installHarness() {
                     blue: 0,
                     alpha: 1
                 )
+                snapshotChild.opacity = 0.5
                 snapshotRoot.addSublayer(snapshotChild)
+                backfaceChild.bounds = snapshotChild.bounds
+                backfaceChild.position = CGPoint(x: 100, y: 50)
+                backfaceChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                backfaceChild.transform = CATransform3DMakeScale(-1, 1, 1)
+                backfaceChild.isDoubleSided = false
+                snapshotRoot.addSublayer(backfaceChild)
                 CATransaction.commit()
 
                 snapshotChild.backgroundColor = CGColor(
@@ -5817,12 +5830,14 @@ func installHarness() {
                     blue: 0,
                     alpha: 1
                 )
+                snapshotChild.opacity = 1
+                backfaceChild.isDoubleSided = true
                 renderer.render(layer: snapshotRoot)
                 do {
-                    let pixel = try await renderer.readbackPixel(
-                        x: 50,
-                        y: 250
-                    )
+                    let pixels = try await renderer.readbackPixels(at: [
+                        CGPoint(x: 50, y: 250),
+                        CGPoint(x: 100, y: 250),
+                    ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
                     var overflowCompletionRan = false
@@ -5863,7 +5878,9 @@ func installHarness() {
                     let overflowCompletionRemainedPending =
                         !overflowCompletionRan
                     ImmutableSnapshotProbeState.result =
-                        pixel.map(String.init).joined(separator: ",")
+                        pixels.map {
+                            $0.map(String.init).joined(separator: ",")
+                        }.joined(separator: ";")
                         + ",overflowTyped=\(overflowWasTyped)"
                         + ",overflowPending=\(overflowCompletionRemainedPending)"
                 } catch {
