@@ -5952,7 +5952,6 @@ func installHarness() {
                 delegateChild.delegate = snapshotDelegate
                 delegateChild.setNeedsDisplay()
                 snapshotRoot.addSublayer(delegateChild)
-                delegateChild.layoutIfNeeded()
                 CATransaction.commit()
 
                 snapshotChild.backgroundColor = CGColor(
@@ -6133,7 +6132,6 @@ func installHarness() {
                     invalidDelegateLayer.delegate = invalidDelegate
                     invalidDelegateLayer.setNeedsDisplay()
                     delegateFailureRoot.addSublayer(invalidDelegateLayer)
-                    invalidDelegateLayer.layoutIfNeeded()
                     CATransaction.commit()
                     let frameFailuresBeforeDelegateFailure =
                         renderer.frameRenderFailureCount

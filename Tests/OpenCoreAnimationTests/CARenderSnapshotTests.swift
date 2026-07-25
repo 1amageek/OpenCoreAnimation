@@ -583,20 +583,43 @@ struct CARenderSnapshotTests {
         root.removeAllAnimations()
     }
 
-    @Test("Layout-pending commits cannot publish stale geometry")
-    func layoutPendingCommitPublishesExplicitPreparationState() {
+    @Test("Layout-pending commits publish post-layout snapshot geometry")
+    func layoutPendingCommitPublishesPostLayoutSnapshot() throws {
         CATransaction.flush()
         let root = CALayer()
-        root.layoutManager = SnapshotLayoutManager()
+        let child = CALayer()
+        let layoutManager = SnapshotLayoutManager { layer in
+            layer.sublayers?.first?.bounds = CGRect(
+                x: 0,
+                y: 0,
+                width: 12,
+                height: 8
+            )
+            layer.sublayers?.first?.position = CGPoint(x: 7, y: 5)
+        }
+        root.layoutManager = layoutManager
 
         CATransaction.begin()
-        root.addSublayer(CALayer())
+        root.addSublayer(child)
         CATransaction.commit()
 
-        guard case .requiresLiveTreePreparation = root.pendingCommittedRenderState else {
-            Issue.record("Expected an explicit live-tree preparation state")
+        guard case .snapshot(let snapshot) =
+                root.pendingCommittedRenderState else {
+            Issue.record("Expected an immutable post-layout snapshot")
             return
         }
+        let rootNode = snapshot.nodes[snapshot.rootIndex]
+        let childIndex = try #require(rootNode.childIndices.first)
+        let childValues = snapshot.nodes[childIndex].presentationValues
+        #expect(childValues.bounds == CGRect(
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 8
+        ))
+        #expect(childValues.position == SIMD3<Float>(7, 5, 0))
+        #expect(layoutManager.layoutCount == 2)
+        #expect(!root.needsLayout())
     }
 
     @Test("Capture failure is retained as a typed committed state")
@@ -767,7 +790,17 @@ struct CARenderSnapshotTests {
 }
 
 private final class SnapshotLayoutManager: CALayoutManager {
-    func layoutSublayers(of layer: CALayer) {}
+    private let operation: (CALayer) -> Void
+    private(set) var layoutCount = 0
+
+    init(operation: @escaping (CALayer) -> Void = { _ in }) {
+        self.operation = operation
+    }
+
+    func layoutSublayers(of layer: CALayer) {
+        layoutCount += 1
+        operation(layer)
+    }
 }
 
 private final class SnapshotContentsToken {}

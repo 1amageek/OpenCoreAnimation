@@ -838,15 +838,16 @@ transform are value-owned and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents with
 `unsupportedCommittedSnapshotFeature(.imageContents)` rather than dropping the
 resource and reporting a successful frame.
-Animated commits similarly publish
-`requiresLiveAnimationEvaluation`; layout-pending commits publish
-`requiresLiveTreePreparation`. WebGPU rejects typed committed capture failures,
+Layout reaches a parent-to-child fixed point before static snapshot capture,
+including detached-mask trees and descendants introduced by layout callbacks.
+Animated commits still publish `requiresLiveAnimationEvaluation`. WebGPU rejects
+typed committed capture failures,
 captures layer and detached-mask revisions after delegate callbacks, clears
 only matching revisions after submission, and acknowledges only the committed
 generation with which the frame began. Every committed state carries that
-generation token. R4.1 and R4.2 remain partial; R4.4, commit-time layout
-preparation, full snapshot-token decoupling, and active-subtree-only animation
-evaluation remain open design targets below.
+generation token. R4.1 and R4.2 remain partial; R4.4, full snapshot-token
+decoupling, and active-subtree-only animation evaluation remain open design
+targets below.
 
 ### 6.1 `CARenderSnapshot`
 

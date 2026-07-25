@@ -4895,6 +4895,26 @@ open class CALayer: CAMediaTiming, Hashable {
         return hasPendingLayoutRecursively(visited: &visited)
     }
 
+    internal func prepareLayoutForRenderSnapshot() {
+        repeat {
+            var visited: Set<ObjectIdentifier> = []
+            prepareLayoutRecursively(visited: &visited)
+        } while hasPendingLayoutRecursively()
+    }
+
+    private func prepareLayoutRecursively(
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        guard visited.insert(ObjectIdentifier(self)).inserted else { return }
+        layoutIfNeeded()
+        if let mask = _maskForDirty {
+            mask.prepareLayoutRecursively(visited: &visited)
+        }
+        for sublayer in _sublayersForDirty ?? [] {
+            sublayer.prepareLayoutRecursively(visited: &visited)
+        }
+    }
+
     private func hasPendingLayoutRecursively(
         visited: inout Set<ObjectIdentifier>
     ) -> Bool {

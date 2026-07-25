@@ -98,7 +98,6 @@ public final class CAMetalRenderer: CARendererDelegate {
             lastRenderError = error
             return
         case .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveTreePreparation(let frameToken),
              .requiresLiveResourceCapture(let frameToken, _):
             CALayer.advanceFrameToken()
             do {

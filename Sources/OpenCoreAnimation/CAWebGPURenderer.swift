@@ -4478,7 +4478,6 @@ private final class EmitterLayerState {
             synchronizeDelegateBackingStoreDiagnostics(in: snapshot)
             committedFrameToken = snapshot.frameToken
         case .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveTreePreparation(let frameToken),
              .requiresLiveResourceCapture(let frameToken, _):
             committedFrameToken = frameToken
         case nil:

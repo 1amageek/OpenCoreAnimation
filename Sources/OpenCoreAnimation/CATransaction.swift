@@ -511,10 +511,10 @@ public class CATransaction {
 
     /// Publishes one immutable static-tree snapshot per distinct render root.
     ///
-    /// Animated and layout-pending trees use explicit transitional states
-    /// until immutable animation evaluators and commit-time layout preparation
-    /// are carried by CARenderSnapshot. This keeps animations progressing and
-    /// prevents stale pre-layout geometry from being published as committed.
+    /// Layout reaches a parent-to-child fixed point before capability
+    /// classification, so static snapshots cannot publish stale geometry.
+    /// Animated trees use an explicit transitional state until immutable
+    /// animation evaluators are carried by CARenderSnapshot.
     private class func publishCommittedRenderStates(for layers: [CALayer]) {
         var roots: [ObjectIdentifier: CALayer] = [:]
         for layer in layers {
@@ -524,15 +524,10 @@ public class CATransaction {
 
         for root in roots.values {
             let frameToken = CALayer.advanceFrameToken()
+            root.prepareLayoutForRenderSnapshot()
             guard !root.hasUnfinishedAnimationsRecursively() else {
                 root.publishCommittedRenderState(
                     .requiresLiveAnimationEvaluation(frameToken: frameToken)
-                )
-                continue
-            }
-            guard !root.hasPendingLayoutRecursively() else {
-                root.publishCommittedRenderState(
-                    .requiresLiveTreePreparation(frameToken: frameToken)
                 )
                 continue
             }

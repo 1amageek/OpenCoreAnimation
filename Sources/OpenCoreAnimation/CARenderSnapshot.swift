@@ -22,8 +22,8 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
 // including nested rectangular and rounded clipping and ordinary CGImage
 // contents. Production WebGPU still uses explicitly typed live-tree branches
-// for non-image contents, masks, specialized layers, animation evaluation, and
-// layout preparation. Phase 4 must not be considered complete until those
+// for non-image contents, masks, specialized layers, and animation evaluation.
+// Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
 // capture.
@@ -495,7 +495,6 @@ internal enum CACommittedRenderState: Sendable {
     case snapshot(CARenderSnapshot)
     case captureFailure(frameToken: UInt64, error: CARendererError)
     case requiresLiveAnimationEvaluation(frameToken: UInt64)
-    case requiresLiveTreePreparation(frameToken: UInt64)
     // FIXME(INCOMPLETE_IMPLEMENTATION): Static trees using this feature still
     // reach production WebGPU through the live-tree renderer. This branch must
     // not be treated as snapshot success until the named resource category is
@@ -511,7 +510,6 @@ internal enum CACommittedRenderState: Sendable {
             snapshot.frameToken
         case .captureFailure(let frameToken, _),
              .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveTreePreparation(let frameToken),
              .requiresLiveResourceCapture(let frameToken, _):
             frameToken
         }
