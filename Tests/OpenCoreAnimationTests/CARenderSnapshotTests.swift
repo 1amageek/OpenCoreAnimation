@@ -125,6 +125,46 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Rasterization policy becomes immutable snapshot values")
+    func rasterizationIsCapturedByValue() throws {
+        let layer = CALayer()
+        layer.shouldRasterize = true
+        layer.rasterizationScale = 2.5
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 46
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(values.shouldRasterize)
+        #expect(values.rasterizationScale == 2.5)
+
+        layer.shouldRasterize = false
+        layer.rasterizationScale = 1
+        #expect(values.shouldRasterize)
+        #expect(values.rasterizationScale == 2.5)
+    }
+
+    @Test("Invalid active rasterization scale fails snapshot capture")
+    func invalidRasterizationScaleFailsCapture() {
+        let layer = CALayer()
+        layer.shouldRasterize = true
+        layer.rasterizationScale = 0
+
+        #expect(throws: CARendererError.invalidLayerRasterization(
+            .invalidRasterizationScale(0)
+        )) {
+            _ = try CARenderSnapshot.capture(
+                layer,
+                frameToken: 46
+            )
+        }
+    }
+
     @Test("Layer and mask filters become value-owned snapshot plans")
     func filtersAreCapturedByValue() throws {
         let root = CALayer()
@@ -1080,6 +1120,33 @@ private final class SnapshotDisplayDelegate: CALayerDelegate {
 import Metal
 
 extension CARenderSnapshotTests {
+    @Test("Metal reports committed rasterization instead of dropping it")
+    func metalRejectsUnsupportedRasterizationSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.shouldRasterize = true
+        root.rasterizationScale = 2
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.rasterization))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
     @Test("Metal reports committed filters instead of dropping them")
     func metalRejectsUnsupportedFilterSnapshot() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())

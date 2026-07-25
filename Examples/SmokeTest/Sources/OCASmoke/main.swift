@@ -6025,6 +6025,9 @@ func installHarness() {
                 let snapshotCompositionLayer = CALayer()
                 let snapshotBackgroundFilterBackdrop = CALayer()
                 let snapshotBackgroundFilterLayer = CALayer()
+                let snapshotRasterizedLayer = CALayer()
+                let snapshotRasterizedChild = CALayer()
+                let snapshotRasterizedMask = CALayer()
                 guard let snapshotCoreImageFilter = CIFilter(
                     name: "CIColorInvert"
                 ), let snapshotCompositionFilter = CIFilter(
@@ -6366,6 +6369,46 @@ func installHarness() {
                     snapshotBackgroundFilter,
                 ]
                 snapshotRoot.addSublayer(snapshotBackgroundFilterLayer)
+                snapshotRasterizedLayer.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotRasterizedLayer.position = CGPoint(
+                    x: 170,
+                    y: 230
+                )
+                snapshotRasterizedLayer.shouldRasterize = true
+                snapshotRasterizedLayer.rasterizationScale = 2
+                snapshotRasterizedLayer.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotRasterizedChild.frame = CGRect(
+                    x: 10,
+                    y: 10,
+                    width: 20,
+                    height: 20
+                )
+                snapshotRasterizedChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotRasterizedLayer.addSublayer(
+                    snapshotRasterizedChild
+                )
+                snapshotRasterizedMask.frame =
+                    snapshotRasterizedLayer.bounds
+                snapshotRasterizedMask.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 0.5
+                )
+                snapshotRasterizedLayer.mask =
+                    snapshotRasterizedMask
+                snapshotRoot.addSublayer(snapshotRasterizedLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6439,7 +6482,33 @@ func installHarness() {
                 snapshotCompositionLayer.compositingFilter = nil
                 snapshotBackgroundFilter.isEnabled = false
                 snapshotBackgroundFilterLayer.backgroundFilters = []
+                snapshotRasterizedLayer.shouldRasterize = false
+                snapshotRasterizedLayer.rasterizationScale = 1
+                snapshotRasterizedLayer.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotRasterizedChild.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotRasterizedLayer.mask = nil
+                snapshotRasterizedMask.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 1
+                )
                 renderer.render(layer: snapshotRoot)
+                let snapshotRasterizationScaleWasApplied =
+                    renderer.explicitRasterizationCapturePixelSizes
+                        .contains(
+                            CGSize(width: 800, height: 600)
+                        )
                 let snapshotCompletionRanAfterRender =
                     snapshotCompletionRan
                 let delegateCapturedAtCommit =
@@ -6467,6 +6536,7 @@ func installHarness() {
                         CGPoint(x: 270, y: 130),
                         CGPoint(x: 50, y: 70),
                         CGPoint(x: 110, y: 70),
+                        CGPoint(x: 170, y: 70),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6810,6 +6880,42 @@ func installHarness() {
                     let snapshotCompositionFailureCompletionRemainedPending =
                         !snapshotCompositionFailureCompletionRan
 
+                    let snapshotRasterizationFailureRoot = CALayer()
+                    var snapshotRasterizationFailureCompletionRan =
+                        false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        snapshotRasterizationFailureCompletionRan =
+                            true
+                    }
+                    snapshotRasterizationFailureRoot.bounds =
+                        snapshotRoot.bounds
+                    snapshotRasterizationFailureRoot.position =
+                        snapshotRoot.position
+                    snapshotRasterizationFailureRoot.shouldRasterize =
+                        true
+                    snapshotRasterizationFailureRoot
+                        .rasterizationScale = 0
+                    CATransaction.commit()
+                    let frameFailuresBeforeSnapshotRasterizationFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.render(
+                        layer: snapshotRasterizationFailureRoot
+                    )
+                    let snapshotRasterizationFailureWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeSnapshotRasterizationFailure
+                                + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerRasterization(
+                                    .invalidRasterizationScale(0)
+                                )
+                            )
+                    let snapshotRasterizationFailureCompletionRemainedPending =
+                        !snapshotRasterizationFailureCompletionRan
+
                     let delegateFailureRoot = CALayer()
                     let invalidDelegate = DelegateDrawProbeDelegate()
                     let invalidDelegateLayer = CALayer()
@@ -6868,6 +6974,9 @@ func installHarness() {
                         + ",snapshotFilterFailurePending=\(snapshotFilterFailureCompletionRemainedPending)"
                         + ",snapshotCompositionFailureTyped=\(snapshotCompositionFailureWasTyped)"
                         + ",snapshotCompositionFailurePending=\(snapshotCompositionFailureCompletionRemainedPending)"
+                        + ",snapshotRasterScale=\(snapshotRasterizationScaleWasApplied)"
+                        + ",snapshotRasterFailureTyped=\(snapshotRasterizationFailureWasTyped)"
+                        + ",snapshotRasterFailurePending=\(snapshotRasterizationFailureCompletionRemainedPending)"
                         + ",delegateCaptured=\(delegateCapturedAtCommit)"
                         + ",snapshotPending=\(snapshotCompletionPendingBeforeRender)"
                         + ",snapshotCompleted=\(snapshotCompletionRanAfterRender)"

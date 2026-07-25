@@ -13,6 +13,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case imageContents
     case contentMask
     case groupOpacity
+    case rasterization
     case filters
     case backdropComposition
     case shadow
@@ -36,6 +37,11 @@ public enum CARenderSnapshotShadowError: Error, Equatable, Sendable {
     case nonFiniteGeometry
     case invalidColor
     case pathTessellationFailed
+}
+
+/// A rasterization value that could not cross the immutable commit boundary.
+public enum CARenderSnapshotRasterizationError: Error, Equatable, Sendable {
+    case invalidRasterizationScale(CGFloat)
 }
 
 /// Errors that can occur during renderer operations.
@@ -74,6 +80,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidDelegateBackingStore(CADelegateBackingStoreError)
     /// A visible shadow could not become an immutable renderer resource.
     case invalidLayerShadow(CARenderSnapshotShadowError)
+    /// A rasterization policy could not become an immutable renderer value.
+    case invalidLayerRasterization(CARenderSnapshotRasterizationError)
     /// A layer filter could not become an immutable renderer resource.
     case invalidLayerFilter(CARenderSnapshotFilterError)
     /// A layer compositing filter could not become an immutable renderer resource.

@@ -340,6 +340,7 @@ private struct PrerenderedFilter {
 private enum SnapshotCompositeKind: Equatable {
     case contentMask
     case groupOpacity
+    case rasterization
     case filter
 }
 
@@ -4405,6 +4406,8 @@ private final class EmitterLayerState {
                         ].identity
                     )
                 )
+            case .rasterization(let failure):
+                recordRasterizationFailure(failure)
             case .filter(let failure):
                 recordLayerFilterFailure(
                     failure,
@@ -4499,6 +4502,8 @@ private final class EmitterLayerState {
                         layer: snapshot.nodes[snapshot.rootIndex].identity
                     )
                 )
+            case .rasterization(let failure):
+                recordRasterizationFailure(failure)
             case .filter(let failure):
                 recordLayerFilterFailure(
                     failure,
@@ -4557,6 +4562,7 @@ private final class EmitterLayerState {
                 && values.opacity < 1
                 && !root.childIndices.isEmpty
             )
+            || values.shouldRasterize
             || !values.filters.isEmpty
             || values.compositingFilter != nil
             || !values.backgroundFilters.isEmpty
@@ -6208,6 +6214,7 @@ private final class EmitterLayerState {
                 || !values.backgroundFilters.isEmpty
             if node.maskIndex != nil
                 || requiresGroupOpacity
+                || values.shouldRasterize
                 || !values.filters.isEmpty
                 || requiresBackdropComposition {
                 targets.append(
@@ -6228,13 +6235,65 @@ private final class EmitterLayerState {
         for target in targets {
             let node = snapshot.nodes[target.nodeIndex]
             let values = node.presentationValues
+            let captureConfiguration:
+                CARasterizationCaptureConfiguration?
+            if values.shouldRasterize {
+                do {
+                    captureConfiguration =
+                        try CARasterizationCaptureConfiguration(
+                            captureBounds: CGRect(
+                                origin: .zero,
+                                size: size
+                            ),
+                            rasterizationScale:
+                                values.rasterizationScale,
+                            maximumTextureDimension: Int(
+                                device.limits.maxTextureDimension2D
+                            )
+                        )
+                } catch {
+                    throw .rasterization(error)
+                }
+            } else {
+                captureConfiguration = nil
+            }
+            let captureWidth =
+                captureConfiguration?.pixelWidth ?? Int(size.width)
+            let captureHeight =
+                captureConfiguration?.pixelHeight ?? Int(size.height)
             let resources = FilterLayerResources(
                 device: device,
-                width: Int(size.width),
-                height: Int(size.height),
+                width: captureWidth,
+                height: captureHeight,
                 format: preferredFormat
             )
             transientRasterizationFilterResources.append(resources)
+            let captureDepthView: GPUTextureView
+            if captureConfiguration != nil {
+                let captureDepthTexture = device.createTexture(
+                    descriptor: GPUTextureDescriptor(
+                        size: GPUExtent3D(
+                            width: UInt32(captureWidth),
+                            height: UInt32(captureHeight)
+                        ),
+                        format: .depth24plusStencil8,
+                        usage: [.renderAttachment]
+                    )
+                )
+                transientCaptureDepthTextures.append(
+                    captureDepthTexture
+                )
+                captureDepthView = captureDepthTexture.createView()
+                explicitRasterizationCaptureCount += 1
+                explicitRasterizationCapturePixelSizes.append(
+                    CGSize(
+                        width: captureWidth,
+                        height: captureHeight
+                    )
+                )
+            } else {
+                captureDepthView = depthTextureView
+            }
 
             let contentPass = encoder.beginRenderPass(
                 descriptor: GPURenderPassDescriptor(
@@ -6253,7 +6312,7 @@ private final class EmitterLayerState {
                     ],
                     depthStencilAttachment:
                         GPURenderPassDepthStencilAttachment(
-                            view: depthTextureView,
+                            view: captureDepthView,
                             depthClearValue: 0,
                             depthLoadOp: .clear,
                             depthStoreOp: .store,
@@ -6267,13 +6326,18 @@ private final class EmitterLayerState {
             contentPass.setViewport(
                 x: 0,
                 y: 0,
-                width: Float(size.width),
-                height: Float(size.height),
+                width: Float(captureWidth),
+                height: Float(captureHeight),
                 minDepth: 0,
                 maxDepth: 1
             )
             snapshotCompositeCaptureRootNodeIndex = target.nodeIndex
             snapshotCompositeCaptureSuppressesOpacity = true
+            let previousRenderTargetSize = renderTargetSizeOverride
+            renderTargetSizeOverride = CGSize(
+                width: captureWidth,
+                height: captureHeight
+            )
             do {
                 try renderSnapshotNode(
                     at: target.nodeIndex,
@@ -6287,11 +6351,13 @@ private final class EmitterLayerState {
             } catch {
                 snapshotCompositeCaptureRootNodeIndex = nil
                 snapshotCompositeCaptureSuppressesOpacity = false
+                renderTargetSizeOverride = previousRenderTargetSize
                 contentPass.end()
                 throw error
             }
             snapshotCompositeCaptureRootNodeIndex = nil
             snapshotCompositeCaptureSuppressesOpacity = false
+            renderTargetSizeOverride = previousRenderTargetSize
             contentPass.end()
 
             var currentTexture = resources.sourceTexture
@@ -6368,7 +6434,7 @@ private final class EmitterLayerState {
                     ],
                     depthStencilAttachment:
                         GPURenderPassDepthStencilAttachment(
-                            view: depthTextureView,
+                            view: captureDepthView,
                             depthClearValue: 0,
                             depthLoadOp: .clear,
                             depthStoreOp: .store,
@@ -6382,13 +6448,19 @@ private final class EmitterLayerState {
                 maskPass.setViewport(
                 x: 0,
                 y: 0,
-                width: Float(size.width),
-                height: Float(size.height),
+                width: Float(captureWidth),
+                height: Float(captureHeight),
                 minDepth: 0,
                 maxDepth: 1
                 )
                 let targetModelMatrix = values.modelMatrix(
                     parentMatrix: target.parentMatrix
+                )
+                let previousMaskRenderTargetSize =
+                    renderTargetSizeOverride
+                renderTargetSizeOverride = CGSize(
+                    width: captureWidth,
+                    height: captureHeight
                 )
                 do {
                     try renderSnapshotNode(
@@ -6401,9 +6473,13 @@ private final class EmitterLayerState {
                         bindGroup: bindGroup
                     )
                 } catch {
+                    renderTargetSizeOverride =
+                        previousMaskRenderTargetSize
                     maskPass.end()
                     throw error
                 }
+                renderTargetSizeOverride =
+                    previousMaskRenderTargetSize
                 maskPass.end()
 
                 guard encodeCompositionMaskOperation(
@@ -6436,7 +6512,9 @@ private final class EmitterLayerState {
                         ? .contentMask
                         : !values.filters.isEmpty
                             ? .filter
-                            : .groupOpacity
+                            : values.shouldRasterize
+                                ? .rasterization
+                                : .groupOpacity
                 )
         }
     }
@@ -7450,6 +7528,10 @@ private final class EmitterLayerState {
                     throw .contentMask(error)
                 case .groupOpacity:
                     throw .groupOpacity(error)
+                case .rasterization:
+                    throw .rasterization(
+                        .compositeFailed(error)
+                    )
                 case .filter:
                     throw .filter(error)
                 }
@@ -13097,8 +13179,8 @@ private final class EmitterLayerState {
                         filter: filter,
                         inputMode: .singleInput,
                         inputTexture: currentTexture,
-                        width: UInt32(size.width),
-                        height: UInt32(size.height)
+                        width: UInt32(resources.width),
+                        height: UInt32(resources.height)
                     )
                     try execution.encode(commandEncoder: encoder)
                     activeCompositionExecutions.append(execution)

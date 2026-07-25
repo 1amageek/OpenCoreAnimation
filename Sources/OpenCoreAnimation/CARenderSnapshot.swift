@@ -3,7 +3,6 @@ import Foundation
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
     case contents
-    case rasterization
     case transition
 }
 
@@ -18,8 +17,8 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // including nested rectangular and rounded clipping, ordinary CGImage
 // contents, layer filter execution plans, and backdrop composition plans.
 // Production WebGPU still uses explicitly typed live-tree branches for
-// non-image contents, specialized layers, rasterization, transitions, and
-// animation evaluation.
+// non-image contents, specialized layers, transitions, and animation
+// evaluation.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -45,6 +44,8 @@ internal struct CARenderSnapshot: Sendable {
         internal let isDoubleSided: Bool
         internal let masksToBounds: Bool
         internal let allowsGroupOpacity: Bool
+        internal let shouldRasterize: Bool
+        internal let rasterizationScale: CGFloat
         internal let opacity: Float
         internal let isHidden: Bool
         internal let cornerRadius: Float
@@ -196,9 +197,6 @@ internal struct CARenderSnapshot: Sendable {
            !(presentationLayer.contents is CGImage) {
             return .contents
         }
-        if presentationLayer.shouldRasterize {
-            return .rasterization
-        }
         if presentationLayer._transitionRenderState != nil {
             return .transition
         }
@@ -229,6 +227,16 @@ internal struct CARenderSnapshot: Sendable {
         }
         guard layer.cornerRadius >= 0 else {
             throw .invalidLayerCornerGeometry
+        }
+        if layer.shouldRasterize {
+            guard layer.rasterizationScale.isFinite,
+                  layer.rasterizationScale > 0 else {
+                throw .invalidLayerRasterization(
+                    .invalidRasterizationScale(
+                        layer.rasterizationScale
+                    )
+                )
+            }
         }
         let cornerCurveExponent: Float
         do {
@@ -385,6 +393,8 @@ internal struct CARenderSnapshot: Sendable {
             isDoubleSided: layer.isDoubleSided,
             masksToBounds: layer.masksToBounds,
             allowsGroupOpacity: layer.allowsGroupOpacity,
+            shouldRasterize: layer.shouldRasterize,
+            rasterizationScale: layer.rasterizationScale,
             opacity: layer.opacity,
             isHidden: layer.isHidden,
             cornerRadius: Float(layer.cornerRadius),

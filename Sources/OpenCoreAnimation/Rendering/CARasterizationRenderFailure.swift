@@ -9,6 +9,7 @@ public enum CARasterizationRenderFailure: Error, Equatable, Sendable {
     case captureProjectionOutOfRange(CGRect)
     case subtreeReplicatorFailed(CAReplicatorRenderFailure)
     case compositeResourcesUnavailable
+    case compositeFailed(CALayerFilterRenderFailure)
     case invalidCompositeBounds(CGRect)
     case compositeVertexCapacityExceeded
     case compositePipelineUnavailable

@@ -392,6 +392,11 @@ public final class CAMetalRenderer: CARendererDelegate {
             return .groupOpacity
         }
         if snapshot.nodes.contains(where: {
+            $0.presentationValues.shouldRasterize
+        }) {
+            return .rasterization
+        }
+        if snapshot.nodes.contains(where: {
             $0.presentationValues.shadow != nil
         }) {
             return .shadow
