@@ -78,23 +78,67 @@ struct CARenderSnapshotTests {
         )
     }
 
-    @Test("Static resources remain an explicit live-tree state")
-    func unsupportedStaticResourceIsExplicit() {
+    @Test("Detached mask trees become value-owned snapshot nodes")
+    func maskTreeIsCapturedByValue() throws {
         CATransaction.flush()
         let root = CALayer()
         let mask = CALayer()
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        mask.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+        mask.backgroundColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 1,
+            alpha: 0.5
+        )
         root.mask = mask
         CATransaction.commit()
 
-        guard case .requiresLiveResourceCapture(_, let requirement) =
+        guard case .snapshot(let snapshot) =
                 root.pendingCommittedRenderState else {
-            Issue.record("Expected an explicit live-resource capture state")
+            Issue.record("Expected the mask tree to publish a snapshot")
             return
         }
-        #expect(requirement == .mask)
+        let rootNode = snapshot.nodes[snapshot.rootIndex]
+        let maskIndex = try #require(rootNode.maskIndex)
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(snapshot.nodes[maskIndex].identity
+            == ObjectIdentifier(mask))
+        #expect(
+            snapshot.nodes[maskIndex]
+                .presentationValues.backgroundColor
+                == SIMD4<Float>(1, 1, 1, 0.5)
+        )
+
+        mask.backgroundColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        #expect(
+            snapshot.nodes[maskIndex]
+                .presentationValues.backgroundColor
+                == SIMD4<Float>(1, 1, 1, 0.5)
+        )
+    }
+
+    @Test("Mask effects retain an explicit live-resource requirement")
+    func maskEffectsRemainOnLiveResourcePath() throws {
+        let root = CALayer()
+        let mask = CALayer()
+        mask.filters = [CAFilter.blur(radius: 4)]
+        root.mask = mask
+
+        let snapshot = try CARenderSnapshot.capture(
+            root,
+            frameToken: 45
+        )
+
+        #expect(snapshot.liveTreeRequirement == .filters)
+        #expect(snapshot.nodes[snapshot.rootIndex].maskIndex != nil)
     }
 
     @Test("Only overlapping group opacity requires live resource capture")
@@ -865,6 +909,47 @@ private final class SnapshotDisplayDelegate: CALayerDelegate {
 import Metal
 
 extension CARenderSnapshotTests {
+    @Test("Metal reports committed content masks instead of dropping them")
+    func metalRejectsUnsupportedContentMaskSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.position = CGPoint(x: 1, y: 0.5)
+        root.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        let mask = CALayer()
+        mask.frame = root.bounds
+        mask.backgroundColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 1,
+            alpha: 1
+        )
+        root.mask = mask
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.contentMask))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
     @Test("Metal reports committed image contents instead of dropping them")
     func metalRejectsUnsupportedImageSnapshot() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())

@@ -6001,9 +6001,18 @@ func installHarness() {
                 }
                 let imageChild = CALayer()
                 let delegateChild = CALayer()
+                let maskedChild = CALayer()
+                let snapshotMask = CALayer()
+                let nestedMaskedChild = CALayer()
+                let nestedSnapshotMask = CALayer()
+                let innerSnapshotMask = CALayer()
                 let snapshotDelegate = DelegateDrawProbeDelegate()
+                var snapshotCompletionRan = false
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
+                CATransaction.setCompletionBlock {
+                    snapshotCompletionRan = true
+                }
                 snapshotRoot.bounds = CGRect(
                     x: 0,
                     y: 0,
@@ -6091,8 +6100,57 @@ func installHarness() {
                 delegateChild.delegate = snapshotDelegate
                 delegateChild.setNeedsDisplay()
                 snapshotRoot.addSublayer(delegateChild)
+                maskedChild.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40
+                )
+                maskedChild.position = CGPoint(x: 340, y: 50)
+                maskedChild.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotMask.frame = maskedChild.bounds
+                snapshotMask.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 0.5
+                )
+                maskedChild.mask = snapshotMask
+                snapshotRoot.addSublayer(maskedChild)
+                nestedMaskedChild.bounds = maskedChild.bounds
+                nestedMaskedChild.position = CGPoint(x: 340, y: 110)
+                nestedMaskedChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                nestedSnapshotMask.frame = nestedMaskedChild.bounds
+                nestedSnapshotMask.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 0.5
+                )
+                innerSnapshotMask.frame = nestedSnapshotMask.bounds
+                innerSnapshotMask.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 0.5
+                )
+                nestedSnapshotMask.mask = innerSnapshotMask
+                nestedMaskedChild.mask = nestedSnapshotMask
+                snapshotRoot.addSublayer(nestedMaskedChild)
                 CATransaction.commit()
 
+                let snapshotCompletionPendingBeforeRender =
+                    !snapshotCompletionRan
                 snapshotChild.backgroundColor = CGColor(
                     red: 1,
                     green: 0,
@@ -6113,7 +6171,29 @@ func installHarness() {
                 imageChild.magnificationFilter = .linear
                 snapshotDelegate.usesSwappedColors = true
                 delegateChild.setNeedsDisplay()
+                maskedChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotMask.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 1,
+                    alpha: 1
+                )
+                nestedMaskedChild.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                nestedSnapshotMask.backgroundColor = snapshotMask.backgroundColor
+                innerSnapshotMask.backgroundColor = snapshotMask.backgroundColor
                 renderer.render(layer: snapshotRoot)
+                let snapshotCompletionRanAfterRender =
+                    snapshotCompletionRan
                 let delegateCapturedAtCommit =
                     snapshotDelegate.willDrawCount == 1
                     && snapshotDelegate.drawCount == 1
@@ -6128,6 +6208,8 @@ func installHarness() {
                         CGPoint(x: 230, y: 250),
                         CGPoint(x: 270, y: 250),
                         CGPoint(x: 290, y: 250),
+                        CGPoint(x: 340, y: 250),
+                        CGPoint(x: 340, y: 190),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6248,6 +6330,63 @@ func installHarness() {
                     let contentsOverflowCompletionRemainedPending =
                         !contentsOverflowCompletionRan
 
+                    let snapshotMaskFailureRoot = CALayer()
+                    let snapshotMaskFailureLayer = CALayer()
+                    let snapshotMaskFailureMask = CALayer()
+                    var snapshotMaskFailureCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        snapshotMaskFailureCompletionRan = true
+                    }
+                    snapshotMaskFailureRoot.bounds = snapshotRoot.bounds
+                    snapshotMaskFailureRoot.position = snapshotRoot.position
+                    snapshotMaskFailureRoot.backgroundColor =
+                        snapshotRoot.backgroundColor
+                    snapshotMaskFailureLayer.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    snapshotMaskFailureLayer.position = CGPoint(x: 20, y: 20)
+                    snapshotMaskFailureLayer.backgroundColor =
+                        snapshotChild.backgroundColor
+                    snapshotMaskFailureMask.frame =
+                        snapshotMaskFailureLayer.bounds
+                    snapshotMaskFailureMask.backgroundColor = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 0.5
+                    )
+                    snapshotMaskFailureLayer.mask = snapshotMaskFailureMask
+                    snapshotMaskFailureRoot.addSublayer(
+                        snapshotMaskFailureLayer
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeSnapshotMaskFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.setNextCommittedSnapshotAllocationLimit(0)
+                    renderer.render(layer: snapshotMaskFailureRoot)
+                    let snapshotMaskFailureWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeSnapshotMaskFailure + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .solid(
+                                    .vertexCapacityExceeded(.background)
+                                )
+                            )
+                    let snapshotMaskFailureCompletionRemainedPending =
+                        !snapshotMaskFailureCompletionRan
+                    renderer.render(layer: snapshotMaskFailureRoot)
+                    let snapshotMaskFailureRecovered =
+                        snapshotMaskFailureCompletionRan
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeSnapshotMaskFailure + 1
+                        && renderer.lastFrameRenderFailure == nil
+
                     let delegateFailureRoot = CALayer()
                     let invalidDelegate = DelegateDrawProbeDelegate()
                     let invalidDelegateLayer = CALayer()
@@ -6296,7 +6435,12 @@ func installHarness() {
                         + ",maskOverflowPending=\(maskOverflowCompletionRemainedPending)"
                         + ",contentsOverflowTyped=\(contentsOverflowWasTyped)"
                         + ",contentsOverflowPending=\(contentsOverflowCompletionRemainedPending)"
+                        + ",snapshotMaskFailureTyped=\(snapshotMaskFailureWasTyped)"
+                        + ",snapshotMaskFailurePending=\(snapshotMaskFailureCompletionRemainedPending)"
+                        + ",snapshotMaskFailureRecovered=\(snapshotMaskFailureRecovered)"
                         + ",delegateCaptured=\(delegateCapturedAtCommit)"
+                        + ",snapshotPending=\(snapshotCompletionPendingBeforeRender)"
+                        + ",snapshotCompleted=\(snapshotCompletionRanAfterRender)"
                         + ",delegateFailureTyped=\(delegateFailureWasTyped)"
                         + ",delegateFailurePending=\(delegateFailureCompletionRemainedPending)"
                 } catch {

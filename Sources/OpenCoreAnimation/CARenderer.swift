@@ -11,6 +11,7 @@ import JavaScriptKit
 /// A committed resource that a renderer backend cannot encode.
 public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case imageContents
+    case contentMask
 }
 
 /// Errors that can occur during renderer operations.

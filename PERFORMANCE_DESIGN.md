@@ -828,15 +828,20 @@ arithmetic before bitmap allocation; preparation failure publishes a typed
 committed capture or live-frame failure without submitting a partial frame.
 The failed invalidation is restored, so retries cannot silently submit missing
 pixels and a corrected configuration can recover through the original redraw
-request. The snapshot does not yet own masks, non-image contents,
-specialized-layer resources, or copied animation evaluators. A static tree that
-needs those resources, effects, a specialized layer, rasterization, transition
-state, or true group opacity publishes
+request. Ordinary `CALayer.mask` trees are captured as value-owned snapshot
+nodes. WebGPU prepares nested content masks deepest-first, applies their alpha
+to full-viewport subtree captures, and destroys unsubmitted transient resources
+on typed encoding failure; retrying the same committed frame retains its
+completion obligation until successful submission. The snapshot does not yet
+own non-image contents, specialized-layer resources, effects, or copied
+animation evaluators. A static tree that needs those resources, a specialized
+layer, rasterization, transition state, or true group opacity publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
-The native Metal verification renderer rejects committed image contents with
-`unsupportedCommittedSnapshotFeature(.imageContents)` rather than dropping the
+The native Metal verification renderer rejects committed image contents and
+content masks with the corresponding
+`unsupportedCommittedSnapshotFeature` value rather than dropping either
 resource and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,
 including detached-mask trees and descendants introduced by layout callbacks.

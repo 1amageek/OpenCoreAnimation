@@ -3,7 +3,6 @@ import Foundation
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
     case contents
-    case mask
     case opacityGroup
     case shadow
     case filters
@@ -22,7 +21,7 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
 // including nested rectangular and rounded clipping and ordinary CGImage
 // contents. Production WebGPU still uses explicitly typed live-tree branches
-// for non-image contents, masks, specialized layers, and animation evaluation.
+// for non-image contents, specialized layers, and animation evaluation.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -59,6 +58,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let contentRevision: UInt64
         internal let presentationValues: PresentationValues
         internal let childIndices: [Int]
+        internal let maskIndex: Int?
     }
 
     internal let nodes: [Node]
@@ -134,7 +134,8 @@ internal struct CARenderSnapshot: Sendable {
                 identity: identity,
                 contentRevision: contentRevision,
                 presentationValues: values,
-                childIndices: []
+                childIndices: [],
+                maskIndex: nil
             )
         )
 
@@ -150,12 +151,24 @@ internal struct CARenderSnapshot: Sendable {
                 )
             )
         }
+        let maskIndex: Int?
+        if let mask = layer.mask {
+            maskIndex = try captureNode(
+                mask,
+                nodes: &nodes,
+                visited: &visited,
+                liveTreeRequirement: &liveTreeRequirement
+            )
+        } else {
+            maskIndex = nil
+        }
 
         nodes[nodeIndex] = Node(
             identity: identity,
             contentRevision: contentRevision,
             presentationValues: values,
-            childIndices: childIndices
+            childIndices: childIndices,
+            maskIndex: maskIndex
         )
         return nodeIndex
     }
@@ -170,9 +183,6 @@ internal struct CARenderSnapshot: Sendable {
         if presentationLayer.contents != nil,
            !(presentationLayer.contents is CGImage) {
             return .contents
-        }
-        if presentationLayer.mask != nil {
-            return .mask
         }
         if presentationLayer.allowsGroupOpacity,
            presentationLayer.opacity < 1,
