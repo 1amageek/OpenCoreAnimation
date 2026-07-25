@@ -584,19 +584,41 @@ struct CARenderSnapshotTests {
         }
     }
 
-    @Test("Non-image contents remain an explicit live-tree requirement")
-    func nonImageContentsRemainExplicit() throws {
+    @Test("Non-image contents fail instead of becoming an empty live draw")
+    func nonImageContentsFailCapture() {
         let layer = CALayer()
         layer.contents = SnapshotContentsToken()
 
+        #expect(throws: CARendererError.invalidLayerContents(
+            .unsupportedContentsType(
+                String(reflecting: SnapshotContentsToken.self)
+            )
+        )) {
+            _ = try CARenderSnapshot.capture(
+                layer,
+                frameToken: 55
+            )
+        }
+    }
+
+    @Test("Delegate bitmap supersedes unsupported model contents")
+    func delegateBitmapSupersedesUnsupportedContents() throws {
+        let delegate = SnapshotDrawingDelegate()
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        layer.contents = SnapshotContentsToken()
+        layer.delegate = delegate
+        layer.setNeedsDisplay()
+
         let snapshot = try CARenderSnapshot.capture(
             layer,
-            frameToken: 55
+            frameToken: 56
         )
-        #expect(snapshot.liveTreeRequirement == .contents)
+
+        #expect(snapshot.liveTreeRequirement == nil)
         #expect(
             snapshot.nodes[snapshot.rootIndex]
-                .presentationValues.imageContents == nil
+                .presentationValues.imageContents != nil
         )
     }
 

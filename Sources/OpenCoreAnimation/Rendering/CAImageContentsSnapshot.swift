@@ -24,6 +24,7 @@ internal struct CAImageContentsSnapshot: Equatable, Hashable, Sendable {
 
 /// Describes why layer image contents could not cross the commit boundary.
 public enum CAImageContentsSnapshotError: Error, Equatable, Sendable {
+    case unsupportedContentsType(String)
     case imageConversion(CAImageContentsConversionError)
     case invalidSamplingFilters(
         magnification: CALayerContentsFilter,

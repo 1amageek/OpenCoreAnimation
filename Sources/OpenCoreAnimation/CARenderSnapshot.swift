@@ -2,7 +2,6 @@ import Foundation
 
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
-    case contents
     case transition
 }
 
@@ -17,8 +16,7 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // including nested rectangular and rounded clipping, ordinary CGImage
 // contents, layer filter execution plans, and backdrop composition plans.
 // Production WebGPU still uses explicitly typed live-tree branches for
-// non-image contents, specialized layers, transitions, and animation
-// evaluation.
+// specialized layers, transitions, and animation evaluation.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -192,10 +190,6 @@ internal struct CARenderSnapshot: Sendable {
     ) -> CARenderSnapshotLiveTreeRequirement? {
         if ObjectIdentifier(type(of: modelLayer)) != ObjectIdentifier(CALayer.self) {
             return .specializedLayer
-        }
-        if presentationLayer.contents != nil,
-           !(presentationLayer.contents is CGImage) {
-            return .contents
         }
         if presentationLayer._transitionRenderState != nil {
             return .transition
@@ -427,9 +421,19 @@ internal struct CARenderSnapshot: Sendable {
         from layer: CALayer,
         delegateBackingStore: CADelegateBackingStore?
     ) throws(CAImageContentsSnapshotError) -> CAImageContentsSnapshot? {
-        let image = delegateBackingStore?.image
-            ?? (layer.contents as? CGImage)
-        guard let image else { return nil }
+        let image: CGImage
+        if let delegateImage = delegateBackingStore?.image {
+            image = delegateImage
+        } else if let contents = layer.contents {
+            guard let contentsImage = contents as? CGImage else {
+                throw .unsupportedContentsType(
+                    String(reflecting: type(of: contents))
+                )
+            }
+            image = contentsImage
+        } else {
+            return nil
+        }
         guard let sampling = CAContentsSampling(
             magnificationFilter: layer.magnificationFilter,
             minificationFilter: layer.minificationFilter

@@ -6916,6 +6916,41 @@ func installHarness() {
                     let snapshotRasterizationFailureCompletionRemainedPending =
                         !snapshotRasterizationFailureCompletionRan
 
+                    let unsupportedContentsRoot = CALayer()
+                    let unsupportedContentsLayer = CALayer()
+                    var unsupportedContentsCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        unsupportedContentsCompletionRan = true
+                    }
+                    unsupportedContentsRoot.bounds =
+                        snapshotRoot.bounds
+                    unsupportedContentsRoot.position =
+                        snapshotRoot.position
+                    unsupportedContentsLayer.contents =
+                        "unsupported"
+                    unsupportedContentsRoot.addSublayer(
+                        unsupportedContentsLayer
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeUnsupportedContents =
+                        renderer.frameRenderFailureCount
+                    renderer.render(layer: unsupportedContentsRoot)
+                    let unsupportedContentsWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeUnsupportedContents + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerContents(
+                                    .unsupportedContentsType(
+                                        "Swift.String"
+                                    )
+                                )
+                            )
+                    let unsupportedContentsCompletionRemainedPending =
+                        !unsupportedContentsCompletionRan
+
                     let delegateFailureRoot = CALayer()
                     let invalidDelegate = DelegateDrawProbeDelegate()
                     let invalidDelegateLayer = CALayer()
@@ -6977,6 +7012,8 @@ func installHarness() {
                         + ",snapshotRasterScale=\(snapshotRasterizationScaleWasApplied)"
                         + ",snapshotRasterFailureTyped=\(snapshotRasterizationFailureWasTyped)"
                         + ",snapshotRasterFailurePending=\(snapshotRasterizationFailureCompletionRemainedPending)"
+                        + ",unsupportedContentsTyped=\(unsupportedContentsWasTyped)"
+                        + ",unsupportedContentsPending=\(unsupportedContentsCompletionRemainedPending)"
                         + ",delegateCaptured=\(delegateCapturedAtCommit)"
                         + ",snapshotPending=\(snapshotCompletionPendingBeforeRender)"
                         + ",snapshotCompleted=\(snapshotCompletionRanAfterRender)"
