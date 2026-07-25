@@ -17,12 +17,15 @@ struct CAShadowPathKeyframeAnimationTests {
         animation.fillMode = .both
         animation.isRemovedOnCompletion = false
         layer.add(animation, forKey: "shadowPath")
+        let evaluationTime: CFTimeInterval = 100
         setStoredAnimationBeginTime(
-            CACurrentMediaTime() - elapsed,
+            evaluationTime - elapsed,
             on: layer,
             forKey: "shadowPath"
         )
-        return try #require(layer.presentation())
+        return try CARenderTimeContext.$mediaTime.withValue(evaluationTime) {
+            try #require(layer.presentation())
+        }
     }
 
     @Test("Single-value shadow paths update presentation state")
