@@ -1876,6 +1876,16 @@ public final class CAWebGPURenderer: CARendererDelegate {
 
         // Request device
         let device = try await adapter.requestDevice()
+        let renderTarget: CARenderTargetConfiguration
+        do {
+            renderTarget = try CARenderTargetConfiguration(
+                width: canvas.width.number,
+                height: canvas.height.number,
+                maximumTextureDimension: Int(device.limits.maxTextureDimension2D)
+            )
+        } catch {
+            throw CARendererError.invalidRenderTarget(error)
+        }
         self.device = device
         uncapturedGPUErrorHandler = device.onUncapturedError { [weak self] event in
             guard self?.firstUncapturedGPUError == nil else { return }
@@ -2126,19 +2136,6 @@ public final class CAWebGPURenderer: CARendererDelegate {
             maxMemoryBytes: 64 * 1024 * 1024  // 64 MB
         )
 
-        // Get initial canvas size
-        let width = canvas.width.number ?? 800
-        let height = canvas.height.number ?? 600
-        let renderTarget: CARenderTargetConfiguration
-        do {
-            renderTarget = try CARenderTargetConfiguration(
-                width: width,
-                height: height,
-                maximumTextureDimension: Int(device.limits.maxTextureDimension2D)
-            )
-        } catch {
-            throw CARendererError.invalidRenderTarget(error)
-        }
         size = CGSize(width: renderTarget.width, height: renderTarget.height)
 
         // Create depth texture

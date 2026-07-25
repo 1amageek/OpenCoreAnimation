@@ -37,6 +37,28 @@ struct CARenderTargetConfigurationTests {
         }
     }
 
+    @Test("Unavailable width is rejected without fabricating a default")
+    func unavailableWidth() {
+        #expect(throws: CARenderTargetConfigurationError.unavailableDimension(.width)) {
+            try CARenderTargetConfiguration(
+                width: nil,
+                height: 1080,
+                maximumTextureDimension: 8192
+            )
+        }
+    }
+
+    @Test("Unavailable height is rejected without fabricating a default")
+    func unavailableHeight() {
+        #expect(throws: CARenderTargetConfigurationError.unavailableDimension(.height)) {
+            try CARenderTargetConfiguration(
+                width: 1920,
+                height: nil,
+                maximumTextureDimension: 8192
+            )
+        }
+    }
+
     @Test("Device dimension limits retain the exact rejected values")
     func deviceLimit() {
         #expect(throws: CARenderTargetConfigurationError.dimensionLimitExceeded(

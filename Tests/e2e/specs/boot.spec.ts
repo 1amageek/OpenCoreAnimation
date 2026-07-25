@@ -47,6 +47,7 @@ interface OCA extends Harness {
     getGradientTypeProbeResult: () => string;
     getCornerCurveProbeResult: () => string;
     getDynamicRangeProbeResult: () => string;
+    getCanvasValidationProbeResult: () => string;
     getTransitionSourceCaptureCount: () => number;
     getTransitionTargetCaptureCount: () => number;
     getActiveTransitionTextureCount: () => number;
@@ -87,6 +88,7 @@ interface OCA extends Harness {
     beginGradientTypeProbe: () => void;
     beginCornerCurveProbe: () => void;
     beginDynamicRangeProbe: () => void;
+    beginCanvasValidationProbe: () => void;
     beginShadowProbe: () => void;
     beginDisplayLinkProbe: () => void;
     beginEmitterProbe: () => void;
@@ -128,6 +130,10 @@ test.describe("OpenCoreAnimation smoke", () => {
             [K in keyof OCA]: (...a: Parameters<OCA[K]>) => Promise<ReturnType<OCA[K]>>;
         };
         expect(await h.getStatus()).toBe("ready");
+        await h.beginCanvasValidationProbe();
+        await expect.poll(() => h.getCanvasValidationProbeResult(), { timeout: 10_000 }).toBe(
+            "typed=true"
+        );
         expect(await h.getTileState()).toBe("delegate=true,bounds=80.0x80.0");
         await expect.poll(() => h.getTileDrawCount(), { timeout: 2_000 }).toBeGreaterThan(0);
         await expect.poll(() => h.getTransitionSourceCaptureCount()).toBe(2);

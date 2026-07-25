@@ -49,6 +49,9 @@ import JavaScriptKit
 /// timestamp in milliseconds, which is then converted to seconds.
 public func CACurrentMediaTime() -> CFTimeInterval {
     let performance = JSObject.global.performance
+    // FIXME(INCOMPLETE_IMPLEMENTATION): A malformed browser `performance.now()` result is still
+    // converted to a successful zero timestamp on the production WASM media-time path. Completion
+    // requires an explicit invalid-time result and behavior tests proving callers do not advance.
     let milliseconds = performance.now().number ?? 0
     return milliseconds / 1000.0
 }

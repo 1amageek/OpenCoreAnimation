@@ -202,6 +202,9 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
         stopAnimationLoop()
 
         animationFrameCallback = JSClosure { [weak self] arguments in
+            // FIXME(INCOMPLETE_IMPLEMENTATION): A malformed requestAnimationFrame timestamp still
+            // fires the production display-link callback with fabricated time zero. Completion
+            // requires typed scheduling failure and tests proving the delegate is not invoked.
             let timestampMilliseconds = arguments[0].number ?? 0
             MainActor.assumeIsolated {
                 self?.handleAnimationFrame(timestampMilliseconds: timestampMilliseconds)
@@ -258,6 +261,9 @@ public struct Selector: Hashable, ExpressibleByStringLiteral, Sendable {
     private func requestNextFrame() {
         guard let callback = animationFrameCallback else { return }
         let result = JSObject.global.requestAnimationFrame!(callback)
+        // FIXME(INCOMPLETE_IMPLEMENTATION): A malformed requestAnimationFrame return value still
+        // stores a fabricated identifier on the production scheduling path. Completion requires
+        // explicit failure state and tests proving no uncancellable identifier is retained.
         animationFrameId = Int(result.number ?? 0)
     }
 

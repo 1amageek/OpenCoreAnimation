@@ -62,6 +62,7 @@ nonisolated(unsafe) var shapeFillRuleProbeResult: String = "pending"
 nonisolated(unsafe) var gradientTypeProbeResult: String = "pending"
 nonisolated(unsafe) var cornerCurveProbeResult: String = "pending"
 nonisolated(unsafe) var dynamicRangeProbeResult: String = "pending"
+nonisolated(unsafe) var canvasValidationProbeResult: String = "pending"
 
 final class SmokeTileDelegate: CALayerDelegate {
     func draw(_ layer: CALayer, in context: CGContext) {
@@ -218,6 +219,7 @@ public func setup() {
             gradientTypeProbeResult = "pending"
             cornerCurveProbeResult = "pending"
             dynamicRangeProbeResult = "pending"
+            canvasValidationProbeResult = "pending"
         },
         then: { await performSetup() }
     )
@@ -475,6 +477,29 @@ func installHarness() {
         })
         h.expose("getDynamicRangeProbeResult", returning: {
             .string(dynamicRangeProbeResult)
+        })
+        h.expose("getCanvasValidationProbeResult", returning: {
+            .string(canvasValidationProbeResult)
+        })
+        h.expose("beginCanvasValidationProbe", action: {
+            Task { @MainActor in
+                canvasValidationProbeResult = "running"
+                let invalidCanvas = JSObject.global.Object.function!.new()
+                invalidCanvas.width = .string("not-a-number")
+                invalidCanvas.height = .number(300)
+
+                do {
+                    _ = try await CARenderer(canvas: invalidCanvas)
+                    canvasValidationProbeResult = "unexpected-success"
+                } catch let error as CARendererError {
+                    canvasValidationProbeResult = error
+                        == .invalidRenderTarget(.unavailableDimension(.width))
+                        ? "typed=true"
+                        : "wrong-error: \(error)"
+                } catch {
+                    canvasValidationProbeResult = "wrong-error: \(error)"
+                }
+            }
         })
         h.expose("getTransitionSourceCaptureCount", returning: {
             let count = MainActor.assumeIsolated {

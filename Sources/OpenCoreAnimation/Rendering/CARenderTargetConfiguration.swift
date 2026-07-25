@@ -7,10 +7,16 @@ internal struct CARenderTargetConfiguration: Equatable {
     let viewportSize: SIMD2<Float>
 
     init(
-        width: Double,
-        height: Double,
+        width: Double?,
+        height: Double?,
         maximumTextureDimension: Int
     ) throws(CARenderTargetConfigurationError) {
+        guard let width else {
+            throw .unavailableDimension(.width)
+        }
+        guard let height else {
+            throw .unavailableDimension(.height)
+        }
         guard width.isFinite,
               height.isFinite,
               width > 0,
