@@ -181,7 +181,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginCornerCurveProbe();
         await expect.poll(() => h.getCornerCurveProbeResult(), { timeout: 10_000 }).toBe(
-            "79,20,29,255;48,207,0,255;0,48,207,255;255,255,0,255;243,48,219,255;5,212,214,255;255,0,255,255;0,0,0,255;0,255,0,255;0,255,0,255,failures=2,typed=layer:future-curve,maskFailures=1,maskTyped=contentMask:future-mask-curve"
+            "79,20,29,255;48,207,0,255;0,48,207,255;255,255,0,255;243,48,219,255;5,212,214,255;255,0,255,255;0,0,0,255;0,255,0,255;0,255,0,255,failures=2,typed=layer:future-curve,maskFailures=1,maskTyped=contentMask:future-mask-curve,frameTyped=true"
         );
 
         await h.beginTransitionFilterProbes();
@@ -196,10 +196,10 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginLayerFilterProbe();
         await expect.poll(() => h.getLayerFilterProbeResult(), { timeout: 10_000 }).toBe(
-            "128,255,255,255;191,191,0,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true,rejected=true,invalid=true,typed=true,alphaFilter=true,alphaPixel=13,141,147,255,displayTyped=true,rasterTyped=true"
+            "128,255,255,255;191,191,0,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true,rejected=true,invalid=true,typed=true,alphaFilter=true,alphaPixel=13,141,147,255,displayTyped=true,rasterTyped=true,maskFrameTyped=true,maskRasterTyped=true,maskShadowTyped=true"
         );
         expect(await h.getActiveFilterResourceCount()).toBe(0);
-        expect(await h.getLayerFilterFailureCount()).toBe(5);
+        expect(await h.getLayerFilterFailureCount()).toBe(7);
 
         await h.beginTextProbe();
         await expect.poll(() => h.getTextProbeResult(), { timeout: 10_000 }).toBe(
@@ -288,7 +288,7 @@ test.describe("OpenCoreAnimation smoke", () => {
             "255,0,0,255;13,140,19,255;13,13,147,255;25,25,38,255;255,0,0,255;255,0,0,255;emptyRegion=true;emptyLayer=true;imageEdges=true;imageCenter=true;maskTransition=true;animatedSilhouette=true;typed=true;displayTyped=true"
         );
         expect(await h.getActiveShadowResourceCount()).toBe(0);
-        expect(await h.getShadowRenderFailureCount()).toBe(2);
+        expect(await h.getShadowRenderFailureCount()).toBe(3);
 
         await h.beginEmitterProbe();
         await expect.poll(() => h.getEmitterProbeResult(), { timeout: 10_000 }).toBe(

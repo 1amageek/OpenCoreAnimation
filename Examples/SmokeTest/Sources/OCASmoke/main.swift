@@ -1090,6 +1090,133 @@ func installHarness() {
                         && renderer.lastLayerFilterFailure == .coreImageExecutionFailed
                     rasterizedRejected.removeFromSuperlayer()
 
+                    let invalidMaskedLayer = CALayer()
+                    invalidMaskedLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+                    invalidMaskedLayer.position = CGPoint(x: 220, y: 140)
+                    invalidMaskedLayer.zPosition = 100
+                    invalidMaskedLayer.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    let invalidMask = CALayer()
+                    invalidMask.frame = invalidMaskedLayer.bounds
+                    invalidMask.backgroundColor = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    invalidMask.filters = [CAFilter(
+                        type: .gaussianBlur,
+                        parameters: ["inputRaduis": 8]
+                    )]
+                    invalidMaskedLayer.mask = invalidMask
+                    let frameFailuresBeforeInvalidMask =
+                        renderer.frameRenderFailureCount
+                    root.addSublayer(invalidMaskedLayer)
+                    engine.renderFrame()
+                    engine.renderFrame()
+                    let invalidMaskRejectsEveryFrame =
+                        renderer.frameRenderFailureCount
+                            - frameFailuresBeforeInvalidMask == 2
+                        && renderer.lastFrameRenderFailure
+                            == .contentMaskPreparationFailed(
+                                .layerFilter(
+                                    .invalidConfiguration(
+                                        .unexpectedParameter("inputRaduis")
+                                    )
+                                )
+                            )
+                    invalidMaskedLayer.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    let invalidMaskedRasterization = CALayer()
+                    invalidMaskedRasterization.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    invalidMaskedRasterization.position = CGPoint(x: 220, y: 140)
+                    invalidMaskedRasterization.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    let rasterizationMask = CALayer()
+                    rasterizationMask.frame = invalidMaskedRasterization.bounds
+                    rasterizationMask.backgroundColor = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    invalidMaskedRasterization.mask = rasterizationMask
+                    invalidMaskedRasterization.shouldRasterize = true
+                    invalidMaskedRasterization.rasterizationScale = 0
+                    let frameFailuresBeforeInvalidMaskedRasterization =
+                        renderer.frameRenderFailureCount
+                    root.addSublayer(invalidMaskedRasterization)
+                    engine.renderFrame()
+                    let invalidMaskedRasterizationTyped =
+                        renderer.frameRenderFailureCount
+                            - frameFailuresBeforeInvalidMaskedRasterization == 1
+                        && renderer.lastFrameRenderFailure
+                            == .contentMaskPreparationFailed(
+                                .rasterization(
+                                    .invalidRasterizationScale(0)
+                                )
+                            )
+                    invalidMaskedRasterization.removeFromSuperlayer()
+                    engine.renderFrame()
+
+                    let invalidMaskedShadow = CALayer()
+                    invalidMaskedShadow.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    invalidMaskedShadow.position = CGPoint(x: 220, y: 140)
+                    invalidMaskedShadow.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    invalidMaskedShadow.shadowColor = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    invalidMaskedShadow.shadowOpacity = .infinity
+                    let shadowMask = CALayer()
+                    shadowMask.frame = invalidMaskedShadow.bounds
+                    shadowMask.backgroundColor = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    invalidMaskedShadow.mask = shadowMask
+                    let frameFailuresBeforeInvalidMaskedShadow =
+                        renderer.frameRenderFailureCount
+                    root.addSublayer(invalidMaskedShadow)
+                    engine.renderFrame()
+                    let invalidMaskedShadowTyped =
+                        renderer.frameRenderFailureCount
+                            - frameFailuresBeforeInvalidMaskedShadow == 1
+                        && renderer.lastFrameRenderFailure
+                            == .contentMaskPreparationFailed(
+                                .shadow(.nonFiniteGeometry)
+                            )
+                    invalidMaskedShadow.removeFromSuperlayer()
+                    engine.renderFrame()
+
                     layerFilterProbeResult = pixels.prefix(4)
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
@@ -1103,6 +1230,9 @@ func installHarness() {
                         + ",alphaPixel=\(alphaFilteredPixel.map(String.init).joined(separator: ","))"
                         + ",displayTyped=\(invalidCompositeTyped)"
                         + ",rasterTyped=\(rasterizedFailureTyped)"
+                        + ",maskFrameTyped=\(invalidMaskRejectsEveryFrame)"
+                        + ",maskRasterTyped=\(invalidMaskedRasterizationTyped)"
+                        + ",maskShadowTyped=\(invalidMaskedShadowTyped)"
                 } catch {
                     layerFilterProbeResult = "error: \(error)"
                 }
@@ -3222,6 +3352,8 @@ func installHarness() {
                 }
                 let frameFailuresAtProbeStart =
                     renderer.frameRenderFailureCount
+                let rasterizationFailuresAtProbeStart =
+                    renderer.rasterizationFailureCount
 
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
@@ -3329,7 +3461,8 @@ func installHarness() {
 
                 func makeAlphaMaskedGroup(
                     position: CGPoint,
-                    shouldRasterize: Bool = false
+                    shouldRasterize: Bool = false,
+                    usesMaskFilter: Bool = true
                 ) -> CALayer {
                     let group = CALayer()
                     group.bounds = flattenedContainer.bounds
@@ -3348,7 +3481,9 @@ func installHarness() {
                     translucentHalf.position = CGPoint(x: 10, y: 20)
                     translucentHalf.backgroundColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
                     translucentHalf.opacity = 0.5
-                    translucentHalf.filters = [CAFilter.brightness(0)]
+                    if usesMaskFilter {
+                        translucentHalf.filters = [CAFilter.brightness(0)]
+                    }
                     maskRoot.addSublayer(translucentHalf)
                     group.mask = maskRoot
                     return group
@@ -3357,7 +3492,10 @@ func installHarness() {
                 let maskedGroup = makeAlphaMaskedGroup(position: CGPoint(x: 30, y: 110))
                 crossingGroup.addSublayer(maskedGroup)
 
-                let directMaskedGroup = makeAlphaMaskedGroup(position: CGPoint(x: 370, y: 110))
+                let directMaskedGroup = makeAlphaMaskedGroup(
+                    position: CGPoint(x: 370, y: 110),
+                    usesMaskFilter: false
+                )
                 root.addSublayer(directMaskedGroup)
 
                 let rasterizedMaskedGroup = makeAlphaMaskedGroup(
@@ -3668,7 +3806,8 @@ func installHarness() {
                         && pixels[20] == [255, 0, 0, 255]
                     let overflowRespectsClipping = pixels[21] == [0, 255, 0, 255]
                         && pixels[22] == [0, 0, 0, 255]
-                        && renderer.rasterizationFailureCount == 0
+                        && renderer.rasterizationFailureCount
+                            == rasterizationFailuresAtProbeStart
                     // The composition-dependent flattened group is recaptured every frame
                     // because its pixels depend on an external backdrop, while unrelated
                     // flattened groups remain reusable.
@@ -6995,7 +7134,6 @@ func installHarness() {
                 unsupportedMask.cornerRadius = 30
                 unsupportedMask.cornerCurve = CALayerCornerCurve(rawValue: "future-mask-curve")
                 rejectedMaskedLayer.mask = unsupportedMask
-                root.addSublayer(rejectedMaskedLayer)
 
                 func makeOverlappingClip(
                     position: CGPoint,
@@ -7058,7 +7196,6 @@ func installHarness() {
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
-                    let failureDelta = renderer.cornerCurveRenderFailureCount - failureCountBefore
                     let typedFailure: String
                     switch renderer.lastCornerCurveRenderFailure {
                     case .layer(.unsupportedCurve(let value)):
@@ -7070,6 +7207,24 @@ func installHarness() {
                     case nil:
                         typedFailure = "nil"
                     }
+
+                    let frameFailureCountBefore =
+                        renderer.frameRenderFailureCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    root.addSublayer(rejectedMaskedLayer)
+                    CATransaction.commit()
+                    CAAnimationEngine.shared.renderFrame()
+                    let frameFailureTyped =
+                        renderer.frameRenderFailureCount
+                            - frameFailureCountBefore == 1
+                        && renderer.lastFrameRenderFailure
+                            == .contentMaskPreparationFailed(
+                                .layerFilter(.contentMaskCaptureFailed)
+                            )
+                    let failureDelta =
+                        renderer.cornerCurveRenderFailureCount
+                            - failureCountBefore
                     let maskFailureDelta = renderer.maskRenderFailureCount - maskFailureCountBefore
                     let maskTypedFailure: String
                     switch renderer.lastMaskRenderFailure {
@@ -7080,7 +7235,7 @@ func installHarness() {
                     default:
                         maskTypedFailure = "other"
                     }
-                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta),typed=\(typedFailure),maskFailures=\(maskFailureDelta),maskTyped=\(maskTypedFailure)"
+                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta),typed=\(typedFailure),maskFailures=\(maskFailureDelta),maskTyped=\(maskTypedFailure),frameTyped=\(frameFailureTyped)"
                 } catch {
                     cornerCurveProbeResult = "error: \(error)"
                 }

@@ -1681,6 +1681,11 @@ private final class EmitterLayerState {
     /// Requested layer-filter paths whose configuration is currently not executable.
     private var failedLayerFilterKeys = LayerRenderKeySet()
 
+    /// Exact failures retained by render key so an owning content-mask target
+    /// can reject the frame instead of accepting a transparent failed subtree.
+    private var layerFilterFailuresByKey =
+        LayerRenderKeyMap<CALayerFilterRenderFailure>()
+
     /// Prepared layer-filter textures whose final display composite is currently unavailable.
     private var failedLayerFilterDisplayKeys = LayerRenderKeySet()
 
@@ -1767,6 +1772,11 @@ private final class EmitterLayerState {
 
     /// Per-frame capture failures that must not fall through to live subtree rendering.
     private var failedRasterizationRenderKeys = LayerRenderKeySet()
+
+    /// A requested content mask must reject the complete frame if its
+    /// offscreen subtree, alpha multiplication, or shadow cannot be completed.
+    private var pendingContentMaskFrameFailure:
+        CAContentMaskPreparationFailure?
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCaptureCount: Int = 0
@@ -4124,6 +4134,18 @@ private final class EmitterLayerState {
         lastFrameRenderFailure = failure
     }
 
+    private func rejectFrameForPendingContentMaskFailure() -> Bool {
+        guard let pendingContentMaskFrameFailure else {
+            return false
+        }
+        recordFrameRenderFailure(
+            .contentMaskPreparationFailed(
+                pendingContentMaskFrameFailure
+            )
+        )
+        return true
+    }
+
     public func resize(width: Int, height: Int) {
         let maximumTextureDimension = device.map {
             Int($0.limits.maxTextureDimension2D)
@@ -4188,6 +4210,7 @@ private final class EmitterLayerState {
         configureRasterizationCache(width: renderTarget.width, height: renderTarget.height)
         prerasterizedTextures.removeAll(keepingCapacity: true)
         failedRasterizationRenderKeys.removeAll(keepingCapacity: true)
+        pendingContentMaskFrameFailure = nil
         rasterizePrerenderRootLayer = nil
     }
 
@@ -4434,6 +4457,7 @@ private final class EmitterLayerState {
         isRenderingMainPass = true
         prerasterizedTextures.removeAll(keepingCapacity: true)
         failedRasterizationRenderKeys.removeAll(keepingCapacity: true)
+        pendingContentMaskFrameFailure = nil
         rasterizePrerenderRootLayer = nil
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: true)
     }
@@ -4656,6 +4680,7 @@ private final class EmitterLayerState {
         // Reset rasterization pre-rendering state (R3.2)
         prerasterizedTextures.removeAll(keepingCapacity: true)
         failedRasterizationRenderKeys.removeAll(keepingCapacity: true)
+        pendingContentMaskFrameFailure = nil
         rasterizePrerenderRootLayer = nil
 
         // Drop the previous frame's textured bind groups: the buffer pool has
@@ -4724,6 +4749,9 @@ private final class EmitterLayerState {
                 projectionMatrix: projectionMatrix
             )
             suppressShadowRendering = false
+            if rejectFrameForPendingContentMaskFailure() {
+                return
+            }
         }
 
         // Pre-render shadows with 2-pass Gaussian blur.
@@ -4735,6 +4763,9 @@ private final class EmitterLayerState {
             encoder: encoder,
             projectionMatrix: projectionMatrix
         )
+        if rejectFrameForPendingContentMaskFailure() {
+            return
+        }
 
         // Pre-render layers with blur filters
         prerenderFilteredLayers(
@@ -4745,6 +4776,9 @@ private final class EmitterLayerState {
             encoder: encoder,
             projectionMatrix: projectionMatrix
         )
+        if rejectFrameForPendingContentMaskFailure() {
+            return
+        }
 
         prepareDeferredCompositionRasterizations(
             rootLayer,
@@ -4760,6 +4794,9 @@ private final class EmitterLayerState {
             encoder: encoder,
             projectionMatrix: projectionMatrix
         )
+        if rejectFrameForPendingContentMaskFailure() {
+            return
+        }
 
         // Use root layer's backgroundColor as clear color (for SKScene background)
         // This prevents SKScene's backgroundColor from rendering at zPosition=0
@@ -4771,7 +4808,8 @@ private final class EmitterLayerState {
             // The background will be rendered as geometry with corner radius SDF.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
         } else if rootPresentation.filters?.isEmpty == false
-            || prerenderedFilters[renderKey(for: rootLayer)] != nil {
+            || prerenderedFilters[renderKey(for: rootLayer)] != nil
+            || prerasterizedTextures[renderKey(for: rootLayer)] != nil {
             // The filtered root layer is composited from the offscreen texture, so drawing
             // its background here would double-apply the root background color.
             clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
@@ -4813,6 +4851,9 @@ private final class EmitterLayerState {
                 projectionMatrix: projectionMatrix
             )
             capturesOnlyDeferredCompositionRasterizations = false
+            if rejectFrameForPendingContentMaskFailure() {
+                return
+            }
         }
 
         // Begin render pass with depth attachment
@@ -4854,6 +4895,10 @@ private final class EmitterLayerState {
         isRenderingMainPass = false
 
         renderPass.end()
+
+        if rejectFrameForPendingContentMaskFailure() {
+            return
+        }
 
         // Log warning if layers were dropped due to buffer capacity
         if droppedLayerCount > 0 {
@@ -5267,6 +5312,7 @@ private final class EmitterLayerState {
         activeLayerFilterExecutions.removeAll(keepingCapacity: false)
         retiringLayerFilterExecutions.removeAll(keepingCapacity: false)
         failedLayerFilterKeys.removeAll(keepingCapacity: false)
+        layerFilterFailuresByKey.removeAll(keepingCapacity: false)
         failedLayerFilterDisplayKeys.removeAll(keepingCapacity: false)
         layerFilterFailureCount = 0
         lastLayerFilterFailure = nil
@@ -5342,6 +5388,7 @@ private final class EmitterLayerState {
         transitionFilterProcessor = nil
         prerasterizedTextures.removeAll(keepingCapacity: false)
         failedRasterizationRenderKeys.removeAll(keepingCapacity: false)
+        pendingContentMaskFrameFailure = nil
         rasterizePrerenderRootLayer = nil
         shadowCaptureRootLayer = nil
         suppressShadowRendering = false
@@ -9928,6 +9975,33 @@ private final class EmitterLayerState {
         }
     }
 
+    private func recordShadowPreparationFailure(
+        _ failure: CAShadowRenderFailure,
+        target: LayerPrepassTarget
+    ) {
+        recordShadowRenderFailure(failure, for: target.renderKey)
+        if subtreeContainsContentMask(target.layer) {
+            pendingContentMaskFrameFailure = .shadow(failure)
+        }
+    }
+
+    private func subtreeContainsContentMask(
+        _ rootLayer: CALayer
+    ) -> Bool {
+        var pending = [rootLayer]
+        var visited: Set<ObjectIdentifier> = []
+        while let layer = pending.popLast() {
+            guard visited.insert(ObjectIdentifier(layer)).inserted else {
+                continue
+            }
+            if renderPresentation(for: layer).mask != nil {
+                return true
+            }
+            pending.append(contentsOf: layer.sublayers ?? [])
+        }
+        return false
+    }
+
     private func prerenderShadows(
         _ rootLayer: CALayer,
         device: GPUDevice,
@@ -9959,9 +10033,9 @@ private final class EmitterLayerState {
               let shadowBindGroupLayout = shadowBindGroupLayout,
               let blurSampler = blurSampler else {
             for target in targets {
-                recordShadowRenderFailure(
+                recordShadowPreparationFailure(
                     .rendererResourcesUnavailable,
-                    for: target.renderKey
+                    target: target
                 )
             }
             return
@@ -9978,7 +10052,7 @@ private final class EmitterLayerState {
             do {
                 shadowConfiguration = try CAShadowRenderConfiguration(layer: presentationLayer)
             } catch {
-                recordShadowRenderFailure(error, for: shadowRenderKey)
+                recordShadowPreparationFailure(error, target: target)
                 continue
             }
             activeRenderKeys.insert(shadowRenderKey)
@@ -10099,9 +10173,9 @@ private final class EmitterLayerState {
                         )
                     }
                 } catch {
-                    recordShadowRenderFailure(
+                    recordShadowPreparationFailure(
                         .shadowPathTessellationFailed,
-                        for: shadowRenderKey
+                        target: target
                     )
                     continue
                 }
@@ -10149,12 +10223,12 @@ private final class EmitterLayerState {
                         )
                     }
                 } catch let error as CAShadowRenderFailure {
-                    recordShadowRenderFailure(error, for: shadowRenderKey)
+                    recordShadowPreparationFailure(error, target: target)
                     continue
                 } catch {
-                    recordShadowRenderFailure(
+                    recordShadowPreparationFailure(
                         .rendererResourcesUnavailable,
-                        for: shadowRenderKey
+                        target: target
                     )
                     continue
                 }
@@ -10343,6 +10417,7 @@ private final class EmitterLayerState {
     ) {
         var targets: [LayerPrepassTarget] = []
         var visitedRenderKeys = LayerRenderKeySet()
+        layerFilterFailuresByKey.removeAll(keepingCapacity: true)
         collectFilteredLayers(
             rootLayer,
             parentMatrix: projectionMatrix,
@@ -10359,11 +10434,25 @@ private final class EmitterLayerState {
             let requiresCompositionSource = target.presentationLayer.compositingFilter != nil
                 || target.presentationLayer.backgroundFilters?.isEmpty == false
             let requiresContentMask = target.presentationLayer.mask != nil
+            let maskOwnsBackdropComposition =
+                target.presentationLayer.mask.map { maskLayer in
+                    let maskPresentation = renderPresentation(
+                        for: maskLayer
+                    )
+                    return maskPresentation.compositingFilter != nil
+                        || maskPresentation.backgroundFilters?.isEmpty
+                            == false
+                        || descendantsContainBackdropComposition(
+                            maskLayer
+                        )
+                } ?? false
             let compositionOwnsAncestorMask = requiresContentMask
                 && requestedFilters.isEmpty
                 && !requiresGroup
                 && !requiresCompositionSource
-                && descendantsContainBackdropComposition(filteredLayer)
+                && descendantsContainBackdropComposition(
+                    filteredLayer
+                )
             if compositionOwnsAncestorMask {
                 // Descendant backdrop-composition targets already receive this
                 // ancestor mask through `contentMaskAncestors`. Capturing the
@@ -10377,12 +10466,26 @@ private final class EmitterLayerState {
                     || requiresContentMask else { continue }
 
             let filteredRenderKey = target.renderKey
+            func rejectTarget(
+                _ failure: CALayerFilterRenderFailure
+            ) {
+                failedRenderKeys.insert(filteredRenderKey)
+                recordLayerFilterFailure(
+                    failure,
+                    for: filteredRenderKey
+                )
+                if requiresContentMask
+                    && !requiresCompositionSource
+                    && !maskOwnsBackdropComposition {
+                    pendingContentMaskFrameFailure =
+                        .layerFilter(failure)
+                }
+            }
             let stages: [LayerFilterStage]
             do {
                 stages = try layerFilterStages(from: requestedFilters)
             } catch {
-                failedRenderKeys.insert(filteredRenderKey)
-                recordLayerFilterFailure(error, for: filteredRenderKey)
+                rejectTarget(error)
                 continue
             }
             activeRenderKeys.insert(filteredRenderKey)
@@ -10448,11 +10551,7 @@ private final class EmitterLayerState {
 
             if replicatorRenderFailureGeneration != replicatorFailureGenerationBeforeCapture,
                let failure = lastReplicatorRenderFailure {
-                failedRenderKeys.insert(filteredRenderKey)
-                recordLayerFilterFailure(
-                    .subtreeReplicatorFailed(failure),
-                    for: filteredRenderKey
-                )
+                rejectTarget(.subtreeReplicatorFailed(failure))
                 continue
             }
 
@@ -10570,22 +10669,25 @@ private final class EmitterLayerState {
             }
 
             if let executionFailure {
-                failedRenderKeys.insert(filteredRenderKey)
-                recordLayerFilterFailure(executionFailure, for: filteredRenderKey)
+                rejectTarget(executionFailure)
                 continue
             }
 
             guard convert(to: .premultiplied) else {
-                failedRenderKeys.insert(filteredRenderKey)
-                recordLayerFilterFailure(.alphaConversionFailed, for: filteredRenderKey)
+                rejectTarget(.alphaConversionFailed)
                 continue
             }
 
             if requiresContentMask {
                 guard let maskLayer = target.presentationLayer.mask,
                       let compositionMaskApplyPipeline else {
-                    failedRenderKeys.insert(filteredRenderKey)
-                    recordLayerFilterFailure(.contentMaskUnavailable, for: filteredRenderKey)
+                    rejectTarget(.contentMaskUnavailable)
+                    continue
+                }
+                if !requiresCompositionSource,
+                   !maskOwnsBackdropComposition,
+                   let failure = layerFilterFailure(in: maskLayer) {
+                    rejectTarget(failure)
                     continue
                 }
                 let maskTarget = LayerPrepassTarget(
@@ -10603,8 +10705,7 @@ private final class EmitterLayerState {
                     suppressRootFilters: false,
                     encoder: encoder
                 ) else {
-                    failedRenderKeys.insert(filteredRenderKey)
-                    recordLayerFilterFailure(.contentMaskCaptureFailed, for: filteredRenderKey)
+                    rejectTarget(.contentMaskCaptureFailed)
                     continue
                 }
                 let maskedTexture = currentTexture === resources.resultTexture
@@ -10618,8 +10719,7 @@ private final class EmitterLayerState {
                         outputView: maskedView,
                         encoder: encoder
                       ) else {
-                    failedRenderKeys.insert(filteredRenderKey)
-                    recordLayerFilterFailure(.contentMaskCompositeFailed, for: filteredRenderKey)
+                    rejectTarget(.contentMaskCompositeFailed)
                     continue
                 }
                 currentTexture = maskedTexture
@@ -10627,6 +10727,9 @@ private final class EmitterLayerState {
             }
 
             failedLayerFilterKeys.remove(filteredRenderKey)
+            layerFilterFailuresByKey.removeValue(
+                forKey: filteredRenderKey
+            )
             prerenderedFilters[filteredRenderKey] = PrerenderedFilter(
                 resources: resources,
                 outputTexture: currentTexture,
@@ -10638,6 +10741,36 @@ private final class EmitterLayerState {
         failedLayerFilterKeys.formIntersection(failedRenderKeys)
         failedLayerFilterDisplayKeys.formIntersection(activeRenderKeys)
         evictFilterResources(except: activeRenderKeys)
+    }
+
+    private func layerFilterFailure(
+        in rootLayer: CALayer
+    ) -> CALayerFilterRenderFailure? {
+        var pending = [rootLayer]
+        var visited: Set<ObjectIdentifier> = []
+        while let layer = pending.popLast() {
+            let identifier = ObjectIdentifier(layer)
+            guard visited.insert(identifier).inserted else {
+                continue
+            }
+            let presentation = renderPresentation(for: layer)
+            if presentation.filters?.isEmpty == false {
+                var matchedFailure: CALayerFilterRenderFailure?
+                layerFilterFailuresByKey.forEach { key, failure in
+                    if matchedFailure == nil, key.layer == identifier {
+                        matchedFailure = failure
+                    }
+                }
+                if let matchedFailure {
+                    return matchedFailure
+                }
+            }
+            if let mask = presentation.mask {
+                pending.append(mask)
+            }
+            pending.append(contentsOf: layer.sublayers ?? [])
+        }
+        return nil
     }
 
     private func descendantsContainBackdropComposition(_ layer: CALayer) -> Bool {
@@ -10662,6 +10795,7 @@ private final class EmitterLayerState {
         for renderKey: LayerRenderKey
     ) {
         lastLayerFilterFailure = failure
+        layerFilterFailuresByKey[renderKey] = failure
         if failedLayerFilterKeys.insert(renderKey).inserted {
             layerFilterFailureCount += 1
         }
@@ -12141,6 +12275,16 @@ private final class EmitterLayerState {
         recordRasterizationFailure(failure)
     }
 
+    private func recordRasterizationCompositeFailure(
+        _ failure: CARasterizationRenderFailure,
+        presentationLayer: CALayer
+    ) {
+        recordRasterizationFailure(failure)
+        if presentationLayer.mask != nil {
+            pendingContentMaskFrameFailure = .rasterization(failure)
+        }
+    }
+
     private func captureRasterizedLayer(
         _ layer: CALayer,
         purpose: RasterizationCachePurpose,
@@ -12154,10 +12298,11 @@ private final class EmitterLayerState {
         let key = RasterizationCacheKey(layerRenderKey, purpose: purpose)
         let presentationLayer = renderPresentation(for: layer)
         guard let captureBounds = rasterizationCaptureBounds(for: layer) else {
-            recordRasterizationCaptureFailure(
-                .invalidCaptureBounds,
-                for: layerRenderKey
-            )
+            let failure = CARasterizationRenderFailure.invalidCaptureBounds
+            recordRasterizationCaptureFailure(failure, for: layerRenderKey)
+            if presentationLayer.mask != nil {
+                pendingContentMaskFrameFailure = .rasterization(failure)
+            }
             return
         }
         let contentBoundsHash = rasterizationContentBoundsHash(
@@ -12196,6 +12341,9 @@ private final class EmitterLayerState {
             )
         } catch let failure {
             recordRasterizationCaptureFailure(failure, for: layerRenderKey)
+            if presentationLayer.mask != nil {
+                pendingContentMaskFrameFailure = .rasterization(failure)
+            }
             return
         }
         let pixelWidth = captureConfiguration.pixelWidth
@@ -12211,6 +12359,9 @@ private final class EmitterLayerState {
             } catch {
                 recordLayerFilterFailure(error, for: layerRenderKey)
                 failedRasterizationRenderKeys.insert(layerRenderKey)
+                if presentationLayer.mask != nil {
+                    pendingContentMaskFrameFailure = .layerFilter(error)
+                }
                 return
             }
         }
@@ -12288,12 +12439,17 @@ private final class EmitterLayerState {
         let previousRenderTargetSize = renderTargetSizeOverride
         let previousClipStack = clipRectStack
         let previousOpacityStack = opacityStack
+        let previousSuppressedMaskRoot =
+            contentMaskCaptureSuppressedRootLayer
         let previousMaskNestingDepth = maskNestingDepth
         let previousActiveStencilFrames = activeStencilFrames
         let previousTransformDepthNesting = transformDepthNesting
         let previousStencilValue = currentStencilValue
 
         rasterizePrerenderRootLayer = layer
+        if presentationLayer.mask != nil {
+            contentMaskCaptureSuppressedRootLayer = layer
+        }
         renderTargetSizeOverride = captureSize
         clipRectStack.removeAll(keepingCapacity: true)
         opacityStack.removeAll(keepingCapacity: true)
@@ -12305,6 +12461,8 @@ private final class EmitterLayerState {
         renderLayer(layer, renderPass: capturePass, parentMatrix: captureProjection)
 
         rasterizePrerenderRootLayer = previousCaptureRoot
+        contentMaskCaptureSuppressedRootLayer =
+            previousSuppressedMaskRoot
         renderTargetSizeOverride = previousRenderTargetSize
         clipRectStack = previousClipStack
         opacityStack = previousOpacityStack
@@ -12322,6 +12480,11 @@ private final class EmitterLayerState {
                 .subtreeReplicatorFailed(failure),
                 for: layerRenderKey
             )
+            if presentationLayer.mask != nil {
+                pendingContentMaskFrameFailure = .rasterization(
+                    .subtreeReplicatorFailed(failure)
+                )
+            }
             return
         }
 
@@ -12344,9 +12507,13 @@ private final class EmitterLayerState {
             } catch {
                 recordLayerFilterFailure(error, for: layerRenderKey)
                 failedRasterizationRenderKeys.insert(layerRenderKey)
+                if presentationLayer.mask != nil {
+                    pendingContentMaskFrameFailure = .layerFilter(error)
+                }
                 return
             }
             failedLayerFilterKeys.remove(layerRenderKey)
+            layerFilterFailuresByKey.removeValue(forKey: layerRenderKey)
             cachedTexture = filteredTexture
         }
 
@@ -12368,9 +12535,11 @@ private final class EmitterLayerState {
             } catch {
                 recordLayerFilterFailure(error, for: layerRenderKey)
                 failedRasterizationRenderKeys.insert(layerRenderKey)
+                pendingContentMaskFrameFailure = .layerFilter(error)
                 return
             }
             failedLayerFilterKeys.remove(layerRenderKey)
+            layerFilterFailuresByKey.removeValue(forKey: layerRenderKey)
             cachedTexture = maskedTexture
         }
 
@@ -12388,6 +12557,9 @@ private final class EmitterLayerState {
             } catch {
                 recordShadowRenderFailure(error, for: layerRenderKey)
                 failedRasterizationRenderKeys.insert(layerRenderKey)
+                if presentationLayer.mask != nil {
+                    pendingContentMaskFrameFailure = .shadow(error)
+                }
                 return
             }
         }
@@ -13108,11 +13280,17 @@ private final class EmitterLayerState {
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let basePipeline = pipeline else {
-            recordRasterizationFailure(.compositeResourcesUnavailable)
+            recordRasterizationCompositeFailure(
+                .compositeResourcesUnavailable,
+                presentationLayer: presentationLayer
+            )
             return
         }
         guard let selectedPipeline = selectPremultipliedTexturedPipeline() else {
-            recordRasterizationFailure(.compositePipelineUnavailable)
+            recordRasterizationCompositeFailure(
+                .compositePipelineUnavailable,
+                presentationLayer: presentationLayer
+            )
             return
         }
 
@@ -13127,7 +13305,10 @@ private final class EmitterLayerState {
               captureHeight.isFinite,
               captureWidth > 0,
               captureHeight > 0 else {
-            recordRasterizationFailure(.invalidCompositeBounds(captureBounds))
+            recordRasterizationCompositeFailure(
+                .invalidCompositeBounds(captureBounds),
+                presentationLayer: presentationLayer
+            )
             return
         }
 
@@ -13150,7 +13331,10 @@ private final class EmitterLayerState {
         ]
 
         guard let allocation = allocateVertices(count: vertices.count) else {
-            recordRasterizationFailure(.compositeVertexCapacityExceeded)
+            recordRasterizationCompositeFailure(
+                .compositeVertexCapacityExceeded,
+                presentationLayer: presentationLayer
+            )
             return
         }
         let (vertexOffset, layerIndex) = allocation

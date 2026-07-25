@@ -21,6 +21,7 @@ public enum CAWebGPUFrameRenderFailure: Error, Equatable, Sendable {
     case layerFilterProcessorUnavailable
     case rasterizationCacheUnavailable
     case delegateBackingStoreFailed(CADelegateBackingStoreError)
+    case contentMaskPreparationFailed(CAContentMaskPreparationFailure)
     case committedSnapshotCaptureFailed(CARendererError)
     case committedSnapshotEncodingFailed(
         CACommittedSnapshotEncodingFailure

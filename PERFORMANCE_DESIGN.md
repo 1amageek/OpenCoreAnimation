@@ -771,7 +771,7 @@ contributor's `_dirtyMask` before re-running the blur passes.
 | Layer scrolls (transform-only change) | Transform is a uniform, so cached texture is reused; `contentBoundsHash` excludes the parent's transform — only the *self* transform that affects internal layout matters, which is captured in `bounds`. |
 | `rasterizationScale` change | `.rasterization` bit; cache evicted. |
 | Off-screen layer | Optimization opportunity (skip capture) but out of scope; cache still works. |
-| Mask layer with `shouldRasterize` | Defer to mask first, then rasterize composed result. Documented in mask section. |
+| Mask layer with `shouldRasterize` | Capture the unmasked subtree in layer-local storage, capture the complete detached mask tree as alpha, multiply once, and only then publish the raster-cache entry. Any capture, filter, shadow, or composite failure rejects the frame without inserting a partial cache result. |
 
 ### 5.7 TDD test sequence — Phase 3
 
