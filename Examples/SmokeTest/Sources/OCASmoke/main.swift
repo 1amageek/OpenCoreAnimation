@@ -54,6 +54,7 @@ nonisolated(unsafe) var delegateFormatProbeResult: String = "pending"
 nonisolated(unsafe) var geometryFlipProbeResult: String = "pending"
 nonisolated(unsafe) var shadowProbeResult: String = "pending"
 nonisolated(unsafe) var displayLinkProbeResult: String = "pending"
+nonisolated(unsafe) var transactionSchedulingProbeResult: String = "pending"
 nonisolated(unsafe) var emitterProbeResult: String = "pending"
 nonisolated(unsafe) var replicatorProbeResult: String = "pending"
 nonisolated(unsafe) var compositionProbeResult: String = "pending"
@@ -211,6 +212,7 @@ public func setup() {
             geometryFlipProbeResult = "pending"
             shadowProbeResult = "pending"
             displayLinkProbeResult = "pending"
+            transactionSchedulingProbeResult = "pending"
             emitterProbeResult = "pending"
             replicatorProbeResult = "pending"
             compositionProbeResult = "pending"
@@ -453,6 +455,9 @@ func installHarness() {
         })
         h.expose("getDisplayLinkProbeResult", returning: {
             .string(displayLinkProbeResult)
+        })
+        h.expose("getTransactionSchedulingProbeResult", returning: {
+            .string(transactionSchedulingProbeResult)
         })
         h.expose("getEmitterProbeResult", returning: {
             .string(emitterProbeResult)
@@ -5409,6 +5414,191 @@ func installHarness() {
                     }
                     engine.renderFrame()
                     emitterProbeResult = "error: \(error)"
+                }
+            }
+        })
+        h.expose("beginTransactionSchedulingProbe", action: {
+            Task { @MainActor in
+                transactionSchedulingProbeResult = "running"
+                let browser = JSObject.global
+                let originalSetTimeout = browser.setTimeout
+                let originalClearTimeout = browser.clearTimeout
+                var installedTimerMocks: [JSClosure] = []
+                defer {
+                    browser.setTimeout = originalSetTimeout
+                    browser.clearTimeout = originalClearTimeout
+                    _ = installedTimerMocks
+                    CATransaction.flush()
+                }
+
+                guard let originalSetTimeoutFunction = originalSetTimeout.function else {
+                    transactionSchedulingProbeResult = "error: setTimeout unavailable"
+                    return
+                }
+
+                do {
+                    CATransaction.flush()
+                    let initialFailureCount =
+                        CATransaction.implicitCommitSchedulingFailureCount
+
+                    browser.setTimeout = .undefined
+                    var unavailableCompletionCount = 0
+                    CATransaction.setCompletionBlock {
+                        unavailableCompletionCount += 1
+                    }
+                    try await Task.sleep(for: .milliseconds(20))
+                    let unavailableRejected =
+                        unavailableCompletionCount == 0
+                        && CATransaction.implicitCommitSchedulingFailureCount
+                            == initialFailureCount + 1
+                        && CATransaction.lastImplicitCommitSchedulingFailure
+                            == .setTimeoutUnavailable
+
+                    browser.setTimeout = originalSetTimeout
+                    CATransaction.setDisableActions(false)
+                    try await Task.sleep(for: .milliseconds(40))
+                    let unavailableRecovered =
+                        unavailableCompletionCount == 1
+                        && CATransaction.implicitCommitSchedulingFailureCount
+                            == initialFailureCount + 1
+                        && CATransaction.lastImplicitCommitSchedulingFailure == nil
+
+                    let malformedIdentifierSetTimeout = JSClosure { arguments in
+                        guard let callback = arguments.first?.function else {
+                            return .undefined
+                        }
+                        _ = originalSetTimeoutFunction(
+                            this: browser,
+                            callback,
+                            120
+                        )
+                        return .string("invalid-timer-identifier")
+                    }
+                    installedTimerMocks.append(malformedIdentifierSetTimeout)
+                    browser.setTimeout = malformedIdentifierSetTimeout.jsValue
+
+                    var malformedIdentifierCompletionCount = 0
+                    CATransaction.setCompletionBlock {
+                        malformedIdentifierCompletionCount += 1
+                    }
+                    try await Task.sleep(for: .milliseconds(20))
+                    let malformedIdentifierRejected =
+                        malformedIdentifierCompletionCount == 0
+                        && CATransaction.implicitCommitSchedulingFailureCount
+                            == initialFailureCount + 2
+                        && CATransaction.lastImplicitCommitSchedulingFailure
+                            == .timerIdentifierUnavailable
+
+                    browser.setTimeout = originalSetTimeout
+                    CATransaction.setDisableActions(false)
+                    try await Task.sleep(for: .milliseconds(40))
+                    let completionBeforeStaleTimer =
+                        malformedIdentifierCompletionCount
+                    try await Task.sleep(for: .milliseconds(100))
+                    let malformedIdentifierRecovered =
+                        completionBeforeStaleTimer == 1
+                        && malformedIdentifierCompletionCount == 1
+                        && CATransaction.implicitCommitSchedulingFailureCount
+                            == initialFailureCount + 2
+                        && CATransaction.lastImplicitCommitSchedulingFailure == nil
+
+                    var clearedBoundaryIdentifier: Double?
+                    let maximumSafeTimerIdentifier = 9_007_199_254_740_991.0
+                    let boundaryIdentifierSetTimeout = JSClosure { _ in
+                        .number(maximumSafeTimerIdentifier)
+                    }
+                    let boundaryIdentifierClearTimeout = JSClosure { arguments in
+                        clearedBoundaryIdentifier = arguments.first?.number
+                        return .undefined
+                    }
+                    installedTimerMocks.append(boundaryIdentifierSetTimeout)
+                    installedTimerMocks.append(boundaryIdentifierClearTimeout)
+                    browser.setTimeout = boundaryIdentifierSetTimeout.jsValue
+                    browser.clearTimeout = boundaryIdentifierClearTimeout.jsValue
+
+                    var boundaryIdentifierCompletionCount = 0
+                    CATransaction.setCompletionBlock {
+                        boundaryIdentifierCompletionCount += 1
+                    }
+                    CATransaction.flush()
+                    let boundaryIdentifierPreserved =
+                        clearedBoundaryIdentifier == maximumSafeTimerIdentifier
+                        && boundaryIdentifierCompletionCount == 1
+                        && CATransaction.implicitCommitSchedulingFailureCount
+                            == initialFailureCount + 2
+
+                    let delayedSetTimeout = JSClosure { arguments in
+                        guard let callback = arguments.first?.function else {
+                            return .undefined
+                        }
+                        return originalSetTimeoutFunction(
+                            this: browser,
+                            callback,
+                            120
+                        )
+                    }
+                    installedTimerMocks.append(delayedSetTimeout)
+                    browser.setTimeout = delayedSetTimeout.jsValue
+                    browser.clearTimeout = .undefined
+
+                    var unavailableClearCompletionCount = 0
+                    CATransaction.setCompletionBlock {
+                        unavailableClearCompletionCount += 1
+                    }
+                    CATransaction.flush()
+                    let unavailableClearRejected: Bool
+                    if case .clearTimeoutUnavailable =
+                        CATransaction.lastImplicitCommitSchedulingFailure {
+                        unavailableClearRejected =
+                            unavailableClearCompletionCount == 1
+                            && CATransaction.implicitCommitSchedulingFailureCount
+                                == initialFailureCount + 3
+                    } else {
+                        unavailableClearRejected = false
+                    }
+
+                    browser.setTimeout = originalSetTimeout
+                    browser.clearTimeout = originalClearTimeout
+                    CATransaction.setCompletionBlock {
+                        unavailableClearCompletionCount += 1
+                    }
+                    try await Task.sleep(for: .milliseconds(40))
+                    let completionBeforeUncancellableTimer =
+                        unavailableClearCompletionCount
+                    try await Task.sleep(for: .milliseconds(100))
+                    let unavailableClearRecovered =
+                        completionBeforeUncancellableTimer == 2
+                        && unavailableClearCompletionCount == 2
+                        && CATransaction.implicitCommitSchedulingFailureCount
+                            == initialFailureCount + 3
+                        && CATransaction.lastImplicitCommitSchedulingFailure == nil
+
+                    var blockedImplicitCompletionCount = 0
+                    CATransaction.setCompletionBlock {
+                        blockedImplicitCompletionCount += 1
+                    }
+                    CATransaction.begin()
+                    try await Task.sleep(for: .milliseconds(20))
+                    let explicitTransactionBlockedImplicitCommit =
+                        blockedImplicitCompletionCount == 0
+                    CATransaction.commit()
+                    try await Task.sleep(for: .milliseconds(40))
+                    let explicitTransactionRescheduledImplicitCommit =
+                        explicitTransactionBlockedImplicitCommit
+                        && blockedImplicitCompletionCount == 1
+
+                    transactionSchedulingProbeResult = [
+                        "unavailable=\(unavailableRejected)",
+                        "unavailableRecovered=\(unavailableRecovered)",
+                        "malformed=\(malformedIdentifierRejected)",
+                        "malformedRecovered=\(malformedIdentifierRecovered)",
+                        "boundary=\(boundaryIdentifierPreserved)",
+                        "clearUnavailable=\(unavailableClearRejected)",
+                        "clearRecovered=\(unavailableClearRecovered)",
+                        "explicitNested=\(explicitTransactionRescheduledImplicitCommit)",
+                    ].joined(separator: ",")
+                } catch {
+                    transactionSchedulingProbeResult = "error: \(error)"
                 }
             }
         })

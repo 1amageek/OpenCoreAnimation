@@ -74,13 +74,25 @@ private final class CATransactionStack {
     /// Whether an implicit commit has been scheduled for this thread
     var implicitCommitScheduled: Bool = false
 
+    /// Number of browser scheduling failures observed by this transaction stack.
+    var implicitCommitSchedulingFailureCount = 0
+
+    /// Most recent browser scheduling failure, cleared by a valid new schedule.
+    var lastImplicitCommitSchedulingFailure: CATransactionSchedulingFailure?
+
+    /// Separates cancelled requests from the currently active scheduling generation.
+    var implicitCommitGeneration: UInt64 = 0
+
     /// Completion coordinators associated with the change currently being applied.
     var applyingCompletionCoordinators: [CATransactionCompletionCoordinator] = []
 
     #if arch(wasm32)
-    /// The JSClosure used for scheduling implicit commits.
-    /// Retained here to prevent premature garbage collection.
-    var implicitCommitClosure: JSClosure?
+    /// The one-shot callback and validated browser handle for the active commit request.
+    var implicitCommitClosure: JSOneshotClosure?
+    var implicitCommitTimerIdentifier: Double?
+
+    /// Retains callbacks that the browser accepted without returning a safely cancellable handle.
+    var uncancellableImplicitCommitClosures: [UInt64: JSOneshotClosure] = [:]
     #endif
 
     init() {}
@@ -220,6 +232,8 @@ public class CATransaction {
 
         if stack.levels.isEmpty {
             // This was the outermost transaction - apply all changes now
+            cancelImplicitCommitSchedule(stack)
+
             // Process changes one at a time because applyChange() might trigger
             // new property changes (via custom CAAction implementations)
             var remainingChanges = level.pendingChanges
@@ -230,9 +244,6 @@ public class CATransaction {
                 applyChange(change)
                 stack.applyingCompletionCoordinators = []
             }
-
-            // Reset the implicit commit flag
-            stack.implicitCommitScheduled = false
 
             for coordinator in coordinatorsToSeal {
                 coordinator.seal()
@@ -266,6 +277,7 @@ public class CATransaction {
             }
             stack.levels[outerIndex].pendingAnimations.append(contentsOf: level.pendingAnimations)
             stack.levels[outerIndex].deferredCompletionCoordinators.append(contentsOf: coordinatorsToSeal)
+            scheduleImplicitCommit()
         }
     }
 
@@ -276,12 +288,13 @@ public class CATransaction {
     public class func flush() {
         let stack = getCurrentTransactionStack()
 
+        cancelImplicitCommitSchedule(stack)
+
         // Commit all transaction levels from innermost to outermost
         while !stack.levels.isEmpty {
             commit()
         }
 
-        stack.implicitCommitScheduled = false
     }
 
     /// Internal method to apply a change and trigger implicit animations.
@@ -371,6 +384,7 @@ public class CATransaction {
             capturedDisableActions: capturedDisableActions,
             completionCoordinators: existingChange?.completionCoordinators ?? []
         )
+        scheduleImplicitCommit()
     }
 
     /// Associates an animation with the transaction that added it.
@@ -395,34 +409,52 @@ public class CATransaction {
         var newLevel = CATransactionLevel()
         newLevel.isImplicitTransaction = true
         stack.levels.append(newLevel)
-
-        // Schedule implicit commit for the end of the run loop
-        scheduleImplicitCommit()
     }
 
     /// Schedules the implicit transaction to be committed.
     private class func scheduleImplicitCommit() {
         let stack = getCurrentTransactionStack()
 
+        // Explicit-only transaction stacks are committed by their caller.
+        guard stack.levels.contains(where: \.isImplicitTransaction) else { return }
+
         // Don't schedule if already scheduled
         guard !stack.implicitCommitScheduled else { return }
-        stack.implicitCommitScheduled = true
-
         #if arch(wasm32)
-        // In WASM, use setTimeout to schedule commit at end of current event loop
-        let callback = JSClosure { _ in
-            CATransaction.commitImplicit()
-            return .undefined
+        guard let setTimeout = JSObject.global.setTimeout.function else {
+            recordImplicitCommitSchedulingFailure(.setTimeoutUnavailable, on: stack)
+            return
         }
 
-        // Retain the closure to prevent garbage collection before callback fires
-        stack.implicitCommitClosure = callback
-        _ = JSObject.global.setTimeout!(callback, 0)
+        stack.implicitCommitGeneration &+= 1
+        let generation = stack.implicitCommitGeneration
+        let callback = JSOneshotClosure { _ in
+            CATransaction.handleImplicitCommitCallback(generation: generation)
+            return .undefined
+        }
+        let result = setTimeout(this: JSObject.global, callback, 0)
+
+        switch CATransactionBrowserTimerIdentifierValidator.identifier(result.number) {
+        case .success(let identifier):
+            stack.implicitCommitClosure = callback
+            stack.implicitCommitTimerIdentifier = identifier
+            stack.implicitCommitScheduled = true
+            stack.lastImplicitCommitSchedulingFailure = nil
+        case .failure(let failure):
+            // The host may still invoke the callback even though it did not return
+            // a safely cancellable handle, so retain it until delivery.
+            stack.uncancellableImplicitCommitClosures[generation] = callback
+            recordImplicitCommitSchedulingFailure(failure, on: stack)
+        }
         #else
+        stack.implicitCommitGeneration &+= 1
+        let generation = stack.implicitCommitGeneration
+        stack.implicitCommitScheduled = true
+        stack.lastImplicitCommitSchedulingFailure = nil
         // Schedule on the main actor so implicit transactions commit after
         // the current synchronous mutation batch without using GCD.
         Task { @MainActor in
-            CATransaction.commitImplicit()
+            CATransaction.handleImplicitCommitCallback(generation: generation)
         }
         #endif
     }
@@ -431,17 +463,76 @@ public class CATransaction {
     private class func commitImplicit() {
         let stack = getCurrentTransactionStack()
 
-        // Reset scheduled flag
-        stack.implicitCommitScheduled = false
-
-        #if arch(wasm32)
-        stack.implicitCommitClosure = nil
-        #endif
-
         // Commit all implicit transaction levels
         while let level = stack.levels.last, level.isImplicitTransaction {
             commit()
         }
+    }
+
+    private class func handleImplicitCommitCallback(generation: UInt64) {
+        let stack = getCurrentTransactionStack()
+        #if arch(wasm32)
+        stack.uncancellableImplicitCommitClosures.removeValue(forKey: generation)
+        #endif
+
+        guard generation == stack.implicitCommitGeneration,
+              stack.implicitCommitScheduled else {
+            return
+        }
+
+        stack.implicitCommitScheduled = false
+        #if arch(wasm32)
+        stack.implicitCommitTimerIdentifier = nil
+        stack.implicitCommitClosure = nil
+        #endif
+        commitImplicit()
+    }
+
+    private class func cancelImplicitCommitSchedule(_ stack: CATransactionStack) {
+        guard stack.implicitCommitScheduled else { return }
+
+        let stoppedGeneration = stack.implicitCommitGeneration
+        stack.implicitCommitGeneration &+= 1
+
+        #if arch(wasm32)
+        if let identifier = stack.implicitCommitTimerIdentifier,
+           let callback = stack.implicitCommitClosure {
+            if let clearTimeout = JSObject.global.clearTimeout.function {
+                _ = clearTimeout(this: JSObject.global, identifier)
+                callback.release()
+            } else {
+                stack.uncancellableImplicitCommitClosures[stoppedGeneration] = callback
+                recordImplicitCommitSchedulingFailure(
+                    .clearTimeoutUnavailable(identifier: identifier),
+                    on: stack
+                )
+            }
+        }
+        stack.implicitCommitTimerIdentifier = nil
+        stack.implicitCommitClosure = nil
+        #endif
+
+        stack.implicitCommitScheduled = false
+    }
+
+    private class func recordImplicitCommitSchedulingFailure(
+        _ failure: CATransactionSchedulingFailure,
+        on stack: CATransactionStack
+    ) {
+        stack.implicitCommitSchedulingFailureCount += 1
+        stack.lastImplicitCommitSchedulingFailure = failure
+    }
+
+    /// Number of browser implicit-commit scheduling failures on the current transaction stack.
+    @_spi(RendererDiagnostics)
+    public static var implicitCommitSchedulingFailureCount: Int {
+        getCurrentTransactionStack().implicitCommitSchedulingFailureCount
+    }
+
+    /// Most recent browser implicit-commit scheduling failure on the current transaction stack.
+    @_spi(RendererDiagnostics)
+    public static var lastImplicitCommitSchedulingFailure: CATransactionSchedulingFailure? {
+        getCurrentTransactionStack().lastImplicitCommitSchedulingFailure
     }
 
     // MARK: - Animation Duration
@@ -461,6 +552,7 @@ public class CATransaction {
             beginImplicit()
         }
         stack.levels[stack.levels.count - 1].animationDuration = dur
+        scheduleImplicitCommit()
     }
 
     // MARK: - Animation Timing Function
@@ -480,6 +572,7 @@ public class CATransaction {
             beginImplicit()
         }
         stack.levels[stack.levels.count - 1].animationTimingFunction = function
+        scheduleImplicitCommit()
     }
 
     // MARK: - Disable Actions
@@ -499,6 +592,7 @@ public class CATransaction {
             beginImplicit()
         }
         stack.levels[stack.levels.count - 1].disableActions = flag
+        scheduleImplicitCommit()
     }
 
     // MARK: - Completion Block
@@ -518,6 +612,7 @@ public class CATransaction {
             beginImplicit()
         }
         stack.levels[stack.levels.count - 1].completionBlock = block
+        scheduleImplicitCommit()
     }
 
     // MARK: - Lock Management
@@ -587,5 +682,6 @@ public class CATransaction {
         default:
             break
         }
+        scheduleImplicitCommit()
     }
 }

@@ -39,6 +39,7 @@ interface OCA extends Harness {
     getAdditiveKeyframeProbeResult: () => string;
     getShadowProbeResult: () => string;
     getDisplayLinkProbeResult: () => string;
+    getTransactionSchedulingProbeResult: () => string;
     getEmitterProbeResult: () => string;
     getReplicatorProbeResult: () => string;
     getCompositionProbeResult: () => string;
@@ -91,6 +92,7 @@ interface OCA extends Harness {
     beginCanvasValidationProbe: () => void;
     beginShadowProbe: () => void;
     beginDisplayLinkProbe: () => void;
+    beginTransactionSchedulingProbe: () => void;
     beginEmitterProbe: () => void;
     beginReplicatorProbe: () => void;
     removeTransition: () => void;
@@ -297,6 +299,14 @@ test.describe("OpenCoreAnimation smoke", () => {
         await h.beginDisplayLinkProbe();
         await expect.poll(() => h.getDisplayLinkProbeResult(), { timeout: 10_000 }).toBe(
             "started=true,retained=true,stopped=true,duration=true,cadence=true,paused=true,resumed=true,timestampRejected=true,timestampRecovered=true,identifierRejected=true,identifierRecovered=true,mediaTimeRejected=true,mediaTimeRecovered=true,requestUnavailable=true,requestRecovered=true,boundaryIdentifier=true,cancelUnavailable=true,cancelRecovered=true"
+        );
+
+        await h.beginTransactionSchedulingProbe();
+        await expect.poll(
+            () => h.getTransactionSchedulingProbeResult(),
+            { timeout: 10_000 }
+        ).toBe(
+            "unavailable=true,unavailableRecovered=true,malformed=true,malformedRecovered=true,boundary=true,clearUnavailable=true,clearRecovered=true,explicitNested=true"
         );
 
         await h.exerciseUnsupportedTransitionFilter();
