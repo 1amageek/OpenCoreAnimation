@@ -1,17 +1,18 @@
 import Foundation
+import Synchronization
 import Testing
 @_spi(RendererDiagnostics) @testable import OpenCoreAnimation
 @testable import OpenCoreGraphics
 
-private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unchecked Sendable {
-    struct ImageDrawCall {
+private final class RecordingRenderer: CGContextStatefulRendererDelegate {
+    struct ImageDrawCall: Sendable {
         let image: CGImage
         let rect: CGRect
         let blendMode: CGBlendMode
         let clipPaths: [CGClipPath]
     }
 
-    struct FillCall {
+    struct FillCall: Sendable {
         let path: CGPath
         let color: CGColor
         let clipPaths: [CGClipPath]
@@ -19,12 +20,40 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
         let alpha: CGFloat
     }
 
-    var imageDrawCalls: [ImageDrawCall] = []
-    var fillCalls: [FillCall] = []
-    var transparencyLayerBeginCount = 0
-    var transparencyLayerEndCount = 0
-    var transparencyLayerEndAlphas: [CGFloat] = []
-    var transparencyLayerEndBlendModes: [CGBlendMode] = []
+    private struct State: Sendable {
+        var imageDrawCalls: [ImageDrawCall] = []
+        var fillCalls: [FillCall] = []
+        var transparencyLayerBeginCount = 0
+        var transparencyLayerEndCount = 0
+        var transparencyLayerEndAlphas: [CGFloat] = []
+        var transparencyLayerEndBlendModes: [CGBlendMode] = []
+    }
+
+    private let state = Mutex(State())
+
+    var imageDrawCalls: [ImageDrawCall] {
+        state.withLock { $0.imageDrawCalls }
+    }
+
+    var fillCalls: [FillCall] {
+        state.withLock { $0.fillCalls }
+    }
+
+    var transparencyLayerBeginCount: Int {
+        state.withLock { $0.transparencyLayerBeginCount }
+    }
+
+    var transparencyLayerEndCount: Int {
+        state.withLock { $0.transparencyLayerEndCount }
+    }
+
+    var transparencyLayerEndAlphas: [CGFloat] {
+        state.withLock { $0.transparencyLayerEndAlphas }
+    }
+
+    var transparencyLayerEndBlendModes: [CGBlendMode] {
+        state.withLock { $0.transparencyLayerEndBlendModes }
+    }
 
     func fill(
         path: CGPath,
@@ -63,13 +92,15 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
         rule: CGPathFillRule,
         state: CGDrawingState
     ) {
-        fillCalls.append(FillCall(
-            path: path,
-            color: color,
-            clipPaths: state.clipPaths,
-            transform: state.ctm,
-            alpha: alpha
-        ))
+        self.state.withLock {
+            $0.fillCalls.append(FillCall(
+                path: path,
+                color: color,
+                clipPaths: state.clipPaths,
+                transform: state.ctm,
+                alpha: alpha
+            ))
+        }
     }
 
     func draw(
@@ -80,17 +111,28 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate, @unche
         interpolationQuality: CGInterpolationQuality,
         state: CGDrawingState
     ) {
-        imageDrawCalls.append(ImageDrawCall(image: image, rect: rect, blendMode: blendMode, clipPaths: state.clipPaths))
+        self.state.withLock {
+            $0.imageDrawCalls.append(ImageDrawCall(
+                image: image,
+                rect: rect,
+                blendMode: blendMode,
+                clipPaths: state.clipPaths
+            ))
+        }
     }
 
     func beginTransparencyLayer(in rect: CGRect?, auxiliaryInfo: [String: Any]?, state: CGDrawingState) {
-        transparencyLayerBeginCount += 1
+        self.state.withLock {
+            $0.transparencyLayerBeginCount += 1
+        }
     }
 
     func endTransparencyLayer(alpha: CGFloat, blendMode: CGBlendMode, state: CGDrawingState) {
-        transparencyLayerEndCount += 1
-        transparencyLayerEndAlphas.append(alpha)
-        transparencyLayerEndBlendModes.append(blendMode)
+        self.state.withLock {
+            $0.transparencyLayerEndCount += 1
+            $0.transparencyLayerEndAlphas.append(alpha)
+            $0.transparencyLayerEndBlendModes.append(blendMode)
+        }
     }
 }
 
