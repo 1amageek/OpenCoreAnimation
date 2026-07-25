@@ -26,6 +26,12 @@ public enum CARendererError: Error, Equatable, Sendable {
     case canvasNotConfigured
     /// The requested render target cannot be represented by the renderer.
     case invalidRenderTarget(CARenderTargetConfigurationError)
+    /// A layer hierarchy contains a cycle and cannot be captured safely.
+    case cyclicLayerHierarchy
+    /// A layer contains non-finite geometry that cannot be submitted to the GPU.
+    case nonFiniteLayerGeometry
+    /// A layer background color cannot be converted to finite device-RGB components.
+    case invalidLayerBackgroundColor
     /// A pixel readback coordinate was non-integral or outside the texture.
     case invalidReadbackCoordinate(x: CGFloat, y: CGFloat, width: Int, height: Int)
     /// A mapped WebGPU readback byte was absent or not representable as UInt8.
@@ -382,86 +388,6 @@ internal struct CAMetalRendererUniforms {
 }
 
 // MARK: - Helper Extensions
-
-extension CALayer {
-    /// Converts the layer's background color to SIMD4<Float>.
-    internal var backgroundColorComponents: SIMD4<Float> {
-        guard let color = backgroundColor,
-              let components = color.components,
-              components.count >= 4 else {
-            return SIMD4<Float>(0, 0, 0, 0)
-        }
-        return SIMD4<Float>(
-            Float(components[0]),
-            Float(components[1]),
-            Float(components[2]),
-            Float(components[3])
-        )
-    }
-
-    /// Calculates the model matrix for this layer.
-    internal func modelMatrix(parentMatrix: simd_float4x4 = matrix_identity_float4x4) -> simd_float4x4 {
-        // Start with translation to position
-        var matrix = parentMatrix
-
-        // Translate to layer position
-        let translation = simd_float4x4(translation: SIMD3<Float>(
-            Float(position.x),
-            Float(position.y),
-            Float(zPosition)
-        ))
-        matrix = matrix * translation
-
-        // Apply layer transform if not identity
-        if !CATransform3DIsIdentity(transform) {
-            let layerTransform = transform.simdMatrix
-            matrix = matrix * layerTransform
-        }
-
-        // Translate by anchor point offset
-        let anchorOffset = simd_float4x4(translation: SIMD3<Float>(
-            Float(-bounds.width * anchorPoint.x),
-            Float(-bounds.height * anchorPoint.y),
-            Float(-anchorPointZ)
-        ))
-        matrix = matrix * anchorOffset
-
-        return matrix
-    }
-
-    /// Calculates the parent matrix for sublayer positioning.
-    ///
-    /// This includes the layer's sublayerTransform and bounds.origin offset.
-    /// The bounds.origin offset ensures that sublayers are correctly positioned when the
-    /// layer's bounds origin is non-zero (e.g., for CAScrollLayer scrolling).
-    ///
-    /// - Parameter modelMatrix: The layer's model matrix
-    /// - Returns: The matrix to use as parentMatrix for sublayer rendering
-    internal func sublayerMatrix(modelMatrix: simd_float4x4) -> simd_float4x4 {
-        var result = modelMatrix
-
-        // Apply sublayerTransform if not identity
-        if !CATransform3DIsIdentity(sublayerTransform) {
-            result = result * sublayerTransform.simdMatrix
-        }
-
-        // Apply bounds.origin offset
-        // In CoreAnimation, bounds.origin defines where the coordinate system origin is
-        // within the layer. A sublayer at position (0,0) with parent's bounds.origin = (50, 50)
-        // should appear at (-50, -50) relative to the parent's visible top-left.
-        // This is the scrolling behavior used by CAScrollLayer.
-        if bounds.origin.x != 0 || bounds.origin.y != 0 {
-            let boundsOriginOffset = simd_float4x4(translation: SIMD3<Float>(
-                Float(-bounds.origin.x),
-                Float(-bounds.origin.y),
-                0
-            ))
-            result = result * boundsOriginOffset
-        }
-
-        return result
-    }
-}
 
 extension CATransform3D {
     /// Converts CATransform3D to simd_float4x4.

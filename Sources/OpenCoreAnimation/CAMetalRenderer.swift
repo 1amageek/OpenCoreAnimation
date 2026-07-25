@@ -96,19 +96,41 @@ public final class CAMetalRenderer: CARendererDelegate {
             lastRenderError = .renderingFailed(error.localizedDescription)
             return
         }
-        guard let commandQueue, let pipelineState, let targetTexture else {
-            lastRenderError = .renderingFailed("Metal renderer configuration is incomplete")
-            return
-        }
-
         // Phase 1 (PERFORMANCE_DESIGN.md §3.6): mirror CAWebGPURenderer
         // and bump the per-frame token before any presentation cache lookup.
         CALayer.advanceFrameToken()
+        let snapshot: CARenderSnapshot
+        do {
+            snapshot = try CARenderSnapshot.capture(
+                rootLayer,
+                frameToken: CALayer._currentFrameToken
+            )
+        } catch {
+            lastRenderError = error
+            return
+        }
+
+        guard render(snapshot: snapshot) else { return }
+
+        // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
+        // Mirror CAWebGPURenderer: clear after submit so any setter that
+        // runs in the same tick re-marks for the NEXT frame, not this one.
+        rootLayer.recursivelyClearDirtyAfterCommit()
+        rootLayer.completeTransactionsAfterRenderRecursively()
+    }
+
+    /// Encodes one immutable frame without consulting the mutable layer tree.
+    @discardableResult
+    internal func render(snapshot: CARenderSnapshot) -> Bool {
+        guard let commandQueue, let pipelineState, let targetTexture else {
+            lastRenderError = .renderingFailed("Metal renderer configuration is incomplete")
+            return false
+        }
 
         // Create command buffer
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             lastRenderError = .renderingFailed("Unable to create a Metal command buffer")
-            return
+            return false
         }
 
         // Create render pass descriptor
@@ -121,7 +143,7 @@ public final class CAMetalRenderer: CARendererDelegate {
         // Create render encoder
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
             lastRenderError = .renderingFailed("Unable to create a Metal render encoder")
-            return
+            return false
         }
 
         encoder.setRenderPipelineState(pipelineState)
@@ -139,18 +161,18 @@ public final class CAMetalRenderer: CARendererDelegate {
         )
 
         // Render layer tree
-        renderLayer(rootLayer, encoder: encoder, parentMatrix: projectionMatrix)
+        renderNode(
+            at: snapshot.rootIndex,
+            in: snapshot,
+            encoder: encoder,
+            parentMatrix: projectionMatrix
+        )
 
         encoder.endEncoding()
         lastCommandBuffer = commandBuffer
         commandBuffer.commit()
         lastRenderError = nil
-
-        // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
-        // Mirror CAWebGPURenderer: clear after submit so any setter that
-        // runs in the same tick re-marks for the NEXT frame, not this one.
-        rootLayer.recursivelyClearDirtyAfterCommit()
-        rootLayer.completeTransactionsAfterRenderRecursively()
+        return true
     }
 
     public func invalidate() {
@@ -371,23 +393,24 @@ public final class CAMetalRenderer: CARendererDelegate {
         )
     }
 
-    private func renderLayer(
-        _ layer: CALayer,
+    private func renderNode(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot,
         encoder: MTLRenderCommandEncoder,
         parentMatrix: simd_float4x4
     ) {
-        let presentationLayer = layer._renderTimePresentation()
+        let node = snapshot.nodes[nodeIndex]
+        let values = node.presentationValues
 
         // Skip hidden layers
-        guard !presentationLayer.isHidden && presentationLayer.opacity > 0 else { return }
+        guard !values.isHidden && values.opacity > 0 else { return }
 
         // Calculate model matrix
-        let modelMatrix = presentationLayer.modelMatrix(parentMatrix: parentMatrix)
+        let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
 
         // Create scale matrix for layer bounds (column-major order)
-        let boundsSize = presentationLayer.bounds.size
-        let w = Float(boundsSize.width)
-        let h = Float(boundsSize.height)
+        let w = values.boundsSize.x
+        let h = values.boundsSize.y
         let col0 = SIMD4<Float>(w, 0, 0, 0)
         let col1 = SIMD4<Float>(0, h, 0, 0)
         let col2 = SIMD4<Float>(0, 0, 1, 0)
@@ -399,8 +422,8 @@ public final class CAMetalRenderer: CARendererDelegate {
         // Update uniforms
         var uniforms = CAMetalRendererUniforms(
             mvpMatrix: finalMatrix,
-            opacity: presentationLayer.opacity,
-            cornerRadius: Float(presentationLayer.cornerRadius)
+            opacity: values.opacity,
+            cornerRadius: values.cornerRadius
         )
 
         uniformBuffer?.contents().copyMemory(
@@ -409,10 +432,8 @@ public final class CAMetalRenderer: CARendererDelegate {
         )
 
         // Render background color if set
-        if presentationLayer.backgroundColor != nil {
+        if let color = values.backgroundColor {
             // Update vertex colors with background color
-            let color = presentationLayer.backgroundColorComponents
-
             var vertices: [CAMetalRendererVertex] = [
                 CAMetalRendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
                 CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
@@ -433,14 +454,51 @@ public final class CAMetalRenderer: CARendererDelegate {
         }
 
         // Render sublayers
-        if let sublayers = layer.sublayers {
+        if !node.childIndices.isEmpty {
             // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
-            let sublayerMatrix = presentationLayer.sublayerMatrix(modelMatrix: modelMatrix)
+            let sublayerMatrix = values.sublayerMatrix(modelMatrix: modelMatrix)
 
-            for sublayer in sublayers {
-                renderLayer(sublayer, encoder: encoder, parentMatrix: sublayerMatrix)
+            for childIndex in node.childIndices {
+                renderNode(
+                    at: childIndex,
+                    in: snapshot,
+                    encoder: encoder,
+                    parentMatrix: sublayerMatrix
+                )
             }
         }
+    }
+}
+
+private extension CARenderSnapshot.PresentationValues {
+    func modelMatrix(
+        parentMatrix: simd_float4x4 = matrix_identity_float4x4
+    ) -> simd_float4x4 {
+        var matrix = parentMatrix
+        let positionTranslation = simd_float4x4(translation: position)
+        matrix = matrix * positionTranslation
+        if !CATransform3DIsIdentity(transform) {
+            matrix = matrix * transform.simdMatrix
+        }
+        let anchorTranslation = simd_float4x4(translation: anchorOffset)
+        matrix = matrix * anchorTranslation
+        return matrix
+    }
+
+    func sublayerMatrix(modelMatrix: simd_float4x4) -> simd_float4x4 {
+        var result = modelMatrix
+        if !CATransform3DIsIdentity(sublayerTransform) {
+            result = result * sublayerTransform.simdMatrix
+        }
+        if boundsOrigin.x != 0 || boundsOrigin.y != 0 {
+            let boundsTranslation = simd_float4x4(translation: SIMD3<Float>(
+                -boundsOrigin.x,
+                -boundsOrigin.y,
+                0
+            ))
+            result = result * boundsTranslation
+        }
+        return result
     }
 }
 

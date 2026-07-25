@@ -816,11 +816,15 @@ stubs out actual GPU calls and records calls to a counter.
 ## 6. Phase 4 — Commit-driven rendering
 
 **Implementation checkpoint (2026-07-25).** R4.5 and the static-submit
-suppression slice of R4.3 are implemented against the current live-tree
-renderer contract. R4.1, R4.2, R4.4, snapshot-token decoupling, and
-active-subtree-only animation evaluation remain design targets in the
-subsections below; their pseudocode is not a claim that `CARenderSnapshot`
-already exists.
+suppression slice of R4.3 are implemented. A `Sendable`, CALayer-free
+`CARenderSnapshot` now owns the complete presentation input consumed by the
+native Metal backend, and `CAMetalRenderer` encodes exclusively from that
+snapshot after capture. Native pixel readback proves that a later model
+mutation cannot leak into the captured frame. Production WebGPU still reads
+the live tree, and the snapshot does not yet own its masks, specialized-layer
+resources, or copied animation evaluators. R4.1 therefore remains partial;
+R4.2, R4.4, snapshot-token decoupling, and active-subtree-only animation
+evaluation remain open design targets below.
 
 ### 6.1 `CARenderSnapshot`
 
@@ -1049,16 +1053,19 @@ matches its documented behavior.
 
 ### 6.6 Planned snapshot migration (R4.1–R4.4)
 
-The production renderer currently reads the live model/presentation tree. When
-R4.1–R4.4 are implemented, migration may temporarily permit
+The production WebGPU renderer currently reads the live model/presentation
+tree. The native Metal backend captures and renders an immutable value snapshot
+at the frame boundary, but commit ownership and the richer WebGPU state are not
+yet implemented. As R4.1–R4.4 continue, migration may temporarily permit
 `pendingSnapshot == nil` (no commit happened) to render live for existing
 callers (`CADisplayLink.displayLinkDidFire` direct →
 `renderer.render(layer:)`).
 
-That fallback and `pendingSnapshot` do not exist yet. Completion ordering in
-§6.5 and the live-tree static submission decision in §6.3 are the completed
-Phase 4 slices. The final snapshot acceptance test must prove that, when a
-committed snapshot exists, the renderer no longer reads mutable model state.
+That WebGPU fallback and `pendingSnapshot` do not exist yet. Completion ordering
+in §6.5, the live-tree static submission decision in §6.3, and native
+frame-boundary mutation isolation are the completed Phase 4 slices. The final
+snapshot acceptance test must prove that, when a committed snapshot exists,
+every backend no longer reads mutable model state.
 
 ### 6.7 Edge cases checklist
 
