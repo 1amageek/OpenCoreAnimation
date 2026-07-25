@@ -1864,6 +1864,12 @@ private final class EmitterLayerState {
     /// preventing stencil writes in the discarded regions.
     private var stencilWriteRoundedPipeline: GPURenderPipeline?
 
+    /// Restores a rectangular/content-mask stencil write during stack unwind.
+    private var stencilDecrementPipeline: GPURenderPipeline?
+
+    /// Restores a rounded-clip stencil write during stack unwind.
+    private var stencilRoundedDecrementPipeline: GPURenderPipeline?
+
     /// Pipeline for rendering with stencil test.
     /// Only renders where stencil value matches.
     private var stencilTestPipeline: GPURenderPipeline?
@@ -1884,6 +1890,15 @@ private final class EmitterLayerState {
     /// When > 0, textured and composite pipelines must use stencil-aware variants.
     /// Supports nested masks (e.g., child B with mask inside parent A with mask).
     private var maskNestingDepth: Int = 0
+
+    private struct ActiveStencilFrame {
+        let usesRoundedFragment: Bool
+        let vertexOffset: UInt64
+        let uniformOffset: UInt64
+    }
+
+    /// Geometry needed to decrement each exact stencil mutation on unwind.
+    private var activeStencilFrames: [ActiveStencilFrame] = []
 
     /// Number of active CATransformLayer ancestors in the current traversal.
     private var transformDepthNesting: Int = 0
@@ -2396,6 +2411,21 @@ private final class EmitterLayerState {
             ),
             layout: .layout(pipelineLayout)
         ))
+
+        stencilDecrementPipeline = createStencilMutationPipeline(
+            device: device,
+            pipelineLayout: pipelineLayout,
+            shaderModule: shaderModule,
+            fragmentEntryPoint: "fragmentMain",
+            operation: .decrementClamp
+        )
+        stencilRoundedDecrementPipeline = createStencilMutationPipeline(
+            device: device,
+            pipelineLayout: pipelineLayout,
+            shaderModule: shaderModule,
+            fragmentEntryPoint: "stencilClipFragment",
+            operation: .decrementClamp
+        )
 
         // Stencil test pipeline: only renders where stencil equals reference
         stencilTestPipeline = device.createRenderPipeline(descriptor: GPURenderPipelineDescriptor(
@@ -3739,6 +3769,75 @@ private final class EmitterLayerState {
         ))
     }
 
+    private func createStencilMutationPipeline(
+        device: GPUDevice,
+        pipelineLayout: GPUPipelineLayout,
+        shaderModule: GPUShaderModule,
+        fragmentEntryPoint: String,
+        operation: GPUStencilOperation
+    ) -> GPURenderPipeline {
+        let stencilFace = GPUStencilFaceState(
+            compare: .equal,
+            failOp: .keep,
+            depthFailOp: .keep,
+            passOp: operation
+        )
+        return device.createRenderPipeline(
+            descriptor: GPURenderPipelineDescriptor(
+                vertex: GPUVertexState(
+                    module: shaderModule,
+                    entryPoint: "vertexMain",
+                    buffers: [
+                        GPUVertexBufferLayout(
+                            arrayStride: UInt64(
+                                MemoryLayout<CARendererVertex>.stride
+                            ),
+                            attributes: [
+                                GPUVertexAttribute(
+                                    format: .float32x2,
+                                    offset: 0,
+                                    shaderLocation: 0
+                                ),
+                                GPUVertexAttribute(
+                                    format: .float32x2,
+                                    offset: UInt64(
+                                        MemoryLayout<SIMD2<Float>>.stride
+                                    ),
+                                    shaderLocation: 1
+                                ),
+                                GPUVertexAttribute(
+                                    format: .float32x4,
+                                    offset: UInt64(
+                                        MemoryLayout<SIMD2<Float>>.stride * 2
+                                    ),
+                                    shaderLocation: 2
+                                ),
+                            ]
+                        )
+                    ]
+                ),
+                depthStencil: GPUDepthStencilState(
+                    format: .depth24plusStencil8,
+                    depthWriteEnabled: false,
+                    depthCompare: .always,
+                    stencilFront: stencilFace,
+                    stencilBack: stencilFace
+                ),
+                fragment: GPUFragmentState(
+                    module: shaderModule,
+                    entryPoint: fragmentEntryPoint,
+                    targets: [
+                        GPUColorTargetState(
+                            format: preferredFormat,
+                            writeMask: []
+                        )
+                    ]
+                ),
+                layout: .layout(pipelineLayout)
+            )
+        )
+    }
+
     /// Creates a complete depth resource pair for validated target dimensions.
     private func createDepthResources(
         device: GPUDevice,
@@ -4270,6 +4369,7 @@ private final class EmitterLayerState {
         activeEmitterLayerIDs.removeAll(keepingCapacity: true)
         clipRectStack.removeAll(keepingCapacity: true)
         maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
         currentStencilValue = 0
         prerenderedShadows.removeAll(keepingCapacity: true)
         prerenderedFilters.removeAll(keepingCapacity: true)
@@ -4476,6 +4576,7 @@ private final class EmitterLayerState {
         // Reset clip rect stack for this frame
         clipRectStack.removeAll()
         maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
         currentStencilValue = 0
 
         // Reset per-frame shadow outputs; persistent resource ownership remains cached.
@@ -5350,6 +5451,8 @@ private final class EmitterLayerState {
         // Stencil resources
         stencilWritePipeline = nil
         stencilWriteRoundedPipeline = nil
+        stencilDecrementPipeline = nil
+        stencilRoundedDecrementPipeline = nil
         stencilTestPipeline = nil
         depthStencilTestPipeline = nil
         texturedStencilPipeline = nil
@@ -5358,6 +5461,7 @@ private final class EmitterLayerState {
         texturedDepthStencilOpaquePipeline = nil
         shadowCompositeStencilPipeline = nil
         maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: false)
         transformDepthNesting = 0
         currentStencilValue = 0
 
@@ -6003,28 +6107,26 @@ private final class EmitterLayerState {
 
             // Apply masksToBounds clipping if enabled
             let shouldClip = presentationLayer.masksToBounds
-            let useStencilClip = shouldClip && presentationLayer.cornerRadius > 0
-            var didApplyRoundedClip = false
+            var didApplyBoundsClip = false
             if shouldClip {
-                // Scissor rect for axis-aligned rectangular clipping (always applied as optimization)
+                // Scissor is an axis-aligned rejection optimization. The
+                // stencil geometry remains authoritative for transformed
+                // rectangular and rounded clipping.
                 let layerClipRect = calculateClipRect(layer: presentationLayer, modelMatrix: modelMatrix)
                 let newClipRect = currentClipRect.intersection(with: layerClipRect)
                 clipRectStack.append(newClipRect)
                 applyScissorRect(renderPass)
 
-                // Rounded corner clipping via stencil buffer (only when cornerRadius > 0)
-                if useStencilClip {
-                    didApplyRoundedClip = renderRoundedRectToStencil(
-                        presentationLayer,
-                        renderPass: renderPass,
-                        modelMatrix: modelMatrix,
-                        device: device
-                    )
-                    if !didApplyRoundedClip {
-                        _ = clipRectStack.popLast()
-                        applyScissorRect(renderPass)
-                        return
-                    }
+                didApplyBoundsClip = renderRoundedRectToStencil(
+                    presentationLayer,
+                    renderPass: renderPass,
+                    modelMatrix: modelMatrix,
+                    device: device
+                )
+                if !didApplyBoundsClip {
+                    _ = clipRectStack.popLast()
+                    applyScissorRect(renderPass)
+                    return
                 }
             }
 
@@ -6049,7 +6151,7 @@ private final class EmitterLayerState {
 
             // Restore clipping state
             if shouldClip {
-                if didApplyRoundedClip {
+                if didApplyBoundsClip {
                     clearStencilMask(renderPass: renderPass)
                 }
                 _ = clipRectStack.popLast()
@@ -6424,6 +6526,7 @@ private final class EmitterLayerState {
         clipRectStack.removeAll(keepingCapacity: true)
         opacityStack.removeAll(keepingCapacity: true)
         maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
         currentStencilValue = 0
 
         let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration
@@ -7245,6 +7348,12 @@ private final class EmitterLayerState {
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
 
+        activeStencilFrames.append(ActiveStencilFrame(
+            usesRoundedFragment: false,
+            vertexOffset: vertexOffset,
+            uniformOffset: uniformOffset
+        ))
+
         // Switch to stencil test pipeline for subsequent rendering
         renderPass.setPipeline(stencilTestPipeline)
         maskNestingDepth += 1
@@ -7257,7 +7366,9 @@ private final class EmitterLayerState {
     private func clearStencilMask(renderPass: GPURenderPassEncoder) {
         guard stencilStateIsValid,
               maskNestingDepth > 0,
-              currentStencilValue > 0 else {
+              currentStencilValue > 0,
+              activeStencilFrames.count == maskNestingDepth,
+              let frame = activeStencilFrames.last else {
             recordMaskRenderFailure(
                 .invalidStencilState(
                     depth: maskNestingDepth,
@@ -7275,11 +7386,34 @@ private final class EmitterLayerState {
         } else {
             restorationPipeline = pipeline
         }
-        guard let restorationPipeline else {
+        guard let restorationPipeline,
+              let decrementPipeline = frame.usesRoundedFragment
+                ? stencilRoundedDecrementPipeline
+                : stencilDecrementPipeline else {
             recordMaskRenderFailure(.pipelineUnavailable(.restoration))
             return
         }
+        guard let vertexBuffer,
+              let bindGroup else {
+            recordMaskRenderFailure(.resourcesUnavailable(.restoration))
+            return
+        }
 
+        renderPass.setPipeline(decrementPipeline)
+        renderPass.setStencilReference(currentStencilValue)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: bindGroup,
+            dynamicOffsets: [UInt32(frame.uniformOffset)]
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: frame.vertexOffset
+        )
+        renderPass.draw(vertexCount: 6)
+
+        _ = activeStencilFrames.popLast()
         maskNestingDepth = nextDepth
         currentStencilValue = nextReference
         renderPass.setPipeline(restorationPipeline)
@@ -7400,6 +7534,12 @@ private final class EmitterLayerState {
         renderPass.setBindGroup(0, bindGroup: bindGroup, dynamicOffsets: [UInt32(uniformOffset)])
         renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: vertexOffset)
         renderPass.draw(vertexCount: 6)
+
+        activeStencilFrames.append(ActiveStencilFrame(
+            usesRoundedFragment: true,
+            vertexOffset: vertexOffset,
+            uniformOffset: uniformOffset
+        ))
 
         // Switch to stencil test mode for subsequent content rendering
         maskNestingDepth += 1
@@ -9714,6 +9854,7 @@ private final class EmitterLayerState {
         clipRectStack.removeAll(keepingCapacity: true)
         opacityStack.removeAll(keepingCapacity: true)
         maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
         currentStencilValue = 0
 
         let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration
@@ -10537,6 +10678,7 @@ private final class EmitterLayerState {
         replicatorInstancePath.removeAll(keepingCapacity: true)
         clipRectStack.removeAll(keepingCapacity: true)
         maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
         currentStencilValue = 0
         compositionCaptureStopKey = nil
         compositionCaptureDidReachStop = false
@@ -11025,6 +11167,7 @@ private final class EmitterLayerState {
                 replicatorInstancePath.removeAll(keepingCapacity: true)
                 clipRectStack.removeAll(keepingCapacity: true)
                 maskNestingDepth = 0
+                activeStencilFrames.removeAll(keepingCapacity: true)
                 currentStencilValue = 0
                 compositionCaptureStopKey = key
                 compositionCaptureDidReachStop = false
@@ -11716,6 +11859,7 @@ private final class EmitterLayerState {
         clipRectStack.removeAll(keepingCapacity: true)
         opacityStack.removeAll(keepingCapacity: true)
         maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
         transformDepthNesting = 0
         currentStencilValue = 0
         let replicatorFailureGenerationBeforeCapture = replicatorRenderFailureGeneration

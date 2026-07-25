@@ -6719,6 +6719,47 @@ func installHarness() {
                 unsupportedMask.cornerCurve = CALayerCornerCurve(rawValue: "future-mask-curve")
                 rejectedMaskedLayer.mask = unsupportedMask
                 root.addSublayer(rejectedMaskedLayer)
+
+                func makeOverlappingClip(
+                    position: CGPoint,
+                    color: CGColor
+                ) -> CALayer {
+                    let clip = CALayer()
+                    clip.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 60,
+                        height: 60
+                    )
+                    clip.position = position
+                    clip.cornerRadius = 30
+                    clip.masksToBounds = true
+                    clip.zPosition = 110
+                    let child = CALayer()
+                    child.frame = clip.bounds
+                    child.backgroundColor = color
+                    clip.addSublayer(child)
+                    root.addSublayer(clip)
+                    return clip
+                }
+                let firstOverlappingClip = makeOverlappingClip(
+                    position: CGPoint(x: 340, y: 100),
+                    color: CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                )
+                let secondOverlappingClip = makeOverlappingClip(
+                    position: CGPoint(x: 350, y: 100),
+                    color: CGColor(
+                        red: 0,
+                        green: 1,
+                        blue: 0,
+                        alpha: 1
+                    )
+                )
                 CATransaction.commit()
 
                 let failureCountBefore = renderer.cornerCurveRenderFailureCount
@@ -6734,6 +6775,8 @@ func installHarness() {
                         CGPoint(x: 124, y: 116),
                         CGPoint(x: 230, y: 100),
                         CGPoint(x: 310, y: 100),
+                        CGPoint(x: 345, y: 200),
+                        CGPoint(x: 350, y: 200),
                     ])
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
@@ -6774,6 +6817,8 @@ func installHarness() {
                 unsupported.removeFromSuperlayer()
                 maskFailureBacking.removeFromSuperlayer()
                 rejectedMaskedLayer.removeFromSuperlayer()
+                firstOverlappingClip.removeFromSuperlayer()
+                secondOverlappingClip.removeFromSuperlayer()
                 CAAnimationEngine.shared.renderFrame()
             }
         })
