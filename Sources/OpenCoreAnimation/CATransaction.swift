@@ -1,5 +1,6 @@
 
 import Foundation
+import Synchronization
 #if arch(wasm32)
 import JavaScriptKit
 #endif
@@ -105,65 +106,217 @@ private struct CATransactionRenderCommit {
 
 /// Thread-local transaction stack storage.
 ///
-/// Each thread has its own transaction stack, following CoreAnimation's behavior.
-/// WASM is single-threaded, so only one stack exists in practice.
+/// Each thread has its own transaction stack, following Core Animation's
+/// contract. Native and WASM use the same pthread TLS boundary. The stack is
+/// never shared or transferred to another executor.
 private final class CATransactionStack {
-    /// Stack of transaction levels. The last element is the current (innermost) transaction.
     var levels: [CATransactionLevel] = []
-
-    /// Whether an implicit commit has been scheduled for this thread
-    var implicitCommitScheduled: Bool = false
-
-    /// Number of browser scheduling failures observed by this transaction stack.
+    var implicitCommitScheduled = false
     var implicitCommitSchedulingFailureCount = 0
-
-    /// Most recent browser scheduling failure, cleared by a valid new schedule.
     var lastImplicitCommitSchedulingFailure: CATransactionSchedulingFailure?
-
-    /// Separates cancelled requests from the currently active scheduling generation.
     var implicitCommitGeneration: UInt64 = 0
-
-    /// Completion coordinators associated with the change currently being applied.
     var applyingCompletionCoordinators: [CATransactionCompletionCoordinator] = []
-
-    /// Prevents mutations produced by a custom action during commit from
-    /// opening a second implicit transaction.
     var isApplyingChange = false
+    var rootsMutatedWhileApplyingChanges: [ObjectIdentifier: CALayer] = [:]
+
+    #if DEBUG
+    let lifecycleIdentifier: UInt64
+
+    init(lifecycleIdentifier: UInt64) {
+        self.lifecycleIdentifier = lifecycleIdentifier
+    }
+    #endif
 
     #if arch(wasm32)
-    /// The one-shot callback and validated browser handle for the active commit request.
     var implicitCommitClosure: JSOneshotClosure?
     var implicitCommitTimerIdentifier: Double?
-
-    /// Retains callbacks that the browser accepted without returning a safely cancellable handle.
     var uncancellableImplicitCommitClosures: [UInt64: JSOneshotClosure] = [:]
     #endif
 
-    init() {}
-
-}
-
-#if arch(wasm32)
-/// WASM is single-threaded, so we use a single global stack.
-nonisolated(unsafe) private var _wasmTransactionStack = CATransactionStack()
-
-private func getCurrentTransactionStack() -> CATransactionStack {
-    return _wasmTransactionStack
-}
-#else
-/// Key for thread-local storage of transaction stack.
-private let transactionStackKey = "CATransactionStack"
-
-private func getCurrentTransactionStack() -> CATransactionStack {
-    let threadDict = Thread.current.threadDictionary
-    if let stack = threadDict[transactionStackKey] as? CATransactionStack {
-        return stack
+    var isIdle: Bool {
+        let hasRetainedBrowserCallbacks: Bool
+        #if arch(wasm32)
+        hasRetainedBrowserCallbacks =
+            implicitCommitClosure != nil ||
+            !uncancellableImplicitCommitClosures.isEmpty
+        #else
+        hasRetainedBrowserCallbacks = false
+        #endif
+        return levels.isEmpty &&
+            !implicitCommitScheduled &&
+            !isApplyingChange &&
+            !hasRetainedBrowserCallbacks
     }
-    let newStack = CATransactionStack()
-    threadDict[transactionStackKey] = newStack
-    return newStack
+
+    func appendLevel(_ level: CATransactionLevel) {
+        levels.append(level)
+    }
+
+    func popLastLevel() -> CATransactionLevel? {
+        levels.popLast()
+    }
+
+    func mutateLastLevel(
+        _ body: (inout CATransactionLevel) -> Void
+    ) {
+        guard !levels.isEmpty else { return }
+        body(&levels[levels.count - 1])
+    }
+
+    func mutateLevel(
+        at index: Int,
+        _ body: (inout CATransactionLevel) -> Void
+    ) {
+        guard levels.indices.contains(index) else { return }
+        body(&levels[index])
+    }
+
+    func setApplyingChange(
+        _ isApplying: Bool,
+        coordinators: [CATransactionCompletionCoordinator]
+    ) {
+        isApplyingChange = isApplying
+        applyingCompletionCoordinators.removeAll(keepingCapacity: true)
+        applyingCompletionCoordinators.append(contentsOf: coordinators)
+    }
+
+    func recordRootMutatedWhileApplyingChanges(
+        _ root: CALayer
+    ) {
+        rootsMutatedWhileApplyingChanges[ObjectIdentifier(root)] = root
+    }
+
+    func takeRootsMutatedWhileApplyingChanges() -> [ObjectIdentifier: CALayer] {
+        let roots = rootsMutatedWhileApplyingChanges
+        rootsMutatedWhileApplyingChanges.removeAll(keepingCapacity: true)
+        return roots
+    }
+
+    #if arch(wasm32)
+    func setImplicitCommitBrowserTimer(
+        closure: JSOneshotClosure?,
+        identifier: Double?
+    ) {
+        implicitCommitClosure = closure
+        implicitCommitTimerIdentifier = identifier
+    }
+
+    func retainUncancellableImplicitCommitClosure(
+        _ closure: JSOneshotClosure,
+        generation: UInt64
+    ) {
+        uncancellableImplicitCommitClosures[generation] = closure
+    }
+
+    func removeUncancellableImplicitCommitClosure(generation: UInt64) {
+        uncancellableImplicitCommitClosures.removeValue(forKey: generation)
+    }
+    #endif
+}
+
+@_cdecl("open_core_animation_release_transaction_stack")
+private func releaseTransactionStack(
+    _ pointer: UnsafeMutableRawPointer?
+) {
+    guard let pointer else { return }
+    #if DEBUG
+    let stack = Unmanaged<CATransactionStack>
+        .fromOpaque(pointer)
+        .takeUnretainedValue()
+    releasedTransactionStackCounts.withLock {
+        $0[stack.lifecycleIdentifier, default: 0] += 1
+    }
+    #endif
+    Unmanaged<CATransactionStack>.fromOpaque(pointer).release()
+}
+
+private let transactionStackSlot: CATransactionThreadLocalSlot = {
+    do {
+        return try CATransactionThreadLocalSlot(
+            destructor: releaseTransactionStack
+        )
+    } catch {
+        preconditionFailure(
+            "Unable to initialize CATransaction thread-local storage: \(error)"
+        )
+    }
+}()
+
+private let implicitCommitGenerationState = Mutex<UInt64>(0)
+
+private func nextImplicitCommitGeneration() -> UInt64 {
+    implicitCommitGenerationState.withLock { generation in
+        generation &+= 1
+        if generation == 0 {
+            generation = 1
+        }
+        return generation
+    }
+}
+
+#if DEBUG
+private let transactionStackLifecycleIdentifierState = Mutex<UInt64>(0)
+private let releasedTransactionStackCounts = Mutex<[UInt64: Int]>([:])
+
+private func nextTransactionStackLifecycleIdentifier() -> UInt64 {
+    transactionStackLifecycleIdentifierState.withLock { identifier in
+        identifier &+= 1
+        if identifier == 0 {
+            identifier = 1
+        }
+        return identifier
+    }
 }
 #endif
+
+private func currentTransactionStackIfPresent() -> CATransactionStack? {
+    guard let pointer = transactionStackSlot.value() else { return nil }
+    return Unmanaged<CATransactionStack>
+        .fromOpaque(pointer)
+        .takeUnretainedValue()
+}
+
+private func getCurrentTransactionStack() -> CATransactionStack {
+    if let stack = currentTransactionStackIfPresent() {
+        return stack
+    }
+
+    #if DEBUG
+    let stack = CATransactionStack(
+        lifecycleIdentifier: nextTransactionStackLifecycleIdentifier()
+    )
+    #else
+    let stack = CATransactionStack()
+    #endif
+    let pointer = Unmanaged.passRetained(stack).toOpaque()
+    do {
+        try transactionStackSlot.setValue(pointer)
+    } catch {
+        Unmanaged<CATransactionStack>.fromOpaque(pointer).release()
+        preconditionFailure(
+            "Unable to store CATransaction thread-local state: \(error)"
+        )
+    }
+    return stack
+}
+
+private func releaseTransactionStackIfIdle(_ stack: CATransactionStack) {
+    guard stack.isIdle else { return }
+    guard let pointer = transactionStackSlot.value() else { return }
+    guard Unmanaged<CATransactionStack>
+        .fromOpaque(pointer)
+        .takeUnretainedValue() === stack else {
+        preconditionFailure("CATransaction TLS owner mismatch")
+    }
+    do {
+        try transactionStackSlot.setValue(nil)
+    } catch {
+        preconditionFailure(
+            "Unable to clear CATransaction thread-local state: \(error)"
+        )
+    }
+    releaseTransactionStack(pointer)
+}
 
 /// Represents a pending change in a transaction.
 ///
@@ -218,9 +371,7 @@ private extension Array where Element == CATransactionCompletionCoordinator {
 
 /// A mechanism for grouping multiple layer-tree operations into atomic updates to the render tree.
 public class CATransaction {
-    #if !arch(wasm32)
-    private static let transactionLock = NSRecursiveLock()
-    #endif
+    private static let transactionLock = CATransactionRecursiveLock()
 
     /// Begin a new transaction for the current thread.
     ///
@@ -238,7 +389,7 @@ public class CATransaction {
             // Note: completionBlock is NOT inherited - each level has its own
         }
 
-        stack.levels.append(newLevel)
+        stack.appendLevel(newLevel)
     }
 
     /// Commit all changes made during the current transaction.
@@ -254,10 +405,11 @@ public class CATransaction {
     /// Core Animation begin the associated animations."
     public class func commit() {
         let stack = getCurrentTransactionStack()
-        guard !stack.levels.isEmpty else { return }
+        commit(stack: stack)
+    }
 
-        // Pop the current level
-        var level = stack.levels.removeLast()
+    private class func commit(stack: CATransactionStack) {
+        guard var level = stack.popLastLevel() else { return }
         let ownCoordinator = level.completionBlock.map(CATransactionCompletionCoordinator.init)
         var renderCommits = level.deferredRenderCommits
         if let ownCoordinator, !level.mutatedLayers.isEmpty {
@@ -284,6 +436,7 @@ public class CATransaction {
         if stack.levels.isEmpty {
             // This was the outermost transaction - apply all changes now
             cancelImplicitCommitSchedule(stack)
+            _ = stack.takeRootsMutatedWhileApplyingChanges()
 
             // Process changes one at a time because applyChange() might trigger
             // new property changes (via custom CAAction implementations)
@@ -291,12 +444,19 @@ public class CATransaction {
             while !remainingChanges.isEmpty {
                 guard let (key, change) = remainingChanges.first else { break }
                 remainingChanges.removeValue(forKey: key)
-                stack.applyingCompletionCoordinators = change.completionCoordinators
-                stack.isApplyingChange = true
+                stack.setApplyingChange(
+                    true,
+                    coordinators: change.completionCoordinators
+                )
                 applyChange(change)
-                stack.isApplyingChange = false
-                stack.applyingCompletionCoordinators = []
+                stack.setApplyingChange(false, coordinators: [])
             }
+
+            var snapshotLayers = level.mutatedLayers
+            snapshotLayers.merge(stack.takeRootsMutatedWhileApplyingChanges()) {
+                current, _ in current
+            }
+            publishCommittedRenderStates(for: Array(snapshotLayers.values))
 
             for renderCommit in renderCommits {
                 enqueueRenderCommit(renderCommit)
@@ -304,40 +464,89 @@ public class CATransaction {
             for coordinator in coordinatorsToSeal {
                 coordinator.seal()
             }
+            releaseTransactionStackIfIdle(stack)
         } else {
             // This is a nested transaction - merge changes to the outer transaction
             // The outer level is now at stack.levels.count - 1
             let outerIndex = stack.levels.count - 1
-
-            for (key, change) in level.pendingChanges {
-                // If outer already has a change for this key, preserve outer's oldValue
-                // (the very first oldValue in the chain)
-                if let existingChange = stack.levels[outerIndex].pendingChanges[key] {
-                    // Keep outer's oldValue but use inner's newValue and captured settings
-                    stack.levels[outerIndex].pendingChanges[key] = CATransactionChange(
-                        layer: change.layer,
-                        keyPath: change.keyPath,
-                        oldValue: existingChange.oldValue,
-                        newValue: change.newValue,
-                        capturedDuration: change.capturedDuration,
-                        capturedTimingFunction: change.capturedTimingFunction,
-                        capturedDisableActions: change.capturedDisableActions,
-                        completionCoordinators: existingChange.completionCoordinators.merging(
-                            change.completionCoordinators
+            stack.mutateLevel(at: outerIndex) { outerLevel in
+                for (key, change) in level.pendingChanges {
+                    // If outer already has a change for this key, preserve outer's oldValue
+                    // (the very first oldValue in the chain)
+                    if let existingChange = outerLevel.pendingChanges[key] {
+                        // Keep outer's oldValue but use inner's newValue and captured settings
+                        outerLevel.pendingChanges[key] = CATransactionChange(
+                            layer: change.layer,
+                            keyPath: change.keyPath,
+                            oldValue: existingChange.oldValue,
+                            newValue: change.newValue,
+                            capturedDuration: change.capturedDuration,
+                            capturedTimingFunction: change.capturedTimingFunction,
+                            capturedDisableActions: change.capturedDisableActions,
+                            completionCoordinators: existingChange.completionCoordinators.merging(
+                                change.completionCoordinators
+                            )
                         )
-                    )
-                } else {
-                    // No existing change - just copy it to outer
-                    stack.levels[outerIndex].pendingChanges[key] = change
+                    } else {
+                        // No existing change - just copy it to outer
+                        outerLevel.pendingChanges[key] = change
+                    }
                 }
+                outerLevel.pendingAnimations.append(
+                    contentsOf: level.pendingAnimations
+                )
+                outerLevel.mutatedLayers.merge(level.mutatedLayers) {
+                    current, _ in current
+                }
+                outerLevel.deferredCompletionCoordinators.append(
+                    contentsOf: coordinatorsToSeal
+                )
+                outerLevel.deferredRenderCommits.append(
+                    contentsOf: renderCommits
+                )
             }
-            stack.levels[outerIndex].pendingAnimations.append(contentsOf: level.pendingAnimations)
-            stack.levels[outerIndex].mutatedLayers.merge(level.mutatedLayers) {
-                current, _ in current
-            }
-            stack.levels[outerIndex].deferredCompletionCoordinators.append(contentsOf: coordinatorsToSeal)
-            stack.levels[outerIndex].deferredRenderCommits.append(contentsOf: renderCommits)
             scheduleImplicitCommit()
+        }
+    }
+
+    /// Publishes one immutable static-tree snapshot per distinct render root.
+    ///
+    /// Animated and layout-pending trees use explicit transitional states
+    /// until immutable animation evaluators and commit-time layout preparation
+    /// are carried by CARenderSnapshot. This keeps animations progressing and
+    /// prevents stale pre-layout geometry from being published as committed.
+    private class func publishCommittedRenderStates(for layers: [CALayer]) {
+        var roots: [ObjectIdentifier: CALayer] = [:]
+        for layer in layers {
+            let root = layer.transactionRenderRoot
+            roots[ObjectIdentifier(root)] = root
+        }
+
+        for root in roots.values {
+            let frameToken = CALayer.advanceFrameToken()
+            guard !root.hasUnfinishedAnimationsRecursively() else {
+                root.publishCommittedRenderState(
+                    .requiresLiveAnimationEvaluation(frameToken: frameToken)
+                )
+                continue
+            }
+            guard !root.hasPendingLayoutRecursively() else {
+                root.publishCommittedRenderState(
+                    .requiresLiveTreePreparation(frameToken: frameToken)
+                )
+                continue
+            }
+            do {
+                let snapshot = try CARenderSnapshot.capture(
+                    root,
+                    frameToken: frameToken
+                )
+                root.publishCommittedRenderState(.snapshot(snapshot))
+            } catch {
+                root.publishCommittedRenderState(
+                    .captureFailure(frameToken: frameToken, error: error)
+                )
+            }
         }
     }
 
@@ -367,7 +576,7 @@ public class CATransaction {
 
         // Commit all transaction levels from innermost to outermost
         while !stack.levels.isEmpty {
-            commit()
+            commit(stack: stack)
         }
 
     }
@@ -424,8 +633,6 @@ public class CATransaction {
 
         guard let currentLevel = stack.levels.last else { return }
         let levelIndex = stack.levels.count - 1
-        stack.levels[levelIndex].mutatedLayers[ObjectIdentifier(layer)] = layer
-
         // Capture current transaction settings
         let capturedDuration = currentLevel.animationDuration
         let capturedTimingFunction = currentLevel.animationTimingFunction
@@ -445,16 +652,19 @@ public class CATransaction {
         }
 
         // Update the pending change with the new value and captured settings
-        stack.levels[levelIndex].pendingChanges[changeKey] = CATransactionChange(
-            layer: layer,
-            keyPath: keyPath,
-            oldValue: effectiveOldValue,
-            newValue: newValue,
-            capturedDuration: capturedDuration,
-            capturedTimingFunction: capturedTimingFunction,
-            capturedDisableActions: capturedDisableActions,
-            completionCoordinators: existingChange?.completionCoordinators ?? []
-        )
+        stack.mutateLevel(at: levelIndex) { level in
+            level.mutatedLayers[ObjectIdentifier(layer)] = layer
+            level.pendingChanges[changeKey] = CATransactionChange(
+                layer: layer,
+                keyPath: keyPath,
+                oldValue: effectiveOldValue,
+                newValue: newValue,
+                capturedDuration: capturedDuration,
+                capturedTimingFunction: capturedTimingFunction,
+                capturedDisableActions: capturedDisableActions,
+                completionCoordinators: existingChange?.completionCoordinators ?? []
+            )
+        }
         scheduleImplicitCommit()
     }
 
@@ -473,6 +683,7 @@ public class CATransaction {
         // transaction.
         if stack.isApplyingChange {
             let root = layer.transactionRenderRoot
+            stack.recordRootMutatedWhileApplyingChanges(root)
             for coordinator in stack.applyingCompletionCoordinators {
                 if coordinator.registerRenderSubmission(for: root) {
                     root.enqueueTransactionCompletionAfterRender(coordinator)
@@ -487,8 +698,9 @@ public class CATransaction {
         // no transaction has no completion coordinator to track and must not
         // open an unrelated transaction scope.
         guard !stack.levels.isEmpty else { return }
-        let levelIndex = stack.levels.count - 1
-        stack.levels[levelIndex].mutatedLayers[ObjectIdentifier(layer)] = layer
+        stack.mutateLastLevel {
+            $0.mutatedLayers[ObjectIdentifier(layer)] = layer
+        }
         scheduleImplicitCommit()
     }
 
@@ -503,7 +715,7 @@ public class CATransaction {
         }
 
         guard !stack.levels.isEmpty else { return }
-        stack.levels[stack.levels.count - 1].pendingAnimations.append(animation)
+        stack.mutateLastLevel { $0.pendingAnimations.append(animation) }
     }
 
     /// Begins an implicit transaction.
@@ -513,7 +725,7 @@ public class CATransaction {
 
         var newLevel = CATransactionLevel()
         newLevel.isImplicitTransaction = true
-        stack.levels.append(newLevel)
+        stack.appendLevel(newLevel)
     }
 
     /// Schedules the implicit transaction to be committed.
@@ -531,53 +743,69 @@ public class CATransaction {
             return
         }
 
-        stack.implicitCommitGeneration &+= 1
-        let generation = stack.implicitCommitGeneration
+        let generation = nextImplicitCommitGeneration()
+        stack.implicitCommitGeneration = generation
         let callback = JSOneshotClosure { _ in
-            CATransaction.handleImplicitCommitCallback(generation: generation)
+            CATransaction.handleImplicitCommitCallback(
+                generation: generation
+            )
             return .undefined
         }
         let result = setTimeout(this: JSObject.global, callback, 0)
 
         switch CATransactionBrowserTimerIdentifierValidator.identifier(result.number) {
         case .success(let identifier):
-            stack.implicitCommitClosure = callback
-            stack.implicitCommitTimerIdentifier = identifier
+            stack.setImplicitCommitBrowserTimer(
+                closure: callback,
+                identifier: identifier
+            )
             stack.implicitCommitScheduled = true
             stack.lastImplicitCommitSchedulingFailure = nil
         case .failure(let failure):
             // The host may still invoke the callback even though it did not return
             // a safely cancellable handle, so retain it until delivery.
-            stack.uncancellableImplicitCommitClosures[generation] = callback
+            stack.retainUncancellableImplicitCommitClosure(
+                callback,
+                generation: generation
+            )
             recordImplicitCommitSchedulingFailure(failure, on: stack)
         }
         #else
-        stack.implicitCommitGeneration &+= 1
-        let generation = stack.implicitCommitGeneration
+        let generation = nextImplicitCommitGeneration()
+        stack.implicitCommitGeneration = generation
         stack.implicitCommitScheduled = true
         stack.lastImplicitCommitSchedulingFailure = nil
-        // Schedule on the main actor so implicit transactions commit after
-        // the current synchronous mutation batch without using GCD.
-        Task { @MainActor in
-            CATransaction.handleImplicitCommitCallback(generation: generation)
+        // Core Animation transactions are thread-confined. RunLoop scheduling
+        // commits after the current synchronous mutation batch without moving
+        // non-Sendable layer state to another executor.
+        RunLoop.current.perform {
+            CATransaction.handleImplicitCommitCallback(
+                generation: generation
+            )
         }
         #endif
     }
 
     /// Commits the implicit transaction.
-    private class func commitImplicit() {
-        let stack = getCurrentTransactionStack()
-
+    private class func commitImplicit(stack: CATransactionStack) {
         // Commit all implicit transaction levels
         while let level = stack.levels.last, level.isImplicitTransaction {
-            commit()
+            commit(stack: stack)
         }
     }
 
-    private class func handleImplicitCommitCallback(generation: UInt64) {
-        let stack = getCurrentTransactionStack()
+    private class func handleImplicitCommitCallback(
+        generation: UInt64
+    ) {
+        guard let stack = currentTransactionStackIfPresent() else { return }
+        defer {
+            releaseTransactionStackIfIdle(stack)
+        }
+
         #if arch(wasm32)
-        stack.uncancellableImplicitCommitClosures.removeValue(forKey: generation)
+        stack.removeUncancellableImplicitCommitClosure(
+            generation: generation
+        )
         #endif
 
         guard generation == stack.implicitCommitGeneration,
@@ -587,10 +815,9 @@ public class CATransaction {
 
         stack.implicitCommitScheduled = false
         #if arch(wasm32)
-        stack.implicitCommitTimerIdentifier = nil
-        stack.implicitCommitClosure = nil
+        stack.setImplicitCommitBrowserTimer(closure: nil, identifier: nil)
         #endif
-        commitImplicit()
+        commitImplicit(stack: stack)
     }
 
     #if DEBUG
@@ -601,7 +828,23 @@ public class CATransaction {
     /// thread-local transaction level is open.
     internal class func deliverScheduledImplicitCommitForTesting() {
         let stack = getCurrentTransactionStack()
-        handleImplicitCommitCallback(generation: stack.implicitCommitGeneration)
+        handleImplicitCommitCallback(
+            generation: stack.implicitCommitGeneration
+        )
+    }
+
+    /// Returns the identity of the current retained TLS stack.
+    internal class func transactionStackLifecycleIdentifierForTesting() -> UInt64 {
+        getCurrentTransactionStack().lifecycleIdentifier
+    }
+
+    /// Returns how many retained-owner releases were observed for one TLS stack.
+    internal class func transactionStackReleaseCountForTesting(
+        lifecycleIdentifier: UInt64
+    ) -> Int {
+        releasedTransactionStackCounts.withLock {
+            $0[lifecycleIdentifier, default: 0]
+        }
     }
     #endif
 
@@ -609,7 +852,7 @@ public class CATransaction {
         guard stack.implicitCommitScheduled else { return }
 
         let stoppedGeneration = stack.implicitCommitGeneration
-        stack.implicitCommitGeneration &+= 1
+        stack.implicitCommitGeneration = nextImplicitCommitGeneration()
 
         #if arch(wasm32)
         if let identifier = stack.implicitCommitTimerIdentifier,
@@ -618,15 +861,17 @@ public class CATransaction {
                 _ = clearTimeout(this: JSObject.global, identifier)
                 callback.release()
             } else {
-                stack.uncancellableImplicitCommitClosures[stoppedGeneration] = callback
+                stack.retainUncancellableImplicitCommitClosure(
+                    callback,
+                    generation: stoppedGeneration
+                )
                 recordImplicitCommitSchedulingFailure(
                     .clearTimeoutUnavailable(identifier: identifier),
                     on: stack
                 )
             }
         }
-        stack.implicitCommitTimerIdentifier = nil
-        stack.implicitCommitClosure = nil
+        stack.setImplicitCommitBrowserTimer(closure: nil, identifier: nil)
         #endif
 
         stack.implicitCommitScheduled = false
@@ -640,13 +885,13 @@ public class CATransaction {
         stack.lastImplicitCommitSchedulingFailure = failure
     }
 
-    /// Number of browser implicit-commit scheduling failures on the current transaction stack.
+    /// Number of implicit-commit scheduling failures on the current transaction stack.
     @_spi(RendererDiagnostics)
     public static var implicitCommitSchedulingFailureCount: Int {
         getCurrentTransactionStack().implicitCommitSchedulingFailureCount
     }
 
-    /// Most recent browser implicit-commit scheduling failure on the current transaction stack.
+    /// Most recent implicit-commit scheduling failure on the current transaction stack.
     @_spi(RendererDiagnostics)
     public static var lastImplicitCommitSchedulingFailure: CATransactionSchedulingFailure? {
         getCurrentTransactionStack().lastImplicitCommitSchedulingFailure
@@ -668,7 +913,7 @@ public class CATransaction {
         if stack.levels.isEmpty {
             beginImplicit()
         }
-        stack.levels[stack.levels.count - 1].animationDuration = dur
+        stack.mutateLastLevel { $0.animationDuration = dur }
         scheduleImplicitCommit()
     }
 
@@ -688,7 +933,7 @@ public class CATransaction {
         if stack.levels.isEmpty {
             beginImplicit()
         }
-        stack.levels[stack.levels.count - 1].animationTimingFunction = function
+        stack.mutateLastLevel { $0.animationTimingFunction = function }
         scheduleImplicitCommit()
     }
 
@@ -708,7 +953,7 @@ public class CATransaction {
         if stack.levels.isEmpty {
             beginImplicit()
         }
-        stack.levels[stack.levels.count - 1].disableActions = flag
+        stack.mutateLastLevel { $0.disableActions = flag }
         scheduleImplicitCommit()
     }
 
@@ -728,7 +973,7 @@ public class CATransaction {
         if stack.levels.isEmpty {
             beginImplicit()
         }
-        stack.levels[stack.levels.count - 1].completionBlock = block
+        stack.mutateLastLevel { $0.completionBlock = block }
         scheduleImplicitCommit()
     }
 
@@ -737,22 +982,14 @@ public class CATransaction {
     /// Attempts to acquire a recursive spin-lock lock, ensuring that returned
     /// layer values are valid until unlocked.
     ///
-    /// On WASM this is a no-op because the JavaScript host is single-threaded.
-    /// Native callers receive the recursive exclusion required by nested
-    /// Core Animation transaction operations.
+    /// The same `Mutex`-backed recursive exclusion is used on every target.
     public class func lock() {
-        #if !arch(wasm32)
         transactionLock.lock()
-        #endif
     }
 
     /// Relinquishes a previously acquired transaction lock.
-    ///
-    /// On WASM this is a no-op because the JavaScript host is single-threaded.
     public class func unlock() {
-        #if !arch(wasm32)
         transactionLock.unlock()
-        #endif
     }
 
     // MARK: - Value Access
@@ -786,16 +1023,20 @@ public class CATransaction {
         switch key {
         case "animationDuration":
             if let duration = anObject as? CFTimeInterval {
-                stack.levels[stack.levels.count - 1].animationDuration = duration
+                stack.mutateLastLevel { $0.animationDuration = duration }
             }
         case "disableActions":
             if let flag = anObject as? Bool {
-                stack.levels[stack.levels.count - 1].disableActions = flag
+                stack.mutateLastLevel { $0.disableActions = flag }
             }
         case "animationTimingFunction":
-            stack.levels[stack.levels.count - 1].animationTimingFunction = anObject as? CAMediaTimingFunction
+            let timingFunction = anObject as? CAMediaTimingFunction
+            stack.mutateLastLevel {
+                $0.animationTimingFunction = timingFunction
+            }
         case "completionBlock":
-            stack.levels[stack.levels.count - 1].completionBlock = anObject as? (() -> Void)
+            let completionBlock = anObject as? (() -> Void)
+            stack.mutateLastLevel { $0.completionBlock = completionBlock }
         default:
             break
         }

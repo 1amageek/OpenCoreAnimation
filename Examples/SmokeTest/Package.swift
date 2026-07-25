@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.4
 //
 // OpenCoreAnimation WASM smoke-test executable. Built with the same toolchain
 // and runtime layout as the other Open* smoke tests so Playwright can

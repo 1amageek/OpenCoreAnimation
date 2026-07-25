@@ -2,8 +2,87 @@ import Testing
 @testable import OpenCoreAnimation
 
 @MainActor
-@Suite("Immutable render snapshots")
+@Suite("Immutable render snapshots", .serialized)
 struct CARenderSnapshotTests {
+    @Test("Outermost transaction publishes an immutable root snapshot")
+    func commitPublishesSnapshot() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.position = CGPoint(x: 8, y: 8)
+        root.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+        CATransaction.commit()
+
+        guard case .snapshot(let snapshot) = root.pendingCommittedRenderState else {
+            Issue.record("Expected the outermost transaction to publish a snapshot")
+            return
+        }
+        #expect(snapshot.rootBounds == root.bounds)
+        #expect(snapshot.nodes[snapshot.rootIndex].presentationValues.backgroundColor
+            == SIMD4<Float>(0, 1, 0, 1))
+    }
+
+    @Test("Animated commits request explicit live evaluation until evaluators are immutable")
+    func animatedCommitPublishesExplicitEvaluationState() {
+        CATransaction.flush()
+        let root = CALayer()
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.duration = 1
+
+        CATransaction.begin()
+        root.add(animation, forKey: "opacity")
+        CATransaction.commit()
+
+        guard case .requiresLiveAnimationEvaluation = root.pendingCommittedRenderState else {
+            Issue.record("Expected an explicit live-animation evaluation state")
+            return
+        }
+        root.removeAllAnimations()
+    }
+
+    @Test("Layout-pending commits cannot publish stale geometry")
+    func layoutPendingCommitPublishesExplicitPreparationState() {
+        CATransaction.flush()
+        let root = CALayer()
+        root.layoutManager = SnapshotLayoutManager()
+
+        CATransaction.begin()
+        root.addSublayer(CALayer())
+        CATransaction.commit()
+
+        guard case .requiresLiveTreePreparation = root.pendingCommittedRenderState else {
+            Issue.record("Expected an explicit live-tree preparation state")
+            return
+        }
+    }
+
+    @Test("Capture failure is retained as a typed committed state")
+    func commitRetainsCaptureFailure() {
+        CATransaction.flush()
+        let root = CALayer()
+        let components = [CGFloat.nan, 0, 0, 1]
+        let invalidColor: CGColor? = components.withUnsafeBufferPointer { buffer in
+            guard let baseAddress = buffer.baseAddress else { return nil }
+            return CGColor(colorSpace: .deviceRGB, components: baseAddress)
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.backgroundColor = invalidColor
+        CATransaction.commit()
+
+        guard case .captureFailure(_, let error) = root.pendingCommittedRenderState else {
+            Issue.record("Expected a committed capture failure")
+            return
+        }
+        #expect(error == .invalidLayerBackgroundColor)
+    }
+
     @Test("Captured values and hierarchy do not follow later model mutations")
     func captureIsIndependentFromModelTree() throws {
         let root = CALayer()
@@ -76,10 +155,63 @@ struct CARenderSnapshotTests {
     }
 }
 
+private final class SnapshotLayoutManager: CALayoutManager {
+    func layoutSublayers(of layer: CALayer) {}
+}
+
 #if canImport(Metal)
 import Metal
 
 extension CARenderSnapshotTests {
+    @Test("Metal submits committed pixels without clearing a later mutation")
+    func metalSubmissionPreservesPostCommitMutation() throws {
+        CATransaction.flush()
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 16,
+            height: 16,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(descriptor: descriptor))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.position = CGPoint(x: 8, y: 8)
+        root.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+        CATransaction.commit()
+
+        root.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+        renderer.render(layer: root)
+
+        let commandBuffer = try #require(renderer.lastCommandBuffer)
+        commandBuffer.waitUntilCompleted()
+        #expect(commandBuffer.status == .completed)
+
+        var pixel = [UInt8](repeating: 0, count: 4)
+        pixel.withUnsafeMutableBytes { bytes in
+            guard let destination = bytes.baseAddress else { return }
+            texture.getBytes(
+                destination,
+                bytesPerRow: 4,
+                from: MTLRegionMake2D(8, 8, 1, 1),
+                mipmapLevel: 0
+            )
+        }
+        #expect(pixel == [0, 255, 0, 255])
+        #expect(root._dirtyMask.isEmpty == false)
+        if case .some = root.pendingCommittedRenderState {
+            Issue.record("Expected the submitted committed snapshot to be acknowledged")
+        }
+
+        CATransaction.flush()
+    }
+
     @Test("Metal encoding reads the captured frame instead of the mutated model")
     func metalEncodingUsesCapturedValues() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())

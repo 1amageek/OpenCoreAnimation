@@ -24,7 +24,8 @@ struct CAAnimationFrameRateTests {
     func baselineRange() {
         let engine = CAAnimationEngine()
         engine.preferredFrameRate = 45
-        engine.rootLayer = CALayer()
+        let root = CALayer()
+        engine.rootLayer = root
 
         #expect(engine.resolvedFrameRateRange(at: CACurrentMediaTime()) == CAFrameRateRange(
             minimum: 45,

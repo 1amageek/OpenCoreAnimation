@@ -133,6 +133,21 @@ extension CALayer {
         recursivelyClearDirtyAfterCommit(visited: &visited)
     }
 
+    /// Clears only state that was part of the submitted immutable snapshot.
+    ///
+    /// A mutation made after capture advances `_contentRevision`; retaining
+    /// its dirty bits guarantees that the following commit cannot be erased
+    /// by submission of an older frame.
+    internal func recursivelyClearDirtyAfterCommit(
+        matching snapshot: CARenderSnapshot
+    ) {
+        var visited: Set<ObjectIdentifier> = []
+        recursivelyClearDirtyAfterCommit(
+            matching: snapshot.capturedContentRevisions,
+            visited: &visited
+        )
+    }
+
     private func recursivelyClearDirtyAfterCommit(
         visited: inout Set<ObjectIdentifier>
     ) {
@@ -147,5 +162,28 @@ extension CALayer {
             }
         }
         _maskForDirty?.recursivelyClearDirtyAfterCommit(visited: &visited)
+    }
+
+    private func recursivelyClearDirtyAfterCommit(
+        matching capturedContentRevisions: [ObjectIdentifier: UInt64],
+        visited: inout Set<ObjectIdentifier>
+    ) {
+        let identity = ObjectIdentifier(self)
+        guard visited.insert(identity).inserted else { return }
+        if capturedContentRevisions[identity] == _contentRevision,
+           !_dirtyMask.isEmpty {
+            _dirtyMask = []
+            CALayer.propagateDirtyDeltaPublic(-1, startingAt: self)
+        }
+        _sublayersForDirty?.forEach {
+            $0.recursivelyClearDirtyAfterCommit(
+                matching: capturedContentRevisions,
+                visited: &visited
+            )
+        }
+        _maskForDirty?.recursivelyClearDirtyAfterCommit(
+            matching: capturedContentRevisions,
+            visited: &visited
+        )
     }
 }

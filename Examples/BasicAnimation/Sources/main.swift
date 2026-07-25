@@ -15,6 +15,14 @@ import OpenCoreAnimation
 
 @main
 struct BasicAnimationApp {
+    /// Owns the layer tree for the lifetime of the browser application.
+    ///
+    /// `CAAnimationEngine.rootLayer` is intentionally weak because the engine
+    /// does not manage application content ownership.
+    @MainActor
+    private static var rootLayerOwner: CALayer?
+
+    @MainActor
     static func main() async throws {
         print("OpenCoreAnimation BasicAnimation Demo Starting...")
 
@@ -40,7 +48,7 @@ struct BasicAnimationApp {
         let engine = CAAnimationEngine.shared
         do {
             try await engine.setCanvas(canvas.object!)
-            await runDemo(engine: engine)
+            runDemo(engine: engine)
         } catch {
             print("Failed to initialize renderer: \(error)")
             let errorDiv = document.createElement("div")
@@ -50,7 +58,8 @@ struct BasicAnimationApp {
         }
     }
 
-    static func runDemo(engine: CAAnimationEngine) async {
+    @MainActor
+    static func runDemo(engine: CAAnimationEngine) {
         // Create root layer
         let rootLayer = CALayer()
         rootLayer.bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
@@ -154,6 +163,7 @@ struct BasicAnimationApp {
                       circleLayer: circleLayer, roundedRect: roundedRect)
 
         // Setup animation engine with root layer
+        rootLayerOwner = rootLayer
         engine.rootLayer = rootLayer
 
         print("Starting animation loop...")

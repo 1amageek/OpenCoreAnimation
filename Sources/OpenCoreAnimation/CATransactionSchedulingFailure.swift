@@ -1,6 +1,6 @@
 import Foundation
 
-/// Describes why a browser implicit-transaction commit could not be scheduled or cancelled safely.
+/// Describes why an implicit-transaction commit could not be scheduled or delivered safely.
 @_spi(RendererDiagnostics)
 public enum CATransactionSchedulingFailure: Error, Equatable, Sendable {
     case setTimeoutUnavailable

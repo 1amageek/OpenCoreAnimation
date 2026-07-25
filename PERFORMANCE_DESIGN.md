@@ -15,14 +15,14 @@ where the resolution lives:
 | ID | Blocker | Resolution location |
 |---|---|---|
 | B1 | Public `presentation()` must remain Apple-contract-compliant | §4.1 / §4.2 — R2.2 moved to internal `_renderTimePresentation()` |
-| B2 | `static var _currentFrameToken` violates Swift 6 strict concurrency | §4.1 — `nonisolated(unsafe)` + WASM-only gate |
+| B2 | `static var _currentFrameToken` violates Swift 6 strict concurrency | §4.1 — common `Mutex<UInt64>` storage and accessors |
 | B3 | `CARenderSnapshot: Sendable` cannot hold a `CALayer` reference | §6.1 — `Node` carries `ObjectIdentifier`, not `CALayer` |
 | B4 | Re-parent counter delta not enumerated per mutator | §3.4 — table of 7 mutators with explicit ± delta lines |
 | B5 | R2.2 disabled by lingering `isRemovedOnCompletion = false` animations | §3.5 / §4.1 / §6.2 — finished-animation condition + Phase A sweep |
 | B6 | Completion-block / dirty-clear ordering race | §6.5 — `submit → clear → completionBlocks` |
 | B7 | `_dirtyMask = .all` includes `.contentsRedraw` and triggers spurious `display()` | §3.1 / §3.7 — initial mask is `.all.subtracting(.contentsRedraw)`; `_needsDisplay` is an orthogonal axis |
 | B8 | Pixel test 3.4 untestable through a mock | §5.7 — split into 3.4a (pipeline state) and 3.4b (composite-time alpha multiply) |
-| B9 | Performance suites mutate global state and must be serialized | §10 — every `Performance/*` suite is `@Suite(.serialized)` with `init` reset |
+| B9 | Performance suites mutate global state and must be serialized | §10 — one shared serialized parent suite owns all `Performance/*` suites |
 | B10 | Float32Array pool benefit ambiguous | §7.1 — `JSTypedArray<Float32>` bulk copy; R5.1 acceptance is JS↔WASM boundary count |
 
 ---
@@ -416,29 +416,11 @@ can drive a clean→dirty→clean cycle without invoking the renderer.
 
 ### 4.1 Frame token
 
-Add to `CALayer`:
-
-```swift
-// CALayer+FrameToken.swift  (new file)
-extension CALayer {
-    /// Monotonic per-render-frame counter. Bumped by the renderer at the top of
-    /// each render(layer:). Single-threaded by construction:
-    ///   - WASM is single-threaded by virtue of the host.
-    ///   - On native (test-only paths), we serialize Performance/* suites
-    ///     via @Suite(.serialized) (see §10) and reset to 0 in suite init.
-    /// `nonisolated(unsafe)` is the explicit acknowledgment that we own the
-    /// invariant — Swift 6 strict concurrency demands the annotation. (B2)
-    nonisolated(unsafe) internal static var _currentFrameToken: UInt64 = 0
-
-    internal var _presentationCacheToken: UInt64 = 0
-}
-```
-
-`CAWebGPURenderer.render(layer:)` increments the global at the top:
-
-```swift
-CALayer._currentFrameToken &+= 1
-```
+`CALayer` owns the process-wide frame token in `Mutex<UInt64>`. Both native
+Metal and WASM WebGPU advance it through the same `advanceFrameToken()` entry
+point before presentation-cache lookup. No target assumes single-threaded
+execution, and no test serialization is used as a substitute for production
+synchronization.
 
 #### Public surface — `presentation()` stays Apple-contract-compliant (B1)
 
@@ -819,12 +801,20 @@ stubs out actual GPU calls and records calls to a counter.
 suppression slice of R4.3 are implemented. A `Sendable`, CALayer-free
 `CARenderSnapshot` now owns the complete presentation input consumed by the
 native Metal backend, and `CAMetalRenderer` encodes exclusively from that
-snapshot after capture. Native pixel readback proves that a later model
-mutation cannot leak into the captured frame. Production WebGPU still reads
-the live tree, and the snapshot does not yet own its masks, specialized-layer
-resources, or copied animation evaluators. R4.1 therefore remains partial;
-R4.2, R4.4, snapshot-token decoupling, and active-subtree-only animation
-evaluation remain open design targets below.
+snapshot after capture. Outermost transactions publish static-tree snapshots
+through mutex-protected root storage. Per-node content revisions ensure an
+older submission clears only the dirty state it actually captured; native
+pixel readback proves both the committed pixel and preservation of a later
+model mutation. Capture failures remain typed committed state. Production
+WebGPU still reads the live tree, and the snapshot does not yet own its masks,
+specialized-layer resources, or copied animation evaluators. Animated commits
+therefore publish an explicit `requiresLiveAnimationEvaluation` state instead
+of freezing their commit-time presentation. Layout-pending commits publish
+`requiresLiveTreePreparation` so pre-layout geometry is never accepted as a
+committed snapshot. Every committed state carries a generation token, and only
+the matching successful submission can acknowledge it. R4.1 and R4.2 remain
+partial; R4.4, commit-time layout preparation, full snapshot-token decoupling,
+and active-subtree-only animation evaluation remain open design targets below.
 
 ### 6.1 `CARenderSnapshot`
 
@@ -1029,9 +1019,9 @@ rootLayer.completeTransactionsAfterRenderRecursively() // ② then release block
 
 If a transaction has neither model mutations nor animations, sealing its
 coordinator completes it immediately. If a mutated root has not been submitted,
-the coordinator remains pending on that root. The future R4.1 snapshot will
-carry the same coordinator semantics; R4.5 does not depend on pretending that
-the snapshot already exists.
+the coordinator remains pending on that root. Native static snapshots preserve
+the same coordinator semantics; animated and WebGPU submissions remain live-tree
+paths until the rest of R4.1 is implemented.
 
 **Why this order (B6 detail).** A completion block can legally mutate the
 layer graph — the canonical pattern is "fade-out animation finishes →
@@ -1054,18 +1044,20 @@ matches its documented behavior.
 ### 6.6 Planned snapshot migration (R4.1–R4.4)
 
 The production WebGPU renderer currently reads the live model/presentation
-tree. The native Metal backend captures and renders an immutable value snapshot
-at the frame boundary, but commit ownership and the richer WebGPU state are not
-yet implemented. As R4.1–R4.4 continue, migration may temporarily permit
+tree. The native Metal backend consumes transaction-owned immutable value
+snapshots for static trees. Animated trees still require frame-time capture,
+and the richer WebGPU state is not yet implemented. As R4.1–R4.4 continue,
+migration may temporarily permit
 `pendingSnapshot == nil` (no commit happened) to render live for existing
 callers (`CADisplayLink.displayLinkDidFire` direct →
 `renderer.render(layer:)`).
 
-That WebGPU fallback and `pendingSnapshot` do not exist yet. Completion ordering
-in §6.5, the live-tree static submission decision in §6.3, and native
-frame-boundary mutation isolation are the completed Phase 4 slices. The final
-snapshot acceptance test must prove that, when a committed snapshot exists,
-every backend no longer reads mutable model state.
+The native pending state exists on each render root; WebGPU does not consume it
+yet. Completion ordering in §6.5, the live-tree static submission decision in
+§6.3, transaction-owned native static snapshots, revision-safe dirty clearing,
+and native frame-boundary mutation isolation are the completed Phase 4 slices.
+The final snapshot acceptance test must prove that every backend and animated
+frame no longer read mutable model state after commit.
 
 ### 6.7 Edge cases checklist
 
@@ -1076,7 +1068,34 @@ every backend no longer reads mutable model state.
 | Live animation finishes between snapshots | `activeAnimations` empty in next snapshot → R4.3 skip kicks in. |
 | Mutation during render | Mutates model layer; next commit picks up. In-flight snapshot unaffected (it holds copies). |
 
-### 6.8 TDD test sequence — Phase 4
+### 6.8 Swift 6.4 shared-state review matrix
+
+| Logical state | Native storage/isolation | WASM storage/isolation | Embedded storage/isolation | Read / mutation entry points | Shutdown / owner release |
+|---|---|---|---|---|---|
+| Committed render state per root | `Mutex<CACommittedRenderState?>` | Same common declaration | Package has no Embedded product; no weaker branch exists | `pendingCommittedRenderState`; `publishCommittedRenderState`; generation-matched acknowledgement | Released with owning `CALayer`; no callback or I/O occurs under the mutex |
+| Global frame token | `Mutex<UInt64>` | Same common declaration | Package has no Embedded product; no weaker branch exists | `_currentFrameToken`; `advanceFrameToken()` | Static process lifetime; arithmetic occurs inside `withLock` |
+| Public transaction recursive exclusion | `CATransactionRecursiveLock` with a `Mutex<Void>` gate and `Mutex<State>` owner metadata | Same common declaration and runtime path | Package has no Embedded product; no weaker branch exists | `CATransaction.lock()` / `unlock()` | Static process lifetime; split acquire/release is required by the public API, while owner metadata remains scoped to `withLock` |
+| Transaction stack | Thread-confined `CATransactionStack` retained in the internal pthread TLS slot | Same common declaration and C TLS boundary | Package has no Embedded product; no weaker branch exists | `getCurrentTransactionStack()` creates on the calling thread; all transaction reads and mutations stay on that thread | Idle clearing removes the slot before releasing its retained owner; the pthread destructor releases an uncommitted stack exactly once at thread exit |
+
+The TLS C boundary stores one opaque pointer and never reads Swift object
+memory. Swift creates exactly one retained `CATransactionStack` owner before
+publishing the pointer. A successful nil update transfers that retained owner
+back to Swift for release; otherwise the registered pthread destructor receives
+the pointer at thread exit and releases it. The pointer never crosses into a
+different transaction thread, byte offsets and memory binding are not used, and
+callbacks resolve the current thread's slot by a generation value rather than
+capturing the pointer. This isolated ABI boundary avoids Objective-C dictionary
+storage while preserving the same contract on native and WASM.
+
+Native tests validate recursive acquisition, blocking of a second thread,
+release after the final matching unlock, simultaneous independent transaction
+values, RunLoop delivery on the owning background thread, and exactly-once
+release of an uncommitted stack at thread exit. The fixed Swift 6.4 WASM debug
+and release builds validate compile and link, while Chromium validates browser
+runtime rendering. Embedded execution is not claimed because OpenCoreAnimation
+is a graphics/WASM package rather than an Embedded product.
+
+### 6.9 TDD test sequence — Phase 4
 
 `Tests/OpenCoreAnimationTests/Performance/CommitDrivenRenderingTests.swift`.
 
@@ -1265,73 +1284,25 @@ Each PR ships with its phase's full TDD test set green.
 
 ## 10. Test infrastructure
 
-New file: `Tests/OpenCoreAnimationTests/Performance/_TestHelpers.swift`
-
-```swift
-import Testing
-@testable import OpenCoreAnimation
-
-/// Mock layer that counts presentation() invocations.
-final class CountingLayer: CALayer {
-    nonisolated(unsafe) static var presentationCallCount = 0
-    override func presentation() -> Self? {
-        Self.presentationCallCount += 1
-        return super.presentation()
-    }
-    static func reset() { presentationCallCount = 0 }
-}
-
-/// Resets all global render counters between tests.
-/// Called from every Performance/* suite's init().
-func resetPerformanceTestState() {
-    CALayer._currentFrameToken = 0
-    CountingLayer.reset()
-    // Add new global resets here as Phases 3/4/5 introduce them
-    // (rasterization cache, snapshot pool, Float32Array pool counters).
-}
-
-/// Force-clears dirty state without invoking the renderer.
-extension CALayer {
-    func _testClearDirty() { recursivelyClearDirtyAfterCommit() }
-}
-```
+`Tests/OpenCoreAnimationTests/Performance/_TestHelpers.swift` defines one
+`@Suite(.serialized)` parent for every performance suite. The shared reset
+helper updates the mutex-protected frame token through its internal accessor.
+No test-only `nonisolated(unsafe)` counter or suite-local serialization is used.
 
 #### Suite-serialization contract (B9)
 
-Every `Tests/OpenCoreAnimationTests/Performance/*Tests.swift` file MUST:
-
-1. Annotate the suite with `@Suite(.serialized)` so swift-testing does
-   not parallelise tests within the suite — they share the
-   `CALayer._currentFrameToken` global and would race.
-2. Reset global state in `init()`:
-
-```swift
-@Suite(.serialized, "Dirty propagation")
-struct DirtyPropagationTests {
-    init() { resetPerformanceTestState() }
-
-    @Test func freshLayerIsAllDirty() { ... }
-    // ... rest of suite
-}
-```
-
-Cross-suite parallelism is the next concern. swift-testing parallelises
-*across* suites by default; even with `.serialized` *within* a suite,
-two Performance suites running in parallel would still race on
-`_currentFrameToken`. The fix:
-
-- All Performance suites declare `@Suite(.serialized, .tags(.performance))`.
-- A test plan or CI invocation passes `--no-parallel` for the
-  `.performance` tag.
-- For local `swift test`, a comment at the top of `_TestHelpers.swift`
-  documents: "If you add a new Performance suite, run it via
-  `swift test --filter Performance --no-parallel`."
+Every performance suite is an extension nested beneath the single
+`PerformanceTests` parent. Only that parent owns `.serialized`, which
+serializes sibling suites as one shared resource domain. A suite-local
+`.serialized` trait is insufficient because it cannot order sibling suites.
+New performance suites must use the same parent rather than creating a new
+top-level suite or relying on a command-line parallelism override.
 
 A native-only `MockCARenderer` lives at
 `Tests/OpenCoreAnimationTests/Performance/MockCARenderer.swift` and records
 `submit` / `writeTexture` / `dispatch` calls and pipeline-state mutations.
 Phase 3/4 tests assert against its call log instead of pixels. The
-mock's `clearLog()` is part of `resetPerformanceTestState()`.
+mock owns recorded mutable state in `Mutex<State>`.
 
 ---
 

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Synchronization
 
 
 /// An object that manages image-based content and allows you to perform animations on that content.
@@ -4841,6 +4842,11 @@ open class CALayer: CAMediaTiming, Hashable {
     /// renderer submission.
     private var transactionCompletionsAfterRender: [CATransactionCompletionCoordinator] = []
 
+    /// Latest immutable state published by an outermost transaction for this
+    /// render root. A mutex protects publication because CATransaction remains
+    /// thread-local while the animation engine consumes frames on MainActor.
+    private let committedRenderState = Mutex<CACommittedRenderState?>(nil)
+
     /// The ordinary superlayer root used to associate a committed mutation
     /// with a renderer. Detached mask roots remain independent and are drained
     /// by the renderer's recursive mask traversal.
@@ -4859,6 +4865,71 @@ open class CALayer: CAMediaTiming, Hashable {
             return
         }
         transactionCompletionsAfterRender.append(coordinator)
+    }
+
+    internal var pendingCommittedRenderState: CACommittedRenderState? {
+        committedRenderState.withLock { $0 }
+    }
+
+    internal func publishCommittedRenderState(_ state: CACommittedRenderState) {
+        committedRenderState.withLock { $0 = state }
+    }
+
+    internal func acknowledgeCommittedRenderState(frameToken: UInt64) {
+        committedRenderState.withLock {
+            guard $0?.frameToken == frameToken else {
+                return
+            }
+            $0 = nil
+        }
+    }
+
+    internal func hasPendingLayoutRecursively() -> Bool {
+        var visited: Set<ObjectIdentifier> = []
+        return hasPendingLayoutRecursively(visited: &visited)
+    }
+
+    private func hasPendingLayoutRecursively(
+        visited: inout Set<ObjectIdentifier>
+    ) -> Bool {
+        guard visited.insert(ObjectIdentifier(self)).inserted else { return false }
+        if needsLayout(), layoutManager != nil || delegate != nil {
+            return true
+        }
+        if let mask = _maskForDirty,
+           mask.hasPendingLayoutRecursively(visited: &visited) {
+            return true
+        }
+        for sublayer in _sublayersForDirty ?? [] {
+            if sublayer.hasPendingLayoutRecursively(visited: &visited) {
+                return true
+            }
+        }
+        return false
+    }
+
+    internal func hasUnfinishedAnimationsRecursively() -> Bool {
+        var visited: Set<ObjectIdentifier> = []
+        return hasUnfinishedAnimationsRecursively(visited: &visited)
+    }
+
+    private func hasUnfinishedAnimationsRecursively(
+        visited: inout Set<ObjectIdentifier>
+    ) -> Bool {
+        guard visited.insert(ObjectIdentifier(self)).inserted else { return false }
+        if _animations.values.contains(where: { !$0.isFinished }) {
+            return true
+        }
+        if let mask = _maskForDirty,
+           mask.hasUnfinishedAnimationsRecursively(visited: &visited) {
+            return true
+        }
+        for sublayer in _sublayersForDirty ?? [] {
+            if sublayer.hasUnfinishedAnimationsRecursively(visited: &visited) {
+                return true
+            }
+        }
+        return false
     }
 
     /// Releases transaction completion blocks only after the renderer has

@@ -87,26 +87,50 @@ public final class CAMetalRenderer: CARendererDelegate {
     }
 
     public func render(layer rootLayer: CALayer) {
+        let committedState = rootLayer.pendingCommittedRenderState
+        let snapshot: CARenderSnapshot
+        let committedFrameToken: UInt64?
+        switch committedState {
+        case .snapshot(let committedSnapshot):
+            snapshot = committedSnapshot
+            committedFrameToken = committedSnapshot.frameToken
+        case .captureFailure(_, let error):
+            lastRenderError = error
+            return
+        case .requiresLiveAnimationEvaluation(let frameToken),
+             .requiresLiveTreePreparation(let frameToken):
+            CALayer.advanceFrameToken()
+            do {
+                snapshot = try CARenderSnapshot.capture(
+                    rootLayer,
+                    frameToken: CALayer._currentFrameToken
+                )
+            } catch {
+                lastRenderError = error
+                return
+            }
+            committedFrameToken = frameToken
+        case nil:
+            CALayer.advanceFrameToken()
+            do {
+                snapshot = try CARenderSnapshot.capture(
+                    rootLayer,
+                    frameToken: CALayer._currentFrameToken
+                )
+            } catch {
+                lastRenderError = error
+                return
+            }
+            committedFrameToken = nil
+        }
+
         do {
-            try prepareForRendering(rootLayer)
+            try prepareForRendering(snapshot)
         } catch let error as CARendererError {
             lastRenderError = error
             return
         } catch {
             lastRenderError = .renderingFailed(error.localizedDescription)
-            return
-        }
-        // Phase 1 (PERFORMANCE_DESIGN.md §3.6): mirror CAWebGPURenderer
-        // and bump the per-frame token before any presentation cache lookup.
-        CALayer.advanceFrameToken()
-        let snapshot: CARenderSnapshot
-        do {
-            snapshot = try CARenderSnapshot.capture(
-                rootLayer,
-                frameToken: CALayer._currentFrameToken
-            )
-        } catch {
-            lastRenderError = error
             return
         }
 
@@ -115,7 +139,12 @@ public final class CAMetalRenderer: CARendererDelegate {
         // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
         // Mirror CAWebGPURenderer: clear after submit so any setter that
         // runs in the same tick re-marks for the NEXT frame, not this one.
-        rootLayer.recursivelyClearDirtyAfterCommit()
+        rootLayer.recursivelyClearDirtyAfterCommit(matching: snapshot)
+        if let committedFrameToken {
+            rootLayer.acknowledgeCommittedRenderState(
+                frameToken: committedFrameToken
+            )
+        }
         rootLayer.completeTransactionsAfterRenderRecursively()
     }
 
@@ -306,7 +335,7 @@ public final class CAMetalRenderer: CARendererDelegate {
         createUniformBuffer()
     }
 
-    private func prepareForRendering(_ rootLayer: CALayer) throws {
+    private func prepareForRendering(_ snapshot: CARenderSnapshot) throws {
         if device == nil {
             guard let defaultDevice = MTLCreateSystemDefaultDevice() else {
                 throw CARendererError.deviceNotAvailable
@@ -320,9 +349,9 @@ public final class CAMetalRenderer: CARendererDelegate {
             return
         }
 
-        let scale = max(rootLayer.contentsScale, 1)
-        let widthValue = rootLayer.bounds.size.width * scale
-        let heightValue = rootLayer.bounds.size.height * scale
+        let scale = max(snapshot.rootContentsScale, 1)
+        let widthValue = snapshot.rootBounds.size.width * scale
+        let heightValue = snapshot.rootBounds.size.height * scale
         guard widthValue.isFinite, heightValue.isFinite,
               widthValue > 0, heightValue > 0,
               widthValue <= CGFloat(Int.max),

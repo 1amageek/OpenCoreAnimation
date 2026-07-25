@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.4
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -24,6 +24,7 @@ let package = Package(
         .target(
             name: "OpenCoreAnimation",
             dependencies: [
+                "OpenCoreAnimationTLS",
                 .product(name: "OpenCoreGraphics", package: "OpenCoreGraphics"),
                 .product(name: "OpenCoreImage", package: "OpenCoreImage", condition: .when(platforms: [.wasi])),
                 .product(name: "SwiftWebGPU", package: "swift-webgpu", condition: .when(platforms: [.wasi])),
@@ -31,6 +32,11 @@ let package = Package(
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
+        ),
+        .target(
+            name: "OpenCoreAnimationTLS",
+            path: "Sources/OpenCoreAnimationTLS",
+            publicHeadersPath: "include"
         ),
         .testTarget(
             name: "OpenCoreAnimationTests",

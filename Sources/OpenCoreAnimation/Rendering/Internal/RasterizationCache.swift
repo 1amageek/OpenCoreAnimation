@@ -107,9 +107,10 @@ internal struct RasterizedEntry<TextureRef> {
 /// and nested effect flattening. Generic over the renderer's texture handle
 /// type — `GPUTexture` for the WebGPU renderer, a stub struct for unit tests.
 ///
-/// The cache is **not thread-safe by itself**. WASM is single-threaded
-/// and OpenCoreAnimation runs all rendering on the main actor in native
-/// tests too, so callers do not need additional synchronisation.
+/// The cache is intentionally non-`Sendable` and does not own synchronization.
+/// Production access is confined to the main-actor renderer, while unit tests
+/// run under the shared serialized performance-suite boundary. A caller that
+/// needs cross-actor ownership must provide a separately synchronized owner.
 internal final class RasterizationCache<TextureRef> {
 
     // MARK: Storage

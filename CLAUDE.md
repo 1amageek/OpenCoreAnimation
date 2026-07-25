@@ -67,7 +67,7 @@ To enable focused native tests on macOS/Linux, the library includes fallback imp
 |-----------|---------------------|------------------------------|
 | Timing | `performance.now()` | `ProcessInfo.systemUptime` |
 | Display Link | `requestAnimationFrame` | `Timer` |
-| Transactions | `setTimeout` | `DispatchQueue.main.async` |
+| Transactions | `setTimeout` | owning thread's `RunLoop.perform` |
 | Renderer | `CAWebGPURenderer` | `CAMetalRenderer` |
 | Graphics | `OpenCoreGraphics` | `CoreGraphics` (re-exported) |
 
@@ -308,35 +308,13 @@ open class CADisplayLink {
 }
 ```
 
-#### CATransaction → No Locks Needed
+#### CATransaction Synchronization
 
-**WASM is single-threaded.** No locks or synchronization primitives are needed:
-
-```swift
-open class CATransaction {
-    // WASM is single-threaded - simple stack-based implementation
-    private static var transactionStack: [TransactionState] = []
-
-    open class func begin() {
-        transactionStack.append(TransactionState())
-    }
-
-    open class func commit() {
-        guard !transactionStack.isEmpty else { return }
-        let state = transactionStack.removeLast()
-        // Apply animations from this transaction
-    }
-
-    // No lock() or unlock() needed - WASM is single-threaded
-    open class func lock() {
-        // No-op in WASM
-    }
-
-    open class func unlock() {
-        // No-op in WASM
-    }
-}
-```
+`CATransaction` uses the same thread-local stack contract on native and WASM.
+The public recursive lock uses `Synchronization.Mutex` for both its ownership
+metadata and exclusion gate on every target. Do not weaken synchronization
+based on a single-threaded host assumption, and do not introduce target-only
+raw global transaction state.
 
 #### setTimeout / setInterval Patterns
 
@@ -855,60 +833,20 @@ OpenCoreGraphics implements several caching strategies:
 
 #### BufferPool (Ring Buffer)
 
-Prevents GPU/CPU synchronization stalls:
-
-```swift
-public final class BufferPool: @unchecked Sendable {
-    private let device: GPUDevice
-    private var buffers: [GPUBuffer] = []
-    private var currentIndex: Int = 0
-    private let frameCount: Int = 3  // Triple buffering
-
-    public func allocate(size: Int) -> GPUBuffer {
-        // Return buffer for current frame, cycle to next
-        let buffer = buffers[currentIndex]
-        currentIndex = (currentIndex + 1) % frameCount
-        return buffer
-    }
-}
-```
+Ring-buffer ownership and the active index must be represented by one
+`Mutex<State>` owner. GPU calls and external callbacks remain outside the
+critical section.
 
 #### TextureManager (LRU Cache)
 
-Caches CGImage → GPUTexture conversions:
-
-```swift
-public final class TextureManager: @unchecked Sendable {
-    private var cache: [ObjectIdentifier: CacheEntry] = [:]
-    private let maxMemoryBytes: Int = 256 * 1024 * 1024  // 256 MB
-
-    public func texture(for image: CGImage) -> GPUTexture {
-        let id = ObjectIdentifier(image)
-        if let cached = cache[id] {
-            cached.accessTime = CACurrentMediaTime()
-            return cached.texture
-        }
-        // Create new texture, evict LRU if needed
-        return createTexture(from: image)
-    }
-}
-```
+Texture-cache entries, access order, and memory accounting share one
+`Mutex<State>` contract. Texture creation and GPU uploads occur after the
+cache decision and outside the lock.
 
 #### GeometryCache
 
-Caches tessellated vertex data for repeated paths:
-
-```swift
-public final class GeometryCache: @unchecked Sendable {
-    private var cache: [PathKey: CachedGeometry] = [:]
-    private let maxEntries: Int = 500
-
-    public func geometry(for path: CGPath, transform: CGAffineTransform) -> [CGWebGPUVertex]? {
-        let key = PathKey(path: path, transform: transform)
-        return cache[key]?.vertices
-    }
-}
-```
+Geometry-cache lookup, recency, insertion, and eviction share one
+`Mutex<State>` owner. Tessellation remains outside the critical section.
 
 ### WGSL Shader Patterns
 
@@ -1150,7 +1088,7 @@ if let cached = textTextureCache[cacheKey] {
 3. **Efficient Memory**: Use ring buffers, LRU caches to minimize allocations
 4. **Lazy Compilation**: Create pipelines on-demand, cache for reuse
 5. **Stateless Commands**: Pass all state to shaders via uniforms/vertex data
-6. **Sendable Types**: All GPU resources marked `@unchecked Sendable` (WASM is single-threaded)
+6. **Sendable Types**: Shared mutable GPU state uses `Mutex<State>` or actor isolation on every target; `@unchecked Sendable` is not permitted
 
 ## Future Work (TODO)
 
