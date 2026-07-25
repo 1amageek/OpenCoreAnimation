@@ -4085,6 +4085,8 @@ private final class EmitterLayerState {
             || values.gradient?.colorComponents.contains(
                 where: colorContainsExtendedComponents
             ) == true
+            || colorContainsExtendedComponents(values.shape?.fill?.color)
+            || colorContainsExtendedComponents(values.shape?.stroke?.color)
         let explicitlyRequestsHighRange =
             values.preferredDynamicRange == .high
             || values.preferredDynamicRange == .constrainedHigh
@@ -4434,6 +4436,8 @@ private final class EmitterLayerState {
                 )
             case .gradient(let failure):
                 recordGradientRenderFailure(failure)
+            case .shape(let failure):
+                recordShapeRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4528,6 +4532,8 @@ private final class EmitterLayerState {
                 )
             case .gradient(let failure):
                 recordGradientRenderFailure(failure)
+            case .shape(let failure):
+                recordShapeRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -7593,7 +7599,16 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
-        if let gradient = values.gradient {
+        if let shape = values.shape {
+            try renderSnapshotShape(
+                shape,
+                values: values,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup
+            )
+        } else if let gradient = values.gradient {
             try renderSnapshotGradient(
                 gradient,
                 identity: node.identity,
@@ -7692,6 +7707,119 @@ private final class EmitterLayerState {
                 modelMatrix: modelMatrix,
                 bindGroup: bindGroup
             )
+        }
+    }
+
+    private func renderSnapshotShape(
+        _ shape: CARenderSnapshot.PresentationValues.Shape,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        bindGroup: GPUBindGroup
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        guard vertexBuffer != nil, uniformBuffer != nil else {
+            throw .shape(.rendererResourcesUnavailable)
+        }
+        guard let selectedPipeline = stencilAwarePipeline() else {
+            throw .mask(.pipelineUnavailable(.activeStencil))
+        }
+        renderPass.setPipeline(selectedPipeline)
+        if let fill = shape.fill {
+            try renderSnapshotShapePrimitive(
+                fill,
+                values: values,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup,
+                isFill: true
+            )
+        }
+        if let stroke = shape.stroke {
+            try renderSnapshotShapePrimitive(
+                stroke,
+                values: values,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                bindGroup: bindGroup,
+                isFill: false
+            )
+        }
+    }
+
+    private func renderSnapshotShapePrimitive(
+        _ primitive: CARenderSnapshot.PresentationValues.Shape.Primitive,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        bindGroup: GPUBindGroup,
+        isFill: Bool
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        guard let vertexBuffer, let uniformBuffer else {
+            throw .shape(.rendererResourcesUnavailable)
+        }
+        let hasValidBounds =
+            values.bounds.width > 0 && values.bounds.height > 0
+        var vertices = primitive.vertices.map { point in
+            CARendererVertex(
+                position: point,
+                texCoord: hasValidBounds
+                    ? SIMD2(
+                        (point.x - Float(values.bounds.minX))
+                            / values.boundsSize.x,
+                        (point.y - Float(values.bounds.minY))
+                            / values.boundsSize.y
+                    )
+                    : .zero,
+                color: replicatedColor(primitive.color)
+            )
+        }
+        guard let (vertexOffset, uniformIndex) = allocateVertices(
+            count: vertices.count
+        ) else {
+            throw .shape(
+                isFill
+                    ? .fillVertexCapacityExceeded
+                    : .strokeVertexCapacityExceeded
+            )
+        }
+        var uniforms = CARendererUniforms(
+            mvpMatrix: modelMatrix,
+            opacity: currentEffectiveOpacity,
+            cornerRadius: 0,
+            layerSize: values.boundsSize,
+            edgeAntialiasingMask:
+                hasValidBounds ? values.edgeAntialiasingMask : 0
+        )
+        let uniformOffset =
+            UInt64(uniformIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+        renderPass.setBindGroup(
+            0,
+            bindGroup: bindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: vertexOffset
+        )
+        renderPass.draw(vertexCount: UInt32(vertices.count))
+        if isFill {
+            shapeFillDrawCount += 1
+            shapeFillVertexCount += vertices.count
         }
     }
 

@@ -31,6 +31,16 @@ internal struct CARenderSnapshot: Sendable {
             internal let pathVertices: [SIMD2<Float>]?
         }
 
+        internal struct Shape: Sendable, Equatable {
+            internal struct Primitive: Sendable, Equatable {
+                internal let vertices: [SIMD2<Float>]
+                internal let color: SIMD4<Float>
+            }
+
+            internal let fill: Primitive?
+            internal let stroke: Primitive?
+        }
+
         internal let bounds: CGRect
         internal let boundsSize: SIMD2<Float>
         internal let boundsOrigin: SIMD2<Float>
@@ -62,6 +72,7 @@ internal struct CARenderSnapshot: Sendable {
             CARenderSnapshotCompositingFilter?
         internal let backgroundFilters: [CARenderSnapshotFilterStage]
         internal let gradient: GradientRenderConfiguration?
+        internal let shape: Shape?
         internal let shadow: Shadow?
     }
 
@@ -206,7 +217,6 @@ internal struct CARenderSnapshot: Sendable {
             || layer is CAEmitterLayer
             || layer is CATiledLayer
             || layer is CATextLayer
-            || layer is CAShapeLayer
     }
 
     private static func presentationValues(
@@ -302,13 +312,17 @@ internal struct CARenderSnapshot: Sendable {
             throw .nonFiniteLayerGeometry
         }
         let imageContents: CAImageContentsSnapshot?
-        do {
-            imageContents = try captureImageContents(
-                from: layer,
-                delegateBackingStore: delegateBackingStore
-            )
-        } catch {
-            throw .invalidLayerContents(error)
+        if layer is CAShapeLayer {
+            imageContents = nil
+        } else {
+            do {
+                imageContents = try captureImageContents(
+                    from: layer,
+                    delegateBackingStore: delegateBackingStore
+                )
+            } catch {
+                throw .invalidLayerContents(error)
+            }
         }
         let filters: [CARenderSnapshotFilterStage]
         let compositingFilter: CARenderSnapshotCompositingFilter?
@@ -407,6 +421,7 @@ internal struct CARenderSnapshot: Sendable {
         } else {
             gradient = nil
         }
+        let shape = try captureShape(from: layer)
         return PresentationValues(
             bounds: layer.bounds,
             boundsSize: SIMD2<Float>(boundsWidth, boundsHeight),
@@ -446,8 +461,138 @@ internal struct CARenderSnapshot: Sendable {
             compositingFilter: compositingFilter,
             backgroundFilters: backgroundFilters,
             gradient: gradient,
+            shape: shape,
             shadow: shadow
         )
+    }
+
+    private static func captureShape(
+        from layer: CALayer
+    ) throws(CARendererError) -> PresentationValues.Shape? {
+        guard let shapeLayer = layer as? CAShapeLayer else {
+            return nil
+        }
+        guard let path = shapeLayer.path else {
+            return PresentationValues.Shape(fill: nil, stroke: nil)
+        }
+        do {
+            try ShapeFillTessellator.validate(path)
+        } catch {
+            throw .invalidLayerShape(shapeError(from: error))
+        }
+        let fill: PresentationValues.Shape.Primitive?
+        if let fillColor = shapeLayer.fillColor {
+            let points: [CGPoint]
+            do {
+                points = try ShapeFillTessellator.triangles(
+                    for: path,
+                    rule: shapeLayer.fillRule
+                )
+            } catch {
+                throw .invalidLayerShape(shapeError(from: error))
+            }
+            fill = try shapePrimitive(
+                points: points,
+                color: fillColor,
+                invalidColor: .invalidFillColor
+            )
+        } else {
+            fill = nil
+        }
+        let stroke: PresentationValues.Shape.Primitive?
+        if let strokeColor = shapeLayer.strokeColor {
+            guard shapeLayer.lineWidth.isFinite else {
+                throw .invalidLayerShape(.invalidStrokeGeometry)
+            }
+            guard shapeLayer.lineWidth > 0 else {
+                return PresentationValues.Shape(
+                    fill: fill,
+                    stroke: nil
+                )
+            }
+            let points: [CGPoint]
+            do {
+                points = try ShapeStrokeTessellator.triangles(
+                    for: path,
+                    lineWidth: shapeLayer.lineWidth,
+                    lineCap: shapeLayer.lineCap,
+                    lineJoin: shapeLayer.lineJoin,
+                    miterLimit: shapeLayer.miterLimit,
+                    dashPattern: shapeLayer.lineDashPattern,
+                    dashPhase: shapeLayer.lineDashPhase,
+                    strokeStart: shapeLayer.strokeStart,
+                    strokeEnd: shapeLayer.strokeEnd
+                )
+            } catch {
+                throw .invalidLayerShape(shapeError(from: error))
+            }
+            stroke = try shapePrimitive(
+                points: points,
+                color: strokeColor,
+                invalidColor: .invalidStrokeColor
+            )
+        } else {
+            stroke = nil
+        }
+        return PresentationValues.Shape(fill: fill, stroke: stroke)
+    }
+
+    private static func shapePrimitive(
+        points: [CGPoint],
+        color: CGColor,
+        invalidColor: CARenderSnapshotShapeError
+    ) throws(CARendererError) -> PresentationValues.Shape.Primitive? {
+        guard !points.isEmpty else { return nil }
+        guard let converted = color.converted(
+            to: .deviceRGB,
+            intent: .defaultIntent,
+            options: nil
+        ), let components = converted.components,
+              components.count == 4,
+              components.allSatisfy(\.isFinite) else {
+            throw .invalidLayerShape(invalidColor)
+        }
+        let vertices = points.map { SIMD2(Float($0.x), Float($0.y)) }
+        guard vertices.allSatisfy({
+            $0.x.isFinite && $0.y.isFinite
+        }) else {
+            throw .invalidLayerShape(.nonFinitePath)
+        }
+        return PresentationValues.Shape.Primitive(
+            vertices: vertices,
+            color: SIMD4(
+                Float(components[0]),
+                Float(components[1]),
+                Float(components[2]),
+                Float(components[3])
+            )
+        )
+    }
+
+    private static func shapeError(
+        from error: ShapeFillTessellationError
+    ) -> CARenderSnapshotShapeError {
+        switch error {
+        case .unsupportedFillRule(let value):
+            return .unsupportedFillRule(value)
+        case .nonFinitePath:
+            return .nonFinitePath
+        }
+    }
+
+    private static func shapeError(
+        from error: ShapeStrokeTessellationError
+    ) -> CARenderSnapshotShapeError {
+        switch error {
+        case .invalidGeometry:
+            return .invalidStrokeGeometry
+        case .invalidDashPattern:
+            return .invalidDashPattern
+        case .unsupportedLineCap(let value):
+            return .unsupportedLineCap(value)
+        case .unsupportedLineJoin(let value):
+            return .unsupportedLineJoin(value)
+        }
     }
 
     private static func snapshotGradientError(

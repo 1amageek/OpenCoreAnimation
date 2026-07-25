@@ -6034,6 +6034,8 @@ func installHarness() {
                 let snapshotScrollLayer = CAScrollLayer()
                 let snapshotScrollChild = CALayer()
                 let snapshotGradientLayer = CAGradientLayer()
+                let snapshotShapeLayer = CAShapeLayer()
+                let snapshotShapePath = CGMutablePath()
                 guard let snapshotCoreImageFilter = CIFilter(
                     name: "CIColorInvert"
                 ), let snapshotCompositionFilter = CIFilter(
@@ -6474,6 +6476,23 @@ func installHarness() {
                     ),
                 ]
                 snapshotRoot.addSublayer(snapshotGradientLayer)
+                snapshotShapeLayer.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotShapeLayer.position = CGPoint(
+                    x: 210,
+                    y: 170
+                )
+                snapshotShapePath.addRect(
+                    snapshotShapeLayer.bounds
+                )
+                snapshotShapeLayer.path = snapshotShapePath
+                snapshotShapeLayer.fillColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotRoot.addSublayer(snapshotShapeLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6595,6 +6614,16 @@ func installHarness() {
                         alpha: 1
                     ),
                 ]
+                snapshotShapePath.addRect(
+                    CGRect(x: 0, y: 0, width: 10, height: 10)
+                )
+                snapshotShapeLayer.path = CGMutablePath()
+                snapshotShapeLayer.fillColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
                 renderer.render(layer: snapshotRoot)
                 let snapshotRasterizationScaleWasApplied =
                     renderer.explicitRasterizationCapturePixelSizes
@@ -6633,6 +6662,7 @@ func installHarness() {
                         CGPoint(x: 290, y: 70),
                         CGPoint(x: 320, y: 70),
                         CGPoint(x: 350, y: 70),
+                        CGPoint(x: 210, y: 130),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6752,6 +6782,49 @@ func installHarness() {
                             )
                     let contentsOverflowCompletionRemainedPending =
                         !contentsOverflowCompletionRan
+
+                    let shapeOverflowRoot = CAShapeLayer()
+                    let shapeOverflowPath = CGMutablePath()
+                    var shapeOverflowCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        shapeOverflowCompletionRan = true
+                    }
+                    shapeOverflowRoot.bounds = snapshotRoot.bounds
+                    shapeOverflowRoot.position = snapshotRoot.position
+                    shapeOverflowPath.addRect(
+                        CGRect(x: 0, y: 0, width: 40, height: 40)
+                    )
+                    shapeOverflowRoot.path = shapeOverflowPath
+                    shapeOverflowRoot.fillColor = CGColor(
+                        red: 0,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeShapeOverflow =
+                        renderer.frameRenderFailureCount
+                    renderer.setNextCommittedSnapshotAllocationLimit(0)
+                    renderer.render(layer: shapeOverflowRoot)
+                    let shapeOverflowWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeShapeOverflow + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .shape(
+                                    .fillVertexCapacityExceeded
+                                )
+                            )
+                    let shapeOverflowCompletionRemainedPending =
+                        !shapeOverflowCompletionRan
+                    renderer.render(layer: shapeOverflowRoot)
+                    let shapeOverflowRecovered =
+                        shapeOverflowCompletionRan
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeShapeOverflow + 1
+                        && renderer.lastFrameRenderFailure == nil
 
                     let snapshotMaskFailureRoot = CALayer()
                     let snapshotMaskFailureLayer = CALayer()
@@ -7095,6 +7168,9 @@ func installHarness() {
                         + ",maskOverflowPending=\(maskOverflowCompletionRemainedPending)"
                         + ",contentsOverflowTyped=\(contentsOverflowWasTyped)"
                         + ",contentsOverflowPending=\(contentsOverflowCompletionRemainedPending)"
+                        + ",shapeOverflowTyped=\(shapeOverflowWasTyped)"
+                        + ",shapeOverflowPending=\(shapeOverflowCompletionRemainedPending)"
+                        + ",shapeOverflowRecovered=\(shapeOverflowRecovered)"
                         + ",snapshotMaskFailureTyped=\(snapshotMaskFailureWasTyped)"
                         + ",snapshotMaskFailurePending=\(snapshotMaskFailureCompletionRemainedPending)"
                         + ",snapshotMaskFailureRecovered=\(snapshotMaskFailureRecovered)"

@@ -193,6 +193,132 @@ struct CARenderSnapshotTests {
         }
     }
 
+    @Test("Shape fill and stroke become immutable tessellated values")
+    func shapeValuesUseSnapshots() throws {
+        let committedPath = CGMutablePath()
+        committedPath.addRect(
+            CGRect(x: 2, y: 3, width: 20, height: 10)
+        )
+        let shape = CAShapeLayer()
+        shape.bounds = CGRect(x: 0, y: 0, width: 24, height: 16)
+        shape.path = committedPath
+        shape.fillColor = CGColor(
+            red: 0,
+            green: 1,
+            blue: 1,
+            alpha: 1
+        )
+        shape.strokeColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        shape.lineWidth = 2
+        shape.lineCap = .round
+        shape.lineJoin = .bevel
+        shape.lineDashPattern = [3, 2]
+        shape.lineDashPhase = 1
+        shape.strokeStart = 0.1
+        shape.strokeEnd = 0.9
+
+        let snapshot = try CARenderSnapshot.capture(
+            shape,
+            frameToken: 48
+        )
+        let captured = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.shape
+        )
+        let fill = try #require(captured.fill)
+        let stroke = try #require(captured.stroke)
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(fill.vertices.count == 6)
+        #expect(fill.color == SIMD4<Float>(0, 1, 1, 1))
+        #expect(!stroke.vertices.isEmpty)
+        #expect(stroke.vertices.count.isMultiple(of: 3))
+        #expect(stroke.color == SIMD4<Float>(1, 0, 1, 1))
+
+        let capturedFillVertices = fill.vertices
+        let capturedStrokeVertices = stroke.vertices
+        committedPath.addRect(
+            CGRect(x: 0, y: 0, width: 24, height: 16)
+        )
+        shape.path = CGMutablePath()
+        shape.fillColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+        shape.strokeColor = nil
+        shape.lineWidth = 8
+        shape.lineDashPattern = nil
+
+        #expect(fill.vertices == capturedFillVertices)
+        #expect(stroke.vertices == capturedStrokeVertices)
+        #expect(fill.color == SIMD4<Float>(0, 1, 1, 1))
+        #expect(stroke.color == SIMD4<Float>(1, 0, 1, 1))
+    }
+
+    @Test("A pathless shape remains an empty shape foreground")
+    func pathlessShapeDoesNotFallBackToImageContents() throws {
+        let shape = CAShapeLayer()
+        shape.contents = SnapshotContentsToken()
+
+        let snapshot = try CARenderSnapshot.capture(
+            shape,
+            frameToken: 49
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+        let captured = try #require(values.shape)
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(captured.fill == nil)
+        #expect(captured.stroke == nil)
+        #expect(values.imageContents == nil)
+    }
+
+    @Test("Invalid shape values fail immutable capture explicitly")
+    func invalidShapeFailsCapture() {
+        let path = CGMutablePath()
+        path.addRect(CGRect(x: 0, y: 0, width: 10, height: 10))
+        let shape = CAShapeLayer()
+        shape.path = path
+        shape.fillRule = CAShapeLayerFillRule(rawValue: "future")
+
+        #expect(throws: CARendererError.invalidLayerShape(
+            .unsupportedFillRule("future")
+        )) {
+            try CARenderSnapshot.capture(shape, frameToken: 50)
+        }
+
+        shape.fillRule = .nonZero
+        shape.strokeColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        shape.lineDashPattern = [2, 0]
+        #expect(throws: CARendererError.invalidLayerShape(
+            .invalidDashPattern
+        )) {
+            try CARenderSnapshot.capture(shape, frameToken: 51)
+        }
+
+        shape.lineDashPattern = nil
+        shape.lineCap = CAShapeLayerLineCap(rawValue: "future")
+        #expect(throws: CARendererError.invalidLayerShape(
+            .unsupportedLineCap("future")
+        )) {
+            try CARenderSnapshot.capture(shape, frameToken: 52)
+        }
+    }
+
     @Test("Detached mask trees become value-owned snapshot nodes")
     func maskTreeIsCapturedByValue() throws {
         CATransaction.flush()
@@ -1494,6 +1620,41 @@ extension CARenderSnapshotTests {
 
         #expect(renderer.lastRenderError
             == .unsupportedCommittedSnapshotFeature(.gradient))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed shapes instead of dropping them")
+    func metalRejectsUnsupportedShapeSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(
+            descriptor: descriptor
+        ))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let path = CGMutablePath()
+        path.addRect(CGRect(x: 0, y: 0, width: 2, height: 1))
+        let root = CAShapeLayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.position = CGPoint(x: 1, y: 0.5)
+        root.path = path
+        root.fillColor = CGColor(
+            red: 0,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.shape))
         #expect(renderer.lastCommandBuffer == nil)
     }
 

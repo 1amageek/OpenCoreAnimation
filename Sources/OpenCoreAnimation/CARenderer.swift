@@ -18,6 +18,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case backdropComposition
     case shadow
     case gradient
+    case shape
 }
 
 /// A layer filter value that could not cross the immutable commit boundary.
@@ -55,6 +56,18 @@ public enum CARenderSnapshotGradientError: Error, Equatable, Sendable {
     case nonFiniteLocation(index: Int)
     case locationOutOfRange(index: Int)
     case locationsNotMonotonic(index: Int)
+}
+
+/// Shape content that could not cross the immutable commit boundary.
+public enum CARenderSnapshotShapeError: Error, Equatable, Sendable {
+    case unsupportedFillRule(String)
+    case nonFinitePath
+    case invalidStrokeGeometry
+    case invalidDashPattern
+    case unsupportedLineCap(String)
+    case unsupportedLineJoin(String)
+    case invalidFillColor
+    case invalidStrokeColor
 }
 
 /// Errors that can occur during renderer operations.
@@ -103,6 +116,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerBackgroundFilter(CARenderSnapshotFilterError)
     /// A gradient layer could not become immutable renderer values.
     case invalidLayerGradient(CARenderSnapshotGradientError)
+    /// A shape layer could not become immutable tessellated values.
+    case invalidLayerShape(CARenderSnapshotShapeError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.
