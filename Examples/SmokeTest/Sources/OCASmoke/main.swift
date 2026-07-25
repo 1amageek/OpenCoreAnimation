@@ -6049,6 +6049,8 @@ func installHarness() {
                 let snapshotShapeLayer = CAShapeLayer()
                 let snapshotShapePath = CGMutablePath()
                 let snapshotTextLayer = CATextLayer()
+                let snapshotTransformLayer = CATransformLayer()
+                let snapshotTransformChild = CALayer()
                 guard let snapshotCoreImageFilter = CIFilter(
                     name: "CIColorInvert"
                 ), let snapshotCompositionFilter = CIFilter(
@@ -6522,6 +6524,38 @@ func installHarness() {
                     alpha: 1
                 )
                 snapshotRoot.addSublayer(snapshotTextLayer)
+                snapshotTransformLayer.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotTransformLayer.position = CGPoint(
+                    x: 90,
+                    y: 170
+                )
+                snapshotTransformLayer.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotTransformChild.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 20
+                )
+                snapshotTransformChild.position = CGPoint(
+                    x: 20,
+                    y: 20
+                )
+                snapshotTransformChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotTransformLayer.addSublayer(
+                    snapshotTransformChild
+                )
+                snapshotRoot.addSublayer(snapshotTransformLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6660,6 +6694,22 @@ func installHarness() {
                     blue: 0,
                     alpha: 1
                 )
+                snapshotTransformLayer.backgroundColor = CGColor(
+                    red: 1,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotTransformChild.position = CGPoint(
+                    x: 35,
+                    y: 20
+                )
+                snapshotTransformChild.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
                 renderer.render(layer: snapshotRoot)
                 let snapshotRasterizationScaleWasApplied =
                     renderer.explicitRasterizationCapturePixelSizes
@@ -6700,6 +6750,8 @@ func installHarness() {
                         CGPoint(x: 350, y: 70),
                         CGPoint(x: 210, y: 130),
                         CGPoint(x: 140, y: 120),
+                        CGPoint(x: 90, y: 130),
+                        CGPoint(x: 75, y: 130),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6899,6 +6951,79 @@ func installHarness() {
                         textOverflowCompletionRan
                         && renderer.frameRenderFailureCount
                             == frameFailuresBeforeTextOverflow + 1
+                        && renderer.lastFrameRenderFailure == nil
+
+                    let transformFailureRoot = CATransformLayer()
+                    let transformFailureChild = CALayer()
+                    var transformFailureCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        transformFailureCompletionRan = true
+                    }
+                    transformFailureRoot.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    transformFailureRoot.position = CGPoint(
+                        x: 20,
+                        y: 20
+                    )
+                    transformFailureChild.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 10,
+                        height: 10
+                    )
+                    transformFailureChild.position = CGPoint(
+                        x: 5,
+                        y: 5
+                    )
+                    transformFailureChild.backgroundColor = CGColor(
+                        red: 0,
+                        green: 1,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    var invalidDepthTransform =
+                        CATransform3DIdentity
+                    invalidDepthTransform.m44 = 0
+                    transformFailureChild.transform =
+                        invalidDepthTransform
+                    transformFailureRoot.addSublayer(
+                        transformFailureChild
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeTransformFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.render(layer: transformFailureRoot)
+                    let transformFailureWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeTransformFailure + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .transformDepth(
+                                    .invalidProjectedDepth(
+                                        sublayerIndex: 0,
+                                        reason:
+                                            .zeroHomogeneousCoordinate
+                                    )
+                                )
+                            )
+                    let transformFailureCompletionRemainedPending =
+                        !transformFailureCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    transformFailureChild.transform =
+                        CATransform3DIdentity
+                    CATransaction.commit()
+                    renderer.render(layer: transformFailureRoot)
+                    let transformFailureRecovered =
+                        transformFailureCompletionRan
+                        && renderer.frameRenderFailureCount
+                            == frameFailuresBeforeTransformFailure + 1
                         && renderer.lastFrameRenderFailure == nil
 
                     let snapshotMaskFailureRoot = CALayer()
@@ -7249,6 +7374,9 @@ func installHarness() {
                         + ",textOverflowTyped=\(textOverflowWasTyped)"
                         + ",textOverflowPending=\(textOverflowCompletionRemainedPending)"
                         + ",textOverflowRecovered=\(textOverflowRecovered)"
+                        + ",transformFailureTyped=\(transformFailureWasTyped)"
+                        + ",transformFailurePending=\(transformFailureCompletionRemainedPending)"
+                        + ",transformFailureRecovered=\(transformFailureRecovered)"
                         + ",snapshotMaskFailureTyped=\(snapshotMaskFailureWasTyped)"
                         + ",snapshotMaskFailurePending=\(snapshotMaskFailureCompletionRemainedPending)"
                         + ",snapshotMaskFailureRecovered=\(snapshotMaskFailureRecovered)"

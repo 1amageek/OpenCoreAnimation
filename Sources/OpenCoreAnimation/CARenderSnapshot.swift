@@ -17,7 +17,7 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // contents, layer filter and backdrop-composition plans, gradient inputs,
 // tessellated shape geometry, and validated text configuration.
 // Production WebGPU still uses explicitly typed live-tree branches for
-// specialized layers, transitions, and animation evaluation.
+// replicator, emitter, and tiled layers, transitions, and animation evaluation.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -53,6 +53,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let anchorOffset: SIMD3<Float>
         internal let transform: CATransform3D
         internal let sublayerTransform: CATransform3D
+        internal let isTransformLayer: Bool
         internal let isGeometryFlipped: Bool
         internal let isDoubleSided: Bool
         internal let isOpaque: Bool
@@ -139,12 +140,14 @@ internal struct CARenderSnapshot: Sendable {
             throw .cyclicLayerHierarchy
         }
 
-        do {
-            try layer.prepareDelegateBackingStore(
-                maximumPixelDimension: Int.max
-            )
-        } catch {
-            throw .invalidDelegateBackingStore(error)
+        if !(layer is CATransformLayer) {
+            do {
+                try layer.prepareDelegateBackingStore(
+                    maximumPixelDimension: Int.max
+                )
+            } catch {
+                throw .invalidDelegateBackingStore(error)
+            }
         }
         let contentRevision = layer._contentRevision
         let presentationLayer = layer._renderTimePresentation()
@@ -170,8 +173,11 @@ internal struct CARenderSnapshot: Sendable {
         )
 
         var childIndices: [Int] = []
-        childIndices.reserveCapacity(layer.sublayers?.count ?? 0)
-        for child in layer.sortedSublayers() {
+        let orderedChildren = layer is CATransformLayer
+            ? layer.sublayers ?? []
+            : layer.sortedSublayers()
+        childIndices.reserveCapacity(orderedChildren.count)
+        for child in orderedChildren {
             childIndices.append(
                 try captureNode(
                     child,
@@ -182,7 +188,7 @@ internal struct CARenderSnapshot: Sendable {
             )
         }
         let maskIndex: Int?
-        if let mask = layer.mask {
+        if !(layer is CATransformLayer), let mask = layer.mask {
             maskIndex = try captureNode(
                 mask,
                 nodes: &nodes,
@@ -219,8 +225,7 @@ internal struct CARenderSnapshot: Sendable {
     private static func requiresSpecializedCapture(
         _ layer: CALayer
     ) -> Bool {
-        layer is CATransformLayer
-            || layer is CAReplicatorLayer
+        layer is CAReplicatorLayer
             || layer is CAEmitterLayer
             || layer is CATiledLayer
     }
@@ -229,6 +234,7 @@ internal struct CARenderSnapshot: Sendable {
         from layer: CALayer,
         delegateBackingStore: CADelegateBackingStore? = nil
     ) throws(CARendererError) -> PresentationValues {
+        let isTransformLayer = layer is CATransformLayer
         guard layer.bounds.origin.x.isFinite,
               layer.bounds.origin.y.isFinite,
               layer.bounds.width.isFinite,
@@ -240,17 +246,21 @@ internal struct CARenderSnapshot: Sendable {
               layer.anchorPoint.y.isFinite,
               layer.anchorPointZ.isFinite,
               layer.opacity.isFinite,
-              layer.cornerRadius.isFinite,
-              layer.borderWidth.isFinite,
-              layer.contentsHeadroom.isFinite,
               isFinite(layer.transform),
               isFinite(layer.sublayerTransform) else {
             throw .nonFiniteLayerGeometry
         }
-        guard layer.cornerRadius >= 0 else {
-            throw .invalidLayerCornerGeometry
+        if !isTransformLayer {
+            guard layer.cornerRadius.isFinite,
+                  layer.borderWidth.isFinite,
+                  layer.contentsHeadroom.isFinite else {
+                throw .nonFiniteLayerGeometry
+            }
+            guard layer.cornerRadius >= 0 else {
+                throw .invalidLayerCornerGeometry
+            }
         }
-        if layer.shouldRasterize {
+        if !isTransformLayer, layer.shouldRasterize {
             guard layer.rasterizationScale.isFinite,
                   layer.rasterizationScale > 0 else {
                 throw .invalidLayerRasterization(
@@ -261,16 +271,24 @@ internal struct CARenderSnapshot: Sendable {
             }
         }
         let cornerCurveExponent: Float
-        do {
+        if isTransformLayer {
             cornerCurveExponent = Float(
-                try CornerCurveRenderConfiguration(
-                    curve: layer.cornerCurve
-                ).exponent
+                CornerCurveRenderConfiguration.circularExponent
             )
-        } catch {
-            throw .invalidLayerCornerGeometry
+        } else {
+            do {
+                cornerCurveExponent = Float(
+                    try CornerCurveRenderConfiguration(
+                        curve: layer.cornerCurve
+                    ).exponent
+                )
+            } catch {
+                throw .invalidLayerCornerGeometry
+            }
         }
-        let cornerRadii = cornerRadiiComponents(from: layer)
+        let cornerRadii = isTransformLayer
+            ? SIMD4<Float>.zero
+            : cornerRadiiComponents(from: layer)
         guard cornerCurveExponent.isFinite,
               cornerCurveExponent > 0,
               cornerRadii.x.isFinite,
@@ -279,11 +297,15 @@ internal struct CARenderSnapshot: Sendable {
               cornerRadii.w.isFinite else {
             throw .invalidLayerCornerGeometry
         }
-        let borderWidth = Float(layer.borderWidth)
+        let borderWidth = isTransformLayer
+            ? 0
+            : Float(layer.borderWidth)
         guard borderWidth.isFinite, borderWidth >= 0 else {
             throw .invalidLayerBorderWidth
         }
-        let contentsHeadroom = Float(layer.contentsHeadroom)
+        let contentsHeadroom = isTransformLayer
+            ? 0
+            : Float(layer.contentsHeadroom)
         guard contentsHeadroom.isFinite else {
             throw .nonFiniteLayerGeometry
         }
@@ -318,7 +340,9 @@ internal struct CARenderSnapshot: Sendable {
             throw .nonFiniteLayerGeometry
         }
         let imageContents: CAImageContentsSnapshot?
-        if layer is CAShapeLayer || layer is CATextLayer {
+        if isTransformLayer
+            || layer is CAShapeLayer
+            || layer is CATextLayer {
             imageContents = nil
         } else {
             do {
@@ -333,30 +357,39 @@ internal struct CARenderSnapshot: Sendable {
         let filters: [CARenderSnapshotFilterStage]
         let compositingFilter: CARenderSnapshotCompositingFilter?
         let backgroundFilters: [CARenderSnapshotFilterStage]
-        do {
-            filters = try CARenderSnapshotFilterStage.capture(
-                layer.filters ?? []
-            )
-        } catch {
-            throw .invalidLayerFilter(error)
-        }
-        do {
-            compositingFilter =
-                try CARenderSnapshotCompositingFilter.capture(
-                    layer.compositingFilter
+        if isTransformLayer {
+            filters = []
+            compositingFilter = nil
+            backgroundFilters = []
+        } else {
+            do {
+                filters = try CARenderSnapshotFilterStage.capture(
+                    layer.filters ?? []
                 )
-        } catch {
-            throw .invalidLayerCompositingFilter(error)
-        }
-        do {
-            backgroundFilters = try CARenderSnapshotFilterStage.capture(
-                layer.backgroundFilters ?? []
-            )
-        } catch {
-            throw .invalidLayerBackgroundFilter(error)
+            } catch {
+                throw .invalidLayerFilter(error)
+            }
+            do {
+                compositingFilter =
+                    try CARenderSnapshotCompositingFilter.capture(
+                        layer.compositingFilter
+                    )
+            } catch {
+                throw .invalidLayerCompositingFilter(error)
+            }
+            do {
+                backgroundFilters =
+                    try CARenderSnapshotFilterStage.capture(
+                        layer.backgroundFilters ?? []
+                    )
+            } catch {
+                throw .invalidLayerBackgroundFilter(error)
+            }
         }
         let shadow: PresentationValues.Shadow?
-        if layer.shadowOpacity > 0, layer.shadowColor != nil {
+        if !isTransformLayer,
+           layer.shadowOpacity > 0,
+           layer.shadowColor != nil {
             let configuration: CAShadowRenderConfiguration
             do {
                 configuration = try CAShadowRenderConfiguration(layer: layer)
@@ -437,32 +470,48 @@ internal struct CARenderSnapshot: Sendable {
             anchorOffset: anchorOffset,
             transform: layer.transform,
             sublayerTransform: layer.sublayerTransform,
+            isTransformLayer: isTransformLayer,
             isGeometryFlipped: layer.isGeometryFlipped,
-            isDoubleSided: layer.isDoubleSided,
-            isOpaque: layer.isOpaque,
-            masksToBounds: layer.masksToBounds,
-            allowsGroupOpacity: layer.allowsGroupOpacity,
-            shouldRasterize: layer.shouldRasterize,
-            rasterizationScale: layer.rasterizationScale,
+            isDoubleSided:
+                isTransformLayer ? true : layer.isDoubleSided,
+            isOpaque: isTransformLayer ? false : layer.isOpaque,
+            masksToBounds:
+                isTransformLayer ? false : layer.masksToBounds,
+            allowsGroupOpacity:
+                isTransformLayer ? false : layer.allowsGroupOpacity,
+            shouldRasterize:
+                isTransformLayer ? false : layer.shouldRasterize,
+            rasterizationScale:
+                isTransformLayer ? 1 : layer.rasterizationScale,
             opacity: layer.opacity,
             isHidden: layer.isHidden,
-            cornerRadius: Float(layer.cornerRadius),
+            cornerRadius:
+                isTransformLayer ? 0 : Float(layer.cornerRadius),
             cornerCurveExponent: cornerCurveExponent,
             cornerRadii: cornerRadii,
-            edgeAntialiasingMask: layer.allowsEdgeAntialiasing
+            edgeAntialiasingMask: !isTransformLayer
+                && layer.allowsEdgeAntialiasing
                 ? Float(layer.edgeAntialiasingMask.rawValue & 0xF)
                 : 0,
-            backgroundColor: try colorComponents(
-                layer.backgroundColor,
-                failure: .invalidLayerBackgroundColor
-            ),
+            backgroundColor: isTransformLayer
+                ? nil
+                : try colorComponents(
+                    layer.backgroundColor,
+                    failure: .invalidLayerBackgroundColor
+                ),
             borderWidth: borderWidth,
-            borderColor: try colorComponents(
-                layer.borderColor,
-                failure: .invalidLayerBorderColor
-            ),
-            toneMapMode: layer.toneMapMode,
-            preferredDynamicRange: layer.preferredDynamicRange,
+            borderColor: isTransformLayer
+                ? nil
+                : try colorComponents(
+                    layer.borderColor,
+                    failure: .invalidLayerBorderColor
+                ),
+            toneMapMode:
+                isTransformLayer ? .automatic : layer.toneMapMode,
+            preferredDynamicRange:
+                isTransformLayer
+                    ? .automatic
+                    : layer.preferredDynamicRange,
             contentsHeadroom: contentsHeadroom,
             imageContents: imageContents,
             filters: filters,

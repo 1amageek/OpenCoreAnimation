@@ -797,7 +797,7 @@ stubs out actual GPU calls and records calls to a counter.
 
 ## 6. Phase 4 — Commit-driven rendering
 
-**Implementation checkpoint (2026-07-25).** R4.5 and the static-submit
+**Implementation checkpoint (2026-07-26).** R4.5 and the static-submit
 suppression slice of R4.3 are implemented. A `Sendable`, CALayer-free
 `CARenderSnapshot` now owns the complete presentation input consumed by the
 native Metal backend, and `CAMetalRenderer` encodes exclusively from that
@@ -811,7 +811,10 @@ Those nodes value-own background, border, corner geometry, antialiasing,
 transforms, visibility, geometry orientation, dynamic-range policy, stable
 z-ordered child indices, ordinary `CGImage` contents, gradient inputs,
 commit-time tessellated shape geometry, and validated `CATextLayer`
-configuration. Image capture converts
+configuration. Static `CATransformLayer` nodes additionally value-own their
+container transforms, insertion-order children, and true-3D depth-group
+contract while deliberately omitting the transform layer's non-rendered plane,
+mask, filter, shadow, and contents properties. Image capture converts
 the source into immutable tightly packed storage at commit time and preserves
 crop, center, scale, gravity, sampling filters, mip bias, and opacity policy.
 Chromium readback verifies that captured geometry, color, and image bytes reach
@@ -849,16 +852,18 @@ with shadows included. Mutable model colors, offsets, paths, text, and text
 styles are never read after commit, and failed prepasses retain the committed
 frame for retry. Text configuration failures are rejected during capture,
 while Canvas, texture, and vertex-capacity failures retain their exact
+frame-time reason and the committed frame for retry. Transform depth projection,
+depth-group state, and depth-clear failures likewise retain their exact
 frame-time reason and the committed frame for retry. The snapshot does not yet
-own non-image contents, transform/replicator/emitter/tiled specialized-layer
-resources, or copied animation evaluators. A static tree that needs those
+own non-image contents, replicator/emitter/tiled specialized-layer resources,
+or copied animation evaluators. A static tree that needs those
 resources, a remaining specialized layer, or transition state publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents,
 content masks, group opacity, rasterization, filters, backdrop composition,
-shadows, gradients, shapes, and text with the corresponding
+shadows, gradients, shapes, text, and transform depth with the corresponding
 `unsupportedCommittedSnapshotFeature` value rather than dropping any resource
 and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,

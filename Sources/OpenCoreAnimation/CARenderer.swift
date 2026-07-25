@@ -20,6 +20,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case gradient
     case shape
     case text
+    case transformDepth
 }
 
 /// A layer filter value that could not cross the immutable commit boundary.

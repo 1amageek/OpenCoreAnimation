@@ -4443,6 +4443,8 @@ private final class EmitterLayerState {
                 recordShapeRenderFailure(failure)
             case .text(let failure):
                 recordTextRenderFailure(failure)
+            case .transformDepth(let failure):
+                recordTransformDepthRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4541,6 +4543,8 @@ private final class EmitterLayerState {
                 recordShapeRenderFailure(failure)
             case .text(let failure):
                 recordTextRenderFailure(failure)
+            case .transformDepth(let failure):
+                recordTransformDepthRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -7573,6 +7577,17 @@ private final class EmitterLayerState {
         defer { _ = opacityStack.popLast() }
 
         let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
+        if values.isTransformLayer {
+            try renderSnapshotTransformLayerSublayers(
+                node,
+                in: snapshot,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix,
+                device: device,
+                bindGroup: bindGroup
+            )
+            return
+        }
         if !values.isDoubleSided {
             let firstColumn = modelMatrix.columns.0
             let secondColumn = modelMatrix.columns.1
@@ -16580,6 +16595,113 @@ private final class EmitterLayerState {
     }
 
     // MARK: - CATransformLayer Rendering
+
+    private func renderSnapshotTransformLayerSublayers(
+        _ node: CARenderSnapshot.Node,
+        in snapshot: CARenderSnapshot,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        guard !node.childIndices.isEmpty else { return }
+        let sublayerMatrix = node.presentationValues.sublayerMatrix(
+            modelMatrix: modelMatrix
+        )
+        let orderedChildIndices: [Int]
+        do {
+            orderedChildIndices =
+                try depthOrderedSnapshotChildIndices(
+                    of: node,
+                    in: snapshot,
+                    parentMatrix: sublayerMatrix
+                )
+        } catch {
+            throw .transformDepth(error)
+        }
+
+        let configuration: CADepthGroupRenderConfiguration
+        do {
+            configuration = try CADepthGroupRenderConfiguration(
+                currentNestingDepth: transformDepthNesting
+            )
+        } catch {
+            throw .transformDepth(
+                .depthGroupStateFailure(error)
+            )
+        }
+        if configuration.requiresDepthClear {
+            guard let depthClearPipeline else {
+                throw .transformDepth(
+                    .depthClearPipelineUnavailable
+                )
+            }
+            renderPass.setPipeline(depthClearPipeline)
+            renderPass.draw(vertexCount: 3)
+        }
+        let previousNestingDepth = transformDepthNesting
+        transformDepthNesting = configuration.enteredNestingDepth
+        defer {
+            transformDepthNesting = previousNestingDepth
+        }
+
+        for childIndex in orderedChildIndices {
+            try renderSnapshotNode(
+                at: childIndex,
+                in: snapshot,
+                renderPass: renderPass,
+                parentMatrix: sublayerMatrix,
+                isRoot: false,
+                device: device,
+                bindGroup: bindGroup
+            )
+        }
+    }
+
+    private func depthOrderedSnapshotChildIndices(
+        of node: CARenderSnapshot.Node,
+        in snapshot: CARenderSnapshot,
+        parentMatrix: Matrix4x4
+    ) throws(CATransformDepthRenderFailure) -> [Int] {
+        var projectedChildren:
+            [(index: Int, nodeIndex: Int, depth: Float)] = []
+        projectedChildren.reserveCapacity(node.childIndices.count)
+        for (index, childIndex) in node.childIndices.enumerated() {
+            let values =
+                snapshot.nodes[childIndex].presentationValues
+            let matrix = values.modelMatrix(
+                parentMatrix: parentMatrix
+            )
+            let center = SIMD4<Float>(
+                values.boundsSize.x * 0.5,
+                values.boundsSize.y * 0.5,
+                0,
+                1
+            )
+            let projected = matrix * center
+            let depth: Float
+            do {
+                depth = try CAProjectedDepth.resolve(
+                    z: projected.z,
+                    w: projected.w
+                )
+            } catch {
+                throw .invalidProjectedDepth(
+                    sublayerIndex: index,
+                    reason: error
+                )
+            }
+            projectedChildren.append(
+                (index, childIndex, depth)
+            )
+        }
+        projectedChildren.sort { lhs, rhs in
+            lhs.depth == rhs.depth
+                ? lhs.index < rhs.index
+                : lhs.depth < rhs.depth
+        }
+        return projectedChildren.map(\.nodeIndex)
+    }
 
     private func recordTransformDepthRenderFailure(
         _ failure: CATransformDepthRenderFailure

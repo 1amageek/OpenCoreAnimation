@@ -381,6 +381,11 @@ public final class CAMetalRenderer: CARendererDelegate {
     private func unsupportedFeature(
         in snapshot: CARenderSnapshot
     ) -> CARenderSnapshotFeature? {
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.isTransformLayer
+        }) {
+            return .transformDepth
+        }
         if snapshot.nodes.contains(where: { $0.maskIndex != nil }) {
             return .contentMask
         }

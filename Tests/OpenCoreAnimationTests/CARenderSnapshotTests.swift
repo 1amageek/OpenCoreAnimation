@@ -136,6 +136,98 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Transform layers capture only their 3D container contract")
+    func transformLayerValuesUseSnapshots() throws {
+        let transform = CATransformLayer()
+        transform.bounds = CGRect(
+            x: 3,
+            y: 4,
+            width: 40,
+            height: 30
+        )
+        transform.position = CGPoint(x: 20, y: 15)
+        transform.opacity = 0.5
+        transform.transform = CATransform3DMakeTranslation(
+            2,
+            3,
+            4
+        )
+        transform.sublayerTransform = CATransform3DMakeScale(
+            2,
+            2,
+            1
+        )
+
+        let image = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 255, 255, 255]
+        )
+        let delegate = SnapshotDisplayDelegate(image: image)
+        transform.delegate = delegate
+        transform.setNeedsDisplay()
+        transform.contents = SnapshotContentsToken()
+        transform.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        transform.borderWidth = .nan
+        transform.cornerRadius = .nan
+        transform.contentsHeadroom = .nan
+        transform.filters = [SnapshotContentsToken()]
+        transform.mask = CALayer()
+
+        let first = CALayer()
+        first.zPosition = 4
+        let second = CALayer()
+        second.zPosition = -2
+        transform.addSublayer(first)
+        transform.addSublayer(second)
+
+        let snapshot = try CARenderSnapshot.capture(
+            transform,
+            frameToken: 46
+        )
+        let node = snapshot.nodes[snapshot.rootIndex]
+        let values = node.presentationValues
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(snapshot.nodes.count == 3)
+        #expect(values.isTransformLayer)
+        #expect(values.opacity == 0.5)
+        #expect(values.transform.m41 == 2)
+        #expect(values.sublayerTransform.m11 == 2)
+        #expect(values.backgroundColor == nil)
+        #expect(values.borderWidth == 0)
+        #expect(values.imageContents == nil)
+        #expect(values.filters.isEmpty)
+        #expect(values.compositingFilter == nil)
+        #expect(values.backgroundFilters.isEmpty)
+        #expect(values.shadow == nil)
+        #expect(node.maskIndex == nil)
+        #expect(delegate.displayCount == 0)
+        #expect(
+            node.childIndices.map {
+                snapshot.nodes[$0].identity
+            } == [
+                ObjectIdentifier(first),
+                ObjectIdentifier(second),
+            ]
+        )
+
+        transform.opacity = 1
+        transform.transform = CATransform3DIdentity
+        transform.sublayerTransform = CATransform3DIdentity
+        first.removeFromSuperlayer()
+
+        #expect(values.opacity == 0.5)
+        #expect(values.transform.m41 == 2)
+        #expect(values.sublayerTransform.m11 == 2)
+        #expect(node.childIndices.count == 2)
+    }
+
     @Test("Gradient stops and geometry become immutable snapshot values")
     func gradientValuesUseSnapshots() throws {
         let gradient = CAGradientLayer()
@@ -1803,6 +1895,35 @@ extension CARenderSnapshotTests {
 
         #expect(renderer.lastRenderError
             == .unsupportedCommittedSnapshotFeature(.text))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed transform depth instead of flattening it")
+    func metalRejectsUnsupportedTransformSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 16,
+            height: 16,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(
+            descriptor: descriptor
+        ))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CATransformLayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.position = CGPoint(x: 8, y: 8)
+        root.addSublayer(CALayer())
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(
+                .transformDepth
+            ))
         #expect(renderer.lastCommandBuffer == nil)
     }
 
