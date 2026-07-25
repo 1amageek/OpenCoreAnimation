@@ -4,6 +4,7 @@ import Foundation
 public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
     case solid(CASolidRenderFailure)
     case mask(CAMaskRenderFailure)
+    case contents(CAContentsRenderFailure)
 }
 
 /// Describes why a WebGPU frame could not begin rendering.

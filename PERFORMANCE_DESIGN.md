@@ -806,20 +806,26 @@ through mutex-protected root storage. Per-node content revisions ensure an
 older submission clears only the dirty state it actually captured; native
 pixel readback proves both the committed pixel and preservation of a later
 model mutation. Capture failures remain typed committed state. Production
-WebGPU now encodes common static solid trees directly from the immutable
-snapshot. Those nodes value-own background, border, corner geometry,
-antialiasing, transforms, visibility, geometry orientation, dynamic-range
-policy, and stable z-ordered child indices. Chromium readback verifies that
-captured geometry and color reach the GPU without a post-capture `CALayer`
-read. Capacity or resource failure during that encoding remains a typed frame
-failure and does not submit, clear captured dirty state, or release transaction
-completion. The snapshot does not yet own masks, resource-backed contents,
+WebGPU now encodes common static trees directly from the immutable snapshot.
+Those nodes value-own background, border, corner geometry, antialiasing,
+transforms, visibility, geometry orientation, dynamic-range policy, stable
+z-ordered child indices, and ordinary `CGImage` contents. Image capture converts
+the source into immutable tightly packed storage at commit time and preserves
+crop, center, scale, gravity, sampling filters, mip bias, and opacity policy.
+Chromium readback verifies that captured geometry, color, and image bytes reach
+the GPU without a post-capture `CALayer` or source-image read. Capacity or
+resource failure during that encoding remains a typed frame failure and does
+not submit, clear captured dirty state, or release transaction completion. The
+snapshot does not yet own masks, non-image contents, delegate backing stores,
 specialized-layer resources, or copied animation evaluators. A static tree
-that needs masks, contents, delegates, effects, a specialized layer,
-rasterization, transition state, or true group opacity publishes
+that needs those resources, effects, a specialized layer, rasterization,
+transition state, or true group opacity publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
+The native Metal verification renderer rejects committed image contents with
+`unsupportedCommittedSnapshotFeature(.imageContents)` rather than dropping the
+resource and reporting a successful frame.
 Animated commits similarly publish
 `requiresLiveAnimationEvaluation`; layout-pending commits publish
 `requiresLiveTreePreparation`. WebGPU rejects typed committed capture failures,
@@ -1060,11 +1066,12 @@ matches its documented behavior.
 ### 6.6 Planned snapshot migration (R4.1–R4.4)
 
 The production WebGPU renderer consumes transaction-owned immutable value
-snapshots for common static solid trees. The native Metal backend consumes
-those snapshots for every currently supported static tree. Animated trees and
-resource-backed or specialized WebGPU trees still require frame-time live-tree
-evaluation because the richer immutable resource state is not yet
-implemented. As R4.1–R4.4 continue, migration may temporarily permit
+snapshots for common static trees, including ordinary `CGImage` contents. The
+native Metal backend consumes each snapshot feature it supports and reports a
+typed unsupported-feature error for committed image contents. Animated trees
+and remaining resource-backed or specialized WebGPU trees still require
+frame-time live-tree evaluation because their richer immutable resource state
+is not yet implemented. As R4.1–R4.4 continue, migration may temporarily permit
 `pendingSnapshot == nil` (no commit happened) to render live for existing
 callers (`CADisplayLink.displayLinkDidFire` direct →
 `renderer.render(layer:)`).

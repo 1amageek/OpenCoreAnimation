@@ -5783,6 +5783,37 @@ func installHarness() {
                 let backfaceChild = CALayer()
                 let clipParent = CALayer()
                 let clipChild = CALayer()
+                func makeSnapshotImage(
+                    _ pixels: [UInt8]
+                ) -> CGImage? {
+                    CGImage(
+                        width: 2,
+                        height: 1,
+                        bitsPerComponent: 8,
+                        bitsPerPixel: 32,
+                        bytesPerRow: 8,
+                        space: .deviceRGB,
+                        bitmapInfo: CGBitmapInfo(
+                            rawValue: CGImageAlphaInfo.last.rawValue
+                        ),
+                        provider: CGDataProvider(data: Data(pixels)),
+                        decode: nil,
+                        shouldInterpolate: false,
+                        intent: .defaultIntent
+                    )
+                }
+                guard let committedImage = makeSnapshotImage([
+                    255, 0, 0, 255,
+                    0, 255, 0, 255,
+                ]), let mutatedImage = makeSnapshotImage([
+                    0, 0, 255, 255,
+                    255, 0, 255, 255,
+                ]) else {
+                    ImmutableSnapshotProbeState.result =
+                        "error: image creation failed"
+                    return
+                }
+                let imageChild = CALayer()
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
                 snapshotRoot.bounds = CGRect(
@@ -5848,6 +5879,20 @@ func installHarness() {
                 )
                 clipParent.addSublayer(clipChild)
                 snapshotRoot.addSublayer(clipParent)
+                imageChild.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 40
+                )
+                imageChild.position = CGPoint(x: 220, y: 50)
+                imageChild.contents = committedImage
+                imageChild.contentsGravity = .resize
+                imageChild.magnificationFilter = .nearest
+                imageChild.minificationFilter = .trilinear
+                imageChild.minificationFilterBias = 2
+                imageChild.isOpaque = true
+                snapshotRoot.addSublayer(imageChild)
                 CATransaction.commit()
 
                 snapshotChild.backgroundColor = CGColor(
@@ -5860,6 +5905,14 @@ func installHarness() {
                 backfaceChild.isDoubleSided = true
                 clipParent.masksToBounds = false
                 clipParent.cornerRadius = 0
+                imageChild.contents = mutatedImage
+                imageChild.contentsRect = CGRect(
+                    x: 0.5,
+                    y: 0,
+                    width: 0.5,
+                    height: 1
+                )
+                imageChild.magnificationFilter = .linear
                 renderer.render(layer: snapshotRoot)
                 do {
                     let pixels = try await renderer.readbackPixels(at: [
@@ -5868,6 +5921,8 @@ func installHarness() {
                         CGPoint(x: 150, y: 250),
                         CGPoint(x: 132, y: 268),
                         CGPoint(x: 180, y: 250),
+                        CGPoint(x: 210, y: 250),
+                        CGPoint(x: 230, y: 250),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -5959,6 +6014,34 @@ func installHarness() {
                             )
                     let maskOverflowCompletionRemainedPending =
                         !maskOverflowCompletionRan
+
+                    let contentsOverflowRoot = CALayer()
+                    var contentsOverflowCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        contentsOverflowCompletionRan = true
+                    }
+                    contentsOverflowRoot.bounds = snapshotRoot.bounds
+                    contentsOverflowRoot.position = snapshotRoot.position
+                    contentsOverflowRoot.contents = committedImage
+                    contentsOverflowRoot.contentsGravity = .resize
+                    CATransaction.commit()
+                    let frameFailuresBeforeContentsOverflow =
+                        renderer.frameRenderFailureCount
+                    renderer.setNextCommittedSnapshotAllocationLimit(0)
+                    renderer.render(layer: contentsOverflowRoot)
+                    let contentsOverflowWasTyped =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeContentsOverflow + 1
+                        && renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .contents(
+                                    .standardVertexCapacityExceeded
+                                )
+                            )
+                    let contentsOverflowCompletionRemainedPending =
+                        !contentsOverflowCompletionRan
                     ImmutableSnapshotProbeState.result =
                         pixels.map {
                             $0.map(String.init).joined(separator: ",")
@@ -5967,6 +6050,8 @@ func installHarness() {
                         + ",overflowPending=\(overflowCompletionRemainedPending)"
                         + ",maskOverflowTyped=\(maskOverflowWasTyped)"
                         + ",maskOverflowPending=\(maskOverflowCompletionRemainedPending)"
+                        + ",contentsOverflowTyped=\(contentsOverflowWasTyped)"
+                        + ",contentsOverflowPending=\(contentsOverflowCompletionRemainedPending)"
                 } catch {
                     ImmutableSnapshotProbeState.result =
                         "error: snapshot readback failed: \(error)"

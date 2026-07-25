@@ -20,14 +20,14 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 /// `CALayer`. This prevents mutations made after capture from changing the
 /// frame that is already being encoded.
 // FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot contains every value
-// consumed by CAMetalRenderer and by CAWebGPURenderer's static solid-tree path,
-// including nested rectangular and rounded clipping. Production WebGPU still
-// uses the explicitly typed live-tree branches
-// for resource-backed content, masks, specialized layers, animation evaluation,
-// and layout preparation. Phase 4 must not be considered complete until those
-// values and resources are owned here, the live-tree commit states are removed,
-// and every WebGPU frame encodes without reading mutable model layers after
-// capture.
+// consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
+// including nested rectangular and rounded clipping and ordinary CGImage
+// contents. Production WebGPU still uses explicitly typed live-tree branches
+// for non-image contents, delegate backing stores, masks, specialized layers,
+// animation evaluation, and layout preparation. Phase 4 must not be considered
+// complete until those values and resources are owned here, the live-tree commit
+// states are removed, and every WebGPU frame encodes without reading mutable
+// model layers after capture.
 internal struct CARenderSnapshot: Sendable {
     internal struct PresentationValues: Sendable, Equatable {
         internal let bounds: CGRect
@@ -52,6 +52,7 @@ internal struct CARenderSnapshot: Sendable {
         internal let toneMapMode: CALayer.ToneMapMode
         internal let preferredDynamicRange: CALayer.DynamicRange
         internal let contentsHeadroom: Float
+        internal let imageContents: CAImageContentsSnapshot?
     }
 
     internal struct Node: Sendable, Equatable {
@@ -157,7 +158,8 @@ internal struct CARenderSnapshot: Sendable {
         if ObjectIdentifier(type(of: modelLayer)) != ObjectIdentifier(CALayer.self) {
             return .specializedLayer
         }
-        if presentationLayer.contents != nil {
+        if presentationLayer.contents != nil,
+           !(presentationLayer.contents is CGImage) {
             return .contents
         }
         if modelLayer.delegate != nil {
@@ -272,6 +274,12 @@ internal struct CARenderSnapshot: Sendable {
               anchorOffset.z.isFinite else {
             throw .nonFiniteLayerGeometry
         }
+        let imageContents: CAImageContentsSnapshot?
+        do {
+            imageContents = try captureImageContents(from: layer)
+        } catch {
+            throw .invalidLayerContents(error)
+        }
         return PresentationValues(
             bounds: layer.bounds,
             boundsSize: SIMD2<Float>(boundsWidth, boundsHeight),
@@ -302,7 +310,47 @@ internal struct CARenderSnapshot: Sendable {
             ),
             toneMapMode: layer.toneMapMode,
             preferredDynamicRange: layer.preferredDynamicRange,
-            contentsHeadroom: contentsHeadroom
+            contentsHeadroom: contentsHeadroom,
+            imageContents: imageContents
+        )
+    }
+
+    private static func captureImageContents(
+        from layer: CALayer
+    ) throws(CAImageContentsSnapshotError) -> CAImageContentsSnapshot? {
+        guard let image = layer.contents as? CGImage else { return nil }
+        guard let sampling = CAContentsSampling(
+            magnificationFilter: layer.magnificationFilter,
+            minificationFilter: layer.minificationFilter
+        ) else {
+            throw .invalidSamplingFilters(
+                magnification: layer.magnificationFilter,
+                minification: layer.minificationFilter
+            )
+        }
+        guard layer.minificationFilterBias.isFinite else {
+            throw .invalidMinificationFilterBias(
+                layer.minificationFilterBias
+            )
+        }
+        let storage: CGImageTextureStorage
+        do {
+            storage = try CGImageTextureStorageConverter.convert(image)
+        } catch {
+            throw .imageConversion(error)
+        }
+        return CAImageContentsSnapshot(
+            storage: storage,
+            contentsRect: layer.contentsRect,
+            contentsCenter: layer.contentsCenter,
+            contentsScale: layer.contentsScale,
+            gravity: layer.contentsGravity,
+            sampling: sampling,
+            minificationFilterBias: min(
+                max(layer.minificationFilterBias, -16),
+                15.99
+            ),
+            isOpaque: layer.isOpaque
         )
     }
 

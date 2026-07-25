@@ -86,36 +86,7 @@ public enum CADynamicRangeRenderFailure: Error, Equatable, Sendable {
 /// `ObjectIdentifier` would let those namespaces alias whenever an object
 /// address is reused, returning a stale `GPUTextureView`. Tagging the kind
 /// keeps the namespaces disjoint.
-internal enum EmitterTextureSampling: CaseIterable, Hashable {
-    case nearestNearest
-    case nearestLinear
-    case nearestTrilinear
-    case linearNearest
-    case linearLinear
-    case linearTrilinear
-
-    init?(magnificationFilter: String, minificationFilter: String) {
-        let magnificationIsNearest: Bool
-        switch magnificationFilter {
-        case CALayerContentsFilter.nearest.rawValue:
-            magnificationIsNearest = true
-        case CALayerContentsFilter.linear.rawValue, CALayerContentsFilter.trilinear.rawValue:
-            magnificationIsNearest = false
-        default:
-            return nil
-        }
-
-        switch (magnificationIsNearest, minificationFilter) {
-        case (true, CALayerContentsFilter.nearest.rawValue): self = .nearestNearest
-        case (true, CALayerContentsFilter.linear.rawValue): self = .nearestLinear
-        case (true, CALayerContentsFilter.trilinear.rawValue): self = .nearestTrilinear
-        case (false, CALayerContentsFilter.nearest.rawValue): self = .linearNearest
-        case (false, CALayerContentsFilter.linear.rawValue): self = .linearLinear
-        case (false, CALayerContentsFilter.trilinear.rawValue): self = .linearTrilinear
-        default: return nil
-        }
-    }
-
+private extension CAContentsSampling {
     var magnificationFilter: GPUFilterMode {
         switch self {
         case .nearestNearest, .nearestLinear, .nearestTrilinear: return .nearest
@@ -130,15 +101,9 @@ internal enum EmitterTextureSampling: CaseIterable, Hashable {
         }
     }
 
-    var usesMipmaps: Bool {
-        switch self {
-        case .nearestTrilinear, .linearTrilinear: return true
-        default: return false
-        }
-    }
 }
 
-private struct EmitterTextureSamplerSet {
+private struct ContentsTextureSamplerSet {
     private var nearestNearest: GPUSampler?
     private var nearestLinear: GPUSampler?
     private var nearestTrilinear: GPUSampler?
@@ -146,7 +111,7 @@ private struct EmitterTextureSamplerSet {
     private var linearLinear: GPUSampler?
     private var linearTrilinear: GPUSampler?
 
-    subscript(sampling: EmitterTextureSampling) -> GPUSampler? {
+    subscript(sampling: CAContentsSampling) -> GPUSampler? {
         get {
             switch sampling {
             case .nearestNearest: nearestNearest
@@ -171,8 +136,9 @@ private struct EmitterTextureSamplerSet {
 }
 
 internal enum TexturedCacheKey: Hashable {
-    case image(ObjectIdentifier)
-    case emitterImage(ObjectIdentifier, EmitterTextureSampling)
+    case image(ObjectIdentifier, CAContentsSampling)
+    case emitterImage(ObjectIdentifier, CAContentsSampling)
+    case committedImage(ObjectIdentifier, CAContentsSampling)
     case rasterizedLayer(LayerRenderKey, RasterizationCachePurpose)
     case transitionSource(ObjectIdentifier)
     case transitionTarget(ObjectIdentifier)
@@ -1107,6 +1073,20 @@ private final class EmitterLayerState {
     /// Current layer index during rendering (used for uniform buffer indexing).
     private var currentLayerIndex: Int = 0
 
+    /// Per-frame uniform allocation limit selected at the render boundary.
+    private var activeLayerAllocationLimit: Int =
+        CAWebGPURenderer.maxLayers
+
+    /// One-shot diagnostic limit for proving committed-snapshot failures
+    /// without constructing a thousand-layer fixture in a browser.
+    private var nextCommittedSnapshotAllocationLimit: Int?
+
+    @_spi(RendererDiagnostics)
+    public func setNextCommittedSnapshotAllocationLimit(_ limit: Int) {
+        precondition((0...Self.maxLayers).contains(limit))
+        nextCommittedSnapshotAllocationLimit = limit
+    }
+
     /// Current vertex buffer offset during rendering (dynamic allocation).
     private var currentVertexOffset: UInt64 = 0
 
@@ -1152,7 +1132,7 @@ private final class EmitterLayerState {
               let requiredSize = UInt64(exactly: byteCount.partialValue),
               currentVertexOffset <= Self.maxVertexBufferSize,
               requiredSize <= Self.maxVertexBufferSize - currentVertexOffset,
-              currentLayerIndex < Self.maxLayers else {
+              currentLayerIndex < activeLayerAllocationLimit else {
             return nil
         }
         return requiredSize
@@ -1584,7 +1564,7 @@ private final class EmitterLayerState {
     private var textureSampler: GPUSampler?
 
     /// Samplers covering every supported CAEmitterCell magnification/minification pair.
-    private var emitterTextureSamplers = EmitterTextureSamplerSet()
+    private var contentsTextureSamplers = ContentsTextureSamplerSet()
 
     /// Source-additive textured particle pipeline without stencil testing.
     private var emitterTexturedAdditivePipeline: GPURenderPipeline?
@@ -2203,13 +2183,15 @@ private final class EmitterLayerState {
             let imageID = ObjectIdentifier(cgImage)
             let viewKeys = self.texturedTextureViewCache.texturedKeys.filter {
                 switch $0 {
-                case .image(let id), .emitterImage(let id, _): return id == imageID
+                case .image(let id, _), .emitterImage(let id, _):
+                    return id == imageID
                 default: return false
                 }
             }
             let bindGroupKeys = self.perFrameTexturedBindGroupCache.texturedKeys.filter {
                 switch $0 {
-                case .image(let id), .emitterImage(let id, _): return id == imageID
+                case .image(let id, _), .emitterImage(let id, _):
+                    return id == imageID
                 default: return false
                 }
             }
@@ -2218,6 +2200,28 @@ private final class EmitterLayerState {
             }
             for key in bindGroupKeys {
                 self.perFrameTexturedBindGroupCache.removeValue(forTexturedKey: key)
+            }
+        }
+        manager.onImmutableStorageEvict = { [weak self] _ in
+            guard let self else { return }
+            let viewKeys = self.texturedTextureViewCache.texturedKeys.filter {
+                if case .committedImage = $0 { return true }
+                return false
+            }
+            let bindGroupKeys =
+                self.perFrameTexturedBindGroupCache.texturedKeys.filter {
+                    if case .committedImage = $0 { return true }
+                    return false
+                }
+            for key in viewKeys {
+                self.texturedTextureViewCache.removeValue(
+                    forTexturedKey: key
+                )
+            }
+            for key in bindGroupKeys {
+                self.perFrameTexturedBindGroupCache.removeValue(
+                    forTexturedKey: key
+                )
             }
         }
         textureManager = manager
@@ -2530,8 +2534,8 @@ private final class EmitterLayerState {
             lodMinClamp: 0,
             lodMaxClamp: 0
         ))
-        var samplers = EmitterTextureSamplerSet()
-        for sampling in EmitterTextureSampling.allCases {
+        var samplers = ContentsTextureSamplerSet()
+        for sampling in CAContentsSampling.allCases {
             let sampler = device.createSampler(descriptor: GPUSamplerDescriptor(
                 addressModeU: .clampToEdge,
                 addressModeV: .clampToEdge,
@@ -2544,7 +2548,7 @@ private final class EmitterLayerState {
             ))
             samplers[sampling] = sampler
         }
-        emitterTextureSamplers = samplers
+        contentsTextureSamplers = samplers
 
         // Create bind group layout with uniform, sampler, and texture
         texturedBindGroupLayout = device.createBindGroupLayout(descriptor: GPUBindGroupLayoutDescriptor(
@@ -3132,7 +3136,16 @@ private final class EmitterLayerState {
         for layer: CALayer,
         forceBlending: Bool = false
     ) -> GPURenderPipeline? {
-        let blendOff = !forceBlending && !RasterizationDecisions.blendEnabled(for: layer)
+        selectTexturedPipeline(
+            blendEnabled: forceBlending
+                || RasterizationDecisions.blendEnabled(for: layer)
+        )
+    }
+
+    private func selectTexturedPipeline(
+        blendEnabled: Bool
+    ) -> GPURenderPipeline? {
+        let blendOff = !blendEnabled
         if transformDepthNesting > 0 {
             if maskNestingDepth > 0 {
                 if blendOff, let opaque = texturedDepthStencilOpaquePipeline { return opaque }
@@ -4304,6 +4317,8 @@ private final class EmitterLayerState {
                 recordSolidRenderFailure(failure)
             case .mask(let failure):
                 recordMaskRenderFailure(failure)
+            case .contents(let failure):
+                recordContentsRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4332,6 +4347,9 @@ private final class EmitterLayerState {
     }
 
     private func resetFrameStateForCommittedSnapshot() {
+        activeLayerAllocationLimit =
+            nextCommittedSnapshotAllocationLimit ?? Self.maxLayers
+        nextCommittedSnapshotAllocationLimit = nil
         currentLayerIndex = 0
         currentVertexOffset = 0
         droppedLayerCount = 0
@@ -4525,6 +4543,7 @@ private final class EmitterLayerState {
         CALayer.advanceFrameToken()
 
         // Reset per-frame state
+        activeLayerAllocationLimit = Self.maxLayers
         currentLayerIndex = 0
         currentVertexOffset = 0
         droppedLayerCount = 0
@@ -5479,7 +5498,7 @@ private final class EmitterLayerState {
         currentStencilValue = 0
 
         // Particle resources
-        emitterTextureSamplers = EmitterTextureSamplerSet()
+        contentsTextureSamplers = ContentsTextureSamplerSet()
         emitterTexturedAdditivePipeline = nil
         emitterTexturedAdditiveStencilPipeline = nil
         emitterTexturedAdditiveDepthPipeline = nil
@@ -5626,6 +5645,19 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
+        if let imageContents = values.imageContents {
+            do {
+                try renderSnapshotContents(
+                    imageContents,
+                    values: values,
+                    device: device,
+                    renderPass: renderPass,
+                    modelMatrix: modelMatrix
+                )
+            } catch {
+                throw .contents(error)
+            }
+        }
 
         if !node.childIndices.isEmpty {
             let sublayerMatrix = values.sublayerMatrix(
@@ -5704,6 +5736,400 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
+    }
+
+    private func renderSnapshotContents(
+        _ contents: CAImageContentsSnapshot,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CAContentsRenderFailure) {
+        guard values.bounds.width > 0, values.bounds.height > 0 else {
+            return
+        }
+        guard let texturedBindGroupLayout,
+              let sampler = contentsTextureSamplers[contents.sampling],
+              let vertexBuffer,
+              let uniformBuffer,
+              let selectedPipeline = selectTexturedPipeline(
+                blendEnabled: !contents.isOpaque
+                    || currentEffectiveOpacity < 1
+              ) else {
+            throw .rendererResourcesUnavailable
+        }
+        guard let textureManager else {
+            throw .textureManagerUnavailable
+        }
+
+        let storage = contents.storage
+        let memorySizeBytes: UInt64
+        do {
+            memorySizeBytes = try mipmappedRGBAByteCount(
+                width: storage.width,
+                height: storage.height,
+                format: storage.format,
+                device: device
+            )
+        } catch {
+            throw .imageConversion(error)
+        }
+        var conversionError: CAImageContentsConversionError?
+        let gpuTexture = textureManager.getOrCreateTexture(
+            for: storage,
+            memorySizeBytes: memorySizeBytes,
+            factory: {
+                do {
+                    return try self.createGPUTexture(
+                        from: storage,
+                        device: device
+                    )
+                } catch let error as CAImageContentsConversionError {
+                    conversionError = error
+                    return nil
+                } catch {
+                    conversionError = .conversionFailed
+                    return nil
+                }
+            }
+        )
+        guard let gpuTexture else {
+            if let conversionError {
+                throw .imageConversion(conversionError)
+            }
+            throw .textureCreationFailed
+        }
+
+        let cacheKey = TexturedCacheKey.committedImage(
+            ObjectIdentifier(gpuTexture),
+            contents.sampling
+        )
+        if ContentsRenderConfiguration.usesNineSlice(
+            gravity: contents.gravity,
+            contentsCenter: contents.contentsCenter
+        ) {
+            try renderSnapshotNineSliceContents(
+                contents,
+                values: values,
+                gpuTexture: gpuTexture,
+                cacheKey: cacheKey,
+                sampler: sampler,
+                selectedPipeline: selectedPipeline,
+                texturedBindGroupLayout: texturedBindGroupLayout,
+                vertexBuffer: vertexBuffer,
+                uniformBuffer: uniformBuffer,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+        } else {
+            try renderSnapshotStandardContents(
+                contents,
+                values: values,
+                gpuTexture: gpuTexture,
+                cacheKey: cacheKey,
+                sampler: sampler,
+                selectedPipeline: selectedPipeline,
+                texturedBindGroupLayout: texturedBindGroupLayout,
+                vertexBuffer: vertexBuffer,
+                uniformBuffer: uniformBuffer,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+        }
+    }
+
+    private func renderSnapshotNineSliceContents(
+        _ contents: CAImageContentsSnapshot,
+        values: CARenderSnapshot.PresentationValues,
+        gpuTexture: GPUTexture,
+        cacheKey: TexturedCacheKey,
+        sampler: GPUSampler,
+        selectedPipeline: GPURenderPipeline,
+        texturedBindGroupLayout: GPUBindGroupLayout,
+        vertexBuffer: GPUBuffer,
+        uniformBuffer: GPUBuffer,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CAContentsRenderFailure) {
+        let configuration: ContentsRenderConfiguration
+        do {
+            configuration = try ContentsRenderConfiguration(
+                imageSize: CGSize(
+                    width: contents.storage.width,
+                    height: contents.storage.height
+                ),
+                boundsSize: values.bounds.size,
+                contentsRect: contents.contentsRect,
+                contentsCenter: contents.contentsCenter,
+                contentsScale: contents.contentsScale,
+                gravity: contents.gravity
+            )
+        } catch {
+            throw .nineSliceConfiguration(error)
+        }
+        let finalMatrix = modelMatrix * Matrix4x4(columns: (
+            SIMD4<Float>(Float(values.bounds.width), 0, 0, 0),
+            SIMD4<Float>(0, Float(values.bounds.height), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        guard matrixIsFinite(finalMatrix) else {
+            throw .invalidTransform
+        }
+
+        let totalVertexCount = configuration.patches.count * 6
+        guard totalVertexCount > 0 else { return }
+        guard let (baseVertexOffset, layerIndex) = allocateVertices(
+            count: totalVertexCount
+        ) else {
+            throw .nineSliceVertexCapacityExceeded
+        }
+
+        var uniforms = snapshotContentsUniforms(
+            contents,
+            values: values,
+            finalMatrix: finalMatrix
+        )
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        let texturedBindGroup = cachedTexturedBindGroup(
+            cacheKey: cacheKey,
+            gpuTexture: gpuTexture,
+            device: device,
+            layout: texturedBindGroupLayout,
+            sampler: sampler,
+            uniformBuffer: uniformBuffer,
+            uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
+        )
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: texturedBindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
+
+        let boundsWidth = values.bounds.width
+        let boundsHeight = values.bounds.height
+        let white = currentReplicatorColor
+        for (patchIndex, patch) in configuration.patches.enumerated() {
+            let destination = patch.destinationRect
+            let source = patch.sourceUnitRect
+            let pMinX = Float(destination.minX / boundsWidth)
+            let pMaxX = Float(destination.maxX / boundsWidth)
+            let pMinY = Float(destination.minY / boundsHeight)
+            let pMaxY = Float(destination.maxY / boundsHeight)
+            let uMinX = Float(source.minX)
+            let uMaxX = Float(source.maxX)
+            let uMinY = Float(source.minY)
+            let uMaxY = Float(source.maxY)
+            var vertices: [CARendererVertex] = [
+                CARendererVertex(
+                    position: SIMD2(pMinX, pMinY),
+                    texCoord: SIMD2(uMinX, uMaxY),
+                    color: white
+                ),
+                CARendererVertex(
+                    position: SIMD2(pMaxX, pMinY),
+                    texCoord: SIMD2(uMaxX, uMaxY),
+                    color: white
+                ),
+                CARendererVertex(
+                    position: SIMD2(pMinX, pMaxY),
+                    texCoord: SIMD2(uMinX, uMinY),
+                    color: white
+                ),
+                CARendererVertex(
+                    position: SIMD2(pMaxX, pMinY),
+                    texCoord: SIMD2(uMaxX, uMaxY),
+                    color: white
+                ),
+                CARendererVertex(
+                    position: SIMD2(pMaxX, pMaxY),
+                    texCoord: SIMD2(uMaxX, uMinY),
+                    color: white
+                ),
+                CARendererVertex(
+                    position: SIMD2(pMinX, pMaxY),
+                    texCoord: SIMD2(uMinX, uMinY),
+                    color: white
+                ),
+            ]
+            let vertexOffset = baseVertexOffset + UInt64(
+                patchIndex
+                    * 6
+                    * MemoryLayout<CARendererVertex>.stride
+            )
+            device.queue.writeBuffer(
+                vertexBuffer,
+                bufferOffset: vertexOffset,
+                data: createFloat32Array(from: &vertices)
+            )
+            renderPass.setVertexBuffer(
+                0,
+                buffer: vertexBuffer,
+                offset: vertexOffset
+            )
+            renderPass.draw(vertexCount: 6)
+        }
+        if let pipeline {
+            renderPass.setPipeline(pipeline)
+        }
+    }
+
+    private func renderSnapshotStandardContents(
+        _ contents: CAImageContentsSnapshot,
+        values: CARenderSnapshot.PresentationValues,
+        gpuTexture: GPUTexture,
+        cacheKey: TexturedCacheKey,
+        sampler: GPUSampler,
+        selectedPipeline: GPURenderPipeline,
+        texturedBindGroupLayout: GPUBindGroupLayout,
+        vertexBuffer: GPUBuffer,
+        uniformBuffer: GPUBuffer,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CAContentsRenderFailure) {
+        let destinationRect: CGRect
+        do {
+            destinationRect = try ContentsRenderConfiguration.destinationRect(
+                imageSize: CGSize(
+                    width: contents.storage.width,
+                    height: contents.storage.height
+                ),
+                boundsSize: values.bounds.size,
+                contentsRect: contents.contentsRect,
+                contentsScale: contents.contentsScale,
+                gravity: contents.gravity
+            )
+        } catch {
+            throw .standardConfiguration(error)
+        }
+        let source = contents.contentsRect
+        let boundsWidth = values.bounds.width
+        let boundsHeight = values.bounds.height
+        let minX = Float(destinationRect.minX / boundsWidth)
+        let minY = Float(destinationRect.minY / boundsHeight)
+        let maxX = Float(destinationRect.maxX / boundsWidth)
+        let maxY = Float(destinationRect.maxY / boundsHeight)
+        let minU = Float(source.minX)
+        let minV = Float(source.minY)
+        let maxU = Float(source.maxX)
+        let maxV = Float(source.maxY)
+        let white = currentReplicatorColor
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(
+                position: SIMD2(minX, minY),
+                texCoord: SIMD2(minU, maxV),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(maxX, minY),
+                texCoord: SIMD2(maxU, maxV),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(minX, maxY),
+                texCoord: SIMD2(minU, minV),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(maxX, minY),
+                texCoord: SIMD2(maxU, maxV),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(maxX, maxY),
+                texCoord: SIMD2(maxU, minV),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(minX, maxY),
+                texCoord: SIMD2(minU, minV),
+                color: white
+            ),
+        ]
+        guard let (vertexOffset, layerIndex) = allocateVertices(
+            count: vertices.count
+        ) else {
+            throw .standardVertexCapacityExceeded
+        }
+
+        let finalMatrix = modelMatrix * Matrix4x4(columns: (
+            SIMD4<Float>(Float(boundsWidth), 0, 0, 0),
+            SIMD4<Float>(0, Float(boundsHeight), 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        guard matrixIsFinite(finalMatrix) else {
+            throw .invalidTransform
+        }
+        var uniforms = snapshotContentsUniforms(
+            contents,
+            values: values,
+            finalMatrix: finalMatrix
+        )
+        let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+        let texturedBindGroup = cachedTexturedBindGroup(
+            cacheKey: cacheKey,
+            gpuTexture: gpuTexture,
+            device: device,
+            layout: texturedBindGroupLayout,
+            sampler: sampler,
+            uniformBuffer: uniformBuffer,
+            uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
+        )
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: texturedBindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: vertexOffset
+        )
+        renderPass.draw(vertexCount: 6)
+        if let pipeline {
+            renderPass.setPipeline(pipeline)
+        }
+    }
+
+    private func snapshotContentsUniforms(
+        _ contents: CAImageContentsSnapshot,
+        values: CARenderSnapshot.PresentationValues,
+        finalMatrix: Matrix4x4
+    ) -> TexturedUniforms {
+        TexturedUniforms(
+            mvpMatrix: finalMatrix,
+            opacity: currentEffectiveOpacity,
+            cornerRadius: values.masksToBounds ? values.cornerRadius : 0,
+            layerSize: values.boundsSize,
+            cornerRadii: values.masksToBounds ? values.cornerRadii : .zero,
+            samplingBias: contents.minificationFilterBias,
+            edgeAntialiasingMask: values.edgeAntialiasingMask,
+            cornerCurveExponent: values.masksToBounds
+                ? values.cornerCurveExponent
+                : Float(CornerCurveRenderConfiguration.circularExponent)
+        )
     }
 
     private func renderSnapshotSolid(
@@ -7973,6 +8399,8 @@ private final class EmitterLayerState {
         layer: CALayer,
         contents: CGImage,
         gpuTexture: GPUTexture,
+        sampling: CAContentsSampling,
+        sampler: GPUSampler,
         imageWidth: Int,
         imageHeight: Int,
         device: GPUDevice,
@@ -7980,7 +8408,6 @@ private final class EmitterLayerState {
         modelMatrix: Matrix4x4
     ) {
         guard let texturedBindGroupLayout = texturedBindGroupLayout,
-              let textureSampler = textureSampler,
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let selectedPipeline = selectTexturedPipeline(for: layer) else {
@@ -8028,6 +8455,10 @@ private final class EmitterLayerState {
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
             cornerRadii: effectiveCornerRadii,
+            samplingBias: min(
+                max(layer.minificationFilterBias, -16),
+                15.99
+            ),
             edgeAntialiasingMask: layer.edgeAntialiasingMaskValue,
             cornerCurveExponent: effectiveCornerCurveExponent
         )
@@ -8050,11 +8481,11 @@ private final class EmitterLayerState {
             data: createFloat32Array(from: &uploadedUniforms)
         )
         let texturedBindGroup = cachedTexturedBindGroup(
-            cacheKey: .image(ObjectIdentifier(contents)),
+            cacheKey: .image(ObjectIdentifier(contents), sampling),
             gpuTexture: gpuTexture,
             device: device,
             layout: texturedBindGroupLayout,
-            sampler: textureSampler,
+            sampler: sampler,
             uniformBuffer: uniformBuffer,
             uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
         )
@@ -8121,8 +8552,24 @@ private final class EmitterLayerState {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
+        guard let sampling = CAContentsSampling(
+            magnificationFilter: layer.magnificationFilter,
+            minificationFilter: layer.minificationFilter
+        ) else {
+            recordContentsRenderFailure(.invalidSamplingFilters(
+                magnification: layer.magnificationFilter,
+                minification: layer.minificationFilter
+            ))
+            return
+        }
+        guard layer.minificationFilterBias.isFinite else {
+            recordContentsRenderFailure(.invalidMinificationFilterBias(
+                layer.minificationFilterBias
+            ))
+            return
+        }
         guard let texturedBindGroupLayout = texturedBindGroupLayout,
-              let textureSampler = textureSampler,
+              let sampler = contentsTextureSamplers[sampling],
               let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer,
               let selectedPipeline = selectTexturedPipeline(for: layer) else {
@@ -8190,6 +8637,8 @@ private final class EmitterLayerState {
                 layer: layer,
                 contents: contents,
                 gpuTexture: gpuTexture,
+                sampling: sampling,
+                sampler: sampler,
                 imageWidth: imageWidth,
                 imageHeight: imageHeight,
                 device: device,
@@ -8297,6 +8746,10 @@ private final class EmitterLayerState {
             cornerRadius: effectiveCornerRadius,
             layerSize: SIMD2<Float>(Float(boundsWidth), Float(boundsHeight)),
             cornerRadii: effectiveCornerRadii,
+            samplingBias: min(
+                max(layer.minificationFilterBias, -16),
+                15.99
+            ),
             edgeAntialiasingMask: layer.edgeAntialiasingMaskValue,
             cornerCurveExponent: effectiveCornerCurveExponent
         )
@@ -8320,11 +8773,11 @@ private final class EmitterLayerState {
         // CGImage identity — the texture manager owns `contents` for the
         // cached lifetime so the key stays unique).
         let texturedBindGroup = cachedTexturedBindGroup(
-            cacheKey: .image(ObjectIdentifier(contents)),
+            cacheKey: .image(ObjectIdentifier(contents), sampling),
             gpuTexture: gpuTexture,
             device: device,
             layout: texturedBindGroupLayout,
-            sampler: textureSampler,
+            sampler: sampler,
             uniformBuffer: uniformBuffer,
             uniformStride: UInt64(MemoryLayout<TexturedUniforms>.stride)
         )
@@ -8415,8 +8868,23 @@ private final class EmitterLayerState {
             throw .invalidDimensions(width: width, height: height)
         }
 
-        let baseLevel = try CGImageTextureStorageConverter.convert(cgImage, to: format)
+        let baseLevel = try CGImageTextureStorageConverter.convert(
+            cgImage,
+            to: format
+        )
+        return try createGPUTexture(from: baseLevel, device: device)
+    }
 
+    /// Creates a complete mipmapped GPU texture from commit-owned pixels.
+    private func createGPUTexture(
+        from baseLevel: CGImageTextureStorage,
+        device: GPUDevice
+    ) throws(CAImageContentsConversionError) -> GPUTexture {
+        let width = baseLevel.width
+        let height = baseLevel.height
+        guard width > 0, height > 0 else {
+            throw .invalidDimensions(width: width, height: height)
+        }
         var mipLevelCount: UInt32 = 1
         var mipWidth = width
         var mipHeight = height
@@ -8426,10 +8894,11 @@ private final class EmitterLayerState {
             mipLevelCount += 1
         }
 
-        // Every cached image receives a complete mip chain. Linear samplers clamp
-        // to level zero, while CAEmitterCell.trilinear selects between these levels.
+        // Every cached image receives a complete mip chain. Non-trilinear
+        // samplers clamp to level zero; trilinear layer and emitter contents
+        // select between these levels.
         let gpuTextureFormat: GPUTextureFormat
-        switch format {
+        switch baseLevel.format {
         case .rgba8Unorm: gpuTextureFormat = .rgba8unorm
         case .rgba16Float: gpuTextureFormat = .rgba16float
         }
@@ -13984,7 +14453,7 @@ private final class EmitterLayerState {
                   cell.contentsRect.width > 0,
                   cell.contentsRect.height > 0,
                   cell.minificationFilterBias.isFinite,
-                  EmitterTextureSampling(
+                  CAContentsSampling(
                     magnificationFilter: cell.magnificationFilter,
                     minificationFilter: cell.minificationFilter
                   ) != nil else {
@@ -14125,13 +14594,13 @@ private final class EmitterLayerState {
             recordContentsConversionFailure(error)
             throw .imageConversionFailed(error)
         }
-        guard let sampling = EmitterTextureSampling(
+        guard let sampling = CAContentsSampling(
             magnificationFilter: particle.magnificationFilter,
             minificationFilter: particle.minificationFilter
         ) else {
             throw .invalidCellContents
         }
-        guard let sampler = emitterTextureSamplers[sampling],
+        guard let sampler = contentsTextureSamplers[sampling],
               let texturedBindGroupLayout,
               let selectedPipeline = selectedEmitterPipeline(additive: additive) else {
             throw .rendererResourcesUnavailable

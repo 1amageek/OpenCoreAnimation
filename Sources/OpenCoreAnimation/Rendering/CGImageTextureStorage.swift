@@ -1,7 +1,7 @@
 import Foundation
 
 /// Tightly packed, straight-alpha pixels ready for GPU texture upload.
-internal struct CGImageTextureStorage {
+internal struct CGImageTextureStorage: Equatable, Hashable, Sendable {
     internal let format: CGImageTexturePixelFormat
     internal let width: Int
     internal let height: Int

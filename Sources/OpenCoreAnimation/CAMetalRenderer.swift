@@ -152,6 +152,12 @@ public final class CAMetalRenderer: CARendererDelegate {
     /// Encodes one immutable frame without consulting the mutable layer tree.
     @discardableResult
     internal func render(snapshot: CARenderSnapshot) -> Bool {
+        if let unsupportedFeature = unsupportedFeature(in: snapshot) {
+            lastRenderError = .unsupportedCommittedSnapshotFeature(
+                unsupportedFeature
+            )
+            return false
+        }
         guard let commandQueue, let pipelineState, let targetTexture else {
             lastRenderError = .renderingFailed("Metal renderer configuration is incomplete")
             return false
@@ -337,6 +343,11 @@ public final class CAMetalRenderer: CARendererDelegate {
     }
 
     private func prepareForRendering(_ snapshot: CARenderSnapshot) throws {
+        if let unsupportedFeature = unsupportedFeature(in: snapshot) {
+            throw CARendererError.unsupportedCommittedSnapshotFeature(
+                unsupportedFeature
+            )
+        }
         if device == nil {
             guard let defaultDevice = MTLCreateSystemDefaultDevice() else {
                 throw CARendererError.deviceNotAvailable
@@ -366,6 +377,17 @@ public final class CAMetalRenderer: CARendererDelegate {
         if targetTexture?.width != width || targetTexture?.height != height {
             try resizeTarget(width: width, height: height)
         }
+    }
+
+    private func unsupportedFeature(
+        in snapshot: CARenderSnapshot
+    ) -> CARenderSnapshotFeature? {
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.imageContents != nil
+        }) {
+            return .imageContents
+        }
+        return nil
     }
 
     private func resizeTarget(width: Int, height: Int) throws {

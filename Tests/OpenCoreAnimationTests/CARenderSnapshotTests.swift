@@ -127,6 +127,224 @@ struct CARenderSnapshotTests {
         #expect(groupedSnapshot.liveTreeRequirement == .opacityGroup)
     }
 
+    @Test("CGImage contents become value-owned commit resources")
+    func imageContentsAreCapturedByValue() throws {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 8, height: 4)
+        layer.contentsRect = CGRect(x: 0.25, y: 0, width: 0.5, height: 1)
+        layer.contentsCenter = CGRect(
+            x: 0.2,
+            y: 0.3,
+            width: 0.4,
+            height: 0.5
+        )
+        layer.contentsScale = 2
+        layer.contentsGravity = .resizeAspect
+        layer.magnificationFilter = .nearest
+        layer.minificationFilter = .trilinear
+        layer.minificationFilterBias = 20
+        layer.isOpaque = true
+
+        weak var sourceImage: CGImage?
+        let snapshot: CARenderSnapshot
+        do {
+            let image = try makeImage(
+                width: 2,
+                height: 1,
+                pixels: [255, 0, 0, 255, 0, 255, 0, 255]
+            )
+            sourceImage = image
+            layer.contents = image
+            snapshot = try CARenderSnapshot.capture(
+                layer,
+                frameToken: 49
+            )
+            layer.contents = nil
+        }
+        layer.removeAllAnimations()
+        CATransaction.flush()
+
+        #expect(sourceImage == nil)
+        #expect(snapshot.liveTreeRequirement == nil)
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+        #expect(contents.storage.format == .rgba8Unorm)
+        #expect(contents.storage.width == 2)
+        #expect(contents.storage.height == 1)
+        #expect(contents.storage.data == Data([
+            255, 0, 0, 255,
+            0, 255, 0, 255,
+        ]))
+        #expect(contents.contentsRect == layer.contentsRect)
+        #expect(contents.contentsCenter == layer.contentsCenter)
+        #expect(contents.contentsScale == 2)
+        #expect(contents.gravity == .resizeAspect)
+        #expect(contents.sampling == .nearestTrilinear)
+        #expect(contents.minificationFilterBias == 15.99)
+        #expect(contents.isOpaque)
+        requireSendable(snapshot)
+    }
+
+    @Test("Captured image state does not follow later layer mutations")
+    func capturedImageStateIsImmutable() throws {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        layer.contents = try makeImage(
+            width: 2,
+            height: 1,
+            pixels: [255, 0, 0, 255, 0, 255, 0, 255]
+        )
+        layer.magnificationFilter = .nearest
+        layer.minificationFilter = .nearest
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 50
+        )
+        layer.contents = try makeImage(
+            width: 2,
+            height: 1,
+            pixels: [0, 0, 255, 255, 255, 255, 255, 255]
+        )
+        layer.contentsRect = CGRect(x: 0.5, y: 0, width: 0.5, height: 1)
+        layer.magnificationFilter = .linear
+
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+        #expect(contents.storage.data == Data([
+            255, 0, 0, 255,
+            0, 255, 0, 255,
+        ]))
+        #expect(contents.contentsRect == CGRect(
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1
+        ))
+        #expect(contents.sampling == .nearestNearest)
+    }
+
+    @Test("Unknown image sampling filters fail capture explicitly")
+    func invalidImageSamplingFailsCapture() throws {
+        let layer = CALayer()
+        layer.contents = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 255, 255, 255]
+        )
+        layer.magnificationFilter = CALayerContentsFilter(
+            rawValue: "future"
+        )
+
+        #expect(throws: CARendererError.invalidLayerContents(
+            .invalidSamplingFilters(
+                magnification: CALayerContentsFilter(rawValue: "future"),
+                minification: .linear
+            )
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 51)
+        }
+    }
+
+    @Test(
+        "Image sampling captures every supported filter combination",
+        arguments: [
+            (
+                CALayerContentsFilter.nearest,
+                CALayerContentsFilter.nearest,
+                CAContentsSampling.nearestNearest
+            ),
+            (
+                CALayerContentsFilter.nearest,
+                CALayerContentsFilter.linear,
+                CAContentsSampling.nearestLinear
+            ),
+            (
+                CALayerContentsFilter.nearest,
+                CALayerContentsFilter.trilinear,
+                CAContentsSampling.nearestTrilinear
+            ),
+            (
+                CALayerContentsFilter.linear,
+                CALayerContentsFilter.nearest,
+                CAContentsSampling.linearNearest
+            ),
+            (
+                CALayerContentsFilter.linear,
+                CALayerContentsFilter.linear,
+                CAContentsSampling.linearLinear
+            ),
+            (
+                CALayerContentsFilter.trilinear,
+                CALayerContentsFilter.trilinear,
+                CAContentsSampling.linearTrilinear
+            ),
+        ]
+    )
+    func imageSamplingCapturesSupportedFilters(
+        magnification: CALayerContentsFilter,
+        minification: CALayerContentsFilter,
+        expected: CAContentsSampling
+    ) throws {
+        let layer = CALayer()
+        layer.contents = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 255, 255, 255]
+        )
+        layer.magnificationFilter = magnification
+        layer.minificationFilter = minification
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 53
+        )
+        let contents = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+
+        #expect(contents.sampling == expected)
+        #expect(contents.sampling.usesMipmaps == (minification == .trilinear))
+    }
+
+    @Test("Non-finite image mip bias fails capture explicitly")
+    func nonFiniteImageMipBiasFailsCapture() throws {
+        let layer = CALayer()
+        layer.contents = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 255, 255, 255]
+        )
+        layer.minificationFilterBias = .infinity
+
+        #expect(throws: CARendererError.invalidLayerContents(
+            .invalidMinificationFilterBias(.infinity)
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 54)
+        }
+    }
+
+    @Test("Non-image contents remain an explicit live-tree requirement")
+    func nonImageContentsRemainExplicit() throws {
+        let layer = CALayer()
+        layer.contents = SnapshotContentsToken()
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 55
+        )
+        #expect(snapshot.liveTreeRequirement == .contents)
+        #expect(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents == nil
+        )
+    }
+
     @Test("Animated commits request explicit live evaluation until evaluators are immutable")
     func animatedCommitPublishesExplicitEvaluationState() {
         CATransaction.flush()
@@ -304,16 +522,71 @@ struct CARenderSnapshotTests {
     private func requireSendable<T: Sendable>(_ value: T) {
         _ = value
     }
+
+    private func makeImage(
+        width: Int,
+        height: Int,
+        pixels: [UInt8]
+    ) throws -> CGImage {
+        let bytesPerRow = width * 4
+        #expect(pixels.count == bytesPerRow * height)
+        return try #require(CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: .deviceRGB,
+            bitmapInfo: CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.last.rawValue
+            ),
+            provider: CGDataProvider(data: Data(pixels)),
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ))
+    }
 }
 
 private final class SnapshotLayoutManager: CALayoutManager {
     func layoutSublayers(of layer: CALayer) {}
 }
 
+private final class SnapshotContentsToken {}
+
 #if canImport(Metal)
 import Metal
 
 extension CARenderSnapshotTests {
+    @Test("Metal reports committed image contents instead of dropping them")
+    func metalRejectsUnsupportedImageSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(descriptor: descriptor))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.position = CGPoint(x: 1, y: 0.5)
+        root.contents = try makeImage(
+            width: 2,
+            height: 1,
+            pixels: [255, 0, 0, 255, 0, 255, 0, 255]
+        )
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.imageContents))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
     @Test("Metal submits committed pixels without clearing a later mutation")
     func metalSubmissionPreservesPostCommitMutation() throws {
         CATransaction.flush()

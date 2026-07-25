@@ -8,6 +8,11 @@ import Foundation
 import JavaScriptKit
 #endif
 
+/// A committed resource that a renderer backend cannot encode.
+public enum CARenderSnapshotFeature: String, Equatable, Sendable {
+    case imageContents
+}
+
 /// Errors that can occur during renderer operations.
 public enum CARendererError: Error, Equatable, Sendable {
     /// The GPU/graphics device is not available.
@@ -38,6 +43,10 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerBorderWidth
     /// A layer corner curve or radius cannot be represented by the renderer.
     case invalidLayerCornerGeometry
+    /// Layer image contents could not be captured into immutable renderer storage.
+    case invalidLayerContents(CAImageContentsSnapshotError)
+    /// The selected verification backend cannot encode a committed resource.
+    case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.
     case invalidReadbackCoordinate(x: CGFloat, y: CGFloat, width: Int, height: Int)
     /// A mapped WebGPU readback byte was absent or not representable as UInt8.

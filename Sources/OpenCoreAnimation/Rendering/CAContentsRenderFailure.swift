@@ -6,7 +6,13 @@ public enum CAContentsRenderFailure: Error, Equatable, Sendable {
     case nineSliceConfiguration(ContentsRenderConfigurationError)
     case standardConfiguration(ContentsRenderConfigurationError)
     case imageConversion(CAImageContentsConversionError)
+    case invalidSamplingFilters(
+        magnification: CALayerContentsFilter,
+        minification: CALayerContentsFilter
+    )
+    case invalidMinificationFilterBias(Float)
     case textureCreationFailed
+    case invalidTransform
     case nineSliceVertexCapacityExceeded
     case standardVertexCapacityExceeded
 }
