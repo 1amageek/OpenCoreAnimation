@@ -164,6 +164,35 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Backdrop filters become value-owned snapshot plans")
+    func backdropFiltersAreCapturedByValue() throws {
+        let layer = CALayer()
+        var backgroundFilter = CAFilter.brightness(0.25)
+        layer.backgroundFilters = [backgroundFilter]
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 46
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(values.compositingFilter == nil)
+        #expect(
+            values.backgroundFilters
+                == [.renderer(.brightness(amount: 0.25))]
+        )
+
+        backgroundFilter.parameters["inputBrightness"] = -0.75
+        layer.backgroundFilters = [backgroundFilter]
+        #expect(
+            values.backgroundFilters
+                == [.renderer(.brightness(amount: 0.25))]
+        )
+    }
+
     @Test("Invalid filter plans fail snapshot capture explicitly")
     func invalidFilterCaptureIsTyped() {
         let layer = CALayer()
@@ -180,6 +209,38 @@ struct CARenderSnapshotTests {
             )
         )) {
             try CARenderSnapshot.capture(layer, frameToken: 46)
+        }
+    }
+
+    @Test("Invalid backdrop plans retain their owning property")
+    func invalidBackdropCaptureIsTyped() {
+        let backgroundLayer = CALayer()
+        backgroundLayer.backgroundFilters = [
+            CAFilter(
+                type: .brightness,
+                parameters: ["inputBrightness": "invalid"]
+            ),
+        ]
+        #expect(throws: CARendererError.invalidLayerBackgroundFilter(
+            .invalidConfiguration(
+                .invalidParameterType("inputBrightness")
+            )
+        )) {
+            try CARenderSnapshot.capture(
+                backgroundLayer,
+                frameToken: 47
+            )
+        }
+
+        let compositionLayer = CALayer()
+        compositionLayer.compositingFilter = "invalid"
+        #expect(throws: CARendererError.invalidLayerCompositingFilter(
+            .unsupportedFilterValue("Swift.String")
+        )) {
+            try CARenderSnapshot.capture(
+                compositionLayer,
+                frameToken: 48
+            )
         }
     }
 
@@ -1042,6 +1103,34 @@ extension CARenderSnapshotTests {
 
         #expect(renderer.lastRenderError
             == .unsupportedCommittedSnapshotFeature(.filters))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed backdrop filters instead of dropping them")
+    func metalRejectsUnsupportedBackdropSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 2,
+            height: 1,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
+        root.backgroundFilters = [CAFilter.colorInvert()]
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(
+                .backdropComposition
+            ))
         #expect(renderer.lastCommandBuffer == nil)
     }
 

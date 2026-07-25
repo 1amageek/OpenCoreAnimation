@@ -6021,7 +6021,15 @@ func installHarness() {
                 let snapshotShadowPath = CGMutablePath()
                 let snapshotCAFilterLayer = CALayer()
                 let snapshotCoreImageFilterLayer = CALayer()
+                let snapshotCompositionBackdrop = CALayer()
+                let snapshotCompositionLayer = CALayer()
+                let snapshotBackgroundFilterBackdrop = CALayer()
+                let snapshotBackgroundFilterLayer = CALayer()
                 guard let snapshotCoreImageFilter = CIFilter(
+                    name: "CIColorInvert"
+                ), let snapshotCompositionFilter = CIFilter(
+                    name: "CIScreenCompositing"
+                ), let snapshotBackgroundFilter = CIFilter(
                     name: "CIColorInvert"
                 ) else {
                     ImmutableSnapshotProbeState.result =
@@ -6308,6 +6316,56 @@ func installHarness() {
                 snapshotRoot.addSublayer(
                     snapshotCoreImageFilterLayer
                 )
+                snapshotCompositionBackdrop.bounds =
+                    snapshotCAFilterLayer.bounds
+                snapshotCompositionBackdrop.position = CGPoint(
+                    x: 50,
+                    y: 230
+                )
+                snapshotCompositionBackdrop.backgroundColor = CGColor(
+                    red: 0,
+                    green: 1,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotRoot.addSublayer(snapshotCompositionBackdrop)
+                snapshotCompositionLayer.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotCompositionLayer.position =
+                    snapshotCompositionBackdrop.position
+                snapshotCompositionLayer.backgroundColor = CGColor(
+                    red: 1,
+                    green: 0,
+                    blue: 0,
+                    alpha: 1
+                )
+                snapshotCompositionLayer.compositingFilter =
+                    snapshotCompositionFilter
+                snapshotRoot.addSublayer(snapshotCompositionLayer)
+                snapshotBackgroundFilterBackdrop.bounds =
+                    snapshotCompositionBackdrop.bounds
+                snapshotBackgroundFilterBackdrop.position = CGPoint(
+                    x: 110,
+                    y: 230
+                )
+                snapshotBackgroundFilterBackdrop.backgroundColor = CGColor(
+                    red: 0,
+                    green: 0,
+                    blue: 1,
+                    alpha: 1
+                )
+                snapshotRoot.addSublayer(
+                    snapshotBackgroundFilterBackdrop
+                )
+                snapshotBackgroundFilterLayer.bounds =
+                    snapshotBackgroundFilterBackdrop.bounds
+                snapshotBackgroundFilterLayer.position =
+                    snapshotBackgroundFilterBackdrop.position
+                snapshotBackgroundFilterLayer.masksToBounds = true
+                snapshotBackgroundFilterLayer.backgroundFilters = [
+                    snapshotBackgroundFilter,
+                ]
+                snapshotRoot.addSublayer(snapshotBackgroundFilterLayer)
                 CATransaction.commit()
 
                 let snapshotCompletionPendingBeforeRender =
@@ -6377,6 +6435,10 @@ func installHarness() {
                 snapshotCAFilterLayer.filters = []
                 snapshotCoreImageFilter.isEnabled = false
                 snapshotCoreImageFilterLayer.filters = []
+                snapshotCompositionFilter.isEnabled = false
+                snapshotCompositionLayer.compositingFilter = nil
+                snapshotBackgroundFilter.isEnabled = false
+                snapshotBackgroundFilterLayer.backgroundFilters = []
                 renderer.render(layer: snapshotRoot)
                 let snapshotCompletionRanAfterRender =
                     snapshotCompletionRan
@@ -6403,6 +6465,8 @@ func installHarness() {
                         CGPoint(x: 280, y: 190),
                         CGPoint(x: 330, y: 130),
                         CGPoint(x: 270, y: 130),
+                        CGPoint(x: 50, y: 70),
+                        CGPoint(x: 110, y: 70),
                     ])
                     CATransaction.flush()
                     let overflowRoot = CALayer()
@@ -6683,6 +6747,69 @@ func installHarness() {
                     let snapshotFilterFailureCompletionRemainedPending =
                         !snapshotFilterFailureCompletionRan
 
+                    let snapshotCompositionFailureRoot = CALayer()
+                    let snapshotCompositionFailureLayer = CALayer()
+                    guard let invalidSnapshotCompositionFilter =
+                            CIFilter(name: "CIScreenCompositing") else {
+                        ImmutableSnapshotProbeState.result =
+                            "error: invalid composition creation failed"
+                        return
+                    }
+                    invalidSnapshotCompositionFilter.setValue(
+                        "invalid",
+                        forKey: "inputUnsupported"
+                    )
+                    var snapshotCompositionFailureCompletionRan =
+                        false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        snapshotCompositionFailureCompletionRan =
+                            true
+                    }
+                    snapshotCompositionFailureRoot.bounds =
+                        snapshotRoot.bounds
+                    snapshotCompositionFailureRoot.position =
+                        snapshotRoot.position
+                    snapshotCompositionFailureRoot.backgroundColor =
+                        snapshotRoot.backgroundColor
+                    snapshotCompositionFailureLayer.bounds =
+                        snapshotChild.bounds
+                    snapshotCompositionFailureLayer.position =
+                        snapshotChild.position
+                    snapshotCompositionFailureLayer.backgroundColor =
+                        snapshotChild.backgroundColor
+                    snapshotCompositionFailureLayer.compositingFilter =
+                        invalidSnapshotCompositionFilter
+                    snapshotCompositionFailureRoot.addSublayer(
+                        snapshotCompositionFailureLayer
+                    )
+                    CATransaction.commit()
+                    let frameFailuresBeforeSnapshotCompositionFailure =
+                        renderer.frameRenderFailureCount
+                    renderer.render(
+                        layer: snapshotCompositionFailureRoot
+                    )
+                    let snapshotCompositionFailureWasTyped: Bool
+                    if case .committedSnapshotCaptureFailed(
+                        .invalidLayerCompositingFilter(
+                            .unsupportedCoreImageParameter(
+                                filter: "CIScreenCompositing",
+                                key: "inputUnsupported",
+                                valueType: "Swift.String"
+                            )
+                        )
+                    ) = renderer.lastFrameRenderFailure {
+                        snapshotCompositionFailureWasTyped =
+                            renderer.frameRenderFailureCount
+                                == frameFailuresBeforeSnapshotCompositionFailure
+                                    + 1
+                    } else {
+                        snapshotCompositionFailureWasTyped = false
+                    }
+                    let snapshotCompositionFailureCompletionRemainedPending =
+                        !snapshotCompositionFailureCompletionRan
+
                     let delegateFailureRoot = CALayer()
                     let invalidDelegate = DelegateDrawProbeDelegate()
                     let invalidDelegateLayer = CALayer()
@@ -6739,6 +6866,8 @@ func installHarness() {
                         + ",snapshotShadowFailureRecovered=\(snapshotShadowFailureRecovered)"
                         + ",snapshotFilterFailureTyped=\(snapshotFilterFailureWasTyped)"
                         + ",snapshotFilterFailurePending=\(snapshotFilterFailureCompletionRemainedPending)"
+                        + ",snapshotCompositionFailureTyped=\(snapshotCompositionFailureWasTyped)"
+                        + ",snapshotCompositionFailurePending=\(snapshotCompositionFailureCompletionRemainedPending)"
                         + ",delegateCaptured=\(delegateCapturedAtCommit)"
                         + ",snapshotPending=\(snapshotCompletionPendingBeforeRender)"
                         + ",snapshotCompleted=\(snapshotCompletionRanAfterRender)"

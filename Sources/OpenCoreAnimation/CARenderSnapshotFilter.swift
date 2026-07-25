@@ -247,3 +247,52 @@ internal enum CARenderSnapshotFilterStage: Equatable, Sendable {
         return stages
     }
 }
+
+internal struct CARenderSnapshotCompositingFilter: Equatable, Sendable {
+    internal let name: String
+    internal let parameters: [
+        String: CARenderSnapshotFilterParameter
+    ]
+    internal let isEnabled: Bool
+
+    internal static func capture(
+        _ value: Any?
+    ) throws(CARenderSnapshotFilterError) -> Self? {
+        guard let value else { return nil }
+        #if arch(wasm32)
+        guard let filter = value as? CIFilter else {
+            throw .unsupportedFilterValue(
+                String(reflecting: type(of: value))
+            )
+        }
+        guard !filter.name.isEmpty else {
+            throw .invalidCoreImageFilterName
+        }
+
+        var parameters: [
+            String: CARenderSnapshotFilterParameter
+        ] = [:]
+        for key in filter.inputKeys.sorted()
+        where key != kCIInputImageKey
+            && key != kCIInputBackgroundImageKey {
+            guard let parameter = filter.value(forKey: key) else {
+                continue
+            }
+            parameters[key] = try .capture(
+                parameter,
+                filterName: filter.name,
+                key: key
+            )
+        }
+        return Self(
+            name: filter.name,
+            parameters: parameters,
+            isEnabled: filter.isEnabled
+        )
+        #else
+        throw .unsupportedFilterValue(
+            String(reflecting: type(of: value))
+        )
+        #endif
+    }
+}

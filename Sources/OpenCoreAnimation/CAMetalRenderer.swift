@@ -402,6 +402,12 @@ public final class CAMetalRenderer: CARendererDelegate {
             return .filters
         }
         if snapshot.nodes.contains(where: {
+            $0.presentationValues.compositingFilter != nil
+                || !$0.presentationValues.backgroundFilters.isEmpty
+        }) {
+            return .backdropComposition
+        }
+        if snapshot.nodes.contains(where: {
             $0.presentationValues.imageContents != nil
         }) {
             return .imageContents

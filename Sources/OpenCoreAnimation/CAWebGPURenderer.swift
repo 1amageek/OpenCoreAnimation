@@ -345,6 +345,7 @@ private enum SnapshotCompositeKind: Equatable {
 
 private struct SnapshotCompositedNode {
     let resources: FilterLayerResources
+    let outputTexture: GPUTexture
     let outputView: GPUTextureView
     let kind: SnapshotCompositeKind
 }
@@ -352,6 +353,29 @@ private struct SnapshotCompositedNode {
 private struct SnapshotCompositeTarget {
     let nodeIndex: Int
     let parentMatrix: Matrix4x4
+}
+
+private struct SnapshotBackdropCompositionTarget {
+    let nodeIndex: Int
+    let parentMatrix: Matrix4x4
+    let scope: SnapshotCompositeTarget?
+    let backgroundFilterExtent: SnapshotCompositeTarget?
+    let ancestorNodeIndices: [Int]
+    let depth: Int
+    let clipAncestors: [SnapshotCompositeTarget]
+    let contentMaskAncestors: [SnapshotCompositeTarget]
+    let targetContentMask: SnapshotCompositeTarget?
+    let sourceOpacity: Float
+}
+
+private struct SnapshotBackdropCompositionRoot {
+    let target: SnapshotCompositeTarget
+    let clearColor: GPUColor
+}
+
+private struct SnapshotPreparedComposition {
+    let resources: CompositionLayerResources
+    let outputView: GPUTextureView
 }
 
 private struct SnapshotPreparedShadow {
@@ -1785,6 +1809,7 @@ private final class EmitterLayerState {
     private var transientRasterizationTextures: [GPUTexture] = []
     private var transientRasterizationFilterResources: [FilterLayerResources] = []
     private var transientRasterizationShadowResources: [ShadowLayerResources] = []
+    private var transientSnapshotCompositionResources: [CompositionLayerResources] = []
 
     /// Per-frame scratch storage: layers whose subtree has been captured
     /// (or had a fresh cache hit) this frame, mapped to the texture used
@@ -1807,6 +1832,10 @@ private final class EmitterLayerState {
     private var snapshotPreparedShadows: [SnapshotPreparedShadow?] = []
     private var snapshotSuppressesShadows = false
     private var snapshotShadowCaptureRootNodeIndex: Int?
+    private var snapshotPreparedCompositions: [SnapshotPreparedComposition?] = []
+    private var snapshotCompositionCaptureStopNodeIndex: Int?
+    private var snapshotCompositionCaptureDidReachStop = false
+    private var snapshotCompositionCapturePassThroughNodeIndices: Set<Int> = []
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCaptureCount: Int = 0
@@ -4340,6 +4369,16 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup,
                 pipeline: pipeline
             )
+            try prerenderSnapshotBackdropCompositions(
+                in: snapshot,
+                projectionMatrix: projectionMatrix,
+                depthTextureView: depthTextureView,
+                clearColor: committedSnapshotClearColor(in: snapshot),
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
         } catch {
             switch error {
             case .solid(let failure):
@@ -4375,6 +4414,9 @@ private final class EmitterLayerState {
                         ].identity
                     )
                 )
+            case .backdropComposition(let failure):
+                lastCompositionFilterFailure = failure
+                compositionFilterFailureCount += 1
             case .shadow(let failure):
                 recordShadowRenderFailure(
                     failure,
@@ -4391,32 +4433,7 @@ private final class EmitterLayerState {
             discardFailedCommittedSnapshotResources()
             return
         }
-        let rootValues = snapshot.nodes[
-            snapshot.rootIndex
-        ].presentationValues
-        let rootHasContentMask =
-            snapshot.nodes[snapshot.rootIndex].maskIndex != nil
-        let rootRequiresGroupOpacity =
-            rootValues.allowsGroupOpacity
-            && rootValues.opacity < 1
-            && !snapshot.nodes[snapshot.rootIndex].childIndices.isEmpty
-        let rootRequiresFilter = !rootValues.filters.isEmpty
-        let clearColor: GPUColor
-        if rootValues.cornerRadius > 0
-            || rootHasContentMask
-            || rootRequiresGroupOpacity
-            || rootRequiresFilter {
-            clearColor = GPUColor(r: 0, g: 0, b: 0, a: 0)
-        } else if let color = rootValues.backgroundColor {
-            clearColor = GPUColor(
-                r: Double(color.x * color.w),
-                g: Double(color.y * color.w),
-                b: Double(color.z * color.w),
-                a: Double(color.w)
-            )
-        } else {
-            clearColor = GPUColor(r: 0, g: 0, b: 0, a: 1)
-        }
+        let clearColor = committedSnapshotClearColor(in: snapshot)
 
         let renderPass = encoder.beginRenderPass(
             descriptor: GPURenderPassDescriptor(
@@ -4489,6 +4506,9 @@ private final class EmitterLayerState {
                         layer: snapshot.nodes[snapshot.rootIndex].identity
                     )
                 )
+            case .backdropComposition(let failure):
+                lastCompositionFilterFailure = failure
+                compositionFilterFailureCount += 1
             case .shadow(let failure):
                 recordShadowRenderFailure(
                     failure,
@@ -4522,6 +4542,36 @@ private final class EmitterLayerState {
         rootLayer.completeTransactionsAfterRenderRecursively()
         lastFrameRenderFailure = nil
         advanceFrameResources()
+    }
+
+    private func committedSnapshotClearColor(
+        in snapshot: CARenderSnapshot
+    ) -> GPUColor {
+        let root = snapshot.nodes[snapshot.rootIndex]
+        let values = root.presentationValues
+        let requiresOffscreenRoot =
+            values.cornerRadius > 0
+            || root.maskIndex != nil
+            || (
+                values.allowsGroupOpacity
+                && values.opacity < 1
+                && !root.childIndices.isEmpty
+            )
+            || !values.filters.isEmpty
+            || values.compositingFilter != nil
+            || !values.backgroundFilters.isEmpty
+        if requiresOffscreenRoot {
+            return GPUColor(r: 0, g: 0, b: 0, a: 0)
+        }
+        if let color = values.backgroundColor {
+            return GPUColor(
+                r: Double(color.x * color.w),
+                g: Double(color.y * color.w),
+                b: Double(color.z * color.w),
+                a: Double(color.w)
+            )
+        }
+        return GPUColor(r: 0, g: 0, b: 0, a: 1)
     }
 
     private func resetFrameStateForCommittedSnapshot() {
@@ -4570,6 +4620,10 @@ private final class EmitterLayerState {
             resources.destroy()
         }
         transientRasterizationShadowResources.removeAll(keepingCapacity: true)
+        for resources in transientSnapshotCompositionResources {
+            resources.destroy()
+        }
+        transientSnapshotCompositionResources.removeAll(keepingCapacity: true)
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
         contentMaskCaptureSuppressedRootLayer = nil
@@ -4617,6 +4671,12 @@ private final class EmitterLayerState {
         snapshotPreparedShadows.removeAll(keepingCapacity: true)
         snapshotSuppressesShadows = false
         snapshotShadowCaptureRootNodeIndex = nil
+        snapshotPreparedCompositions.removeAll(keepingCapacity: true)
+        snapshotCompositionCaptureStopNodeIndex = nil
+        snapshotCompositionCaptureDidReachStop = false
+        snapshotCompositionCapturePassThroughNodeIndices.removeAll(
+            keepingCapacity: true
+        )
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: true)
     }
 
@@ -4637,6 +4697,10 @@ private final class EmitterLayerState {
             resources.destroy()
         }
         transientRasterizationShadowResources.removeAll(keepingCapacity: true)
+        for resources in transientSnapshotCompositionResources {
+            resources.destroy()
+        }
+        transientSnapshotCompositionResources.removeAll(keepingCapacity: true)
         for execution in activeCompositionExecutions {
             execution.invalidate()
         }
@@ -4647,6 +4711,12 @@ private final class EmitterLayerState {
         snapshotPreparedShadows.removeAll(keepingCapacity: true)
         snapshotSuppressesShadows = false
         snapshotShadowCaptureRootNodeIndex = nil
+        snapshotPreparedCompositions.removeAll(keepingCapacity: true)
+        snapshotCompositionCaptureStopNodeIndex = nil
+        snapshotCompositionCaptureDidReachStop = false
+        snapshotCompositionCapturePassThroughNodeIndices.removeAll(
+            keepingCapacity: true
+        )
         isRenderingMainPass = false
     }
 
@@ -4804,6 +4874,16 @@ private final class EmitterLayerState {
             resources.destroy()
         }
         transientRasterizationShadowResources.removeAll(keepingCapacity: true)
+        for resources in transientSnapshotCompositionResources {
+            resources.destroy()
+        }
+        transientSnapshotCompositionResources.removeAll(keepingCapacity: true)
+        snapshotPreparedCompositions.removeAll(keepingCapacity: true)
+        snapshotCompositionCaptureStopNodeIndex = nil
+        snapshotCompositionCaptureDidReachStop = false
+        snapshotCompositionCapturePassThroughNodeIndices.removeAll(
+            keepingCapacity: true
+        )
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
         contentMaskCaptureSuppressedRootLayer = nil
@@ -5566,6 +5646,16 @@ private final class EmitterLayerState {
             resources.destroy()
         }
         transientRasterizationShadowResources.removeAll(keepingCapacity: false)
+        for resources in transientSnapshotCompositionResources {
+            resources.destroy()
+        }
+        transientSnapshotCompositionResources.removeAll(keepingCapacity: false)
+        snapshotPreparedCompositions.removeAll(keepingCapacity: false)
+        snapshotCompositionCaptureStopNodeIndex = nil
+        snapshotCompositionCaptureDidReachStop = false
+        snapshotCompositionCapturePassThroughNodeIndices.removeAll(
+            keepingCapacity: false
+        )
         transitionSourceCaptureCount = 0
         transitionTargetCaptureCount = 0
         transitionFilterDispatchCount = 0
@@ -6113,9 +6203,13 @@ private final class EmitterLayerState {
                 values.allowsGroupOpacity
                 && values.opacity < 1
                 && !node.childIndices.isEmpty
+            let requiresBackdropComposition =
+                values.compositingFilter != nil
+                || !values.backgroundFilters.isEmpty
             if node.maskIndex != nil
                 || requiresGroupOpacity
-                || !values.filters.isEmpty {
+                || !values.filters.isEmpty
+                || requiresBackdropComposition {
                 targets.append(
                     SnapshotCompositeTarget(
                         nodeIndex: nodeIndex,
@@ -6251,6 +6345,7 @@ private final class EmitterLayerState {
                 currentView = premultipliedView
             }
 
+            let outputTexture: GPUTexture
             let outputView: GPUTextureView
             if let maskIndex = node.maskIndex {
                 guard let compositionMaskApplyPipeline else {
@@ -6325,12 +6420,17 @@ private final class EmitterLayerState {
                 outputView = currentTexture === resources.resultTexture
                     ? resources.sourceView
                     : resources.resultView
+                outputTexture = currentTexture === resources.resultTexture
+                    ? resources.sourceTexture
+                    : resources.resultTexture
             } else {
+                outputTexture = currentTexture
                 outputView = currentView
             }
             snapshotCompositedNodes[target.nodeIndex] =
                 SnapshotCompositedNode(
                     resources: resources,
+                    outputTexture: outputTexture,
                     outputView: outputView,
                     kind: node.maskIndex != nil
                         ? .contentMask
@@ -6338,6 +6438,945 @@ private final class EmitterLayerState {
                             ? .filter
                             : .groupOpacity
                 )
+        }
+    }
+
+    private func prerenderSnapshotBackdropCompositions(
+        in snapshot: CARenderSnapshot,
+        projectionMatrix: Matrix4x4,
+        depthTextureView: GPUTextureView,
+        clearColor: GPUColor,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        let roots = snapshotBackdropCompositionRoots(
+            in: snapshot,
+            projectionMatrix: projectionMatrix,
+            mainClearColor: clearColor
+        )
+        snapshotPreparedCompositions = Array(
+            repeating: nil,
+            count: snapshot.nodes.count
+        )
+
+        for root in roots {
+            var targets: [SnapshotBackdropCompositionTarget] = []
+            collectSnapshotBackdropCompositionTargets(
+                at: root.target.nodeIndex,
+                in: snapshot,
+                parentMatrix: root.target.parentMatrix,
+                parentBackdropTarget: nil,
+                ancestorNodeIndices: [],
+                ancestorBackdropScopes: [],
+                ancestorClipTargets: [],
+                ancestorContentMaskTargets: [],
+                inheritedOpacity: 1,
+                targets: &targets
+            )
+            let processingTargets = targets.enumerated().sorted {
+                if $0.element.depth != $1.element.depth {
+                    return $0.element.depth > $1.element.depth
+                }
+                return $0.offset < $1.offset
+            }.map(\.element)
+            var previousDepth = processingTargets.first?.depth
+
+            for target in processingTargets {
+                if let previousDepth, target.depth < previousDepth {
+                    try prerenderSnapshotComposites(
+                        in: snapshot,
+                        projectionMatrix: projectionMatrix,
+                        depthTextureView: depthTextureView,
+                        encoder: encoder,
+                        device: device,
+                        bindGroup: bindGroup,
+                        pipeline: pipeline
+                    )
+                }
+                previousDepth = target.depth
+                try prerenderSnapshotBackdropComposition(
+                    target,
+                    root: root,
+                    in: snapshot,
+                    depthTextureView: depthTextureView,
+                    encoder: encoder,
+                    device: device,
+                    bindGroup: bindGroup,
+                    pipeline: pipeline
+                )
+            }
+
+            if previousDepth != nil {
+                try prerenderSnapshotComposites(
+                    in: snapshot,
+                    projectionMatrix: projectionMatrix,
+                    depthTextureView: depthTextureView,
+                    encoder: encoder,
+                    device: device,
+                    bindGroup: bindGroup,
+                    pipeline: pipeline
+                )
+            }
+        }
+    }
+
+    private func snapshotBackdropCompositionRoots(
+        in snapshot: CARenderSnapshot,
+        projectionMatrix: Matrix4x4,
+        mainClearColor: GPUColor
+    ) -> [SnapshotBackdropCompositionRoot] {
+        var roots: [SnapshotBackdropCompositionRoot] = []
+        var visitedMasks: Set<Int> = []
+
+        func visit(nodeIndex: Int, parentMatrix: Matrix4x4) {
+            let node = snapshot.nodes[nodeIndex]
+            let values = node.presentationValues
+            guard !values.isHidden, values.opacity > 0 else { return }
+            let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
+            if let maskIndex = node.maskIndex,
+               visitedMasks.insert(maskIndex).inserted {
+                visit(nodeIndex: maskIndex, parentMatrix: modelMatrix)
+                roots.append(
+                    SnapshotBackdropCompositionRoot(
+                        target: SnapshotCompositeTarget(
+                            nodeIndex: maskIndex,
+                            parentMatrix: modelMatrix
+                        ),
+                        clearColor: GPUColor(r: 0, g: 0, b: 0, a: 0)
+                    )
+                )
+            }
+            let sublayerMatrix = values.sublayerMatrix(
+                modelMatrix: modelMatrix
+            )
+            for childIndex in node.childIndices {
+                visit(
+                    nodeIndex: childIndex,
+                    parentMatrix: sublayerMatrix
+                )
+            }
+        }
+
+        visit(
+            nodeIndex: snapshot.rootIndex,
+            parentMatrix: projectionMatrix
+        )
+        roots.append(
+            SnapshotBackdropCompositionRoot(
+                target: SnapshotCompositeTarget(
+                    nodeIndex: snapshot.rootIndex,
+                    parentMatrix: projectionMatrix
+                ),
+                clearColor: mainClearColor
+            )
+        )
+        return roots
+    }
+
+    private func collectSnapshotBackdropCompositionTargets(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot,
+        parentMatrix: Matrix4x4,
+        parentBackdropTarget: SnapshotCompositeTarget?,
+        ancestorNodeIndices: [Int],
+        ancestorBackdropScopes: [SnapshotCompositeTarget],
+        ancestorClipTargets: [SnapshotCompositeTarget],
+        ancestorContentMaskTargets: [SnapshotCompositeTarget],
+        inheritedOpacity: Float,
+        targets: inout [SnapshotBackdropCompositionTarget]
+    ) {
+        let node = snapshot.nodes[nodeIndex]
+        let values = node.presentationValues
+        guard !values.isHidden, values.opacity > 0 else { return }
+
+        let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
+        let hasComposition =
+            values.compositingFilter != nil
+            || !values.backgroundFilters.isEmpty
+        let createsBackdropScope =
+            hasComposition
+            || (
+                values.allowsGroupOpacity
+                && values.opacity < 1
+                && !node.childIndices.isEmpty
+            )
+            || !values.filters.isEmpty
+        let prepass = SnapshotCompositeTarget(
+            nodeIndex: nodeIndex,
+            parentMatrix: parentMatrix
+        )
+        let targetContentMask = node.maskIndex.map {
+            SnapshotCompositeTarget(
+                nodeIndex: $0,
+                parentMatrix: modelMatrix
+            )
+        }
+
+        if hasComposition {
+            targets.append(
+                SnapshotBackdropCompositionTarget(
+                    nodeIndex: nodeIndex,
+                    parentMatrix: parentMatrix,
+                    scope: ancestorBackdropScopes.last,
+                    backgroundFilterExtent: values.masksToBounds
+                        ? prepass
+                        : parentBackdropTarget,
+                    ancestorNodeIndices: ancestorNodeIndices,
+                    depth: ancestorBackdropScopes.count,
+                    clipAncestors: ancestorClipTargets,
+                    contentMaskAncestors:
+                        ancestorContentMaskTargets,
+                    targetContentMask: targetContentMask,
+                    sourceOpacity: inheritedOpacity * values.opacity
+                )
+            )
+        }
+
+        var descendantScopes = ancestorBackdropScopes
+        var descendantClipTargets = ancestorClipTargets
+        var descendantContentMaskTargets =
+            ancestorContentMaskTargets
+        if createsBackdropScope {
+            descendantScopes.append(prepass)
+        }
+        if values.masksToBounds {
+            descendantClipTargets.append(prepass)
+        }
+        if let targetContentMask {
+            descendantContentMaskTargets.append(targetContentMask)
+        }
+
+        let sublayerMatrix = values.sublayerMatrix(
+            modelMatrix: modelMatrix
+        )
+        for childIndex in node.childIndices {
+            collectSnapshotBackdropCompositionTargets(
+                at: childIndex,
+                in: snapshot,
+                parentMatrix: sublayerMatrix,
+                parentBackdropTarget: prepass,
+                ancestorNodeIndices: ancestorNodeIndices + [nodeIndex],
+                ancestorBackdropScopes: descendantScopes,
+                ancestorClipTargets: descendantClipTargets,
+                ancestorContentMaskTargets:
+                    descendantContentMaskTargets,
+                inheritedOpacity: createsBackdropScope
+                    ? 1
+                    : inheritedOpacity * values.opacity,
+                targets: &targets
+            )
+        }
+    }
+
+    private func prerenderSnapshotBackdropComposition(
+        _ target: SnapshotBackdropCompositionTarget,
+        root: SnapshotBackdropCompositionRoot,
+        in snapshot: CARenderSnapshot,
+        depthTextureView: GPUTextureView,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        let values = snapshot.nodes[target.nodeIndex].presentationValues
+        guard snapshotCompositedNodes.indices.contains(target.nodeIndex),
+              let source = snapshotCompositedNodes[target.nodeIndex] else {
+            throw .backdropComposition(.sourceCaptureUnavailable)
+        }
+        guard let processor = layerFilterProcessor else {
+            throw .backdropComposition(.compositionExecutionFailed)
+        }
+
+        let compositionFilter: CIFilter
+        if let capturedFilter = values.compositingFilter {
+            guard let filter = CIFilter(
+                name: capturedFilter.name
+            ) else {
+                throw .backdropComposition(
+                    .unsupportedCompositingFilter(
+                        capturedFilter.name
+                    )
+                )
+            }
+            filter.isEnabled = capturedFilter.isEnabled
+            for key in capturedFilter.parameters.keys.sorted() {
+                guard let parameter =
+                        capturedFilter.parameters[key] else {
+                    continue
+                }
+                filter.setValue(parameter.materializedValue, forKey: key)
+            }
+            compositionFilter = filter
+        } else if let sourceOver = CIFilter(
+            name: "CISourceOverCompositing"
+        ) {
+            compositionFilter = sourceOver
+        } else {
+            throw .backdropComposition(
+                .defaultCompositingFilterUnavailable
+            )
+        }
+        guard processor.supports(
+            compositionFilter,
+            inputMode: .foregroundAndBackground
+        ) else {
+            throw .backdropComposition(
+                .unsupportedCompositingFilter(compositionFilter.name)
+            )
+        }
+
+        let backgroundStages: [LayerFilterStage]
+        do {
+            backgroundStages = try layerFilterStages(
+                from: values.backgroundFilters
+            )
+        } catch {
+            throw .backdropComposition(
+                .backgroundFilterPlanningFailed(error)
+            )
+        }
+
+        let resources = CompositionLayerResources(
+            device: device,
+            width: Int(size.width),
+            height: Int(size.height),
+            format: preferredFormat
+        )
+        transientSnapshotCompositionResources.append(resources)
+
+        let backdropPass = encoder.beginRenderPass(
+            descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: resources.backdropView,
+                        clearValue: target.scope == nil
+                            ? root.clearColor
+                            : GPUColor(r: 0, g: 0, b: 0, a: 0),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ],
+                depthStencilAttachment:
+                    GPURenderPassDepthStencilAttachment(
+                        view: depthTextureView,
+                        depthClearValue: 0,
+                        depthLoadOp: .clear,
+                        depthStoreOp: .store,
+                        stencilClearValue: 0,
+                        stencilLoadOp: .clear,
+                        stencilStoreOp: .store
+                    )
+            )
+        )
+        backdropPass.setPipeline(pipeline)
+        backdropPass.setViewport(
+            x: 0,
+            y: 0,
+            width: Float(size.width),
+            height: Float(size.height),
+            minDepth: 0,
+            maxDepth: 1
+        )
+        let savedOpacityStack = opacityStack
+        let savedClipStack = clipRectStack
+        let savedMaskDepth = maskNestingDepth
+        let savedActiveStencilFrames = activeStencilFrames
+        let savedStencilValue = currentStencilValue
+        let savedCaptureRoot = snapshotCompositeCaptureRootNodeIndex
+        let savedSuppressesOpacity =
+            snapshotCompositeCaptureSuppressesOpacity
+        let savedStop = snapshotCompositionCaptureStopNodeIndex
+        let savedDidReachStop =
+            snapshotCompositionCaptureDidReachStop
+        let savedPassThrough =
+            snapshotCompositionCapturePassThroughNodeIndices
+
+        opacityStack.removeAll(keepingCapacity: true)
+        clipRectStack.removeAll(keepingCapacity: true)
+        maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
+        currentStencilValue = 0
+        snapshotCompositeCaptureRootNodeIndex =
+            target.scope?.nodeIndex
+        snapshotCompositeCaptureSuppressesOpacity =
+            target.scope != nil
+        snapshotCompositionCaptureStopNodeIndex = target.nodeIndex
+        snapshotCompositionCaptureDidReachStop = false
+        snapshotCompositionCapturePassThroughNodeIndices = Set(
+            target.ancestorNodeIndices
+        )
+
+        var captureFailure: CACommittedSnapshotEncodingFailure?
+        do {
+            let captureRoot = target.scope ?? root.target
+            try renderSnapshotNode(
+                at: captureRoot.nodeIndex,
+                in: snapshot,
+                renderPass: backdropPass,
+                parentMatrix: captureRoot.parentMatrix,
+                isRoot: false,
+                device: device,
+                bindGroup: bindGroup
+            )
+        } catch {
+            captureFailure = error
+        }
+        let didReachTarget = snapshotCompositionCaptureDidReachStop
+
+        opacityStack = savedOpacityStack
+        clipRectStack = savedClipStack
+        maskNestingDepth = savedMaskDepth
+        activeStencilFrames = savedActiveStencilFrames
+        currentStencilValue = savedStencilValue
+        snapshotCompositeCaptureRootNodeIndex = savedCaptureRoot
+        snapshotCompositeCaptureSuppressesOpacity =
+            savedSuppressesOpacity
+        snapshotCompositionCaptureStopNodeIndex = savedStop
+        snapshotCompositionCaptureDidReachStop = savedDidReachStop
+        snapshotCompositionCapturePassThroughNodeIndices =
+            savedPassThrough
+        backdropPass.end()
+        if let captureFailure {
+            throw captureFailure
+        }
+        guard didReachTarget else {
+            throw .backdropComposition(.backdropCaptureIncomplete)
+        }
+
+        let clipMaskView: GPUTextureView?
+        do {
+            clipMaskView = try buildSnapshotCompositionClipMask(
+                clipTargets: target.clipAncestors,
+                contentMaskTargets: target.contentMaskAncestors,
+                in: snapshot,
+                resources: resources,
+                depthTextureView: depthTextureView,
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
+        } catch {
+            throw .backdropComposition(error)
+        }
+
+        var premultipliedSourceTexture = source.outputTexture
+        if !target.clipAncestors.isEmpty
+            || !target.contentMaskAncestors.isEmpty {
+            guard let clipMaskView,
+                  let compositionMaskApplyPipeline,
+                  encodeCompositionMaskOperation(
+                    pipeline: compositionMaskApplyPipeline,
+                    firstView: source.outputView,
+                    secondView: clipMaskView,
+                    outputView: resources.clippedSourceView,
+                    encoder: encoder
+                  ) else {
+                throw .backdropComposition(.clipMaskFailed)
+            }
+            premultipliedSourceTexture =
+                resources.clippedSourceTexture
+        }
+        if target.sourceOpacity < 1 {
+            guard applyFilterOperation(
+                uniforms: FilterCompositeUniforms(
+                    opacity: target.sourceOpacity
+                ),
+                inputTexture: premultipliedSourceTexture,
+                outputView: resources.sourcePremultipliedView,
+                uniformBuffer: resources.sourceOpacityUniformBuffer,
+                encoder: encoder
+            ) else {
+                throw .backdropComposition(.sourceAdjustmentFailed)
+            }
+            premultipliedSourceTexture =
+                resources.sourcePremultipliedTexture
+        }
+
+        guard applyAlphaConversion(
+            from: .premultiplied,
+            inputTexture: premultipliedSourceTexture,
+            outputView: resources.sourceStraightView,
+            uniformBuffer: resources.sourceUniformBuffer,
+            encoder: encoder
+        ), applyAlphaConversion(
+            from: .premultiplied,
+            inputTexture: resources.backdropTexture,
+            outputView: resources.backdropStraightView,
+            uniformBuffer: resources.backdropUniformBuffer,
+            encoder: encoder
+        ) else {
+            throw .backdropComposition(.alphaConversionFailed)
+        }
+
+        var compositionBackdropTexture =
+            resources.backdropStraightTexture
+        if !backgroundStages.isEmpty {
+            let filteredBackdrop: (
+                texture: GPUTexture,
+                view: GPUTextureView
+            )
+            do {
+                filteredBackdrop = try executeBackdropFilterStages(
+                    backgroundStages,
+                    inputTexture: resources.backdropStraightTexture,
+                    inputView: resources.backdropStraightView,
+                    resources: resources.backgroundFilterResources,
+                    device: device,
+                    processor: processor,
+                    encoder: encoder
+                )
+            } catch {
+                throw .backdropComposition(
+                    .backgroundFilterExecutionFailed(error)
+                )
+            }
+            guard renderSnapshotBackdropFilterMask(
+                for: target,
+                in: snapshot,
+                resources: resources,
+                encoder: encoder,
+                device: device
+            ) else {
+                throw .backdropComposition(
+                    .backgroundFilterMaskFailed
+                )
+            }
+            var backgroundMaskView = resources.backdropMaskView
+            let backgroundClipMaskView: GPUTextureView?
+            do {
+                if let targetContentMask = target.targetContentMask {
+                    backgroundClipMaskView =
+                        try buildSnapshotCompositionClipMask(
+                            clipTargets: target.clipAncestors,
+                            contentMaskTargets:
+                                target.contentMaskAncestors
+                                + [targetContentMask],
+                            in: snapshot,
+                            resources: resources,
+                            depthTextureView: depthTextureView,
+                            encoder: encoder,
+                            device: device,
+                            bindGroup: bindGroup,
+                            pipeline: pipeline
+                        )
+                } else {
+                    backgroundClipMaskView = clipMaskView
+                }
+            } catch {
+                throw .backdropComposition(error)
+            }
+            if let backgroundClipMaskView {
+                guard let compositionMaskIntersectPipeline,
+                      encodeCompositionMaskOperation(
+                        pipeline: compositionMaskIntersectPipeline,
+                        firstView: resources.backdropMaskView,
+                        secondView: backgroundClipMaskView,
+                        outputView:
+                            resources.combinedBackdropMaskView,
+                        encoder: encoder
+                      ) else {
+                    throw .backdropComposition(
+                        .backgroundFilterMaskFailed
+                    )
+                }
+                backgroundMaskView =
+                    resources.combinedBackdropMaskView
+            }
+            guard mixFilteredBackdrop(
+                originalView: resources.backdropStraightView,
+                filteredView: filteredBackdrop.view,
+                maskView: backgroundMaskView,
+                resources: resources,
+                encoder: encoder
+            ) else {
+                throw .backdropComposition(
+                    .backgroundFilterMixFailed
+                )
+            }
+            compositionBackdropTexture =
+                resources.mixedBackdropStraightTexture
+        }
+
+        do {
+            let execution = try processor.makeExecution(
+                filter: compositionFilter,
+                inputMode: .foregroundAndBackground,
+                inputTexture: resources.sourceStraightTexture,
+                backgroundTexture: compositionBackdropTexture,
+                width: UInt32(size.width),
+                height: UInt32(size.height)
+            )
+            try execution.encode(commandEncoder: encoder)
+            activeCompositionExecutions.append(execution)
+            guard applyAlphaConversion(
+                from: .straight,
+                inputTexture: execution.outputTexture,
+                outputView: resources.resultPremultipliedView,
+                uniformBuffer:
+                    resources.resultConversionUniformBuffer,
+                encoder: encoder
+            ) else {
+                throw CACompositionFilterRenderFailure
+                    .alphaConversionFailed
+            }
+            snapshotPreparedCompositions[target.nodeIndex] =
+                SnapshotPreparedComposition(
+                    resources: resources,
+                    outputView: resources.resultPremultipliedView
+                )
+        } catch let failure as CACompositionFilterRenderFailure {
+            throw .backdropComposition(failure)
+        } catch {
+            throw .backdropComposition(.compositionExecutionFailed)
+        }
+    }
+
+    private func renderSnapshotBackdropFilterMask(
+        for target: SnapshotBackdropCompositionTarget,
+        in snapshot: CARenderSnapshot,
+        resources: CompositionLayerResources,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice
+    ) -> Bool {
+        guard let extent = target.backgroundFilterExtent else {
+            let renderPass = encoder.beginRenderPass(
+                descriptor: GPURenderPassDescriptor(
+                    colorAttachments: [
+                        GPURenderPassColorAttachment(
+                            view: resources.backdropMaskView,
+                            clearValue: GPUColor(
+                                r: 1,
+                                g: 1,
+                                b: 1,
+                                a: 1
+                            ),
+                            loadOp: .clear,
+                            storeOp: .store
+                        )
+                    ]
+                )
+            )
+            renderPass.end()
+            return true
+        }
+        return renderSnapshotCompositionClipShape(
+            extent,
+            in: snapshot,
+            outputView: resources.backdropMaskView,
+            uniformBuffer: resources.backdropMaskUniformBuffer,
+            vertexBuffer: resources.backdropMaskVertexBuffer,
+            encoder: encoder,
+            device: device
+        )
+    }
+
+    private func buildSnapshotCompositionClipMask(
+        clipTargets: [SnapshotCompositeTarget],
+        contentMaskTargets: [SnapshotCompositeTarget],
+        in snapshot: CARenderSnapshot,
+        resources: CompositionLayerResources,
+        depthTextureView: GPUTextureView,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline
+    ) throws(CACompositionFilterRenderFailure) -> GPUTextureView? {
+        enum Target {
+            case clip(SnapshotCompositeTarget)
+            case content(SnapshotCompositeTarget)
+        }
+        let targets = clipTargets.map(Target.clip)
+            + contentMaskTargets.map(Target.content)
+        guard !targets.isEmpty else { return nil }
+        guard let compositionMaskIntersectPipeline else {
+            throw .clipMaskFailed
+        }
+
+        var currentView = resources.clipCumulativeViewA
+        for (index, target) in targets.enumerated() {
+            let outputView = index == 0
+                ? resources.clipCumulativeViewA
+                : resources.clipShapeView
+            switch target {
+            case let .clip(clipTarget):
+                guard renderSnapshotCompositionClipShape(
+                    clipTarget,
+                    in: snapshot,
+                    outputView: outputView,
+                    uniformBuffer: resources.clipUniformBuffer(
+                        at: index,
+                        device: device
+                    ),
+                    vertexBuffer: resources.backdropMaskVertexBuffer,
+                    encoder: encoder,
+                    device: device
+                ) else {
+                    throw .clipMaskFailed
+                }
+            case let .content(contentTarget):
+                try renderSnapshotCompositionContentMask(
+                    contentTarget,
+                    in: snapshot,
+                    outputView: outputView,
+                    depthTextureView: depthTextureView,
+                    encoder: encoder,
+                    device: device,
+                    bindGroup: bindGroup,
+                    pipeline: pipeline
+                )
+            }
+
+            guard index > 0 else { continue }
+            let intersectionView =
+                currentView === resources.clipCumulativeViewA
+                    ? resources.clipCumulativeViewB
+                    : resources.clipCumulativeViewA
+            guard encodeCompositionMaskOperation(
+                pipeline: compositionMaskIntersectPipeline,
+                firstView: currentView,
+                secondView: resources.clipShapeView,
+                outputView: intersectionView,
+                encoder: encoder
+            ) else {
+                throw .clipMaskFailed
+            }
+            currentView = intersectionView
+        }
+        return currentView
+    }
+
+    private func renderSnapshotCompositionClipShape(
+        _ target: SnapshotCompositeTarget,
+        in snapshot: CARenderSnapshot,
+        outputView: GPUTextureView,
+        uniformBuffer: GPUBuffer,
+        vertexBuffer: GPUBuffer,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice
+    ) -> Bool {
+        guard let bindGroupLayout,
+              let dummyGradientStopBuffer,
+              let shadowMaskPipeline else {
+            return false
+        }
+        let values = snapshot.nodes[
+            target.nodeIndex
+        ].presentationValues
+        guard values.bounds.width > 0, values.bounds.height > 0 else {
+            return false
+        }
+
+        let modelMatrix = values.modelMatrix(
+            parentMatrix: target.parentMatrix
+        )
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(values.boundsSize.x, 0, 0, 0),
+            SIMD4<Float>(0, values.boundsSize.y, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        var uniforms = CARendererUniforms(
+            mvpMatrix: modelMatrix * scaleMatrix,
+            opacity: 1,
+            cornerRadius: values.cornerRadius,
+            layerSize: values.boundsSize,
+            cornerCurveExponent: values.cornerCurveExponent,
+            cornerRadii: values.cornerRadii
+        )
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &uniforms)
+        )
+
+        let white = SIMD4<Float>(repeating: 1)
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(
+                position: SIMD2(0, 0),
+                texCoord: SIMD2(0, 0),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 0),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 1),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 0),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 1),
+                texCoord: SIMD2(1, 1),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 1),
+                color: white
+            ),
+        ]
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &vertices)
+        )
+        let shapeBindGroup = device.createBindGroup(
+            descriptor: GPUBindGroupDescriptor(
+                layout: bindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .buffer(
+                            uniformBuffer,
+                            offset: 0,
+                            size: Self.alignedUniformSize
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .buffer(
+                            dummyGradientStopBuffer,
+                            offset: 0,
+                            size: Self.gradientStopStride
+                        )
+                    ),
+                ]
+            )
+        )
+        let renderPass = encoder.beginRenderPass(
+            descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: outputView,
+                        clearValue: GPUColor(
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0
+                        ),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ]
+            )
+        )
+        renderPass.setPipeline(shadowMaskPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: shapeBindGroup,
+            dynamicOffsets: [0]
+        )
+        renderPass.setVertexBuffer(0, buffer: vertexBuffer, offset: 0)
+        renderPass.draw(vertexCount: 6)
+        renderPass.end()
+        return true
+    }
+
+    private func renderSnapshotCompositionContentMask(
+        _ target: SnapshotCompositeTarget,
+        in snapshot: CARenderSnapshot,
+        outputView: GPUTextureView,
+        depthTextureView: GPUTextureView,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline
+    ) throws(CACompositionFilterRenderFailure) {
+        let renderPass = encoder.beginRenderPass(
+            descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: outputView,
+                        clearValue: GPUColor(
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0
+                        ),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ],
+                depthStencilAttachment:
+                    GPURenderPassDepthStencilAttachment(
+                        view: depthTextureView,
+                        depthClearValue: 0,
+                        depthLoadOp: .clear,
+                        depthStoreOp: .store,
+                        stencilClearValue: 0,
+                        stencilLoadOp: .clear,
+                        stencilStoreOp: .store
+                    )
+            )
+        )
+        renderPass.setPipeline(pipeline)
+        renderPass.setViewport(
+            x: 0,
+            y: 0,
+            width: Float(size.width),
+            height: Float(size.height),
+            minDepth: 0,
+            maxDepth: 1
+        )
+
+        let savedOpacityStack = opacityStack
+        let savedClipStack = clipRectStack
+        let savedMaskDepth = maskNestingDepth
+        let savedActiveStencilFrames = activeStencilFrames
+        let savedStencilValue = currentStencilValue
+        let savedStop = snapshotCompositionCaptureStopNodeIndex
+        let savedDidReachStop =
+            snapshotCompositionCaptureDidReachStop
+        let savedPassThrough =
+            snapshotCompositionCapturePassThroughNodeIndices
+
+        opacityStack.removeAll(keepingCapacity: true)
+        clipRectStack.removeAll(keepingCapacity: true)
+        maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
+        currentStencilValue = 0
+        snapshotCompositionCaptureStopNodeIndex = nil
+        snapshotCompositionCaptureDidReachStop = false
+        snapshotCompositionCapturePassThroughNodeIndices.removeAll(
+            keepingCapacity: true
+        )
+        var renderFailure: CACommittedSnapshotEncodingFailure?
+        do {
+            try renderSnapshotNode(
+                at: target.nodeIndex,
+                in: snapshot,
+                renderPass: renderPass,
+                parentMatrix: target.parentMatrix,
+                isRoot: false,
+                device: device,
+                bindGroup: bindGroup
+            )
+        } catch {
+            renderFailure = error
+        }
+
+        opacityStack = savedOpacityStack
+        clipRectStack = savedClipStack
+        maskNestingDepth = savedMaskDepth
+        activeStencilFrames = savedActiveStencilFrames
+        currentStencilValue = savedStencilValue
+        snapshotCompositionCaptureStopNodeIndex = savedStop
+        snapshotCompositionCaptureDidReachStop = savedDidReachStop
+        snapshotCompositionCapturePassThroughNodeIndices =
+            savedPassThrough
+        renderPass.end()
+        if renderFailure != nil {
+            throw .clipMaskFailed
         }
     }
 
@@ -6354,7 +7393,36 @@ private final class EmitterLayerState {
         let values = node.presentationValues
         guard !values.isHidden, values.opacity > 0 else { return }
 
+        if snapshotCompositionCaptureDidReachStop {
+            return
+        }
+        if snapshotCompositionCaptureStopNodeIndex == nodeIndex {
+            snapshotCompositionCaptureDidReachStop = true
+            return
+        }
+
         if snapshotCompositeCaptureRootNodeIndex != nodeIndex,
+           !snapshotCompositionCapturePassThroughNodeIndices.contains(
+                nodeIndex
+           ),
+           snapshotPreparedCompositions.indices.contains(nodeIndex),
+           let composition = snapshotPreparedCompositions[nodeIndex] {
+            do {
+                try renderSnapshotPreparedComposition(
+                    composition,
+                    device: device,
+                    renderPass: renderPass
+                )
+            } catch {
+                throw .backdropComposition(error)
+            }
+            return
+        }
+
+        if snapshotCompositeCaptureRootNodeIndex != nodeIndex,
+           !snapshotCompositionCapturePassThroughNodeIndices.contains(
+                nodeIndex
+           ),
            snapshotCompositedNodes.indices.contains(nodeIndex),
            let compositedNode = snapshotCompositedNodes[nodeIndex] {
             do {
@@ -6527,6 +7595,55 @@ private final class EmitterLayerState {
                 bindGroup: bindGroup
             )
         }
+    }
+
+    private func renderSnapshotPreparedComposition(
+        _ composition: SnapshotPreparedComposition,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder
+    ) throws(CACompositionFilterRenderFailure) {
+        guard let filterReplacementPipeline,
+              let blurSampler else {
+            throw .displayResourcesUnavailable
+        }
+        var uniforms = FilterCompositeUniforms()
+        device.queue.writeBuffer(
+            composition.resources.displayUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &uniforms)
+        )
+        let bindGroup = device.createBindGroup(
+            descriptor: GPUBindGroupDescriptor(
+                layout: filterReplacementPipeline.getBindGroupLayout(
+                    index: 0
+                ),
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .buffer(
+                            composition.resources.displayUniformBuffer,
+                            offset: 0,
+                            size: UInt64(
+                                MemoryLayout<
+                                    FilterCompositeUniforms
+                                >.stride
+                            )
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .textureView(composition.outputView)
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 2,
+                        resource: .sampler(blurSampler)
+                    ),
+                ]
+            )
+        )
+        renderPass.setPipeline(filterReplacementPipeline)
+        renderPass.setBindGroup(0, bindGroup: bindGroup)
+        renderPass.draw(vertexCount: 6)
     }
 
     private func renderSnapshotShadow(

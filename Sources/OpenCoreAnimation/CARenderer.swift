@@ -14,6 +14,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case contentMask
     case groupOpacity
     case filters
+    case backdropComposition
     case shadow
 }
 
@@ -75,6 +76,10 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerShadow(CARenderSnapshotShadowError)
     /// A layer filter could not become an immutable renderer resource.
     case invalidLayerFilter(CARenderSnapshotFilterError)
+    /// A layer compositing filter could not become an immutable renderer resource.
+    case invalidLayerCompositingFilter(CARenderSnapshotFilterError)
+    /// A layer background filter could not become an immutable renderer resource.
+    case invalidLayerBackgroundFilter(CARenderSnapshotFilterError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

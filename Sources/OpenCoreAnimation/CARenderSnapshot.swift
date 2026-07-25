@@ -3,7 +3,6 @@ import Foundation
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
     case specializedLayer
     case contents
-    case backdropComposition
     case rasterization
     case transition
 }
@@ -17,10 +16,10 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot contains every value
 // consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
 // including nested rectangular and rounded clipping, ordinary CGImage
-// contents, and layer filter execution plans. Production WebGPU still uses
-// explicitly typed live-tree branches for non-image contents, specialized
-// layers, backdrop composition, rasterization, transitions, and animation
-// evaluation.
+// contents, layer filter execution plans, and backdrop composition plans.
+// Production WebGPU still uses explicitly typed live-tree branches for
+// non-image contents, specialized layers, rasterization, transitions, and
+// animation evaluation.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -60,6 +59,9 @@ internal struct CARenderSnapshot: Sendable {
         internal let contentsHeadroom: Float
         internal let imageContents: CAImageContentsSnapshot?
         internal let filters: [CARenderSnapshotFilterStage]
+        internal let compositingFilter:
+            CARenderSnapshotCompositingFilter?
+        internal let backgroundFilters: [CARenderSnapshotFilterStage]
         internal let shadow: Shadow?
     }
 
@@ -194,10 +196,6 @@ internal struct CARenderSnapshot: Sendable {
            !(presentationLayer.contents is CGImage) {
             return .contents
         }
-        if presentationLayer.compositingFilter != nil
-            || presentationLayer.backgroundFilters?.isEmpty == false {
-            return .backdropComposition
-        }
         if presentationLayer.shouldRasterize {
             return .rasterization
         }
@@ -299,12 +297,29 @@ internal struct CARenderSnapshot: Sendable {
             throw .invalidLayerContents(error)
         }
         let filters: [CARenderSnapshotFilterStage]
+        let compositingFilter: CARenderSnapshotCompositingFilter?
+        let backgroundFilters: [CARenderSnapshotFilterStage]
         do {
             filters = try CARenderSnapshotFilterStage.capture(
                 layer.filters ?? []
             )
         } catch {
             throw .invalidLayerFilter(error)
+        }
+        do {
+            compositingFilter =
+                try CARenderSnapshotCompositingFilter.capture(
+                    layer.compositingFilter
+                )
+        } catch {
+            throw .invalidLayerCompositingFilter(error)
+        }
+        do {
+            backgroundFilters = try CARenderSnapshotFilterStage.capture(
+                layer.backgroundFilters ?? []
+            )
+        } catch {
+            throw .invalidLayerBackgroundFilter(error)
         }
         let shadow: PresentationValues.Shadow?
         if layer.shadowOpacity > 0, layer.shadowColor != nil {
@@ -392,6 +407,8 @@ internal struct CARenderSnapshot: Sendable {
             contentsHeadroom: contentsHeadroom,
             imageContents: imageContents,
             filters: filters,
+            compositingFilter: compositingFilter,
+            backgroundFilters: backgroundFilters,
             shadow: shadow
         )
     }
