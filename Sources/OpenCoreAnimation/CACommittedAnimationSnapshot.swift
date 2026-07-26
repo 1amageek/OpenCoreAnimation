@@ -34,7 +34,7 @@ internal enum CACommittedAnimationValue: Sendable {
     case rect(CGRect)
     case transform(CATransform3D)
     case color(SIMD4<Double>)
-    case path(CGPath)
+    case path(CACommittedPath)
     case scalars([CGFloat])
     case doubles([Double])
     case floats([Float])
@@ -102,15 +102,7 @@ internal enum CACommittedAnimationValue: Sendable {
             return .color(try captureColor(value))
         }
         if let value = value as? CGPath {
-            do {
-                try ShapeFillTessellator.validate(value)
-            } catch {
-                throw .nonFiniteValue("CGPath")
-            }
-            guard let copy = value.copy() else {
-                throw .unsupportedValueType("CGPath")
-            }
-            return .path(copy)
+            return .path(try CACommittedPath(capturing: value))
         }
         if let value = value as? [CGFloat] {
             guard value.allSatisfy(\.isFinite) else {
@@ -175,7 +167,7 @@ internal enum CACommittedAnimationValue: Sendable {
         case .transform(let value): return value
         case .color(let value):
             return Self.materializeColor(value)
-        case .path(let value): return value
+        case .path(let value): return value.materialize()
         case .scalars(let value): return value
         case .doubles(let value): return value
         case .floats(let value): return value
@@ -306,7 +298,7 @@ internal struct CACommittedAnimationSnapshot: Sendable {
 
     internal struct Keyframe: Sendable {
         let values: [CACommittedAnimationValue]?
-        let path: CGPath?
+        let path: CACommittedPath?
         let keyTimes: [CGFloat]?
         let timingFunctions: [TimingFunction]?
         let calculationMode: CAAnimationCalculationMode
@@ -568,7 +560,7 @@ internal struct CACommittedAnimationSnapshot: Sendable {
                 }
                 result.values = materialized
             }
-            result.path = keyframe.path
+            result.path = keyframe.path?.materialize()
             result.keyTimes = keyframe.keyTimes
             result.timingFunctions =
                 keyframe.timingFunctions?.map {
@@ -627,17 +619,9 @@ internal struct CACommittedAnimationSnapshot: Sendable {
 
     private static func copiedPath(
         _ path: CGPath?
-    ) throws(CACommittedAnimationCaptureError) -> CGPath? {
+    ) throws(CACommittedAnimationCaptureError) -> CACommittedPath? {
         guard let path else { return nil }
-        do {
-            try ShapeFillTessellator.validate(path)
-        } catch {
-            throw .nonFiniteValue("CGPath")
-        }
-        guard let copy = path.copy() else {
-            throw .unsupportedValueType("CGPath")
-        }
-        return copy
+        return try CACommittedPath(capturing: path)
     }
 
     private static func validateCommonTiming(

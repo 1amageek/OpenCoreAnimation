@@ -16,6 +16,7 @@ private struct TextureCacheEntry {
 }
 
 private struct ImmutableTextureCacheEntry {
+    let storage: CGImageTextureStorage
     let texture: GPUTexture
     let memorySize: UInt64
     var lastAccessFrame: UInt64
@@ -24,20 +25,20 @@ private struct ImmutableTextureCacheEntry {
 
 private enum TextureEvictionCandidate {
     case image(ObjectIdentifier)
-    case immutableStorage(CGImageTextureStorage)
+    case immutableStorage(ObjectIdentifier)
 }
 
 /// An LRU cache for identity-owned `CGImage` textures and commit-owned pixels.
 ///
-/// Identity keys and value keys intentionally use separate dictionaries. This
-/// preserves the compact, established `ObjectIdentifier` storage path for live
-/// images while both stores share one texture-count and GPU-memory budget.
+/// Live-image and immutable-storage identities intentionally use separate
+/// dictionaries. Both stores share one texture-count and GPU-memory budget,
+/// while neither path hashes complete image pixels during frame rendering.
 public final class GPUTextureManager {
     private weak var device: GPUDevice?
     private var imageCache: [ObjectIdentifier: TextureCacheEntry] = [:]
     private var immutableStorageCache =
         OpenAddressingHashMap<
-            CGImageTextureStorage,
+            ObjectIdentifier,
             ImmutableTextureCacheEntry
         >()
     private var currentFrame: UInt64 = 0
@@ -114,10 +115,11 @@ public final class GPUTextureManager {
         memorySizeBytes: UInt64,
         factory: () -> GPUTexture?
     ) -> GPUTexture? {
-        if var entry = immutableStorageCache[storage] {
+        let key = ObjectIdentifier(storage.cacheIdentity)
+        if var entry = immutableStorageCache[key] {
             entry.lastAccessFrame = currentFrame
             entry.accessCount += 1
-            immutableStorageCache[storage] = entry
+            immutableStorageCache[key] = entry
             cacheHits += 1
             return entry.texture
         }
@@ -125,7 +127,8 @@ public final class GPUTextureManager {
         cacheMisses += 1
         guard let texture = factory() else { return nil }
         evictIfNeeded(forNewMemory: memorySizeBytes)
-        immutableStorageCache[storage] = ImmutableTextureCacheEntry(
+        immutableStorageCache[key] = ImmutableTextureCacheEntry(
+            storage: storage,
             texture: texture,
             memorySize: memorySizeBytes,
             lastAccessFrame: currentFrame,
@@ -189,7 +192,7 @@ public final class GPUTextureManager {
 
     public func clearAll() {
         let evictedImages = imageCache.values.map(\.cgImage)
-        let evictedStorage = Array(immutableStorageCache.keys)
+        let evictedStorage = immutableStorageCache.values.map(\.storage)
         imageCache.removeAll()
         immutableStorageCache.removeAll()
         currentMemoryBytes = 0
@@ -233,7 +236,7 @@ public final class GPUTextureManager {
         for key in storageKeys {
             if let entry = immutableStorageCache.removeValue(forKey: key) {
                 currentMemoryBytes -= entry.memorySize
-                evictedStorage.append(key)
+                evictedStorage.append(entry.storage)
             }
         }
         if let onEvict {
@@ -281,16 +284,16 @@ public final class GPUTextureManager {
             }
             currentMemoryBytes -= entry.memorySize
             onEvict?(entry.cgImage)
-        case .immutableStorage(let storage):
+        case .immutableStorage(let key):
             guard let entry = immutableStorageCache.removeValue(
-                forKey: storage
+                forKey: key
             ) else {
                 preconditionFailure(
                     "Selected immutable texture entry disappeared"
                 )
             }
             currentMemoryBytes -= entry.memorySize
-            onImmutableStorageEvict?(storage)
+            onImmutableStorageEvict?(entry.storage)
         case nil:
             preconditionFailure(
                 "A non-empty texture cache must have an eviction candidate"

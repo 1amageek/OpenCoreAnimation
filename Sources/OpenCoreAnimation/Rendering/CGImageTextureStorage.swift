@@ -1,11 +1,48 @@
 import Foundation
 
 /// Tightly packed, straight-alpha pixels ready for GPU texture upload.
+///
+/// Copies share a cache identity even though value equality continues to
+/// compare pixels. The renderer uses that identity for constant-time texture
+/// lookups instead of hashing the complete `Data` payload every frame.
 internal struct CGImageTextureStorage: Equatable, Hashable, Sendable {
+    internal final class CacheIdentity: Sendable {}
+
+    internal let cacheIdentity: CacheIdentity
     internal let format: CGImageTexturePixelFormat
     internal let width: Int
     internal let height: Int
     internal let data: Data
+
+    internal init(
+        format: CGImageTexturePixelFormat,
+        width: Int,
+        height: Int,
+        data: Data
+    ) {
+        cacheIdentity = CacheIdentity()
+        self.format = format
+        self.width = width
+        self.height = height
+        self.data = data
+    }
+
+    internal static func == (
+        lhs: CGImageTextureStorage,
+        rhs: CGImageTextureStorage
+    ) -> Bool {
+        lhs.format == rhs.format
+            && lhs.width == rhs.width
+            && lhs.height == rhs.height
+            && lhs.data == rhs.data
+    }
+
+    internal func hash(into hasher: inout Hasher) {
+        hasher.combine(format)
+        hasher.combine(width)
+        hasher.combine(height)
+        hasher.combine(data)
+    }
 
     internal var bytesPerRow: Int {
         width * format.bytesPerPixel

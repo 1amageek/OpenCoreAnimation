@@ -6,18 +6,48 @@ import Testing
 
 private final class RecordingRenderer: CGContextStatefulRendererDelegate {
     struct ImageDrawCall: Sendable {
-        let image: CGImage
+        let imageWidth: Int
+        let imageHeight: Int
         let rect: CGRect
         let blendMode: CGBlendMode
-        let clipPaths: [CGClipPath]
+        let clipPaths: [RecordedClipPath]
     }
 
     struct FillCall: Sendable {
-        let path: CGPath
-        let color: CGColor
-        let clipPaths: [CGClipPath]
+        private let pathSnapshot: CACommittedPath
+        let clipPaths: [RecordedClipPath]
         let transform: CGAffineTransform
         let alpha: CGFloat
+
+        init(
+            pathSnapshot: CACommittedPath,
+            clipPaths: [RecordedClipPath],
+            transform: CGAffineTransform,
+            alpha: CGFloat
+        ) {
+            self.pathSnapshot = pathSnapshot
+            self.clipPaths = clipPaths
+            self.transform = transform
+            self.alpha = alpha
+        }
+
+        var path: CGPath {
+            pathSnapshot.materialize()
+        }
+    }
+
+    struct RecordedClipPath: Sendable {
+        private let pathSnapshot: CACommittedPath
+        let rule: CGPathFillRule
+
+        init(_ clipPath: CGClipPath) throws {
+            pathSnapshot = try CACommittedPath(capturing: clipPath.path)
+            rule = clipPath.rule
+        }
+
+        var path: CGPath {
+            pathSnapshot.materialize()
+        }
     }
 
     private struct State: Sendable {
@@ -92,11 +122,19 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate {
         rule: CGPathFillRule,
         state: CGDrawingState
     ) {
+        let pathSnapshot: CACommittedPath
+        let clipPaths: [RecordedClipPath]
+        do {
+            pathSnapshot = try CACommittedPath(capturing: path)
+            clipPaths = try state.clipPaths.map(RecordedClipPath.init)
+        } catch {
+            Issue.record("Failed to capture renderer path: \(error)")
+            return
+        }
         self.state.withLock {
             $0.fillCalls.append(FillCall(
-                path: path,
-                color: color,
-                clipPaths: state.clipPaths,
+                pathSnapshot: pathSnapshot,
+                clipPaths: clipPaths,
                 transform: state.ctm,
                 alpha: alpha
             ))
@@ -111,12 +149,20 @@ private final class RecordingRenderer: CGContextStatefulRendererDelegate {
         interpolationQuality: CGInterpolationQuality,
         state: CGDrawingState
     ) {
+        let clipPaths: [RecordedClipPath]
+        do {
+            clipPaths = try state.clipPaths.map(RecordedClipPath.init)
+        } catch {
+            Issue.record("Failed to capture renderer clip path: \(error)")
+            return
+        }
         self.state.withLock {
             $0.imageDrawCalls.append(ImageDrawCall(
-                image: image,
+                imageWidth: image.width,
+                imageHeight: image.height,
                 rect: rect,
                 blendMode: blendMode,
-                clipPaths: state.clipPaths
+                clipPaths: clipPaths
             ))
         }
     }
@@ -223,8 +269,8 @@ struct CALayerRenderingTests {
 
         #expect(renderer.imageDrawCalls.count == 1)
         guard let drawCall = renderer.imageDrawCalls.first else { return }
-        #expect(drawCall.image.width == 2)
-        #expect(drawCall.image.height == 2)
+        #expect(drawCall.imageWidth == 2)
+        #expect(drawCall.imageHeight == 2)
         #expect(drawCall.rect == layer.bounds)
     }
 
@@ -246,18 +292,18 @@ struct CALayerRenderingTests {
 
         let centerRect = CGRect(x: 1, y: 1, width: 6, height: 6)
         let centerCall = renderer.imageDrawCalls.first { $0.rect == centerRect }
-        #expect(centerCall?.image.width == 2)
-        #expect(centerCall?.image.height == 2)
+        #expect(centerCall?.imageWidth == 2)
+        #expect(centerCall?.imageHeight == 2)
 
         let topEdgeRect = CGRect(x: 1, y: 0, width: 6, height: 1)
         let topEdgeCall = renderer.imageDrawCalls.first { $0.rect == topEdgeRect }
-        #expect(topEdgeCall?.image.width == 2)
-        #expect(topEdgeCall?.image.height == 1)
+        #expect(topEdgeCall?.imageWidth == 2)
+        #expect(topEdgeCall?.imageHeight == 1)
 
         let rightEdgeRect = CGRect(x: 7, y: 1, width: 1, height: 6)
         let rightEdgeCall = renderer.imageDrawCalls.first { $0.rect == rightEdgeRect }
-        #expect(rightEdgeCall?.image.width == 1)
-        #expect(rightEdgeCall?.image.height == 2)
+        #expect(rightEdgeCall?.imageWidth == 1)
+        #expect(rightEdgeCall?.imageHeight == 2)
     }
 
     @Test("contentsCenter is ignored when contentsGravity does not resize")

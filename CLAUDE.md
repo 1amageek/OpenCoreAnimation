@@ -42,8 +42,9 @@ layer.frame = CGRect(x: 0, y: 0, width: 100, height: 100)
 
 ```bash
 swift build
-perl -e 'alarm 30; exec @ARGV' -- \
+perl -e 'alarm 300; exec @ARGV' -- \
   xcodebuild test -scheme OpenCoreAnimation -destination 'platform=macOS' \
+  SWIFT_COMPILATION_MODE=wholemodule SWIFT_ENABLE_BATCH_MODE=NO \
   -only-testing:OpenCoreAnimationTests
 TOOLCHAINS=org.swift.64202607171a xcrun swift build \
   --swift-sdk swift-6.4.x-DEVELOPMENT-SNAPSHOT-2026-07-17-a_wasm

@@ -44,9 +44,14 @@ struct CATiledLayerTests {
         let image = try makeImage()
 
         #expect(layer.beginTileRequest(for: key) != nil)
-        layer.cacheImage(image, for: key, at: 10)
+        try layer.cacheImage(image, for: key, at: 10)
 
-        #expect(layer.cachedImage(for: key) === image)
+        let storage = try #require(
+            layer.cachedStorage(for: key)
+        )
+        #expect(storage.width == image.width)
+        #expect(storage.height == image.height)
+        #expect(storage.data == image.data)
         #expect(!layer.hasLoadingTile(key))
         #expect(layer.tileOpacity(for: key, at: 10) == 0)
         #expect(abs(layer.tileOpacity(for: key, at: 10.125) - 0.5) < 0.001)
@@ -58,11 +63,11 @@ struct CATiledLayerTests {
     func clearingTileRemovesAllCachedState() throws {
         let layer = CATiledLayer()
         let key = CATiledLayer.TileKey(column: 0, row: 0, lodLevel: -1)
-        layer.cacheImage(try makeImage(), for: key, at: 10)
+        try layer.cacheImage(try makeImage(), for: key, at: 10)
 
         layer.clearTile(at: key)
 
-        #expect(layer.cachedImage(for: key) == nil)
+        #expect(layer.cachedStorage(for: key) == nil)
         #expect(layer.tileFadeStartTime(for: key) == nil)
         #expect(layer.tileOpacity(for: key, at: 10) == 1)
     }
@@ -80,7 +85,7 @@ struct CATiledLayerTests {
         let currentGeneration = try #require(
             layer.beginTileRequest(for: key)
         )
-        #expect(!layer.cacheImage(
+        #expect(try !layer.cacheImage(
             try makeImage(),
             for: key,
             requestGeneration: staleGeneration,
@@ -90,28 +95,57 @@ struct CATiledLayerTests {
             layer.loadingGeneration(for: key)
                 == currentGeneration
         )
-        #expect(layer.cachedImage(for: key) == nil)
+        #expect(layer.cachedStorage(for: key) == nil)
 
-        #expect(layer.cacheImage(
+        #expect(try layer.cacheImage(
             try makeImage(),
             for: key,
             requestGeneration: currentGeneration,
             at: 11
         ))
-        #expect(layer.cachedImage(for: key) != nil)
+        #expect(layer.cachedStorage(for: key) != nil)
         #expect(!layer.hasLoadingTile(key))
+    }
+
+    @Test("Stale tile results are rejected before pixel conversion")
+    func staleTileSkipsInvalidPixelConversion() throws {
+        let layer = CATiledLayer()
+        let key = CATiledLayer.TileKey(
+            column: 0,
+            row: 0,
+            lodLevel: 0
+        )
+        let staleGeneration = try #require(
+            layer.beginTileRequest(for: key)
+        )
+        layer.setNeedsDisplay()
+        let currentGeneration = try #require(
+            layer.beginTileRequest(for: key)
+        )
+        let invalidImage = try makeInvalidStrideImage()
+
+        #expect(try !layer.cacheImage(
+            invalidImage,
+            for: key,
+            requestGeneration: staleGeneration
+        ))
+        #expect(
+            layer.loadingGeneration(for: key)
+                == currentGeneration
+        )
+        #expect(layer.cachedStorage(for: key) == nil)
     }
 
     @Test("Tile geometry changes clear cache without dirtying copies")
     func tileConfigurationInvalidationAndCopy() throws {
         let layer = CATiledLayer()
         let key = CATiledLayer.TileKey(column: 0, row: 0, lodLevel: 0)
-        layer.cacheImage(try makeImage(), for: key, at: 10)
+        try layer.cacheImage(try makeImage(), for: key, at: 10)
         layer.displayIfNeeded()
 
         layer.tileSize = CGSize(width: 128, height: 128)
 
-        #expect(layer.cachedImage(for: key) == nil)
+        #expect(layer.cachedStorage(for: key) == nil)
         #expect(layer.needsDisplay())
         layer.levelsOfDetail = 3
         layer.levelsOfDetailBias = 2
@@ -207,6 +241,27 @@ struct CATiledLayerTests {
             bytesPerRow: 4,
             space: .deviceRGB,
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ))
+    }
+
+    private func makeInvalidStrideImage() throws -> CGImage {
+        let provider = CGDataProvider(
+            data: Data(repeating: 0, count: 8)
+        )
+        return try #require(CGImage(
+            width: 2,
+            height: 1,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: 4,
+            space: .deviceRGB,
+            bitmapInfo: CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+            ),
             provider: provider,
             decode: nil,
             shouldInterpolate: false,

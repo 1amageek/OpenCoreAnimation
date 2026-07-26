@@ -5612,7 +5612,7 @@ open class CALayer: CAMediaTiming, Hashable {
         copy._shadowRadius = modelValues.shadowRadius
         copy._shadowOffset = modelValues.shadowOffset
         copy._shadowColor = modelValues.shadowColor
-        copy._shadowPath = modelValues.shadowPath
+        copy._shadowPath = modelValues.shadowPath?.materialize()
         copy._isOpaque = values.isOpaque
         copy.isGeometryFlipped = values.isGeometryFlipped
         copy._shouldRasterize = values.shouldRasterize
@@ -5680,7 +5680,7 @@ open class CALayer: CAMediaTiming, Hashable {
         }
         if let shape = modelValues.shape,
            let destination = copy as? CAShapeLayer {
-            destination._path = shape.path
+            destination._path = shape.path?.materialize()
             destination._fillColor = shape.fillColor
             destination.fillRule = shape.fillRule
             destination.lineCap = shape.lineCap

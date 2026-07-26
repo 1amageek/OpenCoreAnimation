@@ -4,6 +4,27 @@ import Testing
 
 @Suite("CGImage texture storage conversion")
 struct CGImageTextureStorageConverterTests {
+    @Test("Storage copies preserve cache identity without changing value equality")
+    func stableCacheIdentity() {
+        let storage = CGImageTextureStorage(
+            format: .rgba8Unorm,
+            width: 1,
+            height: 1,
+            data: Data([1, 2, 3, 4])
+        )
+        let copy = storage
+        let equalStorage = CGImageTextureStorage(
+            format: .rgba8Unorm,
+            width: 1,
+            height: 1,
+            data: Data([1, 2, 3, 4])
+        )
+
+        #expect(copy.cacheIdentity === storage.cacheIdentity)
+        #expect(equalStorage == storage)
+        #expect(equalStorage.cacheIdentity !== storage.cacheIdentity)
+    }
+
     @Test("Premultiplied RGBA8 is normalized to straight alpha")
     func premultipliedRGBA8IsUnpremultiplied() throws {
         let image = try makeImage(

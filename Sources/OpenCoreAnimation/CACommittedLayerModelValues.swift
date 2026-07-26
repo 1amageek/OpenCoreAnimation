@@ -18,7 +18,7 @@ internal struct CACommittedLayerModelValues: Sendable {
     }
 
     internal struct Shape: Sendable {
-        let path: CGPath?
+        let path: CACommittedPath?
         let fillColor: CGColor?
         let fillRule: CAShapeLayerFillRule
         let lineCap: CAShapeLayerLineCap
@@ -65,7 +65,7 @@ internal struct CACommittedLayerModelValues: Sendable {
     let shadowOpacity: Float
     let shadowRadius: CGFloat
     let shadowOffset: CGSize
-    let shadowPath: CGPath?
+    let shadowPath: CACommittedPath?
     let shape: Shape?
     let replicator: Replicator?
 
@@ -106,13 +106,21 @@ internal struct CACommittedLayerModelValues: Sendable {
         shadowRadius = layer.shadowRadius
         shadowOffset = layer.shadowOffset
         if let path = layer.shadowPath {
-            shadowPath = try Self.copy(path)
+            shadowPath = try CACommittedPath(capturing: path)
         } else {
             shadowPath = nil
         }
         if let layer = layer as? CAShapeLayer {
+            let capturedPath: CACommittedPath?
+            if let path = layer.path {
+                capturedPath = try CACommittedPath(
+                    capturing: path
+                )
+            } else {
+                capturedPath = nil
+            }
             shape = Shape(
-                path: try layer.path.map(Self.copy),
+                path: capturedPath,
                 fillColor: try layer.fillColor.map(
                     Self.copy
                 ),
@@ -149,15 +157,6 @@ internal struct CACommittedLayerModelValues: Sendable {
         } else {
             replicator = nil
         }
-    }
-
-    private static func copy(
-        _ path: CGPath
-    ) throws(CACommittedAnimationCaptureError) -> CGPath {
-        guard let copy = path.copy() else {
-            throw .unsupportedValueType("CGPath")
-        }
-        return copy
     }
 
     private static func copy(

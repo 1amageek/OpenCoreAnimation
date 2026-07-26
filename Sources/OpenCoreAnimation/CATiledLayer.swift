@@ -50,7 +50,7 @@ open class CATiledLayer: CALayer {
         Mutex<UInt64>(0)
 
     private struct TileState {
-        var cache = CATileKeyMap<CGImage>()
+        var cache = CATileKeyMap<CGImageTextureStorage>()
         var fadeStartTimes = CATileKeyMap<CFTimeInterval>()
         var loadingTiles = CATileKeySet()
         var loadingGenerations = CATileKeyMap<UInt64>()
@@ -229,8 +229,10 @@ open class CATiledLayer: CALayer {
         }
     }
 
-    /// Returns the cached image for a tile, or nil if not cached.
-    internal func cachedImage(for key: TileKey) -> CGImage? {
+    /// Returns immutable renderer-ready pixels for a tile.
+    internal func cachedStorage(
+        for key: TileKey
+    ) -> CGImageTextureStorage? {
         tileState.withLock { $0.cache[key] }
     }
 
@@ -286,8 +288,37 @@ open class CATiledLayer: CALayer {
         for key: TileKey,
         requestGeneration: UInt64? = nil,
         at mediaTime: CFTimeInterval = CACurrentMediaTime()
-    ) -> Bool {
-        tileState.withLock { state in
+    ) throws(CAImageContentsConversionError) -> Bool {
+        if let requestGeneration,
+           !ownsTileRequest(
+                for: key,
+                generation: requestGeneration
+           ) {
+            return false
+        }
+
+        // Conversion is intentionally outside the critical section. The
+        // ownership check above avoids work for known-stale results, while the
+        // check in the insertion transaction closes an invalidation race.
+        let storage: CGImageTextureStorage
+        do {
+            storage = try CGImageTextureStorageConverter.convert(
+                image
+            )
+        } catch {
+            // Invalidation owns the result once this request becomes stale.
+            // Do not surface a conversion failure from work that can no
+            // longer affect the current cache generation.
+            if let requestGeneration,
+               !ownsTileRequest(
+                    for: key,
+                    generation: requestGeneration
+               ) {
+                return false
+            }
+            throw error
+        }
+        return tileState.withLock { state in
             if let requestGeneration {
                 guard requestGeneration == state.generation,
                       state.loadingGenerations[key]
@@ -295,11 +326,21 @@ open class CATiledLayer: CALayer {
                     return false
                 }
             }
-            state.cache[key] = image
+            state.cache[key] = storage
             state.fadeStartTimes[key] = mediaTime
             state.loadingTiles.remove(key)
             state.loadingGenerations.removeValue(forKey: key)
             return true
+        }
+    }
+
+    private func ownsTileRequest(
+        for key: TileKey,
+        generation: UInt64
+    ) -> Bool {
+        tileState.withLock { state in
+            generation == state.generation
+                && state.loadingGenerations[key] == generation
         }
     }
 

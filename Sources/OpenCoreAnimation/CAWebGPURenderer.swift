@@ -21090,7 +21090,7 @@ private final class CommittedAnimationEvaluationFailure {
                 let tileMatrix = modelMatrix * tileTranslate * tileScale
 
                 // Check if tile has cached content
-                if let cachedImage = tiledLayer.cachedImage(for: tileKey) {
+                if let cachedStorage = tiledLayer.cachedStorage(for: tileKey) {
                     let fadeOpacity = tiledLayer.tileOpacity(for: tileKey, at: tileMediaTime)
                     if fadeOpacity < 1 {
                         tiledLayer.markDirty(.contents)
@@ -21104,8 +21104,8 @@ private final class CommittedAnimationEvaluationFailure {
                         ? Float(presentation.edgeAntialiasingMask.intersection(outerEdges).rawValue)
                         : 0
                     // Render cached tile as texture
-                    renderTileWithImage(
-                        cachedImage,
+                    renderTileWithStorage(
+                        cachedStorage,
                         layer: presentation,
                         device: device,
                         renderPass: renderPass,
@@ -21136,9 +21136,9 @@ private final class CommittedAnimationEvaluationFailure {
 
     }
 
-    /// Renders a tile with a cached image texture.
-    private func renderTileWithImage(
-        _ image: CGImage,
+    /// Renders a tile from immutable, renderer-ready pixel storage.
+    private func renderTileWithStorage(
+        _ storage: CGImageTextureStorage,
         layer: CALayer,
         device: GPUDevice,
         renderPass: GPURenderPassEncoder,
@@ -21154,19 +21154,12 @@ private final class CommittedAnimationEvaluationFailure {
             return
         }
 
-        // Get or create texture for image using the texture manager.
-        // The manager retains `image` for the cached lifetime; passing
-        // the CGImage directly (rather than `image as AnyObject`) keeps
-        // the cache key on the same identity that downstream caches use.
-        let imageWidth = image.width
-        let imageHeight = image.height
-        let textureFormat = CGImageTexturePixelFormat.recommended(for: image)
         let memorySizeBytes: UInt64
         do {
             memorySizeBytes = try mipmappedRGBAByteCount(
-                width: imageWidth,
-                height: imageHeight,
-                format: textureFormat,
+                width: storage.width,
+                height: storage.height,
+                format: storage.format,
                 device: device
             )
         } catch {
@@ -21179,15 +21172,12 @@ private final class CommittedAnimationEvaluationFailure {
         }
         var textureConversionError: CAImageContentsConversionError?
         let texture = textureManager.getOrCreateTexture(
-            for: image,
-            width: imageWidth,
-            height: imageHeight,
+            for: storage,
             memorySizeBytes: memorySizeBytes,
             factory: {
                 do {
                     return try self.createGPUTexture(
-                        from: image,
-                        format: textureFormat,
+                        from: storage,
                         device: device
                     )
                 } catch let error as CAImageContentsConversionError {
@@ -21359,12 +21349,26 @@ private final class CommittedAnimationEvaluationFailure {
                 )
                 return
             }
-            if tiledLayer.cacheImage(
-                image,
-                for: tileKey,
-                requestGeneration: cacheGeneration
-            ) {
-                tiledLayer.markDirty(.contents)
+            do {
+                if try tiledLayer.cacheImage(
+                    image,
+                    for: tileKey,
+                    requestGeneration: cacheGeneration
+                ) {
+                    tiledLayer.markDirty(.contents)
+                }
+            } catch let error as CAImageContentsConversionError {
+                self?.recordContentsConversionFailure(error)
+                tiledLayer.cancelTileRequest(
+                    for: tileKey,
+                    generation: cacheGeneration
+                )
+            } catch {
+                self?.recordContentsConversionFailure(.conversionFailed)
+                tiledLayer.cancelTileRequest(
+                    for: tileKey,
+                    generation: cacheGeneration
+                )
             }
         }
     }
