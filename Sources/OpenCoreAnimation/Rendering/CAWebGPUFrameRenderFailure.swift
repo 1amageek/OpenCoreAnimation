@@ -18,6 +18,7 @@ public enum CACommittedSnapshotEncodingFailure: Error, Equatable, Sendable {
     case replicator(CAReplicatorRenderFailure)
     case emitter(CAEmitterFailure)
     case tiled(CATiledLayerRenderFailure)
+    case transition(CATransitionRenderFailure)
 }
 
 /// Describes why a WebGPU frame could not begin rendering.
@@ -35,6 +36,7 @@ public enum CAWebGPUFrameRenderFailure: Error, Equatable, Sendable {
     case rasterizationCacheUnavailable
     case delegateBackingStoreFailed(CADelegateBackingStoreError)
     case contentMaskPreparationFailed(CAContentMaskPreparationFailure)
+    case transitionPreparationFailed(CATransitionRenderFailure)
     case committedSnapshotCaptureFailed(CARendererError)
     case committedSnapshotEncodingFailed(
         CACommittedSnapshotEncodingFailure

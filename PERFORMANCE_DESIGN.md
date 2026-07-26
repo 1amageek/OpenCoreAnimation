@@ -870,10 +870,14 @@ renderer-owned particle state without retaining a model layer. Successful
 submission retains only the immutable emitter snapshot while particles require
 clean-tree frames; encoding failure restores the complete particle state and
 keeps the committed transaction pending for retry. The snapshot does not yet
-own non-image contents or copied animation evaluators. Static tiled layers
-capture immutable provider content and use renderer-owned generation/cache
-state. A tree with active transition state publishes
-`requiresLiveResourceCapture(.transition)` instead of claiming snapshot success.
+own copied animation evaluators. Static tiled layers capture immutable provider
+content and use renderer-owned generation/cache state. When a transition is
+represented in a snapshot, it contains immutable source and target subtrees,
+value-owned filter configuration, composite geometry, and progress; WebGPU
+never rereads the transition's model layer or filter object while encoding that
+snapshot. Active transaction commits still publish
+`requiresLiveAnimationEvaluation` until the copied evaluator produces these
+snapshots in the normal frame path.
 Backface policy, clipping geometry, and the captured transform are value-owned
 and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents,
@@ -1085,7 +1089,7 @@ path. A custom `CAAction` that mutates another root while the outer commit is
 being applied registers that root with the coordinator without opening a
 second implicit transaction.
 
-The Metal renderer, WebGPU immutable-solid path, and WebGPU typed live-tree
+The Metal renderer, WebGPU immutable snapshot path, and WebGPU typed live-tree
 paths release the render-root obligation only after command submission and
 dirty clearing:
 
@@ -1098,9 +1102,9 @@ rootLayer.completeTransactionsAfterRenderRecursively() // ② then release block
 If a transaction has neither model mutations nor animations, sealing its
 coordinator completes it immediately. If a mutated root has not been submitted,
 the coordinator remains pending on that root. Native static snapshots and
-WebGPU common-solid snapshots preserve the same coordinator semantics;
-animated and resource-backed WebGPU submissions remain typed live-tree paths
-until the rest of R4.1 is implemented.
+WebGPU snapshots preserve the same coordinator semantics; animated WebGPU
+submissions remain a typed live-tree path until the copied animation evaluator
+is implemented.
 
 **Why this order (B6 detail).** A completion block can legally mutate the
 layer graph — the canonical pattern is "fade-out animation finishes →
@@ -1127,9 +1131,9 @@ snapshots for common static trees, including ordinary `CGImage` contents,
 gradients, shapes, and text configuration. The native Metal backend consumes
 each snapshot feature it supports and reports a typed unsupported-feature
 error for every unimplemented committed resource category. Animated trees
-and remaining resource-backed or specialized WebGPU trees still require
-frame-time live-tree evaluation because their richer immutable resource state
-is not yet implemented. As R4.1–R4.4 continue, migration may temporarily permit
+still require frame-time live-tree evaluation because the copied animation
+evaluator is not yet implemented. As R4.1–R4.4 continue, migration may
+temporarily permit
 `pendingSnapshot == nil` (no commit happened) to render live for existing
 callers (`CADisplayLink.displayLinkDidFire` direct →
 `renderer.render(layer:)`).
@@ -1138,10 +1142,12 @@ The pending state exists on each render root. WebGPU consumes capture failures,
 generation ownership, and common-solid snapshot render values. Completion
 ordering in §6.5, the live-tree static submission decision in §6.3,
 transaction-owned static snapshots, direct common-solid WebGPU encoding,
-revision-safe dirty clearing on both backends, and frame-boundary mutation
-isolation are completed Phase 4 slices. The final snapshot acceptance test must
-prove that resource-backed, specialized, and animated frames also stop reading
-mutable model state after commit.
+revision-safe dirty clearing on both backends, frame-boundary mutation
+isolation, immutable transition participants, and value-owned transition filter
+configuration are completed Phase 4 building blocks. The final snapshot
+acceptance test must prove that the normal animated commit path, including
+transitions, uses those values and stops reading mutable model state after
+commit.
 
 ### 6.7 Edge cases checklist
 
@@ -1160,6 +1166,8 @@ mutable model state after commit.
 | Global frame token | `Mutex<UInt64>` | Same common declaration | Package has no Embedded product; no weaker branch exists | `_currentFrameToken`; `advanceFrameToken()` | Static process lifetime; arithmetic occurs inside `withLock` |
 | Public transaction recursive exclusion | `CATransactionRecursiveLock` with a `Mutex<Void>` gate and `Mutex<State>` owner metadata | Same common declaration and runtime path | Package has no Embedded product; no weaker branch exists | `CATransaction.lock()` / `unlock()` | Static process lifetime; split acquire/release is required by the public API, while owner metadata remains scoped to `withLock` |
 | Transaction stack | Thread-confined `CATransactionStack` retained in the internal pthread TLS slot | Same common declaration and C TLS boundary | Package has no Embedded product; no weaker branch exists | `getCurrentTransactionStack()` creates on the calling thread; all transaction reads and mutations stay on that thread | Idle clearing removes the slot before releasing its retained owner; the pthread destructor releases an uncommitted stack exactly once at thread exit |
+| Transition resource identity | Static `Mutex<UInt64>` counter shared by every `CATransition` initializer | Same common declaration | Package has no Embedded product; no weaker branch exists | `CATransition.nextResourceIdentity()` is the only mutation entry point | Static process lifetime; no callback or I/O occurs under the mutex |
+| Transition GPU capture and failure history | Renderer state is `MainActor`-isolated | Same `MainActor` renderer declaration and browser execution path | Package has no Embedded product | Frame preparation, encoding, retirement, and diagnostic reads all enter through `CAWebGPURenderer` | Resources are retired at a frame boundary or renderer invalidation; GPU destruction and callbacks occur outside every mutex |
 
 The TLS C boundary stores one opaque pointer and never reads Swift object
 memory. Swift creates exactly one retained `CATransactionStack` owner before

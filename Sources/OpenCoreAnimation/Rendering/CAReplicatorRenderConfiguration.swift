@@ -1,7 +1,6 @@
 import Foundation
 
 /// Describes why a replicator layer could not complete its rendering pipeline.
-@_spi(RendererDiagnostics)
 public enum CAReplicatorRenderFailure: Error, Equatable, Sendable {
     case instanceCountExceedsRendererCapacity(actual: Int, maximum: Int)
     case nonFiniteInstanceDelay

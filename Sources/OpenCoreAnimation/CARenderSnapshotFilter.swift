@@ -27,64 +27,72 @@ internal enum CARenderSnapshotFilterParameter: Equatable, Sendable {
         key: String
     ) throws(CARenderSnapshotFilterError) -> Self {
         let parameter: Self
-        switch value {
-        case let value as Bool:
-            parameter = .boolean(value)
-        case let value as Int:
-            parameter = .integer(value)
-        case let value as Float:
-            parameter = .scalar(Double(value))
-        case let value as CGFloat:
-            parameter = .scalar(Double(value))
-        case let value as Double:
-            parameter = .scalar(value)
-        case let value as CGPoint:
-            parameter = .point(
-                SIMD2(Double(value.x), Double(value.y))
-            )
-        case let value as CGSize:
-            parameter = .size(
-                SIMD2(Double(value.width), Double(value.height))
-            )
-        case let value as CGRect:
-            parameter = .rectangle(
-                SIMD4(
-                    Double(value.origin.x),
-                    Double(value.origin.y),
-                    Double(value.size.width),
-                    Double(value.size.height)
+        if let values = value as? [Float] {
+            parameter = .vector(values.map(Double.init))
+        } else if let values = value as? [Double] {
+            parameter = .vector(values)
+        } else if let values = value as? [CGFloat] {
+            parameter = .vector(values.map(Double.init))
+        } else {
+            switch value {
+            case let value as Bool:
+                parameter = .boolean(value)
+            case let value as Int:
+                parameter = .integer(value)
+            case let value as Float:
+                parameter = .scalar(Double(value))
+            case let value as CGFloat:
+                parameter = .scalar(Double(value))
+            case let value as Double:
+                parameter = .scalar(value)
+            case let value as CGPoint:
+                parameter = .point(
+                    SIMD2(Double(value.x), Double(value.y))
                 )
-            )
-        case let value as CGAffineTransform:
-            parameter = .affineTransform(
-                a: Double(value.a),
-                b: Double(value.b),
-                c: Double(value.c),
-                d: Double(value.d),
-                tx: Double(value.tx),
-                ty: Double(value.ty)
-            )
-        #if arch(wasm32)
-        case let value as CIVector:
-            parameter = .vector(
-                (0..<value.count).map { Double(value.value(at: $0)) }
-            )
-        case let value as CIColor:
-            parameter = .color(
-                SIMD4(
-                    Double(value.red),
-                    Double(value.green),
-                    Double(value.blue),
-                    Double(value.alpha)
+            case let value as CGSize:
+                parameter = .size(
+                    SIMD2(Double(value.width), Double(value.height))
                 )
-            )
-        #endif
-        default:
-            throw .unsupportedCoreImageParameter(
-                filter: filterName,
-                key: key,
-                valueType: String(reflecting: type(of: value))
-            )
+            case let value as CGRect:
+                parameter = .rectangle(
+                    SIMD4(
+                        Double(value.origin.x),
+                        Double(value.origin.y),
+                        Double(value.size.width),
+                        Double(value.size.height)
+                    )
+                )
+            case let value as CGAffineTransform:
+                parameter = .affineTransform(
+                    a: Double(value.a),
+                    b: Double(value.b),
+                    c: Double(value.c),
+                    d: Double(value.d),
+                    tx: Double(value.tx),
+                    ty: Double(value.ty)
+                )
+            #if arch(wasm32)
+            case let value as CIVector:
+                parameter = .vector(
+                    (0..<value.count).map { Double(value.value(at: $0)) }
+                )
+            case let value as CIColor:
+                parameter = .color(
+                    SIMD4(
+                        Double(value.red),
+                        Double(value.green),
+                        Double(value.blue),
+                        Double(value.alpha)
+                    )
+                )
+            #endif
+            default:
+                throw .unsupportedCoreImageParameter(
+                    filter: filterName,
+                    key: key,
+                    valueType: String(reflecting: type(of: value))
+                )
+            }
         }
         guard parameter.hasFiniteFloatingPointValues else {
             throw .nonFiniteCoreImageParameter(

@@ -290,9 +290,11 @@ apparently immutable renderer resource.
 - A successful display invalidation starts a new generation and rejects stale
   asynchronous completion from the previous generation.
 
-Animated and transitioning tiled trees still use the explicitly marked live
-path until animation and transition evaluators themselves become immutable
-snapshot resources.
+Animated tiled trees still use the explicitly marked live path until the copied
+animation evaluator becomes an immutable snapshot resource. The snapshot type
+and renderer already accept immutable transition participants and filter
+configuration, but normal active-transition commits remain on that live path
+until the evaluator publishes a new snapshot for each frame.
 
 ---
 

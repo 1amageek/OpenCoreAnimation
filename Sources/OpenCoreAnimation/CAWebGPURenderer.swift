@@ -139,9 +139,9 @@ internal enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier, CAContentsSampling)
     case committedImage(ObjectIdentifier, CAContentsSampling)
     case rasterizedLayer(LayerRenderKey, RasterizationCachePurpose)
-    case transitionSource(ObjectIdentifier)
-    case transitionTarget(ObjectIdentifier)
-    case transitionFilter(ObjectIdentifier)
+    case transitionSource(UInt64)
+    case transitionTarget(UInt64)
+    case transitionFilter(UInt64)
 }
 
 private struct PendingTileDraw {
@@ -265,7 +265,7 @@ private enum CompositionMaskTarget {
 
 private struct TransitionParticipantCapture {
     let texture: GPUTexture
-    let compositeLayer: CALayer
+    let geometry: CATransitionCompositeGeometry
     let pixelWidth: Int
     let pixelHeight: Int
 }
@@ -273,7 +273,9 @@ private struct TransitionParticipantCapture {
 private struct TransitionCapturePair {
     let source: TransitionParticipantCapture
     let target: TransitionParticipantCapture
-    let filterExecution: CIWebGPUTransitionExecution?
+    var filterConfiguration:
+        CARenderSnapshotTransition.Filter?
+    var filterExecution: CIWebGPUTransitionExecution?
 }
 
 private struct TransitionCompositeRequest {
@@ -1952,22 +1954,31 @@ private final class RetainedDynamicSnapshot {
     /// budget can be sized to `viewport × 4 × 2.5` per WWDC 2014 #419.
     private var rasterizationCache: RasterizationCache<GPUTexture>?
 
-    /// Frozen source/target pairs keyed by the immutable transition source snapshot.
-    private var transitionCaptures: [ObjectIdentifier: TransitionCapturePair] = [:]
+    /// Frozen source/target pairs keyed by one attached transition copy.
+    private var transitionCaptures:
+        [UInt64: TransitionCapturePair] = [:]
 
     /// Transition resources removed while a command encoder may still reference them.
     /// They are destroyed at the next frame boundary, after the current submission.
     private var retiredTransitionCaptures: [TransitionCapturePair] = []
     private var retiredTransitionTextures: [GPUTexture] = []
+    private var retiredTransitionFilterExecutions:
+        [CIWebGPUTransitionExecution] = []
 
     /// Executes Core Image transition shaders on this renderer's GPU device.
     private var transitionFilterProcessor: CIWebGPUTransitionProcessor?
 
-    /// Source snapshots referenced by an active transition during the current frame.
-    private var activeTransitionSourceIDs: Set<ObjectIdentifier> = []
+    /// Transition resources referenced during the current frame.
+    private var activeTransitionResourceIDs: Set<UInt64> = []
 
-    /// Active transitions rejected because their filter cannot execute.
-    private var failedTransitionSourceIDs: Set<ObjectIdentifier> = []
+    /// Transition subtrees rejected during the current frame after a typed
+    /// preparation failure. The rest of the committed frame remains renderable.
+    private var failedTransitionResourceIDs: Set<UInt64> = []
+
+    /// Last typed preparation failure for each attached transition. A stable
+    /// failure remains retryable without inflating diagnostics every frame.
+    private var transitionPreparationFailures:
+        [UInt64: CATransitionRenderFailure] = [:]
 
     /// Capture-only depth textures retained until their command buffer has been submitted.
     private var transientCaptureDepthTextures: [GPUTexture] = []
@@ -2004,6 +2015,8 @@ private final class RetainedDynamicSnapshot {
     private var snapshotCompositionCaptureStopNodeIndex: Int?
     private var snapshotCompositionCaptureDidReachStop = false
     private var snapshotCompositionCapturePassThroughNodeIndices: Set<Int> = []
+    private var snapshotTransitionCaptureRootNodeIndex: Int?
+    private var snapshotTransitionSuppressedNodeIndex: Int?
 
     @_spi(RendererDiagnostics)
     public private(set) var transformFlatteningCaptureCount: Int = 0
@@ -4496,14 +4509,6 @@ private final class RetainedDynamicSnapshot {
         depthTextureView: GPUTextureView,
         renderTarget: CARenderTargetConfiguration
     ) {
-        guard snapshot.liveTreeRequirement == nil else {
-            recordFrameRenderFailure(
-                .committedSnapshotCaptureFailed(.renderingFailed(
-                    "An immutable snapshot retained a live-tree requirement"
-                ))
-            )
-            return
-        }
         guard prepareDynamicRangeOutput(for: snapshot) else { return }
         guard let bindGroup else {
             recordFrameRenderFailure(.baseBindGroupUnavailable)
@@ -4531,45 +4536,10 @@ private final class RetainedDynamicSnapshot {
             far: 1000
         )
         do {
-            let hasSnapshotShadows = snapshot.nodes.contains {
-                $0.presentationValues.shadow != nil
-            }
-            if hasSnapshotShadows {
-                snapshotSuppressesShadows = true
-                try prerenderSnapshotComposites(
-                    in: snapshot,
-                    projectionMatrix: projectionMatrix,
-                    depthTextureView: depthTextureView,
-                    encoder: encoder,
-                    device: device,
-                    bindGroup: bindGroup,
-                    pipeline: pipeline
-                )
-                snapshotSuppressesShadows = false
-                try prerenderSnapshotShadows(
-                    in: snapshot,
-                    projectionMatrix: projectionMatrix,
-                    depthTextureView: depthTextureView,
-                    encoder: encoder,
-                    device: device,
-                    bindGroup: bindGroup,
-                    pipeline: pipeline
-                )
-            }
-            try prerenderSnapshotComposites(
+            try prerenderCommittedSnapshot(
                 in: snapshot,
                 projectionMatrix: projectionMatrix,
                 depthTextureView: depthTextureView,
-                encoder: encoder,
-                device: device,
-                bindGroup: bindGroup,
-                pipeline: pipeline
-            )
-            try prerenderSnapshotBackdropCompositions(
-                in: snapshot,
-                projectionMatrix: projectionMatrix,
-                depthTextureView: depthTextureView,
-                clearColor: committedSnapshotClearColor(in: snapshot),
                 encoder: encoder,
                 device: device,
                 bindGroup: bindGroup,
@@ -4638,6 +4608,13 @@ private final class RetainedDynamicSnapshot {
                 recordEmitterRenderFailure(failure)
             case .tiled(let failure):
                 recordTiledLayerRenderFailure(failure)
+            case .transition(let failure):
+                recordTransitionFailure(
+                    failure,
+                    category: transitionFailureCategory(
+                        for: failure
+                    )
+                )
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4748,6 +4725,13 @@ private final class RetainedDynamicSnapshot {
                 recordEmitterRenderFailure(failure)
             case .tiled(let failure):
                 recordTiledLayerRenderFailure(failure)
+            case .transition(let failure):
+                recordTransitionFailure(
+                    failure,
+                    category: transitionFailureCategory(
+                        for: failure
+                    )
+                )
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
@@ -4770,8 +4754,17 @@ private final class RetainedDynamicSnapshot {
         }
         device.queue.submit([encoder.finish()])
         lastRenderedTexture = currentTexture
+        retireInactiveTransitionCaptures()
+        let transitionPreparationFailed =
+            !failedTransitionResourceIDs.isEmpty
 
-        if acknowledgesCommit {
+        if transitionPreparationFailed {
+            emitterLayerStates = emitterStateCheckpoint
+            committedTiledLayerStates = tiledStateCheckpoint
+            pendingCommittedTileDraws =
+                pendingCommittedTileCheckpoint
+        }
+        if acknowledgesCommit && !transitionPreparationFailed {
             rootLayer.recursivelyClearDirtyAfterCommit(
                 matching: snapshot
             )
@@ -4792,8 +4785,90 @@ private final class RetainedDynamicSnapshot {
                 )
             }
         }
-        lastFrameRenderFailure = nil
+        if !transitionPreparationFailed {
+            lastFrameRenderFailure = nil
+        }
         advanceFrameResources()
+    }
+
+    private func prerenderCommittedSnapshot(
+        in snapshot: CARenderSnapshot,
+        projectionMatrix: Matrix4x4,
+        depthTextureView: GPUTextureView,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        prerenderSnapshotTransitions(
+            in: snapshot,
+            device: device,
+            pipeline: pipeline,
+            bindGroup: bindGroup,
+            encoder: encoder
+        )
+        let hasSnapshotShadows = snapshot.nodes.contains {
+            $0.presentationValues.shadow != nil
+        }
+        if hasSnapshotShadows {
+            snapshotSuppressesShadows = true
+            try prerenderSnapshotComposites(
+                in: snapshot,
+                projectionMatrix: projectionMatrix,
+                depthTextureView: depthTextureView,
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
+            snapshotSuppressesShadows = false
+            try prerenderSnapshotShadows(
+                in: snapshot,
+                projectionMatrix: projectionMatrix,
+                depthTextureView: depthTextureView,
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
+        }
+        try prerenderSnapshotComposites(
+            in: snapshot,
+            projectionMatrix: projectionMatrix,
+            depthTextureView: depthTextureView,
+            encoder: encoder,
+            device: device,
+            bindGroup: bindGroup,
+            pipeline: pipeline
+        )
+        try prerenderSnapshotBackdropCompositions(
+            in: snapshot,
+            projectionMatrix: projectionMatrix,
+            depthTextureView: depthTextureView,
+            clearColor: committedSnapshotClearColor(in: snapshot),
+            encoder: encoder,
+            device: device,
+            bindGroup: bindGroup,
+            pipeline: pipeline
+        )
+    }
+
+    private func retireInactiveTransitionCaptures() {
+        let staleResourceIdentities = transitionCaptures.keys.filter {
+            !activeTransitionResourceIDs.contains($0)
+        }
+        for resourceIdentity in staleResourceIdentities {
+            retireTransitionCapture(for: resourceIdentity)
+        }
+        let staleFailureIdentities =
+            transitionPreparationFailures.keys.filter {
+                !activeTransitionResourceIDs.contains($0)
+            }
+        for resourceIdentity in staleFailureIdentities {
+            transitionPreparationFailures.removeValue(
+                forKey: resourceIdentity
+            )
+        }
     }
 
     private func committedSnapshotClearColor(
@@ -4847,7 +4922,8 @@ private final class RetainedDynamicSnapshot {
         reportedReplicatorRenderFailureKeys.removeAll(keepingCapacity: true)
         transitionSuppressedLayer = nil
         renderTargetSizeOverride = nil
-        activeTransitionSourceIDs.removeAll(keepingCapacity: true)
+        activeTransitionResourceIDs.removeAll(keepingCapacity: true)
+        failedTransitionResourceIDs.removeAll(keepingCapacity: true)
         for capture in retiredTransitionCaptures {
             capture.filterExecution?.invalidate()
             capture.source.texture.destroy()
@@ -4858,6 +4934,12 @@ private final class RetainedDynamicSnapshot {
             texture.destroy()
         }
         retiredTransitionTextures.removeAll(keepingCapacity: true)
+        for execution in retiredTransitionFilterExecutions {
+            execution.invalidate()
+        }
+        retiredTransitionFilterExecutions.removeAll(
+            keepingCapacity: true
+        )
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
@@ -4934,6 +5016,8 @@ private final class RetainedDynamicSnapshot {
         snapshotCompositionCapturePassThroughNodeIndices.removeAll(
             keepingCapacity: true
         )
+        snapshotTransitionCaptureRootNodeIndex = nil
+        snapshotTransitionSuppressedNodeIndex = nil
         perFrameTexturedBindGroupCache.removeAll(keepingCapacity: true)
     }
 
@@ -4974,6 +5058,8 @@ private final class RetainedDynamicSnapshot {
         snapshotCompositionCapturePassThroughNodeIndices.removeAll(
             keepingCapacity: true
         )
+        snapshotTransitionCaptureRootNodeIndex = nil
+        snapshotTransitionSuppressedNodeIndex = nil
         isRenderingMainPass = false
     }
 
@@ -4998,6 +5084,27 @@ private final class RetainedDynamicSnapshot {
             committedTiledLayerStates.filter {
                 activeCommittedTiledLayerIDs.contains($0.key)
             }
+    }
+
+    /// Replaces the pending render state with an immutable snapshot captured
+    /// at this call boundary.
+    ///
+    /// This SPI exercises the same committed-snapshot renderer used by
+    /// transactions while allowing browser diagnostics to mutate the live
+    /// layer tree after capture and prove that rendering does not read it.
+    @_spi(RendererDiagnostics)
+    public func captureCommittedSnapshotForDiagnostics(
+        of rootLayer: CALayer
+    ) throws(CARendererError) {
+        rootLayer.prepareLayoutForRenderSnapshot()
+        let frameToken =
+            rootLayer.pendingCommittedRenderState?.frameToken
+            ?? CALayer.advanceFrameToken()
+        let snapshot = try CARenderSnapshot.capture(
+            rootLayer,
+            frameToken: frameToken
+        )
+        rootLayer.publishCommittedRenderState(.snapshot(snapshot))
     }
 
     public func render(layer rootLayer: CALayer) {
@@ -5033,8 +5140,7 @@ private final class RetainedDynamicSnapshot {
                 : pendingCommittedState
         switch pendingCommittedState {
         case .captureFailure,
-             .requiresLiveAnimationEvaluation,
-             .requiresLiveResourceCapture:
+             .requiresLiveAnimationEvaluation:
             retainedDynamicSnapshots.removeValue(
                 forKey: rootIdentity
             )
@@ -5057,8 +5163,7 @@ private final class RetainedDynamicSnapshot {
         case .snapshot(let snapshot):
             synchronizeDelegateBackingStoreDiagnostics(in: snapshot)
             committedFrameToken = snapshot.frameToken
-        case .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveResourceCapture(let frameToken, _):
+        case .requiresLiveAnimationEvaluation(let frameToken):
             committedFrameToken = frameToken
         case nil:
             committedFrameToken = nil
@@ -5148,7 +5253,8 @@ private final class RetainedDynamicSnapshot {
         reportedReplicatorRenderFailureKeys.removeAll(keepingCapacity: true)
         transitionSuppressedLayer = nil
         renderTargetSizeOverride = nil
-        activeTransitionSourceIDs.removeAll(keepingCapacity: true)
+        activeTransitionResourceIDs.removeAll(keepingCapacity: true)
+        failedTransitionResourceIDs.removeAll(keepingCapacity: true)
         for capture in retiredTransitionCaptures {
             capture.filterExecution?.invalidate()
             capture.source.texture.destroy()
@@ -5159,6 +5265,12 @@ private final class RetainedDynamicSnapshot {
             texture.destroy()
         }
         retiredTransitionTextures.removeAll(keepingCapacity: true)
+        for execution in retiredTransitionFilterExecutions {
+            execution.invalidate()
+        }
+        retiredTransitionFilterExecutions.removeAll(
+            keepingCapacity: true
+        )
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
@@ -5185,6 +5297,14 @@ private final class RetainedDynamicSnapshot {
         snapshotCompositionCapturePassThroughNodeIndices.removeAll(
             keepingCapacity: true
         )
+        snapshotCompositedNodes.removeAll(keepingCapacity: true)
+        snapshotCompositeCaptureRootNodeIndex = nil
+        snapshotCompositeCaptureSuppressesOpacity = false
+        snapshotPreparedShadows.removeAll(keepingCapacity: true)
+        snapshotSuppressesShadows = false
+        snapshotShadowCaptureRootNodeIndex = nil
+        snapshotTransitionCaptureRootNodeIndex = nil
+        snapshotTransitionSuppressedNodeIndex = nil
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
         contentMaskCaptureSuppressedRootLayer = nil
@@ -5471,7 +5591,6 @@ private final class RetainedDynamicSnapshot {
         if rejectFrameForPendingContentMaskFailure() {
             return
         }
-
         // Log warning if layers were dropped due to buffer capacity
         if droppedLayerCount > 0 {
             print("[CAWebGPURenderer] \(droppedLayerCount) layer(s) dropped: buffer capacity exceeded (maxLayers=\(Self.maxLayers))")
@@ -5480,22 +5599,26 @@ private final class RetainedDynamicSnapshot {
         // Submit command buffer
         device.queue.submit([encoder.finish()])
         lastRenderedTexture = currentTexture
+        let transitionPreparationFailed =
+            !failedTransitionResourceIDs.isEmpty
 
         // Phase 1 commit-end housekeeping (PERFORMANCE_DESIGN.md §3.8 / §6.5).
         // Order is mandated: submit → clear → user-visible completion blocks.
         // Clearing here means subsequent setters that reach this layer in the
         // SAME frame will mark it dirty for the NEXT frame, never for the one
         // that just left the renderer.
-        rootLayer.recursivelyClearDirtyAfterCommit(
-            matching: submittedRevisions
-        )
-        if let committedFrameToken {
-            rootLayer.acknowledgeCommittedRenderState(
-                frameToken: committedFrameToken
+        if !transitionPreparationFailed {
+            rootLayer.recursivelyClearDirtyAfterCommit(
+                matching: submittedRevisions
             )
+            if let committedFrameToken {
+                rootLayer.acknowledgeCommittedRenderState(
+                    frameToken: committedFrameToken
+                )
+            }
+            rootLayer.completeTransactionsAfterRenderRecursively()
+            lastFrameRenderFailure = nil
         }
-        rootLayer.completeTransactionsAfterRenderRecursively()
-        lastFrameRenderFailure = nil
 
         advanceFrameResources()
     }
@@ -5922,8 +6045,11 @@ private final class RetainedDynamicSnapshot {
             capture.target.texture.destroy()
         }
         transitionCaptures.removeAll(keepingCapacity: false)
-        activeTransitionSourceIDs.removeAll(keepingCapacity: false)
-        failedTransitionSourceIDs.removeAll(keepingCapacity: false)
+        activeTransitionResourceIDs.removeAll(keepingCapacity: false)
+        failedTransitionResourceIDs.removeAll(keepingCapacity: false)
+        transitionPreparationFailures.removeAll(
+            keepingCapacity: false
+        )
         for capture in retiredTransitionCaptures {
             capture.filterExecution?.invalidate()
             capture.source.texture.destroy()
@@ -5934,6 +6060,12 @@ private final class RetainedDynamicSnapshot {
             texture.destroy()
         }
         retiredTransitionTextures.removeAll(keepingCapacity: false)
+        for execution in retiredTransitionFilterExecutions {
+            execution.invalidate()
+        }
+        retiredTransitionFilterExecutions.removeAll(
+            keepingCapacity: false
+        )
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
@@ -6195,8 +6327,8 @@ private final class RetainedDynamicSnapshot {
             }
             let resources = ShadowLayerResources(
                 device: device,
-                width: Int(size.width),
-                height: Int(size.height),
+                width: Int(currentRenderTargetSize.width),
+                height: Int(currentRenderTargetSize.height),
                 format: preferredFormat
             )
             transientRasterizationShadowResources.append(resources)
@@ -6323,8 +6455,8 @@ private final class RetainedDynamicSnapshot {
                 capturePass.setViewport(
                     x: 0,
                     y: 0,
-                    width: Float(size.width),
-                    height: Float(size.height),
+                    width: Float(currentRenderTargetSize.width),
+                    height: Float(currentRenderTargetSize.height),
                     minDepth: 0,
                     maxDepth: 1
                 )
@@ -6354,8 +6486,8 @@ private final class RetainedDynamicSnapshot {
 
             var blurUniforms = BlurUniforms(
                 texelSize: SIMD2(
-                    1 / Float(size.width),
-                    1 / Float(size.height)
+                    1 / Float(currentRenderTargetSize.width),
+                    1 / Float(currentRenderTargetSize.height)
                 ),
                 blurRadius: shadow.radius * 0.5
             )
@@ -6568,9 +6700,11 @@ private final class RetainedDynamicSnapshot {
                 captureConfiguration = nil
             }
             let captureWidth =
-                captureConfiguration?.pixelWidth ?? Int(size.width)
+                captureConfiguration?.pixelWidth
+                    ?? Int(currentRenderTargetSize.width)
             let captureHeight =
-                captureConfiguration?.pixelHeight ?? Int(size.height)
+                captureConfiguration?.pixelHeight
+                    ?? Int(currentRenderTargetSize.height)
             let resources = FilterLayerResources(
                 device: device,
                 width: captureWidth,
@@ -7130,8 +7264,8 @@ private final class RetainedDynamicSnapshot {
 
         let resources = CompositionLayerResources(
             device: device,
-            width: Int(size.width),
-            height: Int(size.height),
+            width: Int(currentRenderTargetSize.width),
+            height: Int(currentRenderTargetSize.height),
             format: preferredFormat
         )
         transientSnapshotCompositionResources.append(resources)
@@ -7164,8 +7298,8 @@ private final class RetainedDynamicSnapshot {
         backdropPass.setViewport(
             x: 0,
             y: 0,
-            width: Float(size.width),
-            height: Float(size.height),
+            width: Float(currentRenderTargetSize.width),
+            height: Float(currentRenderTargetSize.height),
             minDepth: 0,
             maxDepth: 1
         )
@@ -7396,8 +7530,8 @@ private final class RetainedDynamicSnapshot {
                 inputMode: .foregroundAndBackground,
                 inputTexture: resources.sourceStraightTexture,
                 backgroundTexture: compositionBackdropTexture,
-                width: UInt32(size.width),
-                height: UInt32(size.height)
+                width: UInt32(currentRenderTargetSize.width),
+                height: UInt32(currentRenderTargetSize.height)
             )
             try execution.encode(commandEncoder: encoder)
             activeCompositionExecutions.append(execution)
@@ -7713,8 +7847,8 @@ private final class RetainedDynamicSnapshot {
         renderPass.setViewport(
             x: 0,
             y: 0,
-            width: Float(size.width),
-            height: Float(size.height),
+            width: Float(currentRenderTargetSize.width),
+            height: Float(currentRenderTargetSize.height),
             minDepth: 0,
             maxDepth: 1
         )
@@ -7801,6 +7935,25 @@ private final class RetainedDynamicSnapshot {
             return
         }
 
+        if snapshotTransitionSuppressedNodeIndex != nodeIndex,
+           let transition = values.transition {
+            guard !failedTransitionResourceIDs.contains(
+                transition.resourceIdentity
+            ) else {
+                return
+            }
+            do {
+                try renderSnapshotTransition(
+                    transition,
+                    renderPass: renderPass,
+                    parentMatrix: parentMatrix
+                )
+            } catch {
+                throw .transition(error)
+            }
+            return
+        }
+
         if snapshotCompositeCaptureRootNodeIndex != nodeIndex,
            !snapshotCompositionCapturePassThroughNodeIndices.contains(
                 nodeIndex
@@ -7836,6 +7989,8 @@ private final class RetainedDynamicSnapshot {
                                 * (
                                     snapshotShadowCaptureRootNodeIndex
                                         == nodeIndex
+                                    || snapshotTransitionCaptureRootNodeIndex
+                                        == nodeIndex
                                         ? 1
                                         : values.opacity
                                 ),
@@ -7862,7 +8017,8 @@ private final class RetainedDynamicSnapshot {
         }
 
         let opacityMultiplier: Float
-        if snapshotShadowCaptureRootNodeIndex == nodeIndex {
+        if snapshotShadowCaptureRootNodeIndex == nodeIndex
+            || snapshotTransitionCaptureRootNodeIndex == nodeIndex {
             opacityMultiplier = 1
         } else if snapshotCompositeCaptureRootNodeIndex == nodeIndex,
                   snapshotCompositeCaptureSuppressesOpacity {
@@ -7874,7 +8030,14 @@ private final class RetainedDynamicSnapshot {
         opacityStack.append(effectiveOpacity)
         defer { _ = opacityStack.popLast() }
 
-        let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
+        let modelMatrix: Matrix4x4
+        if snapshotTransitionCaptureRootNodeIndex == nodeIndex {
+            modelMatrix = parentMatrix
+        } else {
+            modelMatrix = values.modelMatrix(
+                parentMatrix: parentMatrix
+            )
+        }
         if values.isTransformLayer {
             try renderSnapshotTransformLayerSublayers(
                 node,
@@ -9049,6 +9212,11 @@ private final class RetainedDynamicSnapshot {
 
         if transitionSuppressedLayer !== layer,
            let transitionState = presentationLayer._transitionRenderState {
+            guard !failedTransitionResourceIDs.contains(
+                transitionState.resourceIdentity
+            ) else {
+                return
+            }
             renderTransition(
                 state: transitionState,
                 renderPass: renderPass,
@@ -9429,6 +9597,88 @@ private final class RetainedDynamicSnapshot {
         case render
     }
 
+    private func transitionFailureCategory(
+        for failure: CATransitionRenderFailure
+    ) -> TransitionFailureCategory {
+        switch failure {
+        case .unsupportedFilterValue,
+             .filterSnapshotCaptureFailed,
+             .filterProcessorUnavailable,
+             .unsupportedFilter,
+             .filterExecutionCreationFailed,
+             .filterDispatchFailed:
+            return .filter
+        default:
+            return .render
+        }
+    }
+
+    private func transitionParticipantFailure(
+        role: CATransitionParticipantRole,
+        error: CACommittedSnapshotEncodingFailure
+    ) -> CATransitionRenderFailure {
+        let stage: CATransitionParticipantSnapshotStage
+        let reason: String
+        switch error {
+        case .solid(let failure):
+            stage = .solid
+            reason = String(describing: failure)
+        case .mask(let failure):
+            stage = .mask
+            reason = String(describing: failure)
+        case .contents(let failure):
+            stage = .contents
+            reason = String(describing: failure)
+        case .contentMask(let failure):
+            stage = .contentMask
+            reason = String(describing: failure)
+        case .groupOpacity(let failure):
+            stage = .groupOpacity
+            reason = String(describing: failure)
+        case .rasterization(let failure):
+            stage = .rasterization
+            reason = String(describing: failure)
+        case .filter(let failure):
+            stage = .filter
+            reason = String(describing: failure)
+        case .backdropComposition(let failure):
+            stage = .backdropComposition
+            reason = String(describing: failure)
+        case .shadow(let failure):
+            stage = .shadow
+            reason = String(describing: failure)
+        case .gradient(let failure):
+            stage = .gradient
+            reason = String(describing: failure)
+        case .shape(let failure):
+            stage = .shape
+            reason = String(describing: failure)
+        case .text(let failure):
+            stage = .text
+            reason = String(describing: failure)
+        case .transformDepth(let failure):
+            stage = .transformDepth
+            reason = String(describing: failure)
+        case .replicator(let failure):
+            stage = .replicator
+            reason = String(describing: failure)
+        case .emitter(let failure):
+            stage = .emitter
+            reason = String(describing: failure)
+        case .tiled(let failure):
+            stage = .tiled
+            reason = String(describing: failure)
+        case .transition(let failure):
+            stage = .transition
+            reason = String(describing: failure)
+        }
+        return .participantSnapshotEncodingFailed(
+            role,
+            stage: stage,
+            reason: reason
+        )
+    }
+
     private func recordTransitionFailure(
         _ failure: CATransitionRenderFailure,
         category: TransitionFailureCategory
@@ -9442,23 +9692,433 @@ private final class RetainedDynamicSnapshot {
         lastTransitionRenderFailure = failure
     }
 
-    private func builtInTransitionValidationFailure(
-        type: CATransitionType,
-        subtype: CATransitionSubtype?
-    ) -> CATransitionRenderFailure? {
-        switch type {
-        case .fade:
-            return nil
-        case .moveIn, .push, .reveal:
-            switch subtype {
-            case .fromRight, .fromLeft, .fromTop, .fromBottom, nil:
-                return nil
-            default:
-                return .unsupportedTransitionSubtype(subtype?.rawValue ?? "nil")
-            }
-        default:
-            return .unsupportedTransitionType(type.rawValue)
+    private func recordTransitionPreparationFailure(
+        _ failure: CATransitionRenderFailure,
+        resourceIdentity: UInt64
+    ) {
+        if transitionPreparationFailures[
+            resourceIdentity
+        ] != failure {
+            transitionPreparationFailures[
+                resourceIdentity
+            ] = failure
+            recordTransitionFailure(
+                failure,
+                category: transitionFailureCategory(for: failure)
+            )
         }
+        recordFrameRenderFailure(
+            .transitionPreparationFailed(failure)
+        )
+    }
+
+    private func prerenderSnapshotTransitions(
+        in snapshot: CARenderSnapshot,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        bindGroup: GPUBindGroup,
+        encoder: GPUCommandEncoder
+    ) {
+        func collect(
+            nodeIndex: Int
+        ) {
+            let node = snapshot.nodes[nodeIndex]
+            for childIndex in node.childIndices {
+                collect(nodeIndex: childIndex)
+            }
+            if let maskIndex = node.maskIndex {
+                collect(nodeIndex: maskIndex)
+            }
+            guard let transition =
+                    node.presentationValues.transition else {
+                return
+            }
+
+            let resourceIdentity = transition.resourceIdentity
+            activeTransitionResourceIDs.insert(resourceIdentity)
+            guard !failedTransitionResourceIDs.contains(
+                resourceIdentity
+            ) else {
+                return
+            }
+            do {
+                if transitionCaptures[resourceIdentity] == nil {
+                    transitionCaptures[resourceIdentity] =
+                        try createSnapshotTransitionCapture(
+                            transition,
+                            targetNodeIndex: nodeIndex,
+                            in: snapshot,
+                            device: device,
+                            pipeline: pipeline,
+                            bindGroup: bindGroup,
+                            encoder: encoder
+                        )
+                    transitionSourceCaptureCount += 1
+                    transitionTargetCaptureCount += 1
+                }
+                try synchronizeTransitionFilter(
+                    transition.filter,
+                    resourceIdentity: resourceIdentity
+                )
+                if let execution =
+                        transitionCaptures[
+                            resourceIdentity
+                        ]?.filterExecution {
+                    try execution.encode(
+                        progress: Float(transition.progress),
+                        commandEncoder: encoder
+                    )
+                    transitionFilterDispatchCount += 1
+                }
+                transitionPreparationFailures.removeValue(
+                    forKey: resourceIdentity
+                )
+            } catch let failure as CATransitionRenderFailure {
+                failedTransitionResourceIDs.insert(
+                    resourceIdentity
+                )
+                retireTransitionCapture(for: resourceIdentity)
+                recordTransitionPreparationFailure(
+                    failure,
+                    resourceIdentity: resourceIdentity
+                )
+            } catch {
+                let failure =
+                    CATransitionRenderFailure.filterDispatchFailed(
+                        String(describing: error)
+                    )
+                failedTransitionResourceIDs.insert(
+                    resourceIdentity
+                )
+                retireTransitionCapture(for: resourceIdentity)
+                recordTransitionPreparationFailure(
+                    failure,
+                    resourceIdentity: resourceIdentity
+                )
+            }
+        }
+
+        collect(nodeIndex: snapshot.rootIndex)
+    }
+
+    private func createSnapshotTransitionCapture(
+        _ transition: CARenderSnapshotTransition,
+        targetNodeIndex: Int,
+        in snapshot: CARenderSnapshot,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        bindGroup: GPUBindGroup,
+        encoder: GPUCommandEncoder
+    ) throws(CATransitionRenderFailure) -> TransitionCapturePair {
+        let target = try captureSnapshotTransitionParticipant(
+            at: targetNodeIndex,
+            in: snapshot,
+            role: .target,
+            device: device,
+            pipeline: pipeline,
+            bindGroup: bindGroup,
+            encoder: encoder
+        )
+        let sharedPixelSize = CGSize(
+            width: target.pixelWidth,
+            height: target.pixelHeight
+        )
+        let source: TransitionParticipantCapture
+        do {
+            source = try captureSnapshotTransitionParticipant(
+                at: transition.sourceRootIndex,
+                in: snapshot,
+                role: .source,
+                pixelSizeOverride: sharedPixelSize,
+                device: device,
+                pipeline: pipeline,
+                bindGroup: bindGroup,
+                encoder: encoder
+            )
+        } catch {
+            retiredTransitionTextures.append(target.texture)
+            throw error
+        }
+        let execution: CIWebGPUTransitionExecution?
+        do {
+            execution = try makeTransitionFilterExecution(
+                transition.filter,
+                source: source,
+                target: target
+            )
+        } catch {
+            retiredTransitionTextures.append(source.texture)
+            retiredTransitionTextures.append(target.texture)
+            throw error
+        }
+        return TransitionCapturePair(
+            source: source,
+            target: target,
+            filterConfiguration: transition.filter,
+            filterExecution: execution
+        )
+    }
+
+    private func captureSnapshotTransitionParticipant(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot,
+        role: CATransitionParticipantRole,
+        pixelSizeOverride: CGSize? = nil,
+        device: GPUDevice,
+        pipeline: GPURenderPipeline,
+        bindGroup: GPUBindGroup,
+        encoder: GPUCommandEncoder
+    ) throws(CATransitionRenderFailure)
+        -> TransitionParticipantCapture {
+        let values = snapshot.nodes[nodeIndex].presentationValues
+        let configuration = try CATransitionCaptureConfiguration(
+            bounds: values.bounds,
+            contentsScale: values.contentsScale,
+            pixelSizeOverride: pixelSizeOverride,
+            maximumTextureDimension: Int(
+                device.limits.maxTextureDimension2D
+            ),
+            role: role
+        )
+        let pixelSize = CGSize(
+            width: configuration.pixelWidth,
+            height: configuration.pixelHeight
+        )
+        let texture = device.createTexture(
+            descriptor: GPUTextureDescriptor(
+                size: GPUExtent3D(
+                    width: UInt32(configuration.pixelWidth),
+                    height: UInt32(configuration.pixelHeight),
+                    depthOrArrayLayers: 1
+                ),
+                format: preferredFormat,
+                usage: [.renderAttachment, .textureBinding]
+            )
+        )
+        let depthTexture = device.createTexture(
+            descriptor: GPUTextureDescriptor(
+                size: GPUExtent3D(
+                    width: UInt32(configuration.pixelWidth),
+                    height: UInt32(configuration.pixelHeight),
+                    depthOrArrayLayers: 1
+                ),
+                format: .depth24plusStencil8,
+                usage: .renderAttachment
+            )
+        )
+        transientCaptureDepthTextures.append(depthTexture)
+        let depthView = depthTexture.createView()
+        let rootedSnapshot = snapshot.rooted(at: nodeIndex)
+        let captureProjection = Matrix4x4.orthographic(
+            left: configuration.projectionLeft,
+            right: configuration.projectionRight,
+            bottom: configuration.projectionBottom,
+            top: configuration.projectionTop,
+            near: -1000,
+            far: 1000
+        )
+
+        let savedCompositedNodes = snapshotCompositedNodes
+        let savedCompositeCaptureRoot =
+            snapshotCompositeCaptureRootNodeIndex
+        let savedCompositeSuppressesOpacity =
+            snapshotCompositeCaptureSuppressesOpacity
+        let savedPreparedShadows = snapshotPreparedShadows
+        let savedSuppressesShadows = snapshotSuppressesShadows
+        let savedShadowCaptureRoot =
+            snapshotShadowCaptureRootNodeIndex
+        let savedPreparedCompositions =
+            snapshotPreparedCompositions
+        let savedCompositionStop =
+            snapshotCompositionCaptureStopNodeIndex
+        let savedCompositionDidReachStop =
+            snapshotCompositionCaptureDidReachStop
+        let savedCompositionPassThrough =
+            snapshotCompositionCapturePassThroughNodeIndices
+        let savedTransitionCaptureRoot =
+            snapshotTransitionCaptureRootNodeIndex
+        let savedTransitionSuppression =
+            snapshotTransitionSuppressedNodeIndex
+        let savedOpacityStack = opacityStack
+        let savedReplicatorColorStack =
+            replicatorColorStack
+        let savedReplicatorTimeOffsetStack =
+            replicatorTimeOffsetStack
+        let savedReplicatorInstancePath =
+            replicatorInstancePath
+        let savedClipStack = clipRectStack
+        let savedMaskDepth = maskNestingDepth
+        let savedActiveStencilFrames = activeStencilFrames
+        let savedStencilValue = currentStencilValue
+        let savedRenderTargetSize = renderTargetSizeOverride
+        let savedIsRenderingMainPass = isRenderingMainPass
+
+        func restoreScratchState() {
+            snapshotCompositedNodes = savedCompositedNodes
+            snapshotCompositeCaptureRootNodeIndex =
+                savedCompositeCaptureRoot
+            snapshotCompositeCaptureSuppressesOpacity =
+                savedCompositeSuppressesOpacity
+            snapshotPreparedShadows = savedPreparedShadows
+            snapshotSuppressesShadows =
+                savedSuppressesShadows
+            snapshotShadowCaptureRootNodeIndex =
+                savedShadowCaptureRoot
+            snapshotPreparedCompositions =
+                savedPreparedCompositions
+            snapshotCompositionCaptureStopNodeIndex =
+                savedCompositionStop
+            snapshotCompositionCaptureDidReachStop =
+                savedCompositionDidReachStop
+            snapshotCompositionCapturePassThroughNodeIndices =
+                savedCompositionPassThrough
+            snapshotTransitionCaptureRootNodeIndex =
+                savedTransitionCaptureRoot
+            snapshotTransitionSuppressedNodeIndex =
+                savedTransitionSuppression
+            opacityStack = savedOpacityStack
+            replicatorColorStack = savedReplicatorColorStack
+            replicatorTimeOffsetStack =
+                savedReplicatorTimeOffsetStack
+            replicatorInstancePath =
+                savedReplicatorInstancePath
+            clipRectStack = savedClipStack
+            maskNestingDepth = savedMaskDepth
+            activeStencilFrames = savedActiveStencilFrames
+            currentStencilValue = savedStencilValue
+            renderTargetSizeOverride = savedRenderTargetSize
+            isRenderingMainPass = savedIsRenderingMainPass
+        }
+
+        snapshotTransitionCaptureRootNodeIndex = nodeIndex
+        snapshotTransitionSuppressedNodeIndex = nodeIndex
+        renderTargetSizeOverride = pixelSize
+        isRenderingMainPass = false
+        opacityStack.removeAll(keepingCapacity: true)
+        replicatorColorStack.removeAll(keepingCapacity: true)
+        replicatorTimeOffsetStack.removeAll(
+            keepingCapacity: true
+        )
+        replicatorInstancePath.removeAll(keepingCapacity: true)
+        clipRectStack.removeAll(keepingCapacity: true)
+        maskNestingDepth = 0
+        activeStencilFrames.removeAll(keepingCapacity: true)
+        currentStencilValue = 0
+
+        do {
+            snapshotSuppressesShadows = true
+            try prerenderSnapshotComposites(
+                in: rootedSnapshot,
+                projectionMatrix: captureProjection,
+                depthTextureView: depthView,
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
+            snapshotSuppressesShadows = false
+            try prerenderSnapshotShadows(
+                in: rootedSnapshot,
+                projectionMatrix: captureProjection,
+                depthTextureView: depthView,
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
+            try prerenderSnapshotComposites(
+                in: rootedSnapshot,
+                projectionMatrix: captureProjection,
+                depthTextureView: depthView,
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
+            try prerenderSnapshotBackdropCompositions(
+                in: rootedSnapshot,
+                projectionMatrix: captureProjection,
+                depthTextureView: depthView,
+                clearColor: GPUColor(r: 0, g: 0, b: 0, a: 0),
+                encoder: encoder,
+                device: device,
+                bindGroup: bindGroup,
+                pipeline: pipeline
+            )
+        } catch {
+            restoreScratchState()
+            retiredTransitionTextures.append(texture)
+            throw transitionParticipantFailure(
+                role: role,
+                error: error
+            )
+        }
+
+        let capturePass = encoder.beginRenderPass(
+            descriptor: GPURenderPassDescriptor(
+                colorAttachments: [
+                    GPURenderPassColorAttachment(
+                        view: texture.createView(),
+                        clearValue: GPUColor(
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0
+                        ),
+                        loadOp: .clear,
+                        storeOp: .store
+                    )
+                ],
+                depthStencilAttachment:
+                    GPURenderPassDepthStencilAttachment(
+                        view: depthView,
+                        depthClearValue: 0,
+                        depthLoadOp: .clear,
+                        depthStoreOp: .store,
+                        stencilClearValue: 0,
+                        stencilLoadOp: .clear,
+                        stencilStoreOp: .store
+                    )
+            )
+        )
+        capturePass.setPipeline(pipeline)
+        capturePass.setViewport(
+            x: 0,
+            y: 0,
+            width: Float(configuration.pixelWidth),
+            height: Float(configuration.pixelHeight),
+            minDepth: 0,
+            maxDepth: 1
+        )
+        do {
+            try renderSnapshotNode(
+                at: nodeIndex,
+                in: snapshot,
+                renderPass: capturePass,
+                parentMatrix: captureProjection,
+                isRoot: false,
+                device: device,
+                bindGroup: bindGroup
+            )
+        } catch {
+            capturePass.end()
+            restoreScratchState()
+            retiredTransitionTextures.append(texture)
+            throw transitionParticipantFailure(
+                role: role,
+                error: error
+            )
+        }
+        capturePass.end()
+        restoreScratchState()
+        return TransitionParticipantCapture(
+            texture: texture,
+            geometry: CATransitionCompositeGeometry(
+                values: values
+            ),
+            pixelWidth: configuration.pixelWidth,
+            pixelHeight: configuration.pixelHeight
+        )
     }
 
     private func prerenderTransitions(
@@ -9484,147 +10144,96 @@ private final class RetainedDynamicSnapshot {
             }
 
             if let state = presentation._transitionRenderState {
-                let sourceID = ObjectIdentifier(state.sourceLayer)
-                activeTransitionSourceIDs.insert(sourceID)
-                if transitionCaptures[sourceID] == nil,
-                   !failedTransitionSourceIDs.contains(sourceID) {
-                    let capture: TransitionCapturePair
-                    if let filterValue = state.filter {
-                        guard let filter = filterValue as? CIFilter else {
-                            failedTransitionSourceIDs.insert(sourceID)
-                            recordTransitionFailure(
-                                .unsupportedFilterValue(String(reflecting: type(of: filterValue))),
-                                category: .filter
-                            )
-                            return
-                        }
-                        guard let processor = transitionFilterProcessor else {
-                            failedTransitionSourceIDs.insert(sourceID)
-                            recordTransitionFailure(.filterProcessorUnavailable, category: .filter)
-                            return
-                        }
-                        guard processor.supports(filter) else {
-                            failedTransitionSourceIDs.insert(sourceID)
-                            recordTransitionFailure(
-                                .unsupportedFilter(String(describing: filter)),
-                                category: .filter
-                            )
-                            return
-                        }
-                        do {
-                            capture = try createFilteredTransitionCapture(
-                                sourceLayer: state.sourceLayer,
-                                targetLayer: layer,
-                                filter: filter,
-                                processor: processor,
-                                device: device,
-                                pipeline: pipeline,
-                                encoder: encoder
-                            )
-                        } catch let failure {
-                            failedTransitionSourceIDs.insert(sourceID)
-                            recordTransitionFailure(failure, category: .filter)
-                            return
-                        }
-                    } else {
-                        if let failure = builtInTransitionValidationFailure(
+                let resourceIdentity = state.resourceIdentity
+                activeTransitionResourceIDs.insert(resourceIdentity)
+                guard !failedTransitionResourceIDs.contains(
+                    resourceIdentity
+                ) else {
+                    return
+                }
+                do {
+                    let filterConfiguration =
+                        try CARenderSnapshotTransition.Filter.capture(
+                            state.filter
+                        )
+                    if filterConfiguration == nil {
+                        try CARenderSnapshotTransition.validateBuiltIn(
                             type: state.type,
                             subtype: state.subtype
-                        ) {
-                            failedTransitionSourceIDs.insert(sourceID)
-                            recordTransitionFailure(failure, category: .render)
-                            return
-                        }
-                        do {
-                            capture = try createBuiltInTransitionCapture(
+                        )
+                    }
+                    if transitionCaptures[resourceIdentity] == nil {
+                        transitionCaptures[resourceIdentity] =
+                            try createTransitionCapture(
                                 sourceLayer: state.sourceLayer,
                                 targetLayer: layer,
+                                filterConfiguration:
+                                    filterConfiguration,
                                 device: device,
                                 pipeline: pipeline,
                                 encoder: encoder
                             )
-                        } catch let failure {
-                            failedTransitionSourceIDs.insert(sourceID)
-                            recordTransitionFailure(failure, category: .render)
-                            return
-                        }
+                        transitionSourceCaptureCount += 1
+                        transitionTargetCaptureCount += 1
                     }
-                    transitionCaptures[sourceID] = capture
-                    transitionSourceCaptureCount += 1
-                    transitionTargetCaptureCount += 1
-                }
-
-                if let execution = transitionCaptures[sourceID]?.filterExecution {
+                    try synchronizeTransitionFilter(
+                        filterConfiguration,
+                        resourceIdentity: resourceIdentity
+                    )
                     guard state.progress.isFinite else {
-                        retireTransitionCapture(for: sourceID)
-                        failedTransitionSourceIDs.insert(sourceID)
-                        recordTransitionFailure(.invalidProgress(state.progress), category: .filter)
-                        return
+                        throw CATransitionRenderFailure.invalidProgress(
+                            state.progress
+                        )
                     }
-                    do {
+                    if let execution =
+                            transitionCaptures[
+                                resourceIdentity
+                            ]?.filterExecution {
                         try execution.encode(
                             progress: Float(state.progress),
                             commandEncoder: encoder
                         )
                         transitionFilterDispatchCount += 1
-                    } catch {
-                        retireTransitionCapture(for: sourceID)
-                        failedTransitionSourceIDs.insert(sourceID)
-                        recordTransitionFailure(
-                            .filterDispatchFailed(String(describing: error)),
-                            category: .filter
-                        )
                     }
+                    transitionPreparationFailures.removeValue(
+                        forKey: resourceIdentity
+                    )
+                } catch let failure as CATransitionRenderFailure {
+                    failedTransitionResourceIDs.insert(
+                        resourceIdentity
+                    )
+                    retireTransitionCapture(for: resourceIdentity)
+                    recordTransitionPreparationFailure(
+                        failure,
+                        resourceIdentity: resourceIdentity
+                    )
+                } catch {
+                    let failure =
+                        CATransitionRenderFailure.filterDispatchFailed(
+                            String(describing: error)
+                        )
+                    failedTransitionResourceIDs.insert(
+                        resourceIdentity
+                    )
+                    retireTransitionCapture(for: resourceIdentity)
+                    recordTransitionPreparationFailure(
+                        failure,
+                        resourceIdentity: resourceIdentity
+                    )
                 }
             }
         }
 
         collect(rootLayer)
 
-        let staleSourceIDs = transitionCaptures.keys.filter {
-            !activeTransitionSourceIDs.contains($0)
-        }
-        for sourceID in staleSourceIDs {
-            retireTransitionCapture(for: sourceID)
-        }
-        failedTransitionSourceIDs = failedTransitionSourceIDs.intersection(activeTransitionSourceIDs)
+        retireInactiveTransitionCaptures()
     }
 
-    private func createBuiltInTransitionCapture(
+    private func createTransitionCapture(
         sourceLayer: CALayer,
         targetLayer: CALayer,
-        device: GPUDevice,
-        pipeline: GPURenderPipeline,
-        encoder: GPUCommandEncoder
-    ) throws(CATransitionRenderFailure) -> TransitionCapturePair {
-        let source = try captureTransitionParticipant(
-            sourceLayer,
-            role: .source,
-            device: device,
-            pipeline: pipeline,
-            encoder: encoder
-        )
-        let target: TransitionParticipantCapture
-        do {
-            target = try captureTransitionParticipant(
-                targetLayer,
-                role: .target,
-                device: device,
-                pipeline: pipeline,
-                encoder: encoder
-            )
-        } catch let failure {
-            retiredTransitionTextures.append(source.texture)
-            throw failure
-        }
-        return TransitionCapturePair(source: source, target: target, filterExecution: nil)
-    }
-
-    private func createFilteredTransitionCapture(
-        sourceLayer: CALayer,
-        targetLayer: CALayer,
-        filter: CIFilter,
-        processor: CIWebGPUTransitionProcessor,
+        filterConfiguration:
+            CARenderSnapshotTransition.Filter?,
         device: GPUDevice,
         pipeline: GPURenderPipeline,
         encoder: GPUCommandEncoder
@@ -9636,7 +10245,10 @@ private final class RetainedDynamicSnapshot {
             pipeline: pipeline,
             encoder: encoder
         )
-        let sharedPixelSize = CGSize(width: target.pixelWidth, height: target.pixelHeight)
+        let sharedPixelSize = CGSize(
+            width: target.pixelWidth,
+            height: target.pixelHeight
+        )
         let source: TransitionParticipantCapture
         do {
             source = try captureTransitionParticipant(
@@ -9651,37 +10263,131 @@ private final class RetainedDynamicSnapshot {
             retiredTransitionTextures.append(target.texture)
             throw failure
         }
-
+        let execution: CIWebGPUTransitionExecution?
         do {
-            let execution = try processor.makeExecution(
+            execution = try makeTransitionFilterExecution(
+                filterConfiguration,
+                source: source,
+                target: target
+            )
+        } catch {
+            retiredTransitionTextures.append(source.texture)
+            retiredTransitionTextures.append(target.texture)
+            throw error
+        }
+        return TransitionCapturePair(
+            source: source,
+            target: target,
+            filterConfiguration: filterConfiguration,
+            filterExecution: execution
+        )
+    }
+
+    private func makeTransitionFilterExecution(
+        _ configuration: CARenderSnapshotTransition.Filter?,
+        source: TransitionParticipantCapture,
+        target: TransitionParticipantCapture
+    ) throws(CATransitionRenderFailure)
+        -> CIWebGPUTransitionExecution? {
+        guard let configuration else {
+            return nil
+        }
+        guard let processor = transitionFilterProcessor else {
+            throw .filterProcessorUnavailable
+        }
+        guard let filter = CIFilter(name: configuration.name) else {
+            throw .unsupportedFilter(configuration.name)
+        }
+        for key in configuration.parameters.keys.sorted() {
+            guard let parameter =
+                    configuration.parameters[key] else {
+                continue
+            }
+            filter.setValue(
+                parameter.materializedValue,
+                forKey: key
+            )
+        }
+        guard processor.supports(filter) else {
+            throw .unsupportedFilter(configuration.name)
+        }
+        do {
+            return try processor.makeExecution(
                 filter: filter,
                 sourceTexture: source.texture,
                 targetTexture: target.texture,
                 width: UInt32(target.pixelWidth),
                 height: UInt32(target.pixelHeight)
             )
-            return TransitionCapturePair(
-                source: source,
-                target: target,
-                filterExecution: execution
-            )
         } catch {
-            retiredTransitionTextures.append(source.texture)
-            retiredTransitionTextures.append(target.texture)
-            throw .filterExecutionCreationFailed(String(describing: error))
+            throw .filterExecutionCreationFailed(
+                String(describing: error)
+            )
         }
     }
 
-    private func retireTransitionCapture(for sourceID: ObjectIdentifier) {
-        if let capture = transitionCaptures.removeValue(forKey: sourceID) {
+    private func synchronizeTransitionFilter(
+        _ configuration: CARenderSnapshotTransition.Filter?,
+        resourceIdentity: UInt64
+    ) throws(CATransitionRenderFailure) {
+        guard var capture = transitionCaptures[
+            resourceIdentity
+        ] else {
+            throw .compositeResourcesUnavailable
+        }
+        guard capture.filterConfiguration != configuration else {
+            return
+        }
+        let execution = try makeTransitionFilterExecution(
+            configuration,
+            source: capture.source,
+            target: capture.target
+        )
+        if let previousExecution = capture.filterExecution {
+            retiredTransitionFilterExecutions.append(
+                previousExecution
+            )
+        }
+        capture.filterConfiguration = configuration
+        capture.filterExecution = execution
+        transitionCaptures[resourceIdentity] = capture
+        texturedTextureViewCache.removeValue(
+            forTexturedKey: .transitionFilter(resourceIdentity)
+        )
+        perFrameTexturedBindGroupCache.removeValue(
+            forTexturedKey: .transitionFilter(resourceIdentity)
+        )
+    }
+
+    private func evictTransitionTextureCaches(
+        resourceIdentity: UInt64
+    ) {
+        let keys: [TexturedCacheKey] = [
+            .transitionSource(resourceIdentity),
+            .transitionTarget(resourceIdentity),
+            .transitionFilter(resourceIdentity),
+        ]
+        for key in keys {
+            texturedTextureViewCache.removeValue(
+                forTexturedKey: key
+            )
+            perFrameTexturedBindGroupCache.removeValue(
+                forTexturedKey: key
+            )
+        }
+    }
+
+    private func retireTransitionCapture(
+        for resourceIdentity: UInt64
+    ) {
+        if let capture = transitionCaptures.removeValue(
+            forKey: resourceIdentity
+        ) {
             retiredTransitionCaptures.append(capture)
         }
-        texturedTextureViewCache.removeValue(forTexturedKey: .transitionSource(sourceID))
-        texturedTextureViewCache.removeValue(forTexturedKey: .transitionTarget(sourceID))
-        texturedTextureViewCache.removeValue(forTexturedKey: .transitionFilter(sourceID))
-        perFrameTexturedBindGroupCache.removeValue(forTexturedKey: .transitionSource(sourceID))
-        perFrameTexturedBindGroupCache.removeValue(forTexturedKey: .transitionTarget(sourceID))
-        perFrameTexturedBindGroupCache.removeValue(forTexturedKey: .transitionFilter(sourceID))
+        evictTransitionTextureCaches(
+            resourceIdentity: resourceIdentity
+        )
     }
 
     private func captureTransitionParticipant(
@@ -9798,11 +10504,11 @@ private final class RetainedDynamicSnapshot {
             throw .participantReplicatorFailed(role, failure)
         }
 
-        let compositeLayer = type(of: presentation).init(layer: presentation)
-        compositeLayer.recursivelyClearDirtyAfterCommit()
         return TransitionParticipantCapture(
             texture: texture,
-            compositeLayer: compositeLayer,
+            geometry: CATransitionCompositeGeometry(
+                presentationLayer: presentation
+            ),
             pixelWidth: pixelWidth,
             pixelHeight: pixelHeight
         )
@@ -9835,11 +10541,14 @@ private final class RetainedDynamicSnapshot {
         for request: TransitionCompositeRequest
     ) throws(CATransitionRenderFailure) -> CATransitionCompositeConfiguration {
         try CATransitionCompositeConfiguration(
-            bounds: request.participant.compositeLayer.bounds,
-            position: request.participant.compositeLayer.position,
+            bounds: request.participant.geometry.bounds,
+            position: CGPoint(
+                x: CGFloat(request.participant.geometry.position.x),
+                y: CGFloat(request.participant.geometry.position.y)
+            ),
             offset: request.offset,
             opacity: currentEffectiveOpacity
-                * request.participant.compositeLayer.opacity
+                * request.participant.geometry.opacity
                 * request.opacityMultiplier
         )
     }
@@ -9862,11 +10571,10 @@ private final class RetainedDynamicSnapshot {
         parentMatrix: Matrix4x4
     ) throws(CATransitionRenderFailure) -> PreparedTransitionComposite {
         let configuration = try transitionCompositeConfiguration(for: request)
-        let presentation = request.participant.compositeLayer
-        let originalPosition = presentation.position
-        presentation.position = configuration.translatedPosition
-        let modelMatrix = presentation.modelMatrix(parentMatrix: parentMatrix)
-        presentation.position = originalPosition
+        let modelMatrix = request.participant.geometry.modelMatrix(
+            parentMatrix: parentMatrix,
+            translatedPosition: configuration.translatedPosition
+        )
         let scaleMatrix = Matrix4x4(columns: (
             SIMD4<Float>(configuration.size.x, 0, 0, 0),
             SIMD4<Float>(0, configuration.size.y, 0, 0),
@@ -9916,19 +10624,70 @@ private final class RetainedDynamicSnapshot {
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
     ) {
-        let sourceID = ObjectIdentifier(state.sourceLayer)
-        guard let capture = transitionCaptures[sourceID] else { return }
-        let failureCategory: TransitionFailureCategory = capture.filterExecution == nil
-            ? .render
-            : .filter
-        guard state.progress.isFinite else {
-            recordTransitionFailure(.invalidProgress(state.progress), category: failureCategory)
-            return
+        do {
+            try encodeTransition(
+                resourceIdentity: state.resourceIdentity,
+                type: state.type,
+                subtype: state.subtype,
+                progress: state.progress,
+                renderPass: renderPass,
+                parentMatrix: parentMatrix
+            )
+        } catch {
+            recordTransitionFailure(
+                error,
+                category: transitionFailureCategory(for: error)
+            )
+            recordFrameRenderFailure(
+                .transitionPreparationFailed(error)
+            )
         }
-        let targetLayer = capture.target.compositeLayer
-        let progress = CGFloat(max(0, min(1, state.progress)))
-        let baseModelMatrix = targetLayer.modelMatrix(parentMatrix: parentMatrix)
-        let transitionClip = calculateClipRect(layer: targetLayer, modelMatrix: baseModelMatrix)
+    }
+
+    private func renderSnapshotTransition(
+        _ transition: CARenderSnapshotTransition,
+        renderPass: GPURenderPassEncoder,
+        parentMatrix: Matrix4x4
+    ) throws(CATransitionRenderFailure) {
+        try encodeTransition(
+            resourceIdentity: transition.resourceIdentity,
+            type: transition.type,
+            subtype: transition.subtype,
+            progress: transition.progress,
+            renderPass: renderPass,
+            parentMatrix: parentMatrix
+        )
+    }
+
+    private func encodeTransition(
+        resourceIdentity: UInt64,
+        type: CATransitionType,
+        subtype: CATransitionSubtype?,
+        progress: CFTimeInterval,
+        renderPass: GPURenderPassEncoder,
+        parentMatrix: Matrix4x4
+    ) throws(CATransitionRenderFailure) {
+        guard let capture = transitionCaptures[
+            resourceIdentity
+        ] else {
+            throw .compositeResourcesUnavailable
+        }
+        guard progress.isFinite else {
+            throw .invalidProgress(progress)
+        }
+        let clampedProgress = CGFloat(max(0, min(1, progress)))
+        let targetGeometry = capture.target.geometry
+        let baseModelMatrix = targetGeometry.modelMatrix(
+            parentMatrix: parentMatrix,
+            translatedPosition: CGPoint(
+                x: CGFloat(targetGeometry.position.x),
+                y: CGFloat(targetGeometry.position.y)
+            )
+        )
+        let transitionClip = calculateClipRect(
+            bounds: targetGeometry.bounds,
+            modelMatrix: baseModelMatrix
+        )
         clipRectStack.append(currentClipRect.intersection(with: transitionClip))
         applyScissorRect(renderPass)
         defer {
@@ -9937,105 +10696,122 @@ private final class RetainedDynamicSnapshot {
         }
 
         if let filterExecution = capture.filterExecution {
-            do {
-                try renderTransitionCompositeRequests(
-                    [TransitionCompositeRequest(
-                        participant: TransitionParticipantCapture(
-                            texture: filterExecution.outputTexture,
-                            compositeLayer: capture.target.compositeLayer,
-                            pixelWidth: capture.target.pixelWidth,
-                            pixelHeight: capture.target.pixelHeight
-                        ),
-                        cacheKey: .transitionFilter(sourceID),
-                        offset: .zero,
-                        opacityMultiplier: 1
-                    )],
-                    renderPass: renderPass,
-                    parentMatrix: parentMatrix
-                )
-            } catch let failure {
-                recordTransitionFailure(failure, category: .filter)
-            }
+            try renderTransitionCompositeRequests(
+                [TransitionCompositeRequest(
+                    participant: TransitionParticipantCapture(
+                        texture: filterExecution.outputTexture,
+                        geometry: capture.target.geometry,
+                        pixelWidth: capture.target.pixelWidth,
+                        pixelHeight: capture.target.pixelHeight
+                    ),
+                    cacheKey:
+                        .transitionFilter(resourceIdentity),
+                    offset: .zero,
+                    opacityMultiplier: 1
+                )],
+                renderPass: renderPass,
+                parentMatrix: parentMatrix
+            )
             return
         }
 
-        do {
-            switch state.type {
-            case .fade:
-                try renderFadeTransition(
-                    capture,
-                    sourceID: sourceID,
-                    progress: Float(progress),
-                    renderPass: renderPass,
-                    parentMatrix: parentMatrix
-                )
+        switch type {
+        case .fade:
+            try renderFadeTransition(
+                capture,
+                resourceIdentity: resourceIdentity,
+                progress: Float(clampedProgress),
+                renderPass: renderPass,
+                parentMatrix: parentMatrix
+            )
 
-            case .moveIn, .push, .reveal:
-                guard let direction = transitionDirection(
-                    subtype: state.subtype,
-                    bounds: targetLayer.bounds
-                ) else {
-                    recordTransitionFailure(
-                        .unsupportedTransitionSubtype(state.subtype?.rawValue ?? "nil"),
-                        category: .render
-                    )
-                    return
-                }
-                let sourceOffset: CGPoint
-                let targetOffset: CGPoint
-                switch state.type {
-                case .moveIn:
-                    sourceOffset = .zero
-                    targetOffset = CGPoint(
-                        x: direction.x * (1 - progress),
-                        y: direction.y * (1 - progress)
-                    )
-                case .push:
-                    sourceOffset = CGPoint(x: -direction.x * progress, y: -direction.y * progress)
-                    targetOffset = CGPoint(
-                        x: direction.x * (1 - progress),
-                        y: direction.y * (1 - progress)
-                    )
-                case .reveal:
-                    sourceOffset = CGPoint(x: -direction.x * progress, y: -direction.y * progress)
-                    targetOffset = .zero
-                default:
-                    sourceOffset = .zero
-                    targetOffset = .zero
-                }
-                let requests: [TransitionCompositeRequest]
-                if state.type == .reveal {
-                    requests = [
-                        TransitionCompositeRequest(participant: capture.target, cacheKey: .transitionTarget(sourceID), offset: targetOffset, opacityMultiplier: 1),
-                        TransitionCompositeRequest(participant: capture.source, cacheKey: .transitionSource(sourceID), offset: sourceOffset, opacityMultiplier: 1),
-                    ]
-                } else {
-                    requests = [
-                        TransitionCompositeRequest(participant: capture.source, cacheKey: .transitionSource(sourceID), offset: sourceOffset, opacityMultiplier: 1),
-                        TransitionCompositeRequest(participant: capture.target, cacheKey: .transitionTarget(sourceID), offset: targetOffset, opacityMultiplier: 1),
-                    ]
-                }
-                try renderTransitionCompositeRequests(
-                    requests,
-                    renderPass: renderPass,
-                    parentMatrix: parentMatrix
+        case .moveIn, .push, .reveal:
+            guard let direction = transitionDirection(
+                subtype: subtype,
+                bounds: targetGeometry.bounds
+            ) else {
+                throw .unsupportedTransitionSubtype(
+                    subtype?.rawValue ?? "nil"
                 )
-
-            default:
-                recordTransitionFailure(
-                    .unsupportedTransitionType(state.type.rawValue),
-                    category: .render
-                )
-                return
             }
-        } catch let failure {
-            recordTransitionFailure(failure, category: .render)
+            let sourceOffset: CGPoint
+            let targetOffset: CGPoint
+            switch type {
+            case .moveIn:
+                sourceOffset = .zero
+                targetOffset = CGPoint(
+                    x: direction.x * (1 - clampedProgress),
+                    y: direction.y * (1 - clampedProgress)
+                )
+            case .push:
+                sourceOffset = CGPoint(
+                    x: -direction.x * clampedProgress,
+                    y: -direction.y * clampedProgress
+                )
+                targetOffset = CGPoint(
+                    x: direction.x * (1 - clampedProgress),
+                    y: direction.y * (1 - clampedProgress)
+                )
+            case .reveal:
+                sourceOffset = CGPoint(
+                    x: -direction.x * clampedProgress,
+                    y: -direction.y * clampedProgress
+                )
+                targetOffset = .zero
+            default:
+                sourceOffset = .zero
+                targetOffset = .zero
+            }
+            let requests: [TransitionCompositeRequest]
+            if type == .reveal {
+                requests = [
+                    TransitionCompositeRequest(
+                        participant: capture.target,
+                        cacheKey:
+                            .transitionTarget(resourceIdentity),
+                        offset: targetOffset,
+                        opacityMultiplier: 1
+                    ),
+                    TransitionCompositeRequest(
+                        participant: capture.source,
+                        cacheKey:
+                            .transitionSource(resourceIdentity),
+                        offset: sourceOffset,
+                        opacityMultiplier: 1
+                    ),
+                ]
+            } else {
+                requests = [
+                    TransitionCompositeRequest(
+                        participant: capture.source,
+                        cacheKey:
+                            .transitionSource(resourceIdentity),
+                        offset: sourceOffset,
+                        opacityMultiplier: 1
+                    ),
+                    TransitionCompositeRequest(
+                        participant: capture.target,
+                        cacheKey:
+                            .transitionTarget(resourceIdentity),
+                        offset: targetOffset,
+                        opacityMultiplier: 1
+                    ),
+                ]
+            }
+            try renderTransitionCompositeRequests(
+                requests,
+                renderPass: renderPass,
+                parentMatrix: parentMatrix
+            )
+
+        default:
+            throw .unsupportedTransitionType(type.rawValue)
         }
     }
 
     private func renderFadeTransition(
         _ capture: TransitionCapturePair,
-        sourceID: ObjectIdentifier,
+        resourceIdentity: UInt64,
         progress: Float,
         renderPass: GPURenderPassEncoder,
         parentMatrix: Matrix4x4
@@ -10054,7 +10830,7 @@ private final class RetainedDynamicSnapshot {
 
         let prepared = try prepareTransitionComposite(TransitionCompositeRequest(
             participant: capture.target,
-            cacheKey: .transitionTarget(sourceID),
+            cacheKey: .transitionTarget(resourceIdentity),
             offset: .zero,
             opacityMultiplier: 1
         ), parentMatrix: parentMatrix)
@@ -10090,11 +10866,11 @@ private final class RetainedDynamicSnapshot {
         )
 
         let sourceView = cachedTransitionTextureView(
-            key: .transitionSource(sourceID),
+            key: .transitionSource(resourceIdentity),
             texture: capture.source.texture
         )
         let targetView = cachedTransitionTextureView(
-            key: .transitionTarget(sourceID),
+            key: .transitionTarget(resourceIdentity),
             texture: capture.target.texture
         )
         let bindGroup = device.createBindGroup(descriptor: GPUBindGroupDescriptor(
@@ -14042,7 +14818,7 @@ private final class RetainedDynamicSnapshot {
         let hasUnpreparedTransition: Bool
         if let transitionState = presentation._transitionRenderState {
             hasUnpreparedTransition = transitionCaptures[
-                ObjectIdentifier(transitionState.sourceLayer)
+                transitionState.resourceIdentity
             ] == nil
         } else {
             hasUnpreparedTransition = false
@@ -18704,11 +19480,11 @@ private final class RetainedDynamicSnapshot {
         lastTiledLayerRenderFailure = failure
     }
 
-    // FIXME(INCOMPLETE_IMPLEMENTATION): Animated or transitioning tiled trees
-    // still reach this live model-layer path. Production static commits use
-    // `renderCommittedTiledLayer`; completion requires immutable animation and
-    // transition snapshots to use the same renderer-owned generation/cache
-    // contract before this model-reading path can be removed.
+    // FIXME(INCOMPLETE_IMPLEMENTATION): Animated tiled trees still reach this
+    // live model-layer path. Production static and transition commits use
+    // `renderCommittedTiledLayer`; completion requires the copied animation
+    // evaluator to use the same renderer-owned generation/cache contract before
+    // this model-reading path can be removed.
     private func renderTiledLayer(
         _ tiledLayer: CATiledLayer,
         presentation: CATiledLayer,

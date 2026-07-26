@@ -1,9 +1,5 @@
 import Foundation
 
-internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
-    case transition
-}
-
 /// An immutable, value-owned view of the presentation state required by a
 /// renderer for one frame.
 ///
@@ -16,11 +12,11 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // contents, layer filter and backdrop-composition plans, gradient inputs,
 // tessellated shape geometry, validated text configuration, and emitter cells
 // with their converted image bytes.
-// Production WebGPU still uses explicitly typed live-tree branches for
-// transitions and animation evaluation; animated or transitioning tiled
-// content is evaluated inside those branches.
+// Production WebGPU still uses an explicitly typed live-tree branch for
+// animation evaluation.
 // Phase 4 must not be considered complete until those
-// values and resources are owned here, the live-tree commit states are removed,
+// values and resources are owned here, the animation live-tree commit state is
+// removed,
 // and every WebGPU frame encodes without reading mutable model layers after
 // capture.
 internal struct CARenderSnapshot: Sendable {
@@ -53,6 +49,8 @@ internal struct CARenderSnapshot: Sendable {
             CAEmitterRenderConfiguration?
         internal let tiled:
             CATiledLayerRenderConfiguration?
+        internal let transition:
+            CARenderSnapshotTransition?
         internal private(set) var replicatorInstanceTransform:
             CATransform3D
         internal private(set) var effectiveReplicatorColor:
@@ -60,6 +58,7 @@ internal struct CARenderSnapshot: Sendable {
         internal private(set) var effectiveReplicatorTimeOffset:
             CFTimeInterval
         internal let bounds: CGRect
+        internal let contentsScale: CGFloat
         internal let boundsSize: SIMD2<Float>
         internal let boundsOrigin: SIMD2<Float>
         internal let position: SIMD3<Float>
@@ -147,7 +146,19 @@ internal struct CARenderSnapshot: Sendable {
     internal let rootBounds: CGRect
     internal let rootContentsScale: CGFloat
     internal let capturedContentRevisions: [ObjectIdentifier: UInt64]
-    internal let liveTreeRequirement: CARenderSnapshotLiveTreeRequirement?
+
+    internal func rooted(at nodeIndex: Int) -> Self {
+        let values = nodes[nodeIndex].presentationValues
+        return Self(
+            nodes: nodes,
+            rootIndex: nodeIndex,
+            frameToken: frameToken,
+            rootBounds: values.bounds,
+            rootContentsScale: values.contentsScale,
+            capturedContentRevisions:
+                capturedContentRevisions
+        )
+    }
 
     internal static func capture(
         _ rootLayer: CALayer,
@@ -155,12 +166,10 @@ internal struct CARenderSnapshot: Sendable {
     ) throws(CARendererError) -> CARenderSnapshot {
         var nodes: [Node] = []
         var visited: Set<ObjectIdentifier> = []
-        var liveTreeRequirement: CARenderSnapshotLiveTreeRequirement?
         let rootIndex = try captureNode(
             rootLayer,
             nodes: &nodes,
-            visited: &visited,
-            liveTreeRequirement: &liveTreeRequirement
+            visited: &visited
         )
         var capturedContentRevisions: [ObjectIdentifier: UInt64] = [:]
         capturedContentRevisions.reserveCapacity(nodes.count)
@@ -173,16 +182,14 @@ internal struct CARenderSnapshot: Sendable {
             frameToken: frameToken,
             rootBounds: rootLayer.bounds,
             rootContentsScale: rootLayer.contentsScale,
-            capturedContentRevisions: capturedContentRevisions,
-            liveTreeRequirement: liveTreeRequirement
+            capturedContentRevisions: capturedContentRevisions
         )
     }
 
     private static func captureNode(
         _ layer: CALayer,
         nodes: inout [Node],
-        visited: inout Set<ObjectIdentifier>,
-        liveTreeRequirement: inout CARenderSnapshotLiveTreeRequirement?
+        visited: inout Set<ObjectIdentifier>
     ) throws(CARendererError) -> Int {
         let identity = ObjectIdentifier(layer)
         guard visited.insert(identity).inserted else {
@@ -203,16 +210,31 @@ internal struct CARenderSnapshot: Sendable {
         }
         let contentRevision = layer._contentRevision
         let presentationLayer = layer._renderTimePresentation()
-        if liveTreeRequirement == nil {
-            liveTreeRequirement = requiredLiveTreeFeature(
-                presentationLayer: presentationLayer
+        let transition: CARenderSnapshotTransition?
+        if let transitionState =
+                presentationLayer._transitionRenderState {
+            let sourceRootIndex = try captureNode(
+                transitionState.sourceLayer,
+                nodes: &nodes,
+                visited: &visited
             )
+            do {
+                transition = try CARenderSnapshotTransition.capture(
+                    transitionState,
+                    sourceRootIndex: sourceRootIndex
+                )
+            } catch {
+                throw .invalidLayerTransition(error)
+            }
+        } else {
+            transition = nil
         }
         let values = try presentationValues(
             from: presentationLayer,
             delegateBackingStore: layer.delegateBackingStore,
             tiledContentDelegate:
-                (layer as? CATiledLayer)?.delegate
+                (layer as? CATiledLayer)?.delegate,
+            transition: transition
         )
         let nodeIndex = nodes.count
         nodes.append(
@@ -236,8 +258,7 @@ internal struct CARenderSnapshot: Sendable {
                 try captureNode(
                     child,
                     nodes: &nodes,
-                    visited: &visited,
-                    liveTreeRequirement: &liveTreeRequirement
+                    visited: &visited
                 )
             )
         }
@@ -259,8 +280,7 @@ internal struct CARenderSnapshot: Sendable {
             maskIndex = try captureNode(
                 mask,
                 nodes: &nodes,
-                visited: &visited,
-                liveTreeRequirement: &liveTreeRequirement
+                visited: &visited
             )
         } else {
             maskIndex = nil
@@ -418,15 +438,6 @@ internal struct CARenderSnapshot: Sendable {
         }
     }
 
-    private static func requiredLiveTreeFeature(
-        presentationLayer: CALayer
-    ) -> CARenderSnapshotLiveTreeRequirement? {
-        if presentationLayer._transitionRenderState != nil {
-            return .transition
-        }
-        return nil
-    }
-
     private static func snapshotReplicatorError(
         from error: CAReplicatorRenderFailure
     ) -> CARenderSnapshotReplicatorError {
@@ -497,7 +508,8 @@ internal struct CARenderSnapshot: Sendable {
         from layer: CALayer,
         delegateBackingStore: CADelegateBackingStore? = nil,
         tiledContentDelegate:
-            (any CALayerDelegate)? = nil
+            (any CALayerDelegate)? = nil,
+        transition: CARenderSnapshotTransition? = nil
     ) throws(CARendererError) -> PresentationValues {
         let isTransformLayer = layer is CATransformLayer
         let replicator: CAReplicatorRenderConfiguration?
@@ -775,12 +787,14 @@ internal struct CARenderSnapshot: Sendable {
             replicator: replicator,
             emitter: emitter,
             tiled: tiled,
+            transition: transition,
             replicatorInstanceTransform:
                 CATransform3DIdentity,
             effectiveReplicatorColor:
                 SIMD4<Float>(repeating: 1),
             effectiveReplicatorTimeOffset: 0,
             bounds: layer.bounds,
+            contentsScale: layer.contentsScale,
             boundsSize: SIMD2<Float>(boundsWidth, boundsHeight),
             boundsOrigin: boundsOrigin,
             position: position,
@@ -1219,22 +1233,13 @@ internal enum CACommittedRenderState: Sendable {
     case snapshot(CARenderSnapshot)
     case captureFailure(frameToken: UInt64, error: CARendererError)
     case requiresLiveAnimationEvaluation(frameToken: UInt64)
-    // FIXME(INCOMPLETE_IMPLEMENTATION): Trees with active transitions still
-    // reach production WebGPU through the live-tree renderer. This branch must
-    // not be treated as snapshot success until transition state is value-owned
-    // by CARenderSnapshot and encoded without CALayer reads.
-    case requiresLiveResourceCapture(
-        frameToken: UInt64,
-        requirement: CARenderSnapshotLiveTreeRequirement
-    )
 
     internal var frameToken: UInt64 {
         switch self {
         case .snapshot(let snapshot):
             snapshot.frameToken
         case .captureFailure(let frameToken, _),
-             .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveResourceCapture(let frameToken, _):
+             .requiresLiveAnimationEvaluation(let frameToken):
             frameToken
         }
     }

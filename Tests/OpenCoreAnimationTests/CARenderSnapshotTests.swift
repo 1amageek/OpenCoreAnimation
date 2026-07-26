@@ -74,8 +74,6 @@ struct CARenderSnapshotTests {
         let snapshot = try CARenderSnapshot.capture(root, frameToken: 45)
         let rootNode = snapshot.nodes[snapshot.rootIndex]
         let values = rootNode.presentationValues
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(values.borderWidth == 2)
         #expect(values.borderColor == SIMD4<Float>(0, 0, 1, 1))
         #expect(values.cornerRadii == SIMD4<Float>(4, 0, 0, 0))
@@ -97,6 +95,178 @@ struct CARenderSnapshotTests {
             rootNode.childIndices.map { snapshot.nodes[$0].identity }
                 == [ObjectIdentifier(back), ObjectIdentifier(front)]
         )
+    }
+
+    @Test("Transition source and configuration become immutable snapshot values")
+    func transitionStateIsCaptured() throws {
+        let source = CALayer()
+        source.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+        source.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        let sourceChild = CALayer()
+        sourceChild.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4
+        )
+        sourceChild.backgroundColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        source.addSublayer(sourceChild)
+
+        let target = CALayer()
+        target.bounds = source.bounds
+        target.contentsScale = 2
+        target.recursivelyClearDirtyAfterCommit()
+        let transition = CATransition()
+        target._transitionRenderState = CATransitionRenderState(
+            resourceIdentity: transition.resourceIdentity,
+            sourceLayer: source,
+            type: .push,
+            subtype: .fromRight,
+            filter: nil,
+            progress: 0.25
+        )
+
+        let snapshot = try CARenderSnapshot.capture(
+            target,
+            frameToken: 47
+        )
+        let targetNode = snapshot.nodes[snapshot.rootIndex]
+        let capturedTransition = try #require(
+            targetNode.presentationValues.transition
+        )
+        let sourceNode = snapshot.nodes[
+            capturedTransition.sourceRootIndex
+        ]
+        #expect(
+            capturedTransition.resourceIdentity
+                == transition.resourceIdentity
+        )
+        #expect(capturedTransition.type == .push)
+        #expect(capturedTransition.subtype == .fromRight)
+        #expect(capturedTransition.progress == 0.25)
+        #expect(targetNode.presentationValues.contentsScale == 2)
+        #expect(
+            sourceNode.presentationValues.backgroundColor
+                == SIMD4<Float>(1, 0, 0, 1)
+        )
+        #expect(sourceNode.childIndices.count == 1)
+        #expect(
+            !targetNode.childIndices.contains(
+                capturedTransition.sourceRootIndex
+            )
+        )
+
+        source.backgroundColor = CGColor(
+            red: 0,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+        sourceChild.backgroundColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+        #expect(
+            sourceNode.presentationValues.backgroundColor
+                == SIMD4<Float>(1, 0, 0, 1)
+        )
+        let capturedChild = snapshot.nodes[
+            try #require(sourceNode.childIndices.first)
+        ]
+        #expect(
+            capturedChild.presentationValues.backgroundColor
+                == SIMD4<Float>(0, 0, 1, 1)
+        )
+    }
+
+    @Test("Invalid built-in transition is a typed capture failure")
+    func invalidTransitionFailsCapture() throws {
+        let source = CALayer()
+        let target = CALayer()
+        target.recursivelyClearDirtyAfterCommit()
+        let transition = CATransition()
+        target._transitionRenderState = CATransitionRenderState(
+            resourceIdentity: transition.resourceIdentity,
+            sourceLayer: source,
+            type: CATransitionType(rawValue: "unsupported"),
+            subtype: nil,
+            filter: nil,
+            progress: 0.5
+        )
+
+        #expect(throws: CARendererError.invalidLayerTransition(
+            .unsupportedTransitionType("unsupported")
+        )) {
+            _ = try CARenderSnapshot.capture(
+                target,
+                frameToken: 48
+            )
+        }
+    }
+
+    @Test("Nonportable transition filter is a typed capture failure")
+    func nonportableTransitionFilterFailsCapture() throws {
+        let source = CALayer()
+        let target = CALayer()
+        target.recursivelyClearDirtyAfterCommit()
+        let transition = CATransition()
+        target._transitionRenderState = CATransitionRenderState(
+            resourceIdentity: transition.resourceIdentity,
+            sourceLayer: source,
+            type: .fade,
+            subtype: nil,
+            filter: "not-a-filter",
+            progress: 0.5
+        )
+
+        #expect(throws: CARendererError.invalidLayerTransition(
+            .unsupportedFilterValue("Swift.String")
+        )) {
+            _ = try CARenderSnapshot.capture(
+                target,
+                frameToken: 49
+            )
+        }
+    }
+
+    @Test("Filter vector arrays become finite immutable values")
+    func filterVectorArraysAreCaptured() throws {
+        #expect(
+            try CARenderSnapshotFilterParameter.capture(
+                [Float(40), Float(20)],
+                filterName: "VectorFilter",
+                key: "inputCenter"
+            ) == .vector([40, 20])
+        )
+        #expect(
+            try CARenderSnapshotFilterParameter.capture(
+                [Double(8), Double(4)],
+                filterName: "VectorFilter",
+                key: "inputExtent"
+            ) == .vector([8, 4])
+        )
+        #expect(throws: CARenderSnapshotFilterError.nonFiniteCoreImageParameter(
+            filter: "VectorFilter",
+            key: "inputCenter"
+        )) {
+            _ = try CARenderSnapshotFilterParameter.capture(
+                [Float.infinity, 1],
+                filterName: "VectorFilter",
+                key: "inputCenter"
+            )
+        }
     }
 
     @Test("Tiled content becomes immutable committed input")
@@ -129,8 +299,6 @@ struct CARenderSnapshotTests {
             capturedContent.snapshot
                 as? SnapshotTileContent
         )
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(
             configuration.resourceIdentity
                 == layer.resourceIdentity
@@ -188,8 +356,6 @@ struct CARenderSnapshotTests {
             rootNode.childIndices.first
         )
         let scrollNode = snapshot.nodes[scrollIndex]
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(scroll.masksToBounds)
         #expect(
             rootNode.presentationValues.backgroundColor
@@ -274,8 +440,6 @@ struct CARenderSnapshotTests {
         )
         let node = snapshot.nodes[snapshot.rootIndex]
         let values = node.presentationValues
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(snapshot.nodes.count == 3)
         #expect(values.isTransformLayer)
         #expect(values.opacity == 0.5)
@@ -349,8 +513,6 @@ struct CARenderSnapshotTests {
             frameToken: 47
         )
         let root = snapshot.nodes[snapshot.rootIndex]
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(snapshot.nodes.count == 7)
         #expect(root.presentationValues.replicator != nil)
         #expect(root.replicatorSourceChildCount == 1)
@@ -455,8 +617,6 @@ struct CARenderSnapshotTests {
         let innerInstances = outerNode.childIndices.map {
             snapshot.nodes[$0]
         }
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(innerInstances.count == 2)
         #expect(
             innerInstances.map {
@@ -548,8 +708,6 @@ struct CARenderSnapshotTests {
         )
         let node = snapshot.nodes[snapshot.rootIndex]
         let values = node.presentationValues
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(values.replicator?.preservesDepth == true)
         #expect(values.backgroundColor == nil)
         #expect(values.borderWidth == 0)
@@ -618,8 +776,6 @@ struct CARenderSnapshotTests {
             configuration.emitterCells.first
         )
         let capturedImage = try #require(capturedCell.image)
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(
             configuration.simulationIdentity
                 == emitter.simulationIdentity
@@ -734,8 +890,6 @@ struct CARenderSnapshotTests {
             snapshot.nodes[snapshot.rootIndex]
                 .presentationValues.gradient
         )
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(configuration.colorComponents == [
             SIMD4<Float>(1, 0, 0, 1),
             SIMD4<Float>(0, 0, 1, 1),
@@ -810,8 +964,6 @@ struct CARenderSnapshotTests {
         )
         let fill = try #require(captured.fill)
         let stroke = try #require(captured.stroke)
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(fill.vertices.count == 6)
         #expect(fill.color == SIMD4<Float>(0, 1, 1, 1))
         #expect(!stroke.vertices.isEmpty)
@@ -853,8 +1005,6 @@ struct CARenderSnapshotTests {
             snapshot.rootIndex
         ].presentationValues
         let captured = try #require(values.shape)
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(captured.fill == nil)
         #expect(captured.stroke == nil)
         #expect(values.imageContents == nil)
@@ -926,8 +1076,6 @@ struct CARenderSnapshotTests {
         let configuration = try #require(
             capturedText.configuration
         )
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(configuration.text == "Committed")
         #expect(configuration.fontFamily == "Snapshot Sans")
         #expect(configuration.fontSize == 18)
@@ -981,8 +1129,6 @@ struct CARenderSnapshotTests {
             snapshot.rootIndex
         ].presentationValues
         let capturedText = try #require(values.text)
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(capturedText.configuration == nil)
         #expect(values.imageContents == nil)
     }
@@ -1042,7 +1188,6 @@ struct CARenderSnapshotTests {
         }
         let rootNode = snapshot.nodes[snapshot.rootIndex]
         let maskIndex = try #require(rootNode.maskIndex)
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(snapshot.nodes[maskIndex].identity
             == ObjectIdentifier(mask))
         #expect(
@@ -1077,8 +1222,6 @@ struct CARenderSnapshotTests {
         let values = snapshot.nodes[
             snapshot.rootIndex
         ].presentationValues
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(values.shouldRasterize)
         #expect(values.rasterizationScale == 2.5)
 
@@ -1120,7 +1263,6 @@ struct CARenderSnapshotTests {
 
         let rootNode = snapshot.nodes[snapshot.rootIndex]
         let maskIndex = try #require(rootNode.maskIndex)
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(
             rootNode.presentationValues.filters
                 == [.renderer(.brightness(amount: 0.25))]
@@ -1156,8 +1298,6 @@ struct CARenderSnapshotTests {
         let values = snapshot.nodes[
             snapshot.rootIndex
         ].presentationValues
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(values.compositingFilter == nil)
         #expect(
             values.backgroundFilters
@@ -1227,21 +1367,19 @@ struct CARenderSnapshotTests {
     func groupOpacityIsCapturedByValue() throws {
         let leaf = CALayer()
         leaf.opacity = 0.5
-        let leafSnapshot = try CARenderSnapshot.capture(
+        _ = try CARenderSnapshot.capture(
             leaf,
             frameToken: 46
         )
-        #expect(leafSnapshot.liveTreeRequirement == nil)
 
         let distributedRoot = CALayer()
         distributedRoot.opacity = 0.5
         distributedRoot.allowsGroupOpacity = false
         distributedRoot.addSublayer(CALayer())
-        let distributedSnapshot = try CARenderSnapshot.capture(
+        _ = try CARenderSnapshot.capture(
             distributedRoot,
             frameToken: 47
         )
-        #expect(distributedSnapshot.liveTreeRequirement == nil)
 
         let groupedRoot = CALayer()
         groupedRoot.opacity = 0.5
@@ -1250,7 +1388,6 @@ struct CARenderSnapshotTests {
             groupedRoot,
             frameToken: 48
         )
-        #expect(groupedSnapshot.liveTreeRequirement == nil)
         let groupedValues = groupedSnapshot.nodes[
             groupedSnapshot.rootIndex
         ].presentationValues
@@ -1287,8 +1424,6 @@ struct CARenderSnapshotTests {
             snapshot.nodes[snapshot.rootIndex]
                 .presentationValues.shadow
         )
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(shadow.color == SIMD4<Float>(0.25, 0.5, 0.75, 0.8))
         #expect(shadow.opacity == 0.6)
         #expect(shadow.radius == 4)
@@ -1359,7 +1494,6 @@ struct CARenderSnapshotTests {
         CATransaction.flush()
 
         #expect(sourceImage == nil)
-        #expect(snapshot.liveTreeRequirement == nil)
         let contents = try #require(
             snapshot.nodes[snapshot.rootIndex]
                 .presentationValues.imageContents
@@ -1553,8 +1687,6 @@ struct CARenderSnapshotTests {
             layer,
             frameToken: 56
         )
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(
             snapshot.nodes[snapshot.rootIndex]
                 .presentationValues.imageContents != nil
@@ -1577,8 +1709,6 @@ struct CARenderSnapshotTests {
             snapshot.nodes[snapshot.rootIndex]
                 .presentationValues.imageContents
         )
-
-        #expect(snapshot.liveTreeRequirement == nil)
         #expect(contents.origin == .delegateBackingStore(.RGBA8Uint))
         #expect(contents.storage.data == Data([
             255, 0, 0, 255,

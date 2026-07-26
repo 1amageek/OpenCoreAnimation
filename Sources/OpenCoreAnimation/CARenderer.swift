@@ -10,6 +10,7 @@ import JavaScriptKit
 
 /// A committed resource that a renderer backend cannot encode.
 public enum CARenderSnapshotFeature: String, Equatable, Sendable {
+    case transition
     case imageContents
     case contentMask
     case groupOpacity
@@ -197,6 +198,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerEmitter(CARenderSnapshotEmitterError)
     /// A tiled layer could not become immutable renderer input.
     case invalidLayerTiled(CATiledLayerRenderFailure)
+    /// A transition could not become immutable renderer input.
+    case invalidLayerTransition(CATransitionRenderFailure)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

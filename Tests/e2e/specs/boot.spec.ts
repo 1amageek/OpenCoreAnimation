@@ -43,6 +43,7 @@ interface OCA extends Harness {
     getTransactionCompletionProbeResult: () => string;
     getImmutableSnapshotProbeResult: () => string;
     getImmutableTileSnapshotProbeResult: () => string;
+    getImmutableTransitionSnapshotProbeResult: () => string;
     getEmitterProbeResult: () => string;
     getReplicatorProbeResult: () => string;
     getCompositionProbeResult: () => string;
@@ -99,6 +100,7 @@ interface OCA extends Harness {
     beginTransactionCompletionProbe: () => void;
     beginImmutableSnapshotProbe: () => void;
     beginImmutableTileSnapshotProbe: () => void;
+    beginImmutableTransitionSnapshotProbe: () => void;
     beginEmitterProbe: () => void;
     beginReplicatorProbe: () => void;
     removeTransition: () => void;
@@ -131,6 +133,60 @@ test.describe("OpenCoreAnimation smoke", () => {
         // isRunning stays true until stop()/deinit — asserting it proves the
         // start() call landed without trapping.
         expect(await h.isEngineRunning(), "CAAnimationEngine.isRunning after start()").toBe(true);
+    });
+
+    test("rendering: immutable transition survives live-tree mutation", async ({ harness }) => {
+        const h = harness as unknown as {
+            [K in keyof OCA]: (...a: Parameters<OCA[K]>) => Promise<ReturnType<OCA[K]>>;
+        };
+        const transitionSourcesBefore =
+            await h.getTransitionSourceCaptureCount();
+        const transitionTargetsBefore =
+            await h.getTransitionTargetCaptureCount();
+        const transitionDispatchesBefore =
+            await h.getTransitionFilterDispatchCount();
+
+        await h.beginImmutableTransitionSnapshotProbe();
+        await expect.poll(
+            () => h.getImmutableTransitionSnapshotProbeResult(),
+            { timeout: 10_000 }
+        ).toBe(
+            `pixel=191,0,64,255,sources=${transitionSourcesBefore + 1},targets=${transitionTargetsBefore + 1},dispatches=${transitionDispatchesBefore + 1},failures=0`
+        );
+        expect(await h.getFirstUncapturedGPUError()).toBe("none");
+    });
+
+    test("rendering: filtered transition replacement remains valid", async ({ harness }) => {
+        const h = harness as unknown as {
+            [K in keyof OCA]: (...a: Parameters<OCA[K]>) => Promise<ReturnType<OCA[K]>>;
+        };
+
+        await h.beginTransitionFilterProbes();
+        await expect.poll(
+            () => h.getTransitionFilterProbeResult(),
+            { timeout: 10_000 }
+        ).toBe(
+            "dissolve=191,0,64,255;swipe=0,255,0,255;bars=0,0,255,255;mod=255,0,0,255;flash=0,128,128,255;copy=0,255,0,255;ripple=0,0,255,255"
+        );
+        expect(await h.getTransitionFilterFailureCount()).toBe(0);
+        expect(await h.getTransitionRenderFailureCount()).toBe(0);
+        expect(await h.getFirstUncapturedGPUError()).toBe("none");
+    });
+
+    test("rendering: unsupported transition subtype is counted once", async ({ harness }) => {
+        const h = harness as unknown as {
+            [K in keyof OCA]: (...a: Parameters<OCA[K]>) => Promise<ReturnType<OCA[K]>>;
+        };
+        const failuresBefore =
+            await h.getTransitionRenderFailureCount();
+
+        await h.exerciseUnsupportedTransitionSubtype();
+        await expect.poll(
+            () => h.getTransitionRenderFailureCount()
+        ).toBe(failuresBefore + 1);
+        expect(await h.getLastTransitionFailure()).toBe(
+            "unsupportedSubtype=unsupported"
+        );
     });
 
     test("rendering: WebGPU readback contains layer colors", async ({ harness }) => {

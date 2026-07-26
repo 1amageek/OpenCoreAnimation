@@ -77,6 +77,11 @@ private enum ImmutableTileSnapshotProbeState {
     static var result: String = "pending"
 }
 
+@MainActor
+private enum ImmutableTransitionSnapshotProbeState {
+    static var result: String = "pending"
+}
+
 final class SnapshotBaseProbeLayer: CALayer {}
 
 final class ImmediateFadeTiledLayer: CATiledLayer {
@@ -667,6 +672,15 @@ func installHarness() {
                 return .string(result)
             }
         )
+        h.expose(
+            "getImmutableTransitionSnapshotProbeResult",
+            returning: {
+                let result = MainActor.assumeIsolated {
+                    ImmutableTransitionSnapshotProbeState.result
+                }
+                return .string(result)
+            }
+        )
         h.expose("getEmitterProbeResult", returning: {
             .string(emitterProbeResult)
         })
@@ -889,6 +903,13 @@ func installHarness() {
                 layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                 unsupportedTransitionSubtypeLayerRef = layer
                 CAAnimationEngine.shared.renderFrame()
+                CAAnimationEngine.shared.renderFrame()
+                layer.removeFromSuperlayer()
+                layer.removeAnimation(
+                    forKey: "unsupportedTransitionSubtype"
+                )
+                unsupportedTransitionSubtypeLayerRef = nil
+                CAAnimationEngine.shared.renderFrame()
             }
         })
         h.expose("beginTransitionFilterProbes", action: {
@@ -974,7 +995,11 @@ func installHarness() {
                         engine.renderFrame()
 
                         let pixel = try await renderer.readbackPixel(x: 80, y: 80)
-                        results.append("\(probe.label)=\(pixel.map(String.init).joined(separator: ","))")
+                        results.append(
+                            "\(probe.label)="
+                            + pixel.map(String.init)
+                                .joined(separator: ",")
+                        )
                         layer.removeAnimation(forKey: "activeFilterProbe")
                         engine.renderFrame()
                     }
@@ -6352,6 +6377,121 @@ func installHarness() {
                             + "submissions=\(renderer.committedTileSubmissionCount)"
                     } catch {
                         ImmutableTileSnapshotProbeState.result =
+                            "error: \(error)"
+                    }
+                }
+            }
+        )
+        h.expose(
+            "beginImmutableTransitionSnapshotProbe",
+            action: {
+                Task { @MainActor in
+                    ImmutableTransitionSnapshotProbeState.result =
+                        "running"
+                    guard let renderer =
+                            CAAnimationEngine.shared.rendererBackend
+                                as? CAWebGPURenderer else {
+                        ImmutableTransitionSnapshotProbeState.result =
+                            "error: renderer unavailable"
+                        return
+                    }
+                    guard let dissolve = CIFilter(
+                        name: "CIDissolveTransition"
+                    ), let replacement = CIFilter(
+                        name: "CICopyMachineTransition"
+                    ) else {
+                        ImmutableTransitionSnapshotProbeState.result =
+                            "error: transition filter unavailable"
+                        return
+                    }
+
+                    let root = CALayer()
+                    let layer = CALayer()
+                    root.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 400,
+                        height: 300
+                    )
+                    root.position = CGPoint(x: 200, y: 150)
+                    root.backgroundColor = CGColor(
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    layer.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 80
+                    )
+                    layer.position = CGPoint(x: 200, y: 150)
+                    layer.backgroundColor = CGColor(
+                        red: 1,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    root.addSublayer(layer)
+
+                    let transition = CATransition()
+                    transition.filter = dissolve
+                    transition.duration = 1
+                    transition.speed = 0
+                    transition.timeOffset = 0.25
+                    transition.fillMode = .both
+                    transition.isRemovedOnCompletion = false
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    layer.add(
+                        transition,
+                        forKey: "immutableTransition"
+                    )
+                    layer.backgroundColor = CGColor(
+                        red: 0,
+                        green: 0,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    CATransaction.commit()
+
+                    do {
+                        try renderer
+                            .captureCommittedSnapshotForDiagnostics(
+                                of: root
+                            )
+                        layer.backgroundColor = CGColor(
+                            red: 0,
+                            green: 1,
+                            blue: 0,
+                            alpha: 1
+                        )
+                        transition.filter = replacement
+                        renderer.render(layer: root)
+                        let pixels = try await renderer.readbackPixels(
+                            at: [CGPoint(x: 200, y: 150)]
+                        )
+                        guard let pixel = pixels.first else {
+                            ImmutableTransitionSnapshotProbeState
+                                .result =
+                                "error: missing readback pixel"
+                            return
+                        }
+                        ImmutableTransitionSnapshotProbeState.result =
+                            "pixel="
+                            + pixel.map(String.init)
+                                .joined(separator: ",")
+                            + ",sources=\(renderer.transitionSourceCaptureCount)"
+                            + ",targets=\(renderer.transitionTargetCaptureCount)"
+                            + ",dispatches=\(renderer.transitionFilterDispatchCount)"
+                            + ",failures=\(renderer.transitionRenderFailureCount)"
+                        layer.removeAnimation(
+                            forKey: "immutableTransition"
+                        )
+                    } catch {
+                        ImmutableTransitionSnapshotProbeState.result =
                             "error: \(error)"
                     }
                 }

@@ -97,8 +97,7 @@ public final class CAMetalRenderer: CARendererDelegate {
         case .captureFailure(_, let error):
             lastRenderError = error
             return
-        case .requiresLiveAnimationEvaluation(let frameToken),
-             .requiresLiveResourceCapture(let frameToken, _):
+        case .requiresLiveAnimationEvaluation(let frameToken):
             CALayer.advanceFrameToken()
             do {
                 snapshot = try CARenderSnapshot.capture(
@@ -381,6 +380,11 @@ public final class CAMetalRenderer: CARendererDelegate {
     private func unsupportedFeature(
         in snapshot: CARenderSnapshot
     ) -> CARenderSnapshotFeature? {
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.transition != nil
+        }) {
+            return .transition
+        }
         if snapshot.nodes.contains(where: {
             $0.presentationValues.tiled != nil
         }) {

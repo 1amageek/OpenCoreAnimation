@@ -41,12 +41,16 @@ public struct CATransitionSubtype: Hashable, Equatable, RawRepresentable, Sendab
     public static let fromBottom = CATransitionSubtype(rawValue: "fromBottom")
 }
 
+import Synchronization
+
 /// An object that provides an animated transition between a layer's states.
 open class CATransition: CAAnimation {
+    private static let resourceIdentityStorage = Mutex<UInt64>(0)
 
     /// The layer tree captured when this transition was attached.
     /// The renderer owns no model state; the animation copy carries its source state.
     internal var sourceLayerSnapshot: CALayer?
+    internal let resourceIdentity: UInt64
 
     /// The name of the transition.
     open var type: CATransitionType = .fade
@@ -64,10 +68,12 @@ open class CATransition: CAAnimation {
     open var filter: Any?
 
     public required init() {
+        resourceIdentity = Self.nextResourceIdentity()
         super.init()
     }
 
     public required init(animation: CAAnimation) {
+        resourceIdentity = Self.nextResourceIdentity()
         super.init(animation: animation)
         if let source = animation as? CATransition {
             self.type = source.type
@@ -76,6 +82,16 @@ open class CATransition: CAAnimation {
             self.endProgress = source.endProgress
             self.filter = source.filter
             self.sourceLayerSnapshot = source.sourceLayerSnapshot
+        }
+    }
+
+    private static func nextResourceIdentity() -> UInt64 {
+        resourceIdentityStorage.withLock { identity in
+            identity &+= 1
+            if identity == 0 {
+                identity = 1
+            }
+            return identity
         }
     }
 

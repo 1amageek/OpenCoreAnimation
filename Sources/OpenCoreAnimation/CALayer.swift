@@ -558,6 +558,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
         guard let sourceLayer = transition.sourceLayerSnapshot else { return }
         layer._transitionRenderState = CATransitionRenderState(
+            resourceIdentity: transition.resourceIdentity,
             sourceLayer: sourceLayer,
             type: transition.type,
             subtype: transition.subtype,
