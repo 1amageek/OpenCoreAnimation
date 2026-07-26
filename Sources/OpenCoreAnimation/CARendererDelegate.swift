@@ -63,6 +63,9 @@ import JavaScriptKit
     /// frame even when the layer tree itself is clean and has no animations.
     var requiresFrameWhenLayerTreeIsClean: Bool { get }
 
+    /// The latest failure represented by the shared renderer error contract.
+    var synchronousRenderError: CARendererError? { get }
+
     // MARK: - Lifecycle
 
     /// Initializes the renderer asynchronously.
@@ -100,6 +103,7 @@ import JavaScriptKit
 
 extension CARendererDelegate {
     var requiresFrameWhenLayerTreeIsClean: Bool { false }
+    var synchronousRenderError: CARendererError? { nil }
 }
 
 // MARK: - Factory

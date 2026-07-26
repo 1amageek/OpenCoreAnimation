@@ -13,6 +13,13 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case transition
     case imageContents
     case contentMask
+    case clipping
+    case roundedCorners
+    case border
+    case geometryFlipped
+    case edgeAntialiasing
+    case dynamicRange
+    case backfaceCulling
     case groupOpacity
     case rasterization
     case filters
@@ -168,6 +175,24 @@ public enum CARendererError: Error, Equatable, Sendable {
     case resourceCreationFailed
     /// The canvas/view is not configured.
     case canvasNotConfigured
+    /// A renderer option key is not recognized.
+    case unsupportedRendererOption(String)
+    /// A renderer option value does not satisfy the option's type contract.
+    case invalidRendererOption(
+        key: String,
+        expected: String,
+        actual: String
+    )
+    /// A client-provided Metal command queue belongs to another device.
+    case rendererCommandQueueDeviceMismatch
+    /// A Metal destination cannot receive render-pass output.
+    case metalDestinationMissingRenderTargetUsage
+    /// The requested output color space cannot represent RGB renderer output.
+    case unsupportedRendererColorSpace(String)
+    /// A committed color could not be converted into the requested output space.
+    case rendererColorConversionFailed
+    /// A destination operation was sent to an incompatible renderer backend.
+    case incompatibleRendererBackend
     /// The requested render target cannot be represented by the renderer.
     case invalidRenderTarget(CARenderTargetConfigurationError)
     /// A layer hierarchy contains a cycle and cannot be captured safely.
@@ -244,6 +269,7 @@ internal enum CARenderTimeContext {
     public var bounds: CGRect = CARenderer.nullRect
 
     internal let backend: any CARendererDelegate
+    private var interfaceRenderError: CARendererError?
     private var frameTime: CFTimeInterval = 0
     private var hasFrameTime = false
     private var frameIsOpen = false
@@ -252,6 +278,20 @@ internal enum CARenderTimeContext {
 
     internal init(backend: any CARendererDelegate) {
         self.backend = backend
+    }
+
+    /// The most recent synchronous renderer failure.
+    ///
+    /// This portable diagnostic preserves Apple's nonthrowing Metal entry
+    /// points while keeping configuration and submission failures observable.
+    public var lastRenderError: CARendererError? {
+        interfaceRenderError ?? backend.synchronousRenderError
+    }
+
+    internal func recordInterfaceRenderError(
+        _ error: CARendererError?
+    ) {
+        interfaceRenderError = error
     }
 
     #if arch(wasm32)

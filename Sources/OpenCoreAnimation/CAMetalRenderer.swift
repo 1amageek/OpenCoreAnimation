@@ -11,7 +11,7 @@ import simd
 /// ## Protocol Conformance
 ///
 /// Conforms to the internal renderer-backend contract used by the animation engine.
-public final class CAMetalRenderer: CARendererDelegate {
+@MainActor public final class CAMetalRenderer: CARendererDelegate {
 
     // MARK: - Properties
 
@@ -21,20 +21,20 @@ public final class CAMetalRenderer: CARendererDelegate {
     /// The command queue.
     private var commandQueue: MTLCommandQueue?
 
+    /// The client-owned command queue, when supplied through renderer options.
+    private var clientCommandQueue: MTLCommandQueue?
+
     /// The render pipeline state.
     private var pipelineState: MTLRenderPipelineState?
-
-    /// The vertex buffer for quad rendering.
-    private var vertexBuffer: MTLBuffer?
-
-    /// The uniform buffer.
-    private var uniformBuffer: MTLBuffer?
 
     /// The current drawable size.
     public var size: CGSize = CGSize(width: 0, height: 0)
 
     /// The pixel format for rendering.
     private var pixelFormat: MTLPixelFormat = .bgra8Unorm
+
+    /// The requested output color space.
+    private var outputColorSpace: OpenCoreGraphics.CGColorSpace?
 
     /// The target texture for offscreen rendering.
     internal private(set) var targetTexture: MTLTexture?
@@ -48,6 +48,15 @@ public final class CAMetalRenderer: CARendererDelegate {
     /// The latest synchronous renderer failure, cleared after a successful submission.
     public private(set) var lastRenderError: CARendererError?
 
+    internal var synchronousRenderError: CARendererError? {
+        lastRenderError
+    }
+
+    internal var configuredCommandQueue:
+        (any MTLCommandQueue)? {
+        commandQueue
+    }
+
     private var retainedAnimationEvaluator:
         CACommittedAnimationEvaluator?
     private var retainedAnimationFrameToken: UInt64?
@@ -58,9 +67,27 @@ public final class CAMetalRenderer: CARendererDelegate {
 
     public init() {}
 
-    internal init(destination texture: any MTLTexture) throws {
-        try configure(device: texture.device, destination: texture)
-        sizesTargetFromRootBounds = false
+    internal init(
+        destination texture: any MTLTexture,
+        commandQueue: (any MTLCommandQueue)? = nil,
+        outputColorSpace: OpenCoreGraphics.CGColorSpace? = nil
+    ) {
+        do {
+            try configure(
+                device: texture.device,
+                destination: texture,
+                clientCommandQueue: commandQueue,
+                outputColorSpace: outputColorSpace
+            )
+            sizesTargetFromRootBounds = false
+            lastRenderError = nil
+        } catch let error as CARendererError {
+            lastRenderError = error
+        } catch {
+            lastRenderError = .renderingFailed(
+                String(describing: error)
+            )
+        }
     }
 
     // MARK: - CARenderer
@@ -70,14 +97,34 @@ public final class CAMetalRenderer: CARendererDelegate {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw CARendererError.deviceNotAvailable
         }
-        try configure(device: device, destination: nil)
+        try configure(
+            device: device,
+            destination: nil,
+            clientCommandQueue: nil,
+            outputColorSpace: nil
+        )
         lastRenderError = nil
     }
 
-    internal func setDestination(_ texture: any MTLTexture) throws {
-        try configure(device: texture.device, destination: texture)
-        sizesTargetFromRootBounds = false
-        lastRenderError = nil
+    internal func replaceDestination(
+        _ texture: any MTLTexture
+    ) {
+        do {
+            try configure(
+                device: texture.device,
+                destination: texture,
+                clientCommandQueue: clientCommandQueue,
+                outputColorSpace: outputColorSpace
+            )
+            sizesTargetFromRootBounds = false
+            lastRenderError = nil
+        } catch let error as CARendererError {
+            lastRenderError = error
+        } catch {
+            lastRenderError = .renderingFailed(
+                String(describing: error)
+            )
+        }
     }
 
     public func resize(width: Int, height: Int) {
@@ -194,8 +241,25 @@ public final class CAMetalRenderer: CARendererDelegate {
             )
             return false
         }
-        guard let commandQueue, let pipelineState, let targetTexture else {
+        guard let device, let commandQueue,
+              let pipelineState, let targetTexture else {
             lastRenderError = .renderingFailed("Metal renderer configuration is incomplete")
+            return false
+        }
+
+        let preparedDraws: [CAMetalPreparedDraw]
+        do {
+            preparedDraws = try prepareDraws(
+                for: snapshot,
+                device: device
+            )
+        } catch let error as CARendererError {
+            lastRenderError = error
+            return false
+        } catch {
+            lastRenderError = .renderingFailed(
+                String(describing: error)
+            )
             return false
         }
 
@@ -220,51 +284,51 @@ public final class CAMetalRenderer: CARendererDelegate {
 
         encoder.setRenderPipelineState(pipelineState)
 
-        // Create projection matrix for SpriteKit/CoreAnimation coordinate system (Y+ up)
-        // - y=0 maps to NDC=-1 (bottom of screen)
-        // - y=height maps to NDC=+1 (top of screen)
-        let projectionMatrix = simd_float4x4.orthographic(
-            left: 0,
-            right: Float(size.width),
-            bottom: 0,
-            top: Float(size.height),
-            near: -1000,
-            far: 1000
-        )
-
-        // Render layer tree
-        renderNode(
-            at: snapshot.rootIndex,
-            in: snapshot,
-            encoder: encoder,
-            parentMatrix: projectionMatrix
-        )
+        for draw in preparedDraws {
+            encoder.setVertexBuffer(
+                draw.vertexBuffer,
+                offset: 0,
+                index: 0
+            )
+            encoder.setVertexBuffer(
+                draw.uniformBuffer,
+                offset: 0,
+                index: 1
+            )
+            encoder.drawPrimitives(
+                type: .triangle,
+                vertexStart: 0,
+                vertexCount: 6
+            )
+        }
 
         encoder.endEncoding()
         lastCommandBuffer = commandBuffer
         commandBuffer.commit()
+        if clientCommandQueue == nil {
+            commandBuffer.waitUntilScheduled()
+        }
         lastRenderError = nil
         return true
     }
 
     public func invalidate() {
         pipelineState = nil
-        vertexBuffer = nil
-        uniformBuffer = nil
         targetTexture = nil
         commandQueue = nil
+        clientCommandQueue = nil
         device = nil
+        outputColorSpace = nil
         lastCommandBuffer = nil
         lastRenderError = nil
     }
 
     // MARK: - Private Methods
 
-    private func createPipeline() throws {
-        guard let device = device else {
-            throw CARendererError.deviceNotAvailable
-        }
-
+    private func makePipeline(
+        device: any MTLDevice,
+        pixelFormat: MTLPixelFormat
+    ) throws -> any MTLRenderPipelineState {
         // Shader source code
         let shaderSource = """
         #include <metal_stdlib>
@@ -353,7 +417,9 @@ public final class CAMetalRenderer: CARendererDelegate {
         pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
         do {
-            pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+            return try device.makeRenderPipelineState(
+                descriptor: pipelineDescriptor
+            )
         } catch {
             throw CARendererError.pipelineCreationFailed
         }
@@ -361,21 +427,52 @@ public final class CAMetalRenderer: CARendererDelegate {
 
     private func configure(
         device: any MTLDevice,
-        destination: (any MTLTexture)?
+        destination: (any MTLTexture)?,
+        clientCommandQueue:
+            (any MTLCommandQueue)?,
+        outputColorSpace:
+            OpenCoreGraphics.CGColorSpace?
     ) throws {
-        guard let commandQueue = device.makeCommandQueue() else {
+        if let destination,
+           !destination.usage.contains(.renderTarget) {
+            throw CARendererError
+                .metalDestinationMissingRenderTargetUsage
+        }
+        if let clientCommandQueue,
+           ObjectIdentifier(clientCommandQueue.device)
+                != ObjectIdentifier(device) {
+            throw CARendererError
+                .rendererCommandQueueDeviceMismatch
+        }
+        guard let configuredCommandQueue =
+                clientCommandQueue
+                ?? device.makeCommandQueue() else {
             throw CARendererError.deviceNotAvailable
         }
-        self.device = device
-        self.commandQueue = commandQueue
-        targetTexture = destination
+        let configuredPixelFormat =
+            destination?.pixelFormat ?? .bgra8Unorm
+        let configuredSize: CGSize
         if let destination {
-            pixelFormat = destination.pixelFormat
-            size = CGSize(width: destination.width, height: destination.height)
+            configuredSize = CGSize(
+                width: destination.width,
+                height: destination.height
+            )
+        } else {
+            configuredSize = CGSize(width: 0, height: 0)
         }
-        try createPipeline()
-        createVertexBuffer()
-        createUniformBuffer()
+        let configuredPipeline = try makePipeline(
+            device: device,
+            pixelFormat: configuredPixelFormat
+        )
+
+        self.device = device
+        commandQueue = configuredCommandQueue
+        self.clientCommandQueue = clientCommandQueue
+        pipelineState = configuredPipeline
+        targetTexture = destination
+        pixelFormat = configuredPixelFormat
+        size = configuredSize
+        self.outputColorSpace = outputColorSpace
     }
 
     private func prepareForRendering(_ snapshot: CARenderSnapshot) throws {
@@ -388,7 +485,12 @@ public final class CAMetalRenderer: CARendererDelegate {
             guard let defaultDevice = MTLCreateSystemDefaultDevice() else {
                 throw CARendererError.deviceNotAvailable
             }
-            try configure(device: defaultDevice, destination: nil)
+            try configure(
+                device: defaultDevice,
+                destination: nil,
+                clientCommandQueue: nil,
+                outputColorSpace: nil
+            )
         }
         guard sizesTargetFromRootBounds else {
             guard targetTexture != nil else {
@@ -440,11 +542,56 @@ public final class CAMetalRenderer: CARendererDelegate {
         }
         if snapshot.nodes.contains(where: {
             $0.presentationValues.isTransformLayer
+                || !CATransform3DIsAffine(
+                    $0.presentationValues.transform
+                )
+                || !CATransform3DIsAffine(
+                    $0.presentationValues.sublayerTransform
+                )
         }) {
             return .transformDepth
         }
         if snapshot.nodes.contains(where: { $0.maskIndex != nil }) {
             return .contentMask
+        }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.masksToBounds
+        }) {
+            return .clipping
+        }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.cornerRadius > 0
+        }) {
+            return .roundedCorners
+        }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.borderWidth > 0
+                && $0.presentationValues.borderColor != nil
+        }) {
+            return .border
+        }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.isGeometryFlipped
+        }) {
+            return .geometryFlipped
+        }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.edgeAntialiasingMask != 15
+        }) {
+            return .edgeAntialiasing
+        }
+        if snapshot.nodes.contains(where: {
+            $0.presentationValues.toneMapMode != .automatic
+                || $0.presentationValues.preferredDynamicRange
+                    != .standard
+                || $0.presentationValues.contentsHeadroom != 0
+        }) {
+            return .dynamicRange
+        }
+        if snapshot.nodes.contains(where: {
+            !$0.presentationValues.isDoubleSided
+        }) {
+            return .backfaceCulling
         }
         if snapshot.nodes.contains(where: {
             $0.presentationValues.allowsGroupOpacity
@@ -522,53 +669,47 @@ public final class CAMetalRenderer: CARendererDelegate {
         targetTexture = texture
     }
 
-    private func createVertexBuffer() {
-        guard let device = device else { return }
-
-        // Quad vertices (two triangles)
-        let vertices: [CAMetalRendererVertex] = [
-            // Triangle 1
-            CAMetalRendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: SIMD4(1, 1, 1, 1)),
-            CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: SIMD4(1, 1, 1, 1)),
-            CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: SIMD4(1, 1, 1, 1)),
-            // Triangle 2
-            CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: SIMD4(1, 1, 1, 1)),
-            CAMetalRendererVertex(position: SIMD2(1, 1), texCoord: SIMD2(1, 1), color: SIMD4(1, 1, 1, 1)),
-            CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: SIMD4(1, 1, 1, 1)),
-        ]
-
-        vertexBuffer = device.makeBuffer(
-            bytes: vertices,
-            length: MemoryLayout<CAMetalRendererVertex>.stride * vertices.count,
-            options: .storageModeShared
+    private func prepareDraws(
+        for snapshot: CARenderSnapshot,
+        device: any MTLDevice
+    ) throws -> [CAMetalPreparedDraw] {
+        let projectionMatrix = simd_float4x4.orthographic(
+            left: 0,
+            right: Float(size.width),
+            bottom: 0,
+            top: Float(size.height),
+            near: -1000,
+            far: 1000
         )
+        var draws: [CAMetalPreparedDraw] = []
+        draws.reserveCapacity(snapshot.nodes.count)
+        try prepareNode(
+            at: snapshot.rootIndex,
+            in: snapshot,
+            device: device,
+            parentMatrix: projectionMatrix,
+            parentOpacity: 1,
+            draws: &draws
+        )
+        return draws
     }
 
-    private func createUniformBuffer() {
-        guard let device = device else { return }
-
-        uniformBuffer = device.makeBuffer(
-            length: MemoryLayout<CAMetalRendererUniforms>.stride,
-            options: .storageModeShared
-        )
-    }
-
-    private func renderNode(
+    private func prepareNode(
         at nodeIndex: Int,
         in snapshot: CARenderSnapshot,
-        encoder: MTLRenderCommandEncoder,
-        parentMatrix: simd_float4x4
-    ) {
+        device: any MTLDevice,
+        parentMatrix: simd_float4x4,
+        parentOpacity: Float,
+        draws: inout [CAMetalPreparedDraw]
+    ) throws {
         let node = snapshot.nodes[nodeIndex]
         let values = node.presentationValues
 
-        // Skip hidden layers
         guard !values.isHidden && values.opacity > 0 else { return }
+        let cumulativeOpacity = parentOpacity * values.opacity
+        guard cumulativeOpacity > 0 else { return }
 
-        // Calculate model matrix
         let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
-
-        // Create scale matrix for layer bounds (column-major order)
         let w = values.boundsSize.x
         let h = values.boundsSize.y
         let col0 = SIMD4<Float>(w, 0, 0, 0)
@@ -579,22 +720,17 @@ public final class CAMetalRenderer: CARendererDelegate {
 
         let finalMatrix = modelMatrix * scaleMatrix
 
-        // Update uniforms
         var uniforms = CAMetalRendererUniforms(
             mvpMatrix: finalMatrix,
-            opacity: values.opacity,
+            opacity: cumulativeOpacity,
             cornerRadius: values.cornerRadius
         )
 
-        uniformBuffer?.contents().copyMemory(
-            from: &uniforms,
-            byteCount: MemoryLayout<CAMetalRendererUniforms>.stride
-        )
-
-        // Render background color if set
-        if let color = values.backgroundColor {
-            // Update vertex colors with background color
-            var vertices: [CAMetalRendererVertex] = [
+        if let backgroundColor = values.backgroundColor {
+            let color = try outputColor(
+                from: backgroundColor
+            )
+            let vertices: [CAMetalRendererVertex] = [
                 CAMetalRendererVertex(position: SIMD2(0, 0), texCoord: SIMD2(0, 0), color: color),
                 CAMetalRendererVertex(position: SIMD2(1, 0), texCoord: SIMD2(1, 0), color: color),
                 CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
@@ -603,31 +739,76 @@ public final class CAMetalRenderer: CARendererDelegate {
                 CAMetalRendererVertex(position: SIMD2(0, 1), texCoord: SIMD2(0, 1), color: color),
             ]
 
-            vertexBuffer?.contents().copyMemory(
-                from: &vertices,
-                byteCount: MemoryLayout<CAMetalRendererVertex>.stride * vertices.count
+            guard let vertexBuffer = device.makeBuffer(
+                bytes: vertices,
+                length:
+                    MemoryLayout<CAMetalRendererVertex>.stride
+                    * vertices.count,
+                options: .storageModeShared
+            ), let uniformBuffer = device.makeBuffer(
+                bytes: &uniforms,
+                length:
+                    MemoryLayout<CAMetalRendererUniforms>.stride,
+                options: .storageModeShared
+            ) else {
+                throw CARendererError.bufferCreationFailed
+            }
+            draws.append(
+                CAMetalPreparedDraw(
+                    vertexBuffer: vertexBuffer,
+                    uniformBuffer: uniformBuffer
+                )
             )
-
-            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
 
-        // Render sublayers
         if !node.childIndices.isEmpty {
-            // Use sublayerMatrix helper to apply sublayerTransform and bounds.origin offset
             let sublayerMatrix = values.sublayerMatrix(modelMatrix: modelMatrix)
-
             for childIndex in node.childIndices {
-                renderNode(
+                try prepareNode(
                     at: childIndex,
                     in: snapshot,
-                    encoder: encoder,
-                    parentMatrix: sublayerMatrix
+                    device: device,
+                    parentMatrix: sublayerMatrix,
+                    parentOpacity: cumulativeOpacity,
+                    draws: &draws
                 )
             }
         }
     }
+
+    private func outputColor(
+        from color: SIMD4<Float>
+    ) throws -> SIMD4<Float> {
+        guard let outputColorSpace else {
+            return color
+        }
+        let sourceColor = OpenCoreGraphics.CGColor(
+            red: CGFloat(color.x),
+            green: CGFloat(color.y),
+            blue: CGFloat(color.z),
+            alpha: CGFloat(color.w)
+        )
+        guard let converted = sourceColor.converted(
+            to: outputColorSpace,
+            intent: .defaultIntent,
+            options: nil
+        ), let components = converted.components,
+           components.count == 4,
+           components.allSatisfy(\.isFinite) else {
+            throw CARendererError.rendererColorConversionFailed
+        }
+        return SIMD4(
+            Float(components[0]),
+            Float(components[1]),
+            Float(components[2]),
+            Float(components[3])
+        )
+    }
+}
+
+private struct CAMetalPreparedDraw {
+    internal let vertexBuffer: any MTLBuffer
+    internal let uniformBuffer: any MTLBuffer
 }
 
 private extension CARenderSnapshot.PresentationValues {

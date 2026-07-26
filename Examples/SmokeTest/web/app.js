@@ -1,6 +1,6 @@
 // OpenCoreAnimation smoke-test loader.
 // Mirrors the runtime used by OpenCoreGraphics/SmokeTest and `swift-wasmport`
-// (JavaScriptKit 0.50.2 + the BridgeJS `bjs` imports + WASI reactor ABI).
+// (JavaScriptKit 0.56.1 + the BridgeJS `bjs` imports + WASI reactor ABI).
 // Keep in sync if the runtime shape changes.
 
 import { SwiftRuntime } from "./runtime.mjs";

@@ -3255,7 +3255,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.shouldRasterize = true
@@ -3282,7 +3282,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.filters = [CAFilter.colorInvert()]
@@ -3308,7 +3308,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.backgroundFilters = [CAFilter.colorInvert()]
@@ -3336,7 +3336,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.shadowOpacity = 1
@@ -3368,7 +3368,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.opacity = 0.5
@@ -3396,7 +3396,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.position = CGPoint(x: 1, y: 0.5)
@@ -3435,7 +3435,7 @@ extension CARenderSnapshotTests {
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .shared
         let texture = try #require(device.makeTexture(descriptor: descriptor))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.position = CGPoint(x: 1, y: 0.5)
@@ -3464,7 +3464,7 @@ extension CARenderSnapshotTests {
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .shared
         let texture = try #require(device.makeTexture(descriptor: descriptor))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CAGradientLayer()
         root.bounds = CGRect(x: 0, y: 0, width: 2, height: 1)
         root.position = CGPoint(x: 1, y: 0.5)
@@ -3494,7 +3494,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(device.makeTexture(
             descriptor: descriptor
         ))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let path = CGMutablePath()
         path.addRect(CGRect(x: 0, y: 0, width: 2, height: 1))
         let root = CAShapeLayer()
@@ -3529,7 +3529,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(device.makeTexture(
             descriptor: descriptor
         ))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CATextLayer()
         root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
         root.position = CGPoint(x: 8, y: 8)
@@ -3557,7 +3557,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(device.makeTexture(
             descriptor: descriptor
         ))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CATransformLayer()
         root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
         root.position = CGPoint(x: 8, y: 8)
@@ -3586,7 +3586,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(device.makeTexture(
             descriptor: descriptor
         ))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CAReplicatorLayer()
         root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
         root.position = CGPoint(x: 8, y: 8)
@@ -3616,7 +3616,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(device.makeTexture(
             descriptor: descriptor
         ))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CAEmitterLayer()
         root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
         root.position = CGPoint(x: 8, y: 8)
@@ -3646,7 +3646,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(
+        let renderer = CAMetalRenderer(
             destination: texture
         )
         let root = CATiledLayer()
@@ -3684,7 +3684,7 @@ extension CARenderSnapshotTests {
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .shared
         let texture = try #require(device.makeTexture(descriptor: descriptor))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
         let root = CALayer()
 
         CATransaction.begin()
@@ -3738,7 +3738,7 @@ extension CARenderSnapshotTests {
         let texture = try #require(
             device.makeTexture(descriptor: descriptor)
         )
-        let renderer = try CAMetalRenderer(
+        let renderer = CAMetalRenderer(
             destination: texture
         )
         let root = CALayer()
@@ -3841,7 +3841,7 @@ extension CARenderSnapshotTests {
         descriptor.usage = [.renderTarget, .shaderRead]
         descriptor.storageMode = .shared
         let texture = try #require(device.makeTexture(descriptor: descriptor))
-        let renderer = try CAMetalRenderer(destination: texture)
+        let renderer = CAMetalRenderer(destination: texture)
 
         let root = CALayer()
         root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
