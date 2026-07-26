@@ -39,8 +39,9 @@ public enum CAEmitterFailure: Error, Equatable, Sendable {
 }
 
 /// Validated, renderer-independent emitter-layer input.
-internal struct CAEmitterRenderConfiguration {
-    let emitterCells: [CAEmitterCell]
+internal struct CAEmitterRenderConfiguration: Equatable, Sendable {
+    let simulationIdentity: UInt64
+    let emitterCells: [CAEmitterCellSnapshot]
     let emitterPosition: CGPoint
     let emitterZPosition: CGFloat
     let emitterSize: CGSize
@@ -56,7 +57,9 @@ internal struct CAEmitterRenderConfiguration {
     let spin: Float
     let seed: UInt32
 
-    init(layer: CAEmitterLayer) throws(CAEmitterFailure) {
+    init(
+        layer: CAEmitterLayer
+    ) throws(CARenderSnapshotEmitterError) {
         switch layer.emitterShape {
         case .point, .line, .rectangle, .cuboid, .circle, .sphere:
             break
@@ -91,7 +94,10 @@ internal struct CAEmitterRenderConfiguration {
             throw .nonFiniteLayerSimulationValue
         }
 
-        emitterCells = layer.emitterCells ?? []
+        simulationIdentity = layer.simulationIdentity
+        emitterCells = try CAEmitterCellSnapshot.capture(
+            layer.emitterCells ?? []
+        )
         emitterPosition = layer.emitterPosition
         emitterZPosition = layer.emitterZPosition
         emitterSize = layer.emitterSize

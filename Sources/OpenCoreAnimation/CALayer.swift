@@ -212,6 +212,8 @@ open class CALayer: CAMediaTiming, Hashable {
         let presentationClass = type(of: self)
         let presentation = presentationClass.init(layer: self)
         presentation._isPresentation = true
+        (presentation as? CAEmitterLayer)?
+            .detachEmitterCellOwnershipForPresentation()
         presentation._modelLayer = self
         // Presentation layers are read-only consumers and must not
         // contribute to any ancestor's dirty count (PERFORMANCE_DESIGN.md
@@ -236,6 +238,8 @@ open class CALayer: CAMediaTiming, Hashable {
         let presentationClass = type(of: self)
         let presentation = presentationClass.init(layer: self)
         presentation._isPresentation = true
+        (presentation as? CAEmitterLayer)?
+            .detachEmitterCellOwnershipForPresentation()
         presentation._modelLayer = self
         // See createPresentationLayer() — presentation layers don't
         // contribute to dirty propagation.

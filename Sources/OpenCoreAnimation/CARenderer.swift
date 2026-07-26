@@ -22,6 +22,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case text
     case transformDepth
     case replicatorInstances
+    case emitter
 }
 
 /// A layer filter value that could not cross the immutable commit boundary.
@@ -117,6 +118,26 @@ public enum CARenderSnapshotReplicatorError:
     )
 }
 
+/// Emitter input that could not cross the immutable commit boundary.
+public enum CARenderSnapshotEmitterError:
+    Error, Equatable, Sendable {
+    case unsupportedEmitterShape(String)
+    case unsupportedEmitterMode(String)
+    case unsupportedRenderMode(String)
+    case nonFiniteLayerGeometry
+    case nonFiniteLayerSimulationValue
+    case cyclicCellHierarchy(path: [Int])
+    case invalidCellTiming(path: [Int])
+    case invalidCellBirthRate(path: [Int])
+    case invalidCellContents(path: [Int])
+    case cellImageConversion(
+        path: [Int],
+        reason: CAImageContentsConversionError
+    )
+    case invalidCellColor(path: [Int])
+    case nonFiniteCellSimulationValue(path: [Int])
+}
+
 /// Errors that can occur during renderer operations.
 public enum CARendererError: Error, Equatable, Sendable {
     /// The GPU/graphics device is not available.
@@ -171,6 +192,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerReplicator(
         CARenderSnapshotReplicatorError
     )
+    /// An emitter layer could not become immutable simulation input.
+    case invalidLayerEmitter(CARenderSnapshotEmitterError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

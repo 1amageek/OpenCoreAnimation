@@ -487,6 +487,117 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Emitter cells and image bytes become immutable snapshot values")
+    func emitterValuesUseSnapshots() throws {
+        let image = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 0, 0, 255]
+        )
+        let child = CAEmitterCell()
+        child.birthRate = 3
+        child.lifetime = 4
+        let cell = CAEmitterCell()
+        cell.contents = image
+        cell.contentsRect = CGRect(
+            x: 0.25,
+            y: 0,
+            width: 0.5,
+            height: 1
+        )
+        cell.contentsScale = 2
+        cell.birthRate = 6
+        cell.lifetime = 7
+        cell.velocity = 8
+        cell.color = CGColor(
+            red: 0,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+        cell.emitterCells = [child]
+
+        let emitter = CAEmitterLayer()
+        emitter.emitterCells = [cell]
+        emitter.emitterPosition = CGPoint(x: 12, y: 14)
+        emitter.emitterSize = CGSize(width: 16, height: 18)
+        emitter.birthRate = 2
+        emitter.seed = 99
+
+        let snapshot = try CARenderSnapshot.capture(
+            emitter,
+            frameToken: 51
+        )
+        let values =
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues
+        let configuration = try #require(values.emitter)
+        let capturedCell = try #require(
+            configuration.emitterCells.first
+        )
+        let capturedImage = try #require(capturedCell.image)
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(
+            configuration.simulationIdentity
+                == emitter.simulationIdentity
+        )
+        #expect(configuration.emitterPosition == CGPoint(x: 12, y: 14))
+        #expect(configuration.emitterSize == CGSize(width: 16, height: 18))
+        #expect(configuration.birthRate == 2)
+        #expect(configuration.seed == 99)
+        #expect(capturedCell.birthRate == 6)
+        #expect(capturedCell.lifetime == 7)
+        #expect(capturedCell.velocity == 8)
+        #expect(capturedCell.color == SIMD4<Float>(0, 1, 0, 1))
+        #expect(capturedCell.childCells.first?.birthRate == 3)
+        #expect(capturedImage.storage.data == Data([255, 0, 0, 255]))
+        #expect(
+            capturedImage.contentsRect
+                == CGRect(x: 0.25, y: 0, width: 0.5, height: 1)
+        )
+        #expect(capturedImage.contentsScale == 2)
+
+        emitter.emitterCells = []
+        emitter.birthRate = 0
+        cell.birthRate = 100
+        cell.contents = nil
+        child.birthRate = 200
+
+        #expect(configuration.emitterCells.count == 1)
+        #expect(capturedCell.birthRate == 6)
+        #expect(capturedCell.childCells.first?.birthRate == 3)
+        #expect(capturedImage.storage.data == Data([255, 0, 0, 255]))
+    }
+
+    @Test("Invalid emitter graphs fail immutable capture exactly")
+    func invalidEmitterCaptureFails() {
+        let cyclic = CAEmitterCell()
+        cyclic.emitterCells = [cyclic]
+        let emitter = CAEmitterLayer()
+        emitter.emitterCells = [cyclic]
+
+        #expect(throws: CARendererError.invalidLayerEmitter(
+            .cyclicCellHierarchy(path: [0, 0])
+        )) {
+            try CARenderSnapshot.capture(
+                emitter,
+                frameToken: 52
+            )
+        }
+
+        cyclic.emitterCells = nil
+        cyclic.contents = SnapshotContentsToken()
+        #expect(throws: CARendererError.invalidLayerEmitter(
+            .invalidCellContents(path: [0])
+        )) {
+            try CARenderSnapshot.capture(
+                emitter,
+                frameToken: 53
+            )
+        }
+    }
+
     @Test("Invalid replicator input fails immutable capture exactly")
     func invalidReplicatorCaptureFails() {
         let replicator = CAReplicatorLayer()
@@ -2247,6 +2358,33 @@ extension CARenderSnapshotTests {
             == .unsupportedCommittedSnapshotFeature(
                 .replicatorInstances
             ))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed emitters instead of omitting them")
+    func metalRejectsUnsupportedEmitterSnapshot() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 16,
+            height: 16,
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(device.makeTexture(
+            descriptor: descriptor
+        ))
+        let renderer = try CAMetalRenderer(destination: texture)
+        let root = CAEmitterLayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.position = CGPoint(x: 8, y: 8)
+        root.emitterCells = [CAEmitterCell()]
+
+        renderer.render(layer: root)
+
+        #expect(renderer.lastRenderError
+            == .unsupportedCommittedSnapshotFeature(.emitter))
         #expect(renderer.lastCommandBuffer == nil)
     }
 

@@ -137,7 +137,6 @@ private struct ContentsTextureSamplerSet {
 
 internal enum TexturedCacheKey: Hashable {
     case image(ObjectIdentifier, CAContentsSampling)
-    case emitterImage(ObjectIdentifier, CAContentsSampling)
     case committedImage(ObjectIdentifier, CAContentsSampling)
     case rasterizedLayer(LayerRenderKey, RasterizationCachePurpose)
     case transitionSource(ObjectIdentifier)
@@ -236,8 +235,8 @@ private struct PreparedTransitionComposite {
 }
 
 internal enum EmitterBirthRemainderKey: Hashable {
-    case root(ObjectIdentifier)
-    case child(parentBirthSequence: UInt64, cell: ObjectIdentifier)
+    case root(UInt64)
+    case child(parentBirthSequence: UInt64, cell: UInt64)
 }
 
 internal struct TextTextureCacheKey: Hashable {
@@ -674,7 +673,7 @@ private struct PrerenderedShadow {
 }
 
 private final class EmitterLayerState {
-    weak var owner: CAEmitterLayer?
+    let simulationIdentity: UInt64
     var particles: [EmitterParticle] = []
     var birthRemainders = RendererCacheMap<Float>()
     var randomSource: EmitterRandomSource
@@ -685,11 +684,51 @@ private final class EmitterLayerState {
     var nextBirthSequence: UInt64 = 0
     var lastRenderedBirthSequences: [UInt64] = []
     var lastRenderUsedAdditiveBlending = false
+    var canEmit = false
 
-    init(owner: CAEmitterLayer, seed: UInt32) {
-        self.owner = owner
+    init(simulationIdentity: UInt64, seed: UInt32) {
+        self.simulationIdentity = simulationIdentity
         randomSource = EmitterRandomSource(seed: seed)
         configuredSeed = seed
+    }
+
+    func copy() -> EmitterLayerState {
+        let result = EmitterLayerState(
+            simulationIdentity: simulationIdentity,
+            seed: configuredSeed
+        )
+        result.particles = particles
+        result.birthRemainders = birthRemainders
+        result.randomSource = randomSource
+        result.configuredSeed = configuredSeed
+        result.lastUpdateTime = lastUpdateTime
+        result.simulationTime = simulationTime
+        result.lastUpdatedFrame = lastUpdatedFrame
+        result.nextBirthSequence = nextBirthSequence
+        result.lastRenderedBirthSequences =
+            lastRenderedBirthSequences
+        result.lastRenderUsedAdditiveBlending =
+            lastRenderUsedAdditiveBlending
+        result.canEmit = canEmit
+        return result
+    }
+}
+
+private enum EmitterLayerEncodingFailure: Error {
+    case spawn(CAEmitterFailure)
+    case render(CAEmitterFailure)
+}
+
+private final class RetainedEmitterSnapshot {
+    weak var rootLayer: CALayer?
+    let snapshot: CARenderSnapshot
+
+    init(
+        rootLayer: CALayer,
+        snapshot: CARenderSnapshot
+    ) {
+        self.rootLayer = rootLayer
+        self.snapshot = snapshot
     }
 }
 
@@ -811,14 +850,26 @@ private final class EmitterLayerState {
             return true
         }
         return emitterLayerStates.values.contains { state in
-            guard let owner = state.owner else { return false }
             if !state.particles.isEmpty {
                 return true
             }
-            guard owner.birthRate > 0 else { return false }
-            return owner.emitterCells?.contains { cell in
-                cell.isEnabled && cell.birthRate > 0
-            } == true
+            return state.canEmit
+        }
+    }
+
+    private func snapshotHasEmitterWork(
+        _ snapshot: CARenderSnapshot
+    ) -> Bool {
+        snapshot.nodes.contains { node in
+            guard let emitter =
+                    node.presentationValues.emitter,
+                  let state =
+                    emitterLayerStates[
+                        emitter.simulationIdentity
+                    ] else {
+                return false
+            }
+            return !state.particles.isEmpty || state.canEmit
         }
     }
 
@@ -863,7 +914,7 @@ private final class EmitterLayerState {
     /// Number of live particles owned by one emitter layer.
     @_spi(RendererDiagnostics)
     public func activeParticleCount(for layer: CAEmitterLayer) -> Int {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return 0
         }
         return state.particles.count
@@ -872,7 +923,7 @@ private final class EmitterLayerState {
     /// Current local-space particle positions for one emitter layer.
     @_spi(RendererDiagnostics)
     public func activeParticlePositions(for layer: CAEmitterLayer) -> [SIMD3<Float>] {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return []
         }
         return state.particles.map(\.position)
@@ -881,7 +932,7 @@ private final class EmitterLayerState {
     /// Current local-space particle velocities for one emitter layer.
     @_spi(RendererDiagnostics)
     public func activeParticleVelocities(for layer: CAEmitterLayer) -> [SIMD3<Float>] {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return []
         }
         return state.particles.map(\.velocity)
@@ -890,7 +941,7 @@ private final class EmitterLayerState {
     /// Generation number for each live particle (zero for root cells).
     @_spi(RendererDiagnostics)
     public func activeParticleGenerations(for layer: CAEmitterLayer) -> [Int] {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return []
         }
         return state.particles.map(\.generation)
@@ -899,7 +950,7 @@ private final class EmitterLayerState {
     /// Current color for each live particle after inheritance and simulation.
     @_spi(RendererDiagnostics)
     public func activeParticleColors(for layer: CAEmitterLayer) -> [SIMD4<Float>] {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return []
         }
         return state.particles.map(\.color)
@@ -908,7 +959,7 @@ private final class EmitterLayerState {
     /// Current scale for each live particle after inheritance and simulation.
     @_spi(RendererDiagnostics)
     public func activeParticleScales(for layer: CAEmitterLayer) -> [Float] {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return []
         }
         return state.particles.map(\.scale)
@@ -917,7 +968,7 @@ private final class EmitterLayerState {
     /// Birth sequences in the order submitted to WebGPU during the latest frame.
     @_spi(RendererDiagnostics)
     public func lastRenderedParticleSequences(for layer: CAEmitterLayer) -> [UInt64] {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return []
         }
         return state.lastRenderedBirthSequences
@@ -926,7 +977,7 @@ private final class EmitterLayerState {
     /// Whether the latest particle submission used source-additive blending.
     @_spi(RendererDiagnostics)
     public func lastEmitterRenderUsedAdditiveBlending(for layer: CAEmitterLayer) -> Bool {
-        guard let state = emitterLayerStates[ObjectIdentifier(layer)], state.owner === layer else {
+        guard let state = emitterLayerStates[layer.simulationIdentity] else {
             return false
         }
         return state.lastRenderUsedAdditiveBlending
@@ -1990,10 +2041,15 @@ private final class EmitterLayerState {
     private static let maxParticles = 10000
 
     /// Simulation state owned independently by each emitter layer.
-    private var emitterLayerStates: [ObjectIdentifier: EmitterLayerState] = [:]
+    private var emitterLayerStates: [UInt64: EmitterLayerState] = [:]
 
     /// Emitter layers reached by rendering or offscreen capture this frame.
-    private var activeEmitterLayerIDs: Set<ObjectIdentifier> = []
+    private var activeEmitterLayerIDs: Set<UInt64> = []
+
+    /// Last immutable tree retained only while renderer-owned emitters need
+    /// clean-tree frames after the originating transaction was acknowledged.
+    private var retainedEmitterSnapshots:
+        [ObjectIdentifier: RetainedEmitterSnapshot] = [:]
 
     // MARK: - Initialization
 
@@ -2254,14 +2310,14 @@ private final class EmitterLayerState {
             let imageID = ObjectIdentifier(cgImage)
             let viewKeys = self.texturedTextureViewCache.texturedKeys.filter {
                 switch $0 {
-                case .image(let id, _), .emitterImage(let id, _):
+                case .image(let id, _):
                     return id == imageID
                 default: return false
                 }
             }
             let bindGroupKeys = self.perFrameTexturedBindGroupCache.texturedKeys.filter {
                 switch $0 {
-                case .image(let id, _), .emitterImage(let id, _):
+                case .image(let id, _):
                     return id == imageID
                 default: return false
                 }
@@ -4310,6 +4366,7 @@ private final class EmitterLayerState {
     private func renderCommittedSnapshot(
         _ snapshot: CARenderSnapshot,
         rootLayer: CALayer,
+        acknowledgesCommit: Bool,
         device: GPUDevice,
         context: GPUCanvasContext,
         pipeline: GPURenderPipeline,
@@ -4332,6 +4389,8 @@ private final class EmitterLayerState {
 
         CALayer.advanceFrameToken()
         resetFrameStateForCommittedSnapshot()
+        let emitterStateCheckpoint =
+            emitterLayerStates.mapValues { $0.copy() }
 
         let currentTexture = context.getCurrentTexture()
         let textureView = currentTexture.createView()
@@ -4448,10 +4507,13 @@ private final class EmitterLayerState {
                 recordTransformDepthRenderFailure(failure)
             case .replicator(let failure):
                 recordCommittedReplicatorRenderFailure(failure)
+            case .emitter(let failure):
+                recordEmitterRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
             )
+            emitterLayerStates = emitterStateCheckpoint
             discardFailedCommittedSnapshotResources()
             return
         }
@@ -4550,10 +4612,13 @@ private final class EmitterLayerState {
                 recordTransformDepthRenderFailure(failure)
             case .replicator(let failure):
                 recordCommittedReplicatorRenderFailure(failure)
+            case .emitter(let failure):
+                recordEmitterRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
             )
+            emitterLayerStates = emitterStateCheckpoint
             discardFailedCommittedSnapshotResources()
             return
         }
@@ -4569,11 +4634,29 @@ private final class EmitterLayerState {
         device.queue.submit([encoder.finish()])
         lastRenderedTexture = currentTexture
 
-        rootLayer.recursivelyClearDirtyAfterCommit(matching: snapshot)
-        rootLayer.acknowledgeCommittedRenderState(
-            frameToken: snapshot.frameToken
-        )
-        rootLayer.completeTransactionsAfterRenderRecursively()
+        if acknowledgesCommit {
+            rootLayer.recursivelyClearDirtyAfterCommit(
+                matching: snapshot
+            )
+            rootLayer.acknowledgeCommittedRenderState(
+                frameToken: snapshot.frameToken
+            )
+            rootLayer.completeTransactionsAfterRenderRecursively()
+            let rootIdentity = ObjectIdentifier(rootLayer)
+            if snapshot.nodes.contains(where: {
+                $0.presentationValues.emitter != nil
+            }) {
+                retainedEmitterSnapshots[rootIdentity] =
+                    RetainedEmitterSnapshot(
+                        rootLayer: rootLayer,
+                        snapshot: snapshot
+                    )
+            } else {
+                retainedEmitterSnapshots.removeValue(
+                    forKey: rootIdentity
+                )
+            }
+        }
         lastFrameRenderFailure = nil
         advanceFrameResources()
     }
@@ -4592,6 +4675,7 @@ private final class EmitterLayerState {
                 && !root.childIndices.isEmpty
             )
             || values.shouldRasterize
+            || values.emitter?.preservesDepth == false
             || !values.filters.isEmpty
             || values.compositingFilter != nil
             || !values.backgroundFilters.isEmpty
@@ -4777,7 +4861,38 @@ private final class EmitterLayerState {
     public func render(layer rootLayer: CALayer) {
         lastContentsConversionError = nil
         lastContentsRenderFailure = nil
-        let committedState = rootLayer.pendingCommittedRenderState
+        retainedEmitterSnapshots = retainedEmitterSnapshots.filter {
+            $0.value.rootLayer != nil
+        }
+        let rootIdentity = ObjectIdentifier(rootLayer)
+        let pendingCommittedState =
+            rootLayer.pendingCommittedRenderState
+        let retainedEntry =
+            pendingCommittedState == nil
+                ? retainedEmitterSnapshots[rootIdentity]
+                : nil
+        let retainedSnapshot =
+            retainedEntry?.rootLayer === rootLayer
+                ? retainedEntry?.snapshot
+                : nil
+        let usesRetainedEmitterSnapshot =
+            retainedSnapshot.map(snapshotHasEmitterWork) == true
+        let committedState: CACommittedRenderState? =
+            usesRetainedEmitterSnapshot
+                ? retainedSnapshot.map(
+                    CACommittedRenderState.snapshot
+                )
+                : pendingCommittedState
+        switch pendingCommittedState {
+        case .captureFailure,
+             .requiresLiveAnimationEvaluation,
+             .requiresLiveResourceCapture:
+            retainedEmitterSnapshots.removeValue(
+                forKey: rootIdentity
+            )
+        case .snapshot, nil:
+            break
+        }
         let committedFrameToken: UInt64?
         switch committedState {
         case .captureFailure(_, let error):
@@ -4839,6 +4954,8 @@ private final class EmitterLayerState {
             renderCommittedSnapshot(
                 snapshot,
                 rootLayer: rootLayer,
+                acknowledgesCommit:
+                    !usesRetainedEmitterSnapshot,
                 device: device,
                 context: context,
                 pipeline: pipeline,
@@ -5329,10 +5446,10 @@ private final class EmitterLayerState {
 
     private func collectEmitterLayerIDs(
         _ layer: CALayer,
-        into result: inout Set<ObjectIdentifier>
+        into result: inout Set<UInt64>
     ) {
-        if layer is CAEmitterLayer {
-            result.insert(ObjectIdentifier(layer))
+        if let emitter = layer as? CAEmitterLayer {
+            result.insert(emitter.simulationIdentity)
         }
         for sublayer in layer.sublayers ?? [] {
             collectEmitterLayerIDs(sublayer, into: &result)
@@ -5749,6 +5866,7 @@ private final class EmitterLayerState {
         emitterTexturedAdditiveDepthStencilPipeline = nil
         emitterLayerStates.removeAll(keepingCapacity: false)
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
+        retainedEmitterSnapshots.removeAll(keepingCapacity: false)
         emitterSpawnFailureCount = 0
         lastEmitterSpawnFailure = nil
         emitterRenderFailureCount = 0
@@ -6241,11 +6359,14 @@ private final class EmitterLayerState {
             let requiresBackdropComposition =
                 values.compositingFilter != nil
                 || !values.backgroundFilters.isEmpty
+            let requiresEmitterFlattening =
+                values.emitter?.preservesDepth == false
             if node.maskIndex != nil
                 || requiresGroupOpacity
                 || values.shouldRasterize
                 || !values.filters.isEmpty
-                || requiresBackdropComposition {
+                || requiresBackdropComposition
+                || requiresEmitterFlattening {
                 targets.append(
                     SnapshotCompositeTarget(
                         nodeIndex: nodeIndex,
@@ -6543,7 +6664,9 @@ private final class EmitterLayerState {
                             ? .filter
                             : values.shouldRasterize
                                 ? .rasterization
-                                : .groupOpacity
+                                : values.emitter?.preservesDepth == false
+                                    ? .rasterization
+                                    : .groupOpacity
                 )
         }
     }
@@ -7697,6 +7820,22 @@ private final class EmitterLayerState {
                 )
             } catch {
                 throw .contents(error)
+            }
+        }
+        if let emitter = values.emitter {
+            do {
+                try renderEmitterLayer(
+                    emitter,
+                    device: device,
+                    renderPass: renderPass,
+                    modelMatrix: modelMatrix
+                )
+            } catch {
+                switch error {
+                case .spawn(let failure),
+                     .render(let failure):
+                    throw .emitter(failure)
+                }
             }
         }
 
@@ -16947,6 +17086,36 @@ private final class EmitterLayerState {
         lastEmitterRenderFailure = failure
     }
 
+    private func emitterFailure(
+        from error: CARenderSnapshotEmitterError
+    ) -> CAEmitterFailure {
+        switch error {
+        case .unsupportedEmitterShape(let value):
+            return .unsupportedEmitterShape(value)
+        case .unsupportedEmitterMode(let value):
+            return .unsupportedEmitterMode(value)
+        case .unsupportedRenderMode(let value):
+            return .unsupportedRenderMode(value)
+        case .nonFiniteLayerGeometry:
+            return .nonFiniteLayerGeometry
+        case .nonFiniteLayerSimulationValue:
+            return .nonFiniteLayerSimulationValue
+        case .cyclicCellHierarchy,
+             .invalidCellTiming:
+            return .invalidCellTiming
+        case .invalidCellBirthRate:
+            return .invalidCellBirthRate
+        case .invalidCellContents:
+            return .invalidCellContents
+        case .cellImageConversion(_, let reason):
+            return .imageConversionFailed(reason)
+        case .invalidCellColor:
+            return .invalidCellColor
+        case .nonFiniteCellSimulationValue:
+            return .nonFiniteParticleState
+        }
+    }
+
     /// Rotates a 2D point around the center (0.5, 0.5) by the given angle in radians.
     private func rotatePoint(_ point: SIMD2<Float>, angle: Float) -> SIMD2<Float> {
         let center = SIMD2<Float>(0.5, 0.5)
@@ -16968,26 +17137,71 @@ private final class EmitterLayerState {
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4
     ) {
-        let layerID = ObjectIdentifier(modelLayer)
-        if let existing = emitterLayerStates[layerID], existing.owner === modelLayer {
-            existing.lastRenderedBirthSequences.removeAll(keepingCapacity: true)
-            existing.lastRenderUsedAdditiveBlending = false
+        if let state =
+                emitterLayerStates[
+                    emitterLayer.simulationIdentity
+                ] {
+            state.lastRenderedBirthSequences.removeAll(
+                keepingCapacity: true
+            )
+            state.lastRenderUsedAdditiveBlending = false
         }
         let configuration: CAEmitterRenderConfiguration
         do {
             configuration = try CAEmitterRenderConfiguration(layer: emitterLayer)
         } catch {
-            if case .unsupportedRenderMode(_) = error {
-                recordEmitterRenderFailure(error)
+            let failure = emitterFailure(from: error)
+            if case .unsupportedRenderMode = failure {
+                recordEmitterRenderFailure(failure)
             } else {
-                recordEmitterSpawnFailure(error)
+                recordEmitterSpawnFailure(failure)
             }
             return
         }
+        let layerID = configuration.simulationIdentity
+        let stateCheckpoint = emitterLayerStates[layerID]?.copy()
+        let wasActive = activeEmitterLayerIDs.contains(layerID)
+        do {
+            try renderEmitterLayer(
+                configuration,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+        } catch {
+            if let stateCheckpoint {
+                emitterLayerStates[layerID] = stateCheckpoint
+            } else {
+                emitterLayerStates.removeValue(forKey: layerID)
+            }
+            if !wasActive {
+                activeEmitterLayerIDs.remove(layerID)
+            }
+            switch error {
+            case .spawn(let failure):
+                recordEmitterSpawnFailure(failure)
+            case .render(let failure):
+                recordEmitterRenderFailure(failure)
+            }
+        }
+    }
+
+    private func renderEmitterLayer(
+        _ configuration: CAEmitterRenderConfiguration,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(EmitterLayerEncodingFailure) {
+        let layerID = configuration.simulationIdentity
+        if let existing = emitterLayerStates[layerID] {
+            existing.lastRenderedBirthSequences.removeAll(
+                keepingCapacity: true
+            )
+            existing.lastRenderUsedAdditiveBlending = false
+        }
         guard let vertexBuffer = vertexBuffer,
               let uniformBuffer = uniformBuffer else {
-            recordEmitterRenderFailure(.rendererResourcesUnavailable)
-            return
+            throw .render(.rendererResourcesUnavailable)
         }
         let entersDepthSpace = configuration.preservesDepth
         let depthConfiguration: CADepthGroupRenderConfiguration?
@@ -16997,16 +17211,14 @@ private final class EmitterLayerState {
                     currentNestingDepth: transformDepthNesting
                 )
             } catch {
-                recordEmitterRenderFailure(.depthGroupStateFailure(error))
-                return
+                throw .render(.depthGroupStateFailure(error))
             }
         } else {
             depthConfiguration = nil
         }
         if depthConfiguration?.requiresDepthClear == true {
             guard let depthClearPipeline else {
-                recordEmitterRenderFailure(.depthResourcesUnavailable)
-                return
+                throw .render(.depthResourcesUnavailable)
             }
             renderPass.setPipeline(depthClearPipeline)
             renderPass.draw(vertexCount: 3)
@@ -17022,17 +17234,23 @@ private final class EmitterLayerState {
 
         activeEmitterLayerIDs.insert(layerID)
         let state: EmitterLayerState
-        if let existing = emitterLayerStates[layerID], existing.owner === modelLayer {
+        if let existing = emitterLayerStates[layerID] {
             state = existing
         } else {
-            state = EmitterLayerState(owner: modelLayer, seed: configuration.seed)
+            state = EmitterLayerState(
+                simulationIdentity: layerID,
+                seed: configuration.seed
+            )
             emitterLayerStates[layerID] = state
         }
+        state.canEmit =
+            configuration.birthRate > 0
+            && emitterCells.contains(where: \.canEmit)
         if state.configuredSeed != configuration.seed {
             state.randomSource.reset(seed: configuration.seed)
             state.configuredSeed = configuration.seed
         }
-        let currentCellIDs = Set(emitterCells.map(ObjectIdentifier.init))
+        let currentCellIDs = Set(emitterCells.map(\.identity))
         state.birthRemainders = state.birthRemainders.filteringEmitterRemainders { key, _ in
             switch key {
             case .root(let cellID): return currentCellIDs.contains(cellID)
@@ -17054,9 +17272,10 @@ private final class EmitterLayerState {
 
             for index in state.particles.indices {
                 state.particles[index].update(deltaTime: deltaTime)
-                if !particleStateIsFinite(state.particles[index]) {
-                    state.particles[index].isAlive = false
-                    recordEmitterSpawnFailure(.nonFiniteParticleState)
+                guard particleStateIsFinite(
+                    state.particles[index]
+                ) else {
+                    throw .spawn(.nonFiniteParticleState)
                 }
             }
             var projectedLiveParticleCount = state.particles.reduce(into: 0) { count, particle in
@@ -17064,7 +17283,7 @@ private final class EmitterLayerState {
             }
 
             for cell in emitterCells where cell.isEnabled {
-                let cellID = ObjectIdentifier(cell)
+                let cellID = cell.identity
                 let activeDelta: Float
                 do {
                     activeDelta = try EmitterCellSimulation.activeEmissionDelta(
@@ -17073,8 +17292,7 @@ private final class EmitterLayerState {
                         to: state.simulationTime
                     )
                 } catch {
-                    recordEmitterSpawnFailure(.invalidCellTiming)
-                    continue
+                    throw .spawn(.invalidCellTiming)
                 }
                 let particlesToSpawn: Int
                 do {
@@ -17086,16 +17304,16 @@ private final class EmitterLayerState {
                         state: state
                     )
                 } catch {
-                    recordEmitterSpawnFailure(error)
-                    continue
+                    throw .spawn(error)
                 }
 
                 for _ in 0..<particlesToSpawn {
                     guard projectedLiveParticleCount < Self.maxParticles else {
-                        recordEmitterSpawnFailure(
-                            .particleCapacityExceeded(maximum: Self.maxParticles)
+                        throw .spawn(
+                            .particleCapacityExceeded(
+                                maximum: Self.maxParticles
+                            )
                         )
-                        break
                     }
                     guard let position = EmitterGeometry.position(
                         shape: configuration.emitterShape,
@@ -17106,8 +17324,7 @@ private final class EmitterLayerState {
                         depth: configuration.emitterDepth,
                         random: &state.randomSource
                     ) else {
-                        recordEmitterSpawnFailure(.nonFiniteLayerGeometry)
-                        continue
+                        throw .spawn(.nonFiniteLayerGeometry)
                     }
                     var particle: EmitterParticle
                     do {
@@ -17122,8 +17339,7 @@ private final class EmitterLayerState {
                             state: state
                         )
                     } catch {
-                        recordEmitterSpawnFailure(error)
-                        continue
+                        throw .spawn(error)
                     }
                     guard particle.isAlive else { continue }
                     assignBirthSequence(to: &particle, state: state)
@@ -17152,8 +17368,7 @@ private final class EmitterLayerState {
                             to: parentEndTime
                         )
                     } catch {
-                        recordEmitterSpawnFailure(.invalidCellTiming)
-                        continue
+                        throw .spawn(.invalidCellTiming)
                     }
                     let particlesToSpawn: Int
                     do {
@@ -17163,21 +17378,21 @@ private final class EmitterLayerState {
                             rateMultiplier: configuration.birthRate,
                             remainderKey: .child(
                                 parentBirthSequence: parent.birthSequence,
-                                cell: ObjectIdentifier(childCell)
+                                cell: childCell.identity
                             ),
                             state: state
                         )
                     } catch {
-                        recordEmitterSpawnFailure(error)
-                        continue
+                        throw .spawn(error)
                     }
 
                     for childIndex in 0..<particlesToSpawn {
                         guard projectedLiveParticleCount < Self.maxParticles else {
-                            recordEmitterSpawnFailure(
-                                .particleCapacityExceeded(maximum: Self.maxParticles)
+                            throw .spawn(
+                                .particleCapacityExceeded(
+                                    maximum: Self.maxParticles
+                                )
                             )
-                            break
                         }
                         let fraction = Float(childIndex + 1) / Float(particlesToSpawn + 1)
                         let position = parent.previousPosition
@@ -17199,8 +17414,7 @@ private final class EmitterLayerState {
                                 state: state
                             )
                         } catch {
-                            recordEmitterSpawnFailure(error)
-                            continue
+                            throw .spawn(error)
                         }
                         guard child.isAlive else { continue }
                         assignBirthSequence(to: &child, state: state)
@@ -17220,7 +17434,10 @@ private final class EmitterLayerState {
                 }
             }
         }
-        func draw(_ particle: EmitterParticle, additive: Bool = false) {
+        func draw(
+            _ particle: EmitterParticle,
+            additive: Bool = false
+        ) throws(EmitterLayerEncodingFailure) {
             guard particle.isAlive else { return }
             do {
                 if try renderEmitterParticle(
@@ -17235,18 +17452,18 @@ private final class EmitterLayerState {
                     state.lastRenderedBirthSequences.append(particle.birthSequence)
                 }
             } catch {
-                recordEmitterRenderFailure(error)
+                throw .render(error)
             }
         }
 
         switch configuration.renderMode {
         case .unordered, .oldestFirst:
             for particle in state.particles {
-                draw(particle)
+                try draw(particle)
             }
         case .oldestLast:
             for particle in state.particles.reversed() {
-                draw(particle)
+                try draw(particle)
             }
         case .backToFront:
             let indices = state.particles.indices.sorted { lhs, rhs in
@@ -17258,7 +17475,7 @@ private final class EmitterLayerState {
                 return lhsParticle.position.z < rhsParticle.position.z
             }
             for index in indices {
-                draw(state.particles[index])
+                try draw(state.particles[index])
             }
         case .additive:
             let additivePipeline: GPURenderPipeline?
@@ -17272,22 +17489,21 @@ private final class EmitterLayerState {
                     : emitterTexturedAdditivePipeline
             }
             guard additivePipeline != nil else {
-                recordEmitterRenderFailure(.additivePipelineUnavailable)
-                return
+                throw .render(.additivePipelineUnavailable)
             }
             state.lastRenderUsedAdditiveBlending = true
             for particle in state.particles {
-                draw(particle, additive: true)
+                try draw(particle, additive: true)
             }
         default:
-            recordEmitterRenderFailure(
+            throw .render(
                 .unsupportedRenderMode(configuration.renderMode.rawValue)
             )
         }
     }
 
     private func emitterParticleBirthCount(
-        cell: CAEmitterCell,
+        cell: CAEmitterCellSnapshot,
         activeDelta: Float,
         rateMultiplier: Float,
         remainderKey: EmitterBirthRemainderKey,
@@ -17322,7 +17538,7 @@ private final class EmitterLayerState {
     }
 
     private func makeEmitterParticle(
-        cell: CAEmitterCell,
+        cell: CAEmitterCellSnapshot,
         position: SIMD3<Float>,
         parentDirection: SIMD3<Float>?,
         inheritedColor: SIMD4<Float>,
@@ -17332,37 +17548,12 @@ private final class EmitterLayerState {
         state: EmitterLayerState
     ) throws(CAEmitterFailure) -> EmitterParticle {
         var particle = EmitterParticle()
-        if let configuredContents = cell.contents {
-            guard let image = configuredContents as? CGImage,
-                  image.width > 0,
-                  image.height > 0,
-                  cell.contentsScale.isFinite,
-                  cell.contentsScale > 0,
-                  cell.contentsRect.origin.x.isFinite,
-                  cell.contentsRect.origin.y.isFinite,
-                  cell.contentsRect.width.isFinite,
-                  cell.contentsRect.height.isFinite,
-                  cell.contentsRect.width > 0,
-                  cell.contentsRect.height > 0,
-                  cell.minificationFilterBias.isFinite,
-                  CAContentsSampling(
-                    magnificationFilter: cell.magnificationFilter,
-                    minificationFilter: cell.minificationFilter
-                  ) != nil else {
-                throw .invalidCellContents
-            }
-            particle.contents = image
-            particle.contentsRect = cell.contentsRect
-            particle.contentsScale = Float(cell.contentsScale)
-            particle.magnificationFilter = cell.magnificationFilter
-            particle.minificationFilter = cell.minificationFilter
-            particle.minificationFilterBias = cell.minificationFilterBias
-        }
+        particle.contents = cell.image
 
         guard let localDirection = EmitterGeometry.direction(
-            longitude: cell.emissionLongitude,
-            latitude: cell.emissionLatitude,
-            range: cell.emissionRange,
+            longitude: CGFloat(cell.emissionLongitude),
+            latitude: CGFloat(cell.emissionLatitude),
+            range: CGFloat(cell.emissionRange),
             random: &state.randomSource
         ) else {
             throw .nonFiniteEmissionDirection
@@ -17380,20 +17571,23 @@ private final class EmitterLayerState {
         } else {
             direction = localDirection
         }
-        let velocityVariation = CGFloat(state.randomSource.signedFloat()) * cell.velocityRange
-        let velocity = Float(cell.velocity + velocityVariation) * configuration.velocity
+        let velocityVariation =
+            state.randomSource.signedFloat() * cell.velocityRange
+        let velocity =
+            (cell.velocity + velocityVariation)
+            * configuration.velocity
         guard velocity.isFinite else { throw .nonFiniteParticleState }
 
         particle.generation = generation
-        particle.emitterCells = cell.emitterCells ?? []
+        particle.emitterCells = cell.childCells
         particle.position = position
         particle.previousPosition = position
         particle.velocity = direction * velocity
         particle.emissionDirection = direction
         particle.acceleration = SIMD3(
-            Float(cell.xAcceleration),
-            Float(cell.yAcceleration),
-            Float(cell.zAcceleration)
+            cell.acceleration.x,
+            cell.acceleration.y,
+            cell.acceleration.z
         )
 
         particle.lifetime = (
@@ -17401,13 +17595,16 @@ private final class EmitterLayerState {
         ) * configuration.lifetime
         particle.previousLifetime = particle.lifetime
         particle.maxLifetime = particle.lifetime
-        particle.scale = Float(
-            cell.scale + CGFloat(state.randomSource.signedFloat()) * cell.scaleRange
+        particle.scale = (
+            cell.scale
+            + state.randomSource.signedFloat() * cell.scaleRange
         ) * configuration.scale * inheritedScale
         particle.previousScale = particle.scale
-        particle.scaleSpeed = Float(cell.scaleSpeed) * configuration.scale * inheritedScale
-        particle.rotationSpeed = Float(
-            cell.spin + CGFloat(state.randomSource.signedFloat()) * cell.spinRange
+        particle.scaleSpeed =
+            cell.scaleSpeed * configuration.scale * inheritedScale
+        particle.rotationSpeed = (
+            cell.spin
+            + state.randomSource.signedFloat() * cell.spinRange
         ) * configuration.spin
 
         let baseColor = try emitterCellColor(cell, random: &state.randomSource)
@@ -17425,34 +17622,14 @@ private final class EmitterLayerState {
     }
 
     private func emitterCellColor(
-        _ cell: CAEmitterCell,
+        _ cell: CAEmitterCellSnapshot,
         random: inout EmitterRandomSource
     ) throws(CAEmitterFailure) -> SIMD4<Float> {
-        let base: SIMD4<Float>
-        if let color = cell.color {
-            guard let converted = color.converted(
-                to: .deviceRGB,
-                intent: .defaultIntent,
-                options: nil
-            ), let components = converted.components,
-               components.count == 4,
-               components.allSatisfy(\.isFinite) else {
-                throw .invalidCellColor
-            }
-            base = SIMD4(
-                Float(components[0]),
-                Float(components[1]),
-                Float(components[2]),
-                Float(components[3])
-            )
-        } else {
-            base = SIMD4(1, 1, 1, 1)
-        }
         let color = SIMD4(
-            base.x + random.signedFloat() * cell.redRange,
-            base.y + random.signedFloat() * cell.greenRange,
-            base.z + random.signedFloat() * cell.blueRange,
-            base.w + random.signedFloat() * cell.alphaRange
+            cell.color.x + random.signedFloat() * cell.redRange,
+            cell.color.y + random.signedFloat() * cell.greenRange,
+            cell.color.z + random.signedFloat() * cell.blueRange,
+            cell.color.w + random.signedFloat() * cell.alphaRange
         )
         guard color.x.isFinite,
               color.y.isFinite,
@@ -17473,25 +17650,20 @@ private final class EmitterLayerState {
         additive: Bool
     ) throws(CAEmitterFailure) -> Bool {
         guard let image = particle.contents else { return false }
-        let textureFormat = CGImageTexturePixelFormat.recommended(for: image)
+        let storage = image.storage
         let memorySizeBytes: UInt64
         do {
             memorySizeBytes = try mipmappedRGBAByteCount(
-                width: image.width,
-                height: image.height,
-                format: textureFormat,
+                width: storage.width,
+                height: storage.height,
+                format: storage.format,
                 device: device
             )
         } catch {
             recordContentsConversionFailure(error)
             throw .imageConversionFailed(error)
         }
-        guard let sampling = CAContentsSampling(
-            magnificationFilter: particle.magnificationFilter,
-            minificationFilter: particle.minificationFilter
-        ) else {
-            throw .invalidCellContents
-        }
+        let sampling = image.sampling
         guard let sampler = contentsTextureSamplers[sampling],
               let texturedBindGroupLayout,
               let selectedPipeline = selectedEmitterPipeline(additive: additive) else {
@@ -17502,15 +17674,12 @@ private final class EmitterLayerState {
         }
         var textureConversionError: CAImageContentsConversionError?
         let texture = textureManager.getOrCreateTexture(
-            for: image,
-            width: image.width,
-            height: image.height,
+            for: storage,
             memorySizeBytes: memorySizeBytes,
             factory: {
                 do {
                     return try self.createGPUTexture(
-                        from: image,
-                        format: textureFormat,
+                        from: storage,
                         device: device
                     )
                 } catch let error as CAImageContentsConversionError {
@@ -17530,15 +17699,17 @@ private final class EmitterLayerState {
             throw .textureResourcesUnavailable
         }
 
-        let width = Float(image.width) / particle.contentsScale * particle.scale
-        let height = Float(image.height) / particle.contentsScale * particle.scale
+        let width =
+            Float(storage.width) / image.contentsScale * particle.scale
+        let height =
+            Float(storage.height) / image.contentsScale * particle.scale
         let rotation = particle.rotation
         let center = SIMD2<Float>(0.5, 0.5)
         let p0 = rotatePoint(SIMD2(0, 0), angle: rotation) - center
         let p1 = rotatePoint(SIMD2(1, 0), angle: rotation) - center
         let p2 = rotatePoint(SIMD2(0, 1), angle: rotation) - center
         let p3 = rotatePoint(SIMD2(1, 1), angle: rotation) - center
-        let contentsRect = particle.contentsRect
+        let contentsRect = image.contentsRect
         let uvMinX = Float(contentsRect.minX)
         let uvMinY = Float(contentsRect.minY)
         let uvMaxX = Float(contentsRect.maxX)
@@ -17573,7 +17744,7 @@ private final class EmitterLayerState {
             mvpMatrix: modelMatrix * translateMatrix * scaleMatrix,
             opacity: currentEffectiveOpacity,
             layerSize: SIMD2<Float>(width, height),
-            samplingBias: min(max(particle.minificationFilterBias, -16), 15.99)
+            samplingBias: image.minificationFilterBias
         )
         let uniformOffset = UInt64(layerIndex) * Self.alignedUniformSize
         device.queue.writeBuffer(
@@ -17587,7 +17758,10 @@ private final class EmitterLayerState {
             data: createFloat32Array(from: &vertices)
         )
         let texturedBindGroup = cachedTexturedBindGroup(
-            cacheKey: .emitterImage(ObjectIdentifier(image), sampling),
+            cacheKey: .committedImage(
+                ObjectIdentifier(texture),
+                sampling
+            ),
             gpuTexture: texture,
             device: device,
             layout: texturedBindGroupLayout,
@@ -17661,13 +17835,20 @@ private final class EmitterLayerState {
             && particle.lifetime.isFinite
             && particle.previousLifetime.isFinite
             && particle.maxLifetime.isFinite
-            && particle.contentsScale.isFinite
-            && particle.contentsScale > 0
-            && particle.contentsRect.origin.x.isFinite
-            && particle.contentsRect.origin.y.isFinite
-            && particle.contentsRect.width.isFinite
-            && particle.contentsRect.height.isFinite
-            && particle.minificationFilterBias.isFinite
+            && particleContentsAreFinite(particle.contents)
+    }
+
+    private func particleContentsAreFinite(
+        _ contents: CAEmitterCellSnapshot.Image?
+    ) -> Bool {
+        guard let contents else { return true }
+        return contents.contentsScale.isFinite
+            && contents.contentsScale > 0
+            && contents.contentsRect.origin.x.isFinite
+            && contents.contentsRect.origin.y.isFinite
+            && contents.contentsRect.width.isFinite
+            && contents.contentsRect.height.isFinite
+            && contents.minificationFilterBias.isFinite
     }
 
     // MARK: - CATiledLayer Rendering

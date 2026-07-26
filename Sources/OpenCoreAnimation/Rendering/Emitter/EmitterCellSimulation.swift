@@ -14,39 +14,81 @@ internal enum EmitterCellSimulation {
         from parentStartTime: CFTimeInterval,
         to parentEndTime: CFTimeInterval
     ) throws -> Float {
+        try activeEmissionDelta(
+            beginTime: cell.beginTime,
+            timeOffset: cell.timeOffset,
+            duration: cell.duration,
+            repeatCount: cell.repeatCount,
+            repeatDuration: cell.repeatDuration,
+            speed: cell.speed,
+            autoreverses: cell.autoreverses,
+            from: parentStartTime,
+            to: parentEndTime
+        )
+    }
+
+    static func activeEmissionDelta(
+        for cell: CAEmitterCellSnapshot,
+        from parentStartTime: CFTimeInterval,
+        to parentEndTime: CFTimeInterval
+    ) throws -> Float {
+        try activeEmissionDelta(
+            beginTime: cell.beginTime,
+            timeOffset: cell.timeOffset,
+            duration: cell.duration,
+            repeatCount: cell.repeatCount,
+            repeatDuration: cell.repeatDuration,
+            speed: cell.speed,
+            autoreverses: cell.autoreverses,
+            from: parentStartTime,
+            to: parentEndTime
+        )
+    }
+
+    private static func activeEmissionDelta(
+        beginTime: CFTimeInterval,
+        timeOffset: CFTimeInterval,
+        duration: CFTimeInterval,
+        repeatCount: Float,
+        repeatDuration: CFTimeInterval,
+        speed: Float,
+        autoreverses: Bool,
+        from parentStartTime: CFTimeInterval,
+        to parentEndTime: CFTimeInterval
+    ) throws -> Float {
         guard parentStartTime.isFinite,
               parentEndTime.isFinite,
               parentStartTime <= parentEndTime else {
             throw EmitterCellSimulationError.invalidTimeInterval
         }
-        guard cell.beginTime.isFinite,
-              cell.timeOffset.isFinite,
-              isFiniteOrPositiveInfinity(cell.duration),
-              isFiniteOrPositiveInfinity(cell.repeatDuration),
-              isFiniteOrPositiveInfinity(cell.repeatCount),
-              cell.speed.isFinite else {
+        guard beginTime.isFinite,
+              timeOffset.isFinite,
+              isFiniteOrPositiveInfinity(duration),
+              isFiniteOrPositiveInfinity(repeatDuration),
+              isFiniteOrPositiveInfinity(repeatCount),
+              speed.isFinite else {
             throw EmitterCellSimulationError.nonFiniteTiming
         }
-        guard cell.speed != 0, parentEndTime > cell.beginTime else { return 0 }
+        guard speed != 0, parentEndTime > beginTime else { return 0 }
 
-        let clippedStart = max(parentStartTime, cell.beginTime)
+        let clippedStart = max(parentStartTime, beginTime)
         let clippedEnd = max(clippedStart, parentEndTime)
-        let speed = CFTimeInterval(cell.speed)
-        let localStart = (clippedStart - cell.beginTime) * speed + cell.timeOffset
-        let localEnd = (clippedEnd - cell.beginTime) * speed + cell.timeOffset
+        let localSpeed = CFTimeInterval(speed)
+        let localStart = (clippedStart - beginTime) * localSpeed + timeOffset
+        let localEnd = (clippedEnd - beginTime) * localSpeed + timeOffset
         guard localStart.isFinite, localEnd.isFinite else {
             throw EmitterCellSimulationError.nonFiniteTiming
         }
 
         let activeUpperBound: CFTimeInterval
-        if cell.duration == .infinity {
+        if duration == .infinity {
             activeUpperBound = .infinity
-        } else if cell.duration > 0 {
+        } else if duration > 0 {
             activeUpperBound = CAMediaTimingEvaluator.activeDuration(
-                duration: cell.duration,
-                repeatCount: cell.repeatCount,
-                repeatDuration: cell.repeatDuration,
-                autoreverses: cell.autoreverses
+                duration: duration,
+                repeatCount: repeatCount,
+                repeatDuration: repeatDuration,
+                autoreverses: autoreverses
             )
             guard isFiniteOrPositiveInfinity(activeUpperBound) else {
                 throw EmitterCellSimulationError.nonFiniteTiming

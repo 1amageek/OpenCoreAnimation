@@ -863,15 +863,23 @@ backdrop resources instance-local without retaining a model layer or a dynamic
 replicator path. Depth-preserving instances validate every projected center
 before clearing depth state, then draw in stable far-to-near order. Capture and
 frame failures retain exact typed instance and source-sublayer locations for
-retry. The snapshot does not yet own non-image contents, emitter/tiled
-specialized-layer resources, or copied animation evaluators. A static tree that needs those
-resources, a remaining specialized layer, or transition state publishes
+retry. Emitter capture recursively converts cells, child-cell graphs, colors,
+timing, simulation values, sampling state, and image bytes into immutable
+values. A stable simulation identity lets presentation copies address the same
+renderer-owned particle state without retaining a model layer. Successful
+submission retains only the immutable emitter snapshot while particles require
+clean-tree frames; encoding failure restores the complete particle state and
+keeps the committed transaction pending for retry. The snapshot does not yet
+own non-image contents, tiled specialized-layer resources, or copied animation
+evaluators. A static tree that needs those resources, a remaining specialized
+layer, or transition state publishes
 `requiresLiveResourceCapture` with the exact first requirement instead of
 claiming snapshot success. Backface policy, clipping geometry, and the captured
 transform are value-owned and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents,
 content masks, group opacity, rasterization, filters, backdrop composition,
-shadows, gradients, shapes, text, transform depth, and replicator instances with the corresponding
+shadows, gradients, shapes, text, transform depth, replicator instances, and
+emitters with the corresponding
 `unsupportedCommittedSnapshotFeature` value rather than dropping any resource
 and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,

@@ -4,38 +4,33 @@ import Foundation
 // MARK: - Particle Data Structure
 
 /// Represents a single particle in the emitter system.
-public struct EmitterParticle {
-    public var birthSequence: UInt64 = 0
-    public var generation: Int = 0
-    public var emitterCells: [CAEmitterCell] = []
-    public var contents: CGImage?
-    public var contentsRect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
-    public var contentsScale: Float = 1
-    public var magnificationFilter: String = CALayerContentsFilter.linear.rawValue
-    public var minificationFilter: String = CALayerContentsFilter.linear.rawValue
-    public var minificationFilterBias: Float = 0
-    public var position: SIMD3<Float> = .zero
-    public var previousPosition: SIMD3<Float> = .zero
-    public var velocity: SIMD3<Float> = .zero
-    public var emissionDirection: SIMD3<Float> = SIMD3(0, 0, 1)
-    public var acceleration: SIMD3<Float> = .zero
-    public var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
-    public var previousColor: SIMD4<Float> = SIMD4(1, 1, 1, 1)
-    public var colorSpeed: SIMD4<Float> = .zero
-    public var scale: Float = 1.0
-    public var previousScale: Float = 1.0
-    public var scaleSpeed: Float = 0.0
-    public var rotation: Float = 0.0
-    public var rotationSpeed: Float = 0.0
-    public var lifetime: Float = 0.0
-    public var previousLifetime: Float = 0.0
-    public var maxLifetime: Float = 1.0
-    public var isAlive: Bool = false
+internal struct EmitterParticle {
+    internal var birthSequence: UInt64 = 0
+    internal var generation: Int = 0
+    internal var emitterCells: [CAEmitterCellSnapshot] = []
+    internal var contents: CAEmitterCellSnapshot.Image?
+    internal var position: SIMD3<Float> = .zero
+    internal var previousPosition: SIMD3<Float> = .zero
+    internal var velocity: SIMD3<Float> = .zero
+    internal var emissionDirection: SIMD3<Float> = SIMD3(0, 0, 1)
+    internal var acceleration: SIMD3<Float> = .zero
+    internal var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
+    internal var previousColor: SIMD4<Float> = SIMD4(1, 1, 1, 1)
+    internal var colorSpeed: SIMD4<Float> = .zero
+    internal var scale: Float = 1.0
+    internal var previousScale: Float = 1.0
+    internal var scaleSpeed: Float = 0.0
+    internal var rotation: Float = 0.0
+    internal var rotationSpeed: Float = 0.0
+    internal var lifetime: Float = 0.0
+    internal var previousLifetime: Float = 0.0
+    internal var maxLifetime: Float = 1.0
+    internal var isAlive: Bool = false
 
-    public init() {}
+    internal init() {}
 
     /// Updates the particle state for the given time delta.
-    public mutating func update(deltaTime: Float) {
+    internal mutating func update(deltaTime: Float) {
         guard isAlive else { return }
 
         previousPosition = position

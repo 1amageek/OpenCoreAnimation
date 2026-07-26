@@ -382,6 +382,11 @@ public final class CAMetalRenderer: CARendererDelegate {
         in snapshot: CARenderSnapshot
     ) -> CARenderSnapshotFeature? {
         if snapshot.nodes.contains(where: {
+            $0.presentationValues.emitter != nil
+        }) {
+            return .emitter
+        }
+        if snapshot.nodes.contains(where: {
             $0.presentationValues.replicator != nil
         }) {
             return .replicatorInstances

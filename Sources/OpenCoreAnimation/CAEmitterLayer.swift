@@ -4,18 +4,30 @@
 // Full API compatibility with Apple's CoreAnimation framework
 
 import Foundation
+import Synchronization
 
 /// A layer that emits, animates, and renders a particle system.
 open class CAEmitterLayer: CALayer {
+    private static let simulationIdentityStorage = Mutex<UInt64>(0)
+
+    internal let simulationIdentity: UInt64
+    private var observedEmitterCells:
+        [ObjectIdentifier: CAEmitterCell] = [:]
 
     // MARK: - Initialization
 
     public required init() {
+        simulationIdentity = Self.nextSimulationIdentity()
         super.init()
     }
 
     /// Initializes a new emitter layer as a copy of the specified layer.
     public required init(layer: Any) {
+        if let emitterLayer = layer as? CAEmitterLayer {
+            simulationIdentity = emitterLayer.simulationIdentity
+        } else {
+            simulationIdentity = Self.nextSimulationIdentity()
+        }
         super.init(layer: layer)
         if let emitterLayer = layer as? CAEmitterLayer {
             self.emitterCells = emitterLayer.emitterCells
@@ -33,6 +45,16 @@ open class CAEmitterLayer: CALayer {
             self._scale = emitterLayer._scale
             self._spin = emitterLayer._spin
             self.seed = emitterLayer.seed
+        }
+    }
+
+    private static func nextSimulationIdentity() -> UInt64 {
+        simulationIdentityStorage.withLock { identity in
+            identity &+= 1
+            if identity == 0 {
+                identity = 1
+            }
+            return identity
         }
     }
 
@@ -56,7 +78,64 @@ open class CAEmitterLayer: CALayer {
 
     /// An array of CAEmitterCell objects that define the types of emitted objects.
     open var emitterCells: [CAEmitterCell]? {
-        didSet { markDirty(.contents) }
+        didSet {
+            guard !_isPresentationLayer else {
+                return
+            }
+            refreshEmitterCellOwnership()
+            markDirty(.contents)
+        }
+    }
+
+    internal func emitterCellDidMutate() {
+        refreshEmitterCellOwnership()
+        markDirty(.contents)
+    }
+
+    internal func detachEmitterCellOwnershipForPresentation() {
+        for cell in observedEmitterCells.values {
+            cell.removeOwningLayer(self)
+        }
+        observedEmitterCells.removeAll(keepingCapacity: false)
+    }
+
+    private func refreshEmitterCellOwnership() {
+        var reachableCells: [ObjectIdentifier: CAEmitterCell] = [:]
+        var activePath: Set<ObjectIdentifier> = []
+        collectEmitterCells(
+            emitterCells ?? [],
+            into: &reachableCells,
+            activePath: &activePath
+        )
+        for (identity, cell) in observedEmitterCells
+        where reachableCells[identity] == nil {
+            cell.removeOwningLayer(self)
+        }
+        for (identity, cell) in reachableCells
+        where observedEmitterCells[identity] == nil {
+            cell.addOwningLayer(self)
+        }
+        observedEmitterCells = reachableCells
+    }
+
+    private func collectEmitterCells(
+        _ cells: [CAEmitterCell],
+        into result: inout [ObjectIdentifier: CAEmitterCell],
+        activePath: inout Set<ObjectIdentifier>
+    ) {
+        for cell in cells {
+            let identity = ObjectIdentifier(cell)
+            result[identity] = cell
+            guard activePath.insert(identity).inserted else {
+                continue
+            }
+            collectEmitterCells(
+                cell.emitterCells ?? [],
+                into: &result,
+                activePath: &activePath
+            )
+            activePath.remove(identity)
+        }
     }
 
     // MARK: - Emitter Geometry

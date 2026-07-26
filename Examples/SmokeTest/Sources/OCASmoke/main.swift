@@ -5595,17 +5595,41 @@ func installHarness() {
                     )
                     unsupportedEmitter.cell.contents = "unsupported"
                     unsupportedEmitter.cell.velocity = 0
-                    transientEmitterLayers = [invisibleEmitter.layer, unsupportedEmitter.layer]
-                    root.addSublayer(invisibleEmitter.layer)
+                    transientEmitterLayers = [unsupportedEmitter.layer]
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     root.addSublayer(unsupportedEmitter.layer)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let unsupportedSnapshotRejected =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerEmitter(
+                                    .invalidCellContents(path: [0])
+                                )
+                            )
+                    let unsupportedLiveResourceRejected =
+                        renderer.lastEmitterSpawnFailure
+                            == .invalidCellContents
+                    let unsupportedRejected =
+                        renderer.activeParticleCount(
+                            for: unsupportedEmitter.layer
+                        ) == 0
+                        && (
+                            unsupportedSnapshotRejected
+                            || unsupportedLiveResourceRejected
+                        )
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    unsupportedEmitter.layer.removeFromSuperlayer()
+                    root.addSublayer(invisibleEmitter.layer)
+                    CATransaction.commit()
+                    transientEmitterLayers = [invisibleEmitter.layer]
                     engine.renderFrame()
                     try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let invisibleMatches = renderer.activeParticleCount(for: invisibleEmitter.layer) == 1
                         && renderer.lastRenderedParticleSequences(for: invisibleEmitter.layer).isEmpty
-                    let unsupportedRejected = renderer.activeParticleCount(for: unsupportedEmitter.layer) == 0
-                        && renderer.emitterSpawnFailureCount == 1
-                        && renderer.lastEmitterSpawnFailure == .invalidCellContents
                     for layer in transientEmitterLayers {
                         layer.removeFromSuperlayer()
                     }
@@ -5639,7 +5663,10 @@ func installHarness() {
                     let childWasDelayed = !renderer.activeParticleGenerations(
                         for: parentEmitter.layer
                     ).contains(1)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     parentEmitter.cell.birthRate = 0
+                    CATransaction.commit()
                     try await browserDelay(milliseconds: 100)
                     engine.renderFrame()
                     let generations = renderer.activeParticleGenerations(for: parentEmitter.layer)
@@ -5707,7 +5734,132 @@ func installHarness() {
                     engine.renderFrame()
 
                     let depthMatches = flattenedEmitterMatches && preservingEmitterMatches
-                    result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected),child=\(childMatches);blend=\(blendPixelsMatch),depth=\(depthMatches),final=\(renderer.activeEmitterStateCount)"
+                    let immutableRoot = CALayer()
+                    let immutableEmitter = CAEmitterLayer()
+                    let immutableCell = CAEmitterCell()
+                    var immutableCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        immutableCompletionRan = true
+                    }
+                    immutableRoot.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 400,
+                        height: 300
+                    )
+                    immutableRoot.position = CGPoint(x: 200, y: 150)
+                    immutableRoot.backgroundColor = CGColor(
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    immutableEmitter.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    immutableEmitter.position = CGPoint(x: 200, y: 150)
+                    immutableEmitter.emitterPosition = CGPoint(x: 20, y: 20)
+                    immutableEmitter.seed = 41
+                    immutableCell.birthRate = 60
+                    immutableCell.lifetime = 3
+                    immutableCell.velocity = 0
+                    immutableCell.contents = croppedImage
+                    immutableCell.contentsRect = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 0.5,
+                        height: 1
+                    )
+                    immutableCell.color = CGColor(
+                        red: 1,
+                        green: 1,
+                        blue: 1,
+                        alpha: 1
+                    )
+                    immutableEmitter.emitterCells = [immutableCell]
+                    immutableRoot.addSublayer(immutableEmitter)
+                    CATransaction.commit()
+
+                    let immutablePendingBeforeRender =
+                        !immutableCompletionRan
+                    immutableCell.birthRate = 0
+                    immutableCell.contentsRect = CGRect(
+                        x: 0.5,
+                        y: 0,
+                        width: 0.5,
+                        height: 1
+                    )
+                    renderer.render(layer: immutableRoot)
+                    let immutableFirstCount =
+                        renderer.activeParticleCount(
+                            for: immutableEmitter
+                        )
+                    let immutableFirstPixel =
+                        try await renderer.readbackPixel(
+                            x: 200,
+                            y: 150
+                        )
+                    let immutableInitialFrame =
+                        immutablePendingBeforeRender
+                        && immutableCompletionRan
+                        && immutableFirstCount == 1
+                        && immutableFirstPixel[0] > 200
+                        && immutableFirstPixel[1] < 40
+
+                    try await browserDelay(milliseconds: 100)
+                    renderer.render(layer: immutableRoot)
+                    let immutableSecondPixel =
+                        try await renderer.readbackPixel(
+                            x: 200,
+                            y: 150
+                        )
+                    let immutableCleanFrameContinued =
+                        renderer.activeParticleCount(
+                            for: immutableEmitter
+                        ) > immutableFirstCount
+                        && immutableSecondPixel[0] > 200
+                        && immutableSecondPixel[1] < 40
+
+                    var invalidCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidCompletionRan = true
+                    }
+                    immutableCell.emitterCells = [immutableCell]
+                    CATransaction.commit()
+                    renderer.render(layer: immutableRoot)
+                    let immutableFailureTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerEmitter(
+                                    .cyclicCellHierarchy(path: [0, 0])
+                                )
+                            )
+                    let immutableFailurePending =
+                        !invalidCompletionRan
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    immutableCell.emitterCells = nil
+                    CATransaction.commit()
+                    renderer.render(layer: immutableRoot)
+                    let immutableFailureRecovered =
+                        renderer.lastFrameRenderFailure == nil
+                        && invalidCompletionRan
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    immutableEmitter.removeFromSuperlayer()
+                    CATransaction.commit()
+                    renderer.render(layer: immutableRoot)
+
+                    result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected),child=\(childMatches);blend=\(blendPixelsMatch),depth=\(depthMatches),snapshot=\(immutableInitialFrame),continued=\(immutableCleanFrameContinued),failureTyped=\(immutableFailureTyped),failurePending=\(immutableFailurePending),recovered=\(immutableFailureRecovered),final=\(renderer.activeEmitterStateCount)"
                     emitterProbeResult = result
                 } catch {
                     first.removeFromSuperlayer()
