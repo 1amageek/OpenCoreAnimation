@@ -155,6 +155,71 @@ private struct PendingTileDraw {
     let cacheGeneration: UInt64
 }
 
+private struct PendingCommittedTileDraw {
+    let resourceIdentity: UInt64
+    let cacheGeneration: UInt64
+    let capturedContent: CATiledLayerCapturedContent
+    let tileKey: CATiledLayer.TileKey
+    let drawingInfo: CATiledLayerTileDrawingInfo
+    let pixelWidth: Int
+    let pixelHeight: Int
+}
+
+private final class CommittedTiledLayerState {
+    let resourceIdentity: UInt64
+    var cacheGeneration: UInt64
+    var capturedContent: CATiledLayerCapturedContent?
+    var cachedTiles = CATileKeyMap<CGImageTextureStorage>()
+    var fadeStartTimes = CATileKeyMap<CFTimeInterval>()
+    var loadingTiles = CATileKeySet()
+    var needsDisplay = false
+    var terminalFailure: CATiledLayerRenderFailure?
+
+    init(
+        resourceIdentity: UInt64,
+        cacheGeneration: UInt64,
+        capturedContent: CATiledLayerCapturedContent?
+    ) {
+        self.resourceIdentity = resourceIdentity
+        self.cacheGeneration = cacheGeneration
+        self.capturedContent = capturedContent
+    }
+
+    func copy() -> CommittedTiledLayerState {
+        let result = CommittedTiledLayerState(
+            resourceIdentity: resourceIdentity,
+            cacheGeneration: cacheGeneration,
+            capturedContent: capturedContent
+        )
+        result.cachedTiles = cachedTiles
+        result.fadeStartTimes = fadeStartTimes
+        result.loadingTiles = loadingTiles
+        result.needsDisplay = needsDisplay
+        result.terminalFailure = terminalFailure
+        return result
+    }
+
+    func reset(
+        to generation: UInt64,
+        capturedContent: CATiledLayerCapturedContent?
+    ) {
+        cacheGeneration = generation
+        self.capturedContent = capturedContent
+        cachedTiles.removeAll(keepingCapacity: true)
+        fadeStartTimes.removeAll(keepingCapacity: true)
+        loadingTiles.removeAll(keepingCapacity: true)
+        needsDisplay = false
+        terminalFailure = nil
+    }
+
+    var hasWork: Bool {
+        !loadingTiles.isEmpty
+            || !fadeStartTimes.isEmpty
+            || needsDisplay
+            || terminalFailure != nil
+    }
+}
+
 private struct PrerasterizedTexture {
     let texture: GPUTexture
     let purpose: RasterizationCachePurpose
@@ -719,7 +784,7 @@ private enum EmitterLayerEncodingFailure: Error {
     case render(CAEmitterFailure)
 }
 
-private final class RetainedEmitterSnapshot {
+private final class RetainedDynamicSnapshot {
     weak var rootLayer: CALayer?
     let snapshot: CARenderSnapshot
 
@@ -846,7 +911,11 @@ private final class RetainedEmitterSnapshot {
     public private(set) var transitionRenderFailureCount: Int = 0
 
     internal var requiresFrameWhenLayerTreeIsClean: Bool {
-        if !pendingTileDraws.isEmpty {
+        if !pendingTileDraws.isEmpty
+            || !pendingCommittedTileDraws.isEmpty
+            || committedTiledLayerStates.values.contains(
+                where: \.hasWork
+            ) {
             return true
         }
         return emitterLayerStates.values.contains { state in
@@ -857,10 +926,10 @@ private final class RetainedEmitterSnapshot {
         }
     }
 
-    private func snapshotHasEmitterWork(
+    private func snapshotHasRendererWork(
         _ snapshot: CARenderSnapshot
     ) -> Bool {
-        snapshot.nodes.contains { node in
+        if snapshot.nodes.contains(where: { node in
             guard let emitter =
                     node.presentationValues.emitter,
                   let state =
@@ -870,6 +939,21 @@ private final class RetainedEmitterSnapshot {
                 return false
             }
             return !state.particles.isEmpty || state.canEmit
+        }) {
+            return true
+        }
+        return snapshot.nodes.contains { node in
+            guard let tiled =
+                    node.presentationValues.tiled,
+                  let state =
+                    committedTiledLayerStates[
+                        tiled.resourceIdentity
+                    ],
+                  state.cacheGeneration
+                    == tiled.cacheGeneration else {
+                return false
+            }
+            return state.hasWork
         }
     }
 
@@ -1091,6 +1175,37 @@ private final class RetainedEmitterSnapshot {
     /// The most recent typed tiled-layer rendering failure.
     @_spi(RendererDiagnostics)
     public private(set) var lastTiledLayerRenderFailure: CATiledLayerRenderFailure?
+
+    /// Number of renderer-owned committed tiled-layer states.
+    @_spi(RendererDiagnostics)
+    public var committedTiledLayerStateCount: Int {
+        committedTiledLayerStates.count
+    }
+
+    /// Number of committed tile requests waiting for a frame boundary.
+    @_spi(RendererDiagnostics)
+    public var pendingCommittedTileDrawCount: Int {
+        pendingCommittedTileDraws.count
+    }
+
+    /// Number of immutable tile pixel buffers retained by the renderer.
+    @_spi(RendererDiagnostics)
+    public var committedTiledLayerCachedTileCount: Int {
+        committedTiledLayerStates.values.reduce(
+            into: 0
+        ) { count, state in
+            count += state.cachedTiles.count
+        }
+    }
+
+    /// Source RGBA bytes from the latest immutable tile cache insertion.
+    @_spi(RendererDiagnostics)
+    public private(set) var lastCommittedTileSourcePixel:
+        [UInt8] = []
+
+    /// Number of committed tile quads submitted by this renderer.
+    @_spi(RendererDiagnostics)
+    public private(set) var committedTileSubmissionCount: Int = 0
 
     /// The most recent typed image-conversion failure in the current frame.
     @_spi(RendererDiagnostics)
@@ -2048,8 +2163,16 @@ private final class RetainedEmitterSnapshot {
 
     /// Last immutable tree retained only while renderer-owned emitters need
     /// clean-tree frames after the originating transaction was acknowledged.
-    private var retainedEmitterSnapshots:
-        [ObjectIdentifier: RetainedEmitterSnapshot] = [:]
+    private var retainedDynamicSnapshots:
+        [ObjectIdentifier: RetainedDynamicSnapshot] = [:]
+
+    /// Tile state is renderer-owned because a committed snapshot must never
+    /// read or mutate the model layer while asynchronous requests complete.
+    private var committedTiledLayerStates:
+        [UInt64: CommittedTiledLayerState] = [:]
+    private var activeCommittedTiledLayerIDs: Set<UInt64> = []
+    private var pendingCommittedTileDraws:
+        [PendingCommittedTileDraw] = []
 
     // MARK: - Initialization
 
@@ -4391,6 +4514,10 @@ private final class RetainedEmitterSnapshot {
         resetFrameStateForCommittedSnapshot()
         let emitterStateCheckpoint =
             emitterLayerStates.mapValues { $0.copy() }
+        let tiledStateCheckpoint =
+            committedTiledLayerStates.mapValues { $0.copy() }
+        let pendingCommittedTileCheckpoint =
+            pendingCommittedTileDraws
 
         let currentTexture = context.getCurrentTexture()
         let textureView = currentTexture.createView()
@@ -4509,11 +4636,16 @@ private final class RetainedEmitterSnapshot {
                 recordCommittedReplicatorRenderFailure(failure)
             case .emitter(let failure):
                 recordEmitterRenderFailure(failure)
+            case .tiled(let failure):
+                recordTiledLayerRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
             )
             emitterLayerStates = emitterStateCheckpoint
+            committedTiledLayerStates = tiledStateCheckpoint
+            pendingCommittedTileDraws =
+                pendingCommittedTileCheckpoint
             discardFailedCommittedSnapshotResources()
             return
         }
@@ -4614,11 +4746,16 @@ private final class RetainedEmitterSnapshot {
                 recordCommittedReplicatorRenderFailure(failure)
             case .emitter(let failure):
                 recordEmitterRenderFailure(failure)
+            case .tiled(let failure):
+                recordTiledLayerRenderFailure(failure)
             }
             recordFrameRenderFailure(
                 .committedSnapshotEncodingFailed(error)
             )
             emitterLayerStates = emitterStateCheckpoint
+            committedTiledLayerStates = tiledStateCheckpoint
+            pendingCommittedTileDraws =
+                pendingCommittedTileCheckpoint
             discardFailedCommittedSnapshotResources()
             return
         }
@@ -4643,16 +4780,14 @@ private final class RetainedEmitterSnapshot {
             )
             rootLayer.completeTransactionsAfterRenderRecursively()
             let rootIdentity = ObjectIdentifier(rootLayer)
-            if snapshot.nodes.contains(where: {
-                $0.presentationValues.emitter != nil
-            }) {
-                retainedEmitterSnapshots[rootIdentity] =
-                    RetainedEmitterSnapshot(
+            if snapshotHasRendererWork(snapshot) {
+                retainedDynamicSnapshots[rootIdentity] =
+                    RetainedDynamicSnapshot(
                         rootLayer: rootLayer,
                         snapshot: snapshot
                     )
             } else {
-                retainedEmitterSnapshots.removeValue(
+                retainedDynamicSnapshots.removeValue(
                     forKey: rootIdentity
                 )
             }
@@ -4749,6 +4884,9 @@ private final class RetainedEmitterSnapshot {
         shadowCaptureRootLayer = nil
         suppressShadowRendering = false
         activeEmitterLayerIDs.removeAll(keepingCapacity: true)
+        activeCommittedTiledLayerIDs.removeAll(
+            keepingCapacity: true
+        )
         clipRectStack.removeAll(keepingCapacity: true)
         maskNestingDepth = 0
         activeStencilFrames.removeAll(keepingCapacity: true)
@@ -4856,12 +4994,16 @@ private final class RetainedEmitterSnapshot {
         emitterLayerStates = emitterLayerStates.filter {
             activeEmitterLayerIDs.contains($0.key)
         }
+        committedTiledLayerStates =
+            committedTiledLayerStates.filter {
+                activeCommittedTiledLayerIDs.contains($0.key)
+            }
     }
 
     public func render(layer rootLayer: CALayer) {
         lastContentsConversionError = nil
         lastContentsRenderFailure = nil
-        retainedEmitterSnapshots = retainedEmitterSnapshots.filter {
+        retainedDynamicSnapshots = retainedDynamicSnapshots.filter {
             $0.value.rootLayer != nil
         }
         let rootIdentity = ObjectIdentifier(rootLayer)
@@ -4869,16 +5011,22 @@ private final class RetainedEmitterSnapshot {
             rootLayer.pendingCommittedRenderState
         let retainedEntry =
             pendingCommittedState == nil
-                ? retainedEmitterSnapshots[rootIdentity]
+                ? retainedDynamicSnapshots[rootIdentity]
                 : nil
         let retainedSnapshot =
             retainedEntry?.rootLayer === rootLayer
                 ? retainedEntry?.snapshot
                 : nil
-        let usesRetainedEmitterSnapshot =
-            retainedSnapshot.map(snapshotHasEmitterWork) == true
+        let usesRetainedDynamicSnapshot =
+            retainedSnapshot.map(snapshotHasRendererWork) == true
+        if retainedSnapshot != nil,
+           !usesRetainedDynamicSnapshot {
+            retainedDynamicSnapshots.removeValue(
+                forKey: rootIdentity
+            )
+        }
         let committedState: CACommittedRenderState? =
-            usesRetainedEmitterSnapshot
+            usesRetainedDynamicSnapshot
                 ? retainedSnapshot.map(
                     CACommittedRenderState.snapshot
                 )
@@ -4887,7 +5035,7 @@ private final class RetainedEmitterSnapshot {
         case .captureFailure,
              .requiresLiveAnimationEvaluation,
              .requiresLiveResourceCapture:
-            retainedEmitterSnapshots.removeValue(
+            retainedDynamicSnapshots.removeValue(
                 forKey: rootIdentity
             )
         case .snapshot, nil:
@@ -4950,12 +5098,13 @@ private final class RetainedEmitterSnapshot {
             recordFrameRenderFailure(.depthTextureViewUnavailable)
             return
         }
+        processPendingCommittedTileDraws()
         if case .snapshot(let snapshot) = committedState {
             renderCommittedSnapshot(
                 snapshot,
                 rootLayer: rootLayer,
                 acknowledgesCommit:
-                    !usesRetainedEmitterSnapshot,
+                    !usesRetainedDynamicSnapshot,
                 device: device,
                 context: context,
                 pipeline: pipeline,
@@ -5042,6 +5191,9 @@ private final class RetainedEmitterSnapshot {
         shadowCaptureRootLayer = nil
         suppressShadowRendering = false
         activeEmitterLayerIDs.removeAll(keepingCapacity: true)
+        activeCommittedTiledLayerIDs.removeAll(
+            keepingCapacity: true
+        )
         collectEmitterLayerIDs(rootLayer, into: &activeEmitterLayerIDs)
         do {
             try updateDelegateBackingStores(
@@ -5824,13 +5976,21 @@ private final class RetainedEmitterSnapshot {
         suppressShadowRendering = false
         contentMaskCaptureSuppressedRootLayer = nil
         for request in pendingTileDraws {
-            if request.tiledLayer.loadingTileGenerations[request.tileKey]
-                == request.cacheGeneration {
-                request.tiledLayer.loadingTiles.remove(request.tileKey)
-                request.tiledLayer.loadingTileGenerations.removeValue(forKey: request.tileKey)
-            }
+            request.tiledLayer.cancelTileRequest(
+                for: request.tileKey,
+                generation: request.cacheGeneration
+            )
         }
         pendingTileDraws.removeAll(keepingCapacity: false)
+        pendingCommittedTileDraws.removeAll(
+            keepingCapacity: false
+        )
+        committedTiledLayerStates.removeAll(
+            keepingCapacity: false
+        )
+        activeCommittedTiledLayerIDs.removeAll(
+            keepingCapacity: false
+        )
 
         filterReplacementPipeline = nil
         transformedCompositionPipeline = nil
@@ -5866,7 +6026,7 @@ private final class RetainedEmitterSnapshot {
         emitterTexturedAdditiveDepthStencilPipeline = nil
         emitterLayerStates.removeAll(keepingCapacity: false)
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
-        retainedEmitterSnapshots.removeAll(keepingCapacity: false)
+        retainedDynamicSnapshots.removeAll(keepingCapacity: false)
         emitterSpawnFailureCount = 0
         lastEmitterSpawnFailure = nil
         emitterRenderFailureCount = 0
@@ -7770,7 +7930,19 @@ private final class RetainedEmitterSnapshot {
                 bindGroup: bindGroup
             )
         }
-        if let text = values.text {
+        if let tiled = values.tiled {
+            do {
+                try renderCommittedTiledLayer(
+                    tiled,
+                    values: values,
+                    device: device,
+                    renderPass: renderPass,
+                    modelMatrix: modelMatrix
+                )
+            } catch {
+                throw .tiled(error)
+            }
+        } else if let text = values.text {
             if let configuration = text.configuration {
                 do {
                     try renderText(
@@ -17853,6 +18025,654 @@ private final class RetainedEmitterSnapshot {
 
     // MARK: - CATiledLayer Rendering
 
+    private func committedTiledLayerState(
+        for configuration: CATiledLayerRenderConfiguration
+    ) -> CommittedTiledLayerState {
+        activeCommittedTiledLayerIDs.insert(
+            configuration.resourceIdentity
+        )
+        if let state =
+                committedTiledLayerStates[
+                    configuration.resourceIdentity
+                ] {
+            if state.cacheGeneration
+                    != configuration.cacheGeneration {
+                state.reset(
+                    to: configuration.cacheGeneration,
+                    capturedContent:
+                        configuration.capturedContent
+                )
+            }
+            return state
+        }
+        let state = CommittedTiledLayerState(
+            resourceIdentity: configuration.resourceIdentity,
+            cacheGeneration: configuration.cacheGeneration,
+            capturedContent: configuration.capturedContent
+        )
+        committedTiledLayerStates[
+            configuration.resourceIdentity
+        ] = state
+        return state
+    }
+
+    private func calculateLODLevel(
+        configuration: CATiledLayerRenderConfiguration,
+        modelMatrix: Matrix4x4
+    ) -> Int {
+        let renderSize = currentRenderTargetSize
+        let viewportScaleX = Float(renderSize.width) * 0.5
+        let viewportScaleY = Float(renderSize.height) * 0.5
+        let xInPixels = SIMD2<Float>(
+            modelMatrix.columns.0.x * viewportScaleX,
+            modelMatrix.columns.0.y * viewportScaleY
+        )
+        let yInPixels = SIMD2<Float>(
+            modelMatrix.columns.1.x * viewportScaleX,
+            modelMatrix.columns.1.y * viewportScaleY
+        )
+        let scaleX = sqrt(
+            xInPixels.x * xInPixels.x
+                + xInPixels.y * xInPixels.y
+        )
+        let scaleY = sqrt(
+            yInPixels.x * yInPixels.x
+                + yInPixels.y * yInPixels.y
+        )
+        return configuration.lodLevel(
+            forScreenScale: CGFloat(max(scaleX, scaleY))
+        )
+    }
+
+    private func renderCommittedTiledLayer(
+        _ configuration: CATiledLayerRenderConfiguration,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CATiledLayerRenderFailure) {
+        let state = committedTiledLayerState(
+            for: configuration
+        )
+        if let terminalFailure = state.terminalFailure {
+            throw terminalFailure
+        }
+        state.needsDisplay = false
+
+        let bounds = configuration.bounds
+        guard bounds.width > 0, bounds.height > 0 else {
+            return
+        }
+        let lodLevel = calculateLODLevel(
+            configuration: configuration,
+            modelMatrix: modelMatrix
+        )
+        let lodScale = pow(2.0, CGFloat(lodLevel))
+        let pixelScale =
+            configuration.contentsScale / lodScale
+        guard pixelScale.isFinite, pixelScale > 0 else {
+            throw .invalidContentsScale(
+                configuration.contentsScale
+            )
+        }
+        let maximumTextureDimension = max(
+            1,
+            Int(device.limits.maxTextureDimension2D)
+        )
+        let maximumLogicalTileDimension =
+            CGFloat(maximumTextureDimension) / pixelScale
+        let adjustedTileSize = CGSize(
+            width: min(
+                configuration.tileSize.width * lodScale,
+                maximumLogicalTileDimension
+            ),
+            height: min(
+                configuration.tileSize.height * lodScale,
+                maximumLogicalTileDimension
+            )
+        )
+        guard adjustedTileSize.width.isFinite,
+              adjustedTileSize.height.isFinite,
+              adjustedTileSize.width > 0,
+              adjustedTileSize.height > 0 else {
+            throw .invalidTileSize(configuration.tileSize)
+        }
+
+        let tileCountX =
+            ceil(bounds.width / adjustedTileSize.width)
+        let tileCountY =
+            ceil(bounds.height / adjustedTileSize.height)
+        guard tileCountX.isFinite,
+              tileCountY.isFinite,
+              tileCountX > 0,
+              tileCountY > 0,
+              tileCountX <= CGFloat(Self.maxLayers),
+              tileCountY <= CGFloat(Self.maxLayers) else {
+            throw .tileCountExceedsRendererCapacity(Int.max)
+        }
+        let tilesX = Int(tileCountX)
+        let tilesY = Int(tileCountY)
+        guard tilesY == 0
+                || tilesX <= Self.maxLayers / tilesY else {
+            let reportedCount =
+                tilesX > Int.max / max(tilesY, 1)
+                    ? Int.max
+                    : tilesX * tilesY
+            throw .tileCountExceedsRendererCapacity(
+                reportedCount
+            )
+        }
+
+        let mediaTime = CARenderTimeContext.currentMediaTime
+        for row in 0..<tilesY {
+            for column in 0..<tilesX {
+                let tileKey = CATiledLayer.TileKey(
+                    column: column,
+                    row: row,
+                    lodLevel: lodLevel
+                )
+                let localX =
+                    CGFloat(column) * adjustedTileSize.width
+                let localY =
+                    CGFloat(row) * adjustedTileSize.height
+                let tileWidth = min(
+                    adjustedTileSize.width,
+                    bounds.width - localX
+                )
+                let tileHeight = min(
+                    adjustedTileSize.height,
+                    bounds.height - localY
+                )
+                let tileRect = CGRect(
+                    x: bounds.minX + localX,
+                    y: bounds.minY + localY,
+                    width: tileWidth,
+                    height: tileHeight
+                )
+                let tileMatrix = modelMatrix
+                    * Matrix4x4(columns: (
+                        SIMD4<Float>(1, 0, 0, 0),
+                        SIMD4<Float>(0, 1, 0, 0),
+                        SIMD4<Float>(0, 0, 1, 0),
+                        SIMD4<Float>(
+                            Float(localX),
+                            Float(localY),
+                            0,
+                            1
+                        )
+                    ))
+                    * Matrix4x4(columns: (
+                        SIMD4<Float>(
+                            Float(tileWidth),
+                            0,
+                            0,
+                            0
+                        ),
+                        SIMD4<Float>(
+                            0,
+                            Float(tileHeight),
+                            0,
+                            0
+                        ),
+                        SIMD4<Float>(0, 0, 1, 0),
+                        SIMD4<Float>(0, 0, 0, 1)
+                    ))
+
+                if let storage = state.cachedTiles[tileKey] {
+                    let opacity = committedTileOpacity(
+                        for: tileKey,
+                        state: state,
+                        at: mediaTime,
+                        fadeDuration:
+                            configuration.fadeDuration
+                    )
+                    try renderCommittedTile(
+                        storage,
+                        values: values,
+                        device: device,
+                        renderPass: renderPass,
+                        tileMatrix: tileMatrix,
+                        tileSize: CGSize(
+                            width: tileWidth,
+                            height: tileHeight
+                        ),
+                        opacity:
+                            currentEffectiveOpacity * opacity,
+                        edgeAntialiasingMask:
+                            tileEdgeAntialiasingMask(
+                                column: column,
+                                row: row,
+                                tilesX: tilesX,
+                                tilesY: tilesY,
+                                values: values
+                            )
+                    )
+                } else if let capturedContent =
+                            state.capturedContent,
+                          !state.loadingTiles.contains(tileKey) {
+                    try scheduleCommittedTileDraw(
+                        resourceIdentity:
+                            configuration.resourceIdentity,
+                        cacheGeneration:
+                            configuration.cacheGeneration,
+                        capturedContent: capturedContent,
+                        tileKey: tileKey,
+                        tileRect: tileRect,
+                        layerBounds: bounds,
+                        lodLevel: lodLevel,
+                        pixelScale: pixelScale,
+                        maximumTextureDimension:
+                            maximumTextureDimension,
+                        state: state
+                    )
+                }
+            }
+        }
+    }
+
+    private func committedTileOpacity(
+        for tileKey: CATiledLayer.TileKey,
+        state: CommittedTiledLayerState,
+        at mediaTime: CFTimeInterval,
+        fadeDuration: CFTimeInterval
+    ) -> Float {
+        guard let startTime = state.fadeStartTimes[tileKey],
+              fadeDuration > 0 else {
+            state.fadeStartTimes.removeValue(forKey: tileKey)
+            return 1
+        }
+        let progress = min(
+            max((mediaTime - startTime) / fadeDuration, 0),
+            1
+        )
+        if progress >= 1 {
+            state.fadeStartTimes.removeValue(forKey: tileKey)
+        }
+        return Float(progress)
+    }
+
+    private func tileEdgeAntialiasingMask(
+        column: Int,
+        row: Int,
+        tilesX: Int,
+        tilesY: Int,
+        values: CARenderSnapshot.PresentationValues
+    ) -> Float {
+        var outerEdges: CAEdgeAntialiasingMask = []
+        if column == 0 {
+            outerEdges.insert(.layerLeftEdge)
+        }
+        if column == tilesX - 1 {
+            outerEdges.insert(.layerRightEdge)
+        }
+        if row == 0 {
+            outerEdges.insert(.layerBottomEdge)
+        }
+        if row == tilesY - 1 {
+            outerEdges.insert(.layerTopEdge)
+        }
+        let configuredMask = CAEdgeAntialiasingMask(
+            rawValue: UInt32(values.edgeAntialiasingMask)
+        )
+        return Float(
+            configuredMask.intersection(outerEdges).rawValue
+        )
+    }
+
+    private func scheduleCommittedTileDraw(
+        resourceIdentity: UInt64,
+        cacheGeneration: UInt64,
+        capturedContent: CATiledLayerCapturedContent,
+        tileKey: CATiledLayer.TileKey,
+        tileRect: CGRect,
+        layerBounds: CGRect,
+        lodLevel: Int,
+        pixelScale: CGFloat,
+        maximumTextureDimension: Int,
+        state: CommittedTiledLayerState
+    ) throws(CATiledLayerRenderFailure) {
+        let pixelWidthValue = ceil(
+            tileRect.width * pixelScale
+        )
+        let pixelHeightValue = ceil(
+            tileRect.height * pixelScale
+        )
+        guard pixelWidthValue.isFinite,
+              pixelHeightValue.isFinite,
+              pixelWidthValue > 0,
+              pixelHeightValue > 0 else {
+            throw .invalidTileSize(tileRect.size)
+        }
+        let pixelWidth = Int(
+            min(
+                CGFloat(maximumTextureDimension),
+                pixelWidthValue
+            )
+        )
+        let pixelHeight = Int(
+            min(
+                CGFloat(maximumTextureDimension),
+                pixelHeightValue
+            )
+        )
+        state.loadingTiles.insert(tileKey)
+        pendingCommittedTileDraws.append(
+            PendingCommittedTileDraw(
+                resourceIdentity: resourceIdentity,
+                cacheGeneration: cacheGeneration,
+                capturedContent: capturedContent,
+                tileKey: tileKey,
+                drawingInfo: CATiledLayerTileDrawingInfo(
+                    layerBounds: layerBounds,
+                    tileRect: tileRect,
+                    levelOfDetail: lodLevel,
+                    pixelScale: pixelScale
+                ),
+                pixelWidth: pixelWidth,
+                pixelHeight: pixelHeight
+            )
+        )
+    }
+
+    private func processPendingCommittedTileDraws() {
+        let requests = pendingCommittedTileDraws
+        pendingCommittedTileDraws.removeAll(
+            keepingCapacity: true
+        )
+        for request in requests {
+            beginCommittedTileDraw(request)
+        }
+    }
+
+    private func beginCommittedTileDraw(
+        _ request: PendingCommittedTileDraw
+    ) {
+        guard let state =
+                committedTiledLayerStates[
+                    request.resourceIdentity
+                ],
+              state.cacheGeneration
+                == request.cacheGeneration,
+              state.capturedContent?.identity
+                == request.capturedContent.identity,
+              state.loadingTiles.contains(
+                request.tileKey
+              ) else {
+            return
+        }
+        guard let context = CGContext(
+            softwareData: nil,
+            width: request.pixelWidth,
+            height: request.pixelHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: .deviceRGB,
+            bitmapInfo: CGBitmapInfo(
+                rawValue:
+                    CGImageAlphaInfo
+                        .premultipliedLast.rawValue
+            )
+        ) else {
+            failCommittedTileDraw(
+                request,
+                with: .drawingContextCreationFailed
+            )
+            return
+        }
+
+        context.scaleBy(
+            x: request.drawingInfo.pixelScale,
+            y: request.drawingInfo.pixelScale
+        )
+        context.translateBy(
+            x: -request.drawingInfo.tileRect.minX,
+            y: -request.drawingInfo.tileRect.minY
+        )
+        do {
+            try request.capturedContent.snapshot.drawTile(
+                request.drawingInfo,
+                in: context
+            )
+        } catch {
+            failCommittedTileDraw(
+                request,
+                with: .contentDrawingFailed(
+                    String(describing: error)
+                )
+            )
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let image = await context.makeImageAsync() else {
+                self.failCommittedTileDraw(
+                    request,
+                    with: .imageCreationFailed
+                )
+                return
+            }
+            let storage: CGImageTextureStorage
+            do {
+                storage =
+                    try CGImageTextureStorageConverter.convert(
+                        image
+                    )
+            } catch let error as CAImageContentsConversionError {
+                self.failCommittedTileDraw(
+                    request,
+                    with: .imageConversionFailed(error)
+                )
+                return
+            } catch {
+                self.failCommittedTileDraw(
+                    request,
+                    with: .imageConversionFailed(
+                        .conversionFailed
+                    )
+                )
+                return
+            }
+            guard let currentState =
+                    self.committedTiledLayerStates[
+                        request.resourceIdentity
+                    ],
+                  currentState.cacheGeneration
+                    == request.cacheGeneration,
+                  currentState.capturedContent?.identity
+                    == request.capturedContent.identity,
+                  currentState.loadingTiles.contains(
+                    request.tileKey
+                  ) else {
+                return
+            }
+            currentState.cachedTiles[request.tileKey] = storage
+            if storage.data.count >= 4 {
+                currentState.needsDisplay = true
+                self.lastCommittedTileSourcePixel = [
+                    storage.data[0],
+                    storage.data[1],
+                    storage.data[2],
+                    storage.data[3],
+                ]
+            }
+            currentState.fadeStartTimes[request.tileKey] =
+                CARenderTimeContext.currentMediaTime
+            currentState.loadingTiles.remove(request.tileKey)
+            currentState.needsDisplay = true
+        }
+    }
+
+    private func failCommittedTileDraw(
+        _ request: PendingCommittedTileDraw,
+        with failure: CATiledLayerRenderFailure
+    ) {
+        guard let state =
+                committedTiledLayerStates[
+                    request.resourceIdentity
+                ],
+              state.cacheGeneration
+                == request.cacheGeneration,
+              state.capturedContent?.identity
+                == request.capturedContent.identity else {
+            return
+        }
+        state.loadingTiles.remove(request.tileKey)
+        state.terminalFailure = failure
+        state.needsDisplay = true
+    }
+
+    private func renderCommittedTile(
+        _ storage: CGImageTextureStorage,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        tileMatrix: Matrix4x4,
+        tileSize: CGSize,
+        opacity: Float,
+        edgeAntialiasingMask: Float
+    ) throws(CATiledLayerRenderFailure) {
+        guard let vertexBuffer,
+              let uniformBuffer,
+              let sampler = textureSampler,
+              let texturedBindGroupLayout,
+              let selectedPipeline = selectTexturedPipeline(
+                blendEnabled:
+                    !values.isOpaque || opacity < 1
+              ),
+              let textureManager else {
+            throw .rendererResourcesUnavailable
+        }
+        let memorySizeBytes: UInt64
+        do {
+            memorySizeBytes = try mipmappedRGBAByteCount(
+                width: storage.width,
+                height: storage.height,
+                format: storage.format,
+                device: device
+            )
+        } catch {
+            throw .imageConversionFailed(error)
+        }
+        var conversionFailure:
+            CAImageContentsConversionError?
+        let texture = textureManager.getOrCreateTexture(
+            for: storage,
+            memorySizeBytes: memorySizeBytes,
+            factory: {
+                do {
+                    return try self.createGPUTexture(
+                        from: storage,
+                        device: device
+                    )
+                } catch let error
+                        as CAImageContentsConversionError {
+                    conversionFailure = error
+                    return nil
+                } catch {
+                    conversionFailure = .conversionFailed
+                    return nil
+                }
+            }
+        )
+        guard let texture else {
+            if let conversionFailure {
+                throw .imageConversionFailed(
+                    conversionFailure
+                )
+            }
+            throw .rendererResourcesUnavailable
+        }
+
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(
+                position: SIMD2(0, 0),
+                texCoord: SIMD2(0, 1),
+                color: currentReplicatorColor
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 1),
+                color: currentReplicatorColor
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 0),
+                color: currentReplicatorColor
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 1),
+                color: currentReplicatorColor
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 1),
+                texCoord: SIMD2(1, 0),
+                color: currentReplicatorColor
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 0),
+                color: currentReplicatorColor
+            ),
+        ]
+        guard let allocation =
+                allocateVertices(count: vertices.count) else {
+            throw .rendererResourcesUnavailable
+        }
+        let (vertexOffset, layerIndex) = allocation
+        var uniforms = TexturedUniforms(
+            mvpMatrix: tileMatrix,
+            opacity: opacity,
+            cornerRadius: 0,
+            layerSize: SIMD2<Float>(
+                Float(tileSize.width),
+                Float(tileSize.height)
+            ),
+            edgeAntialiasingMask:
+                edgeAntialiasingMask
+        )
+        let uniformOffset =
+            UInt64(layerIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+        let texturedBindGroup = cachedTexturedBindGroup(
+            cacheKey: .committedImage(
+                ObjectIdentifier(texture),
+                .linearLinear
+            ),
+            gpuTexture: texture,
+            device: device,
+            layout: texturedBindGroupLayout,
+            sampler: sampler,
+            uniformBuffer: uniformBuffer,
+            uniformStride: UInt64(
+                MemoryLayout<TexturedUniforms>.stride
+            )
+        )
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: texturedBindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: vertexOffset
+        )
+        renderPass.draw(vertexCount: 6)
+        committedTileSubmissionCount += 1
+    }
+
     /// Calculates the current LOD level based on the layer's transform.
     /// Returns the LOD level (0 = highest detail, higher = lower detail).
     private func calculateLODLevel(
@@ -17884,6 +18704,11 @@ private final class RetainedEmitterSnapshot {
         lastTiledLayerRenderFailure = failure
     }
 
+    // FIXME(INCOMPLETE_IMPLEMENTATION): Animated or transitioning tiled trees
+    // still reach this live model-layer path. Production static commits use
+    // `renderCommittedTiledLayer`; completion requires immutable animation and
+    // transition snapshots to use the same renderer-owned generation/cache
+    // contract before this model-reading path can be removed.
     private func renderTiledLayer(
         _ tiledLayer: CATiledLayer,
         presentation: CATiledLayer,
@@ -18010,7 +18835,7 @@ private final class RetainedEmitterSnapshot {
                     )
                 } else {
                     // Request tile from delegate if not already loading
-                    if !tiledLayer.loadingTiles.contains(tileKey) {
+                    if !tiledLayer.hasLoadingTile(tileKey) {
                         requestTileFromDelegate(
                             tiledLayer: tiledLayer,
                             tileKey: tileKey,
@@ -18178,9 +19003,10 @@ private final class RetainedEmitterSnapshot {
 
         let pixelWidth = min(maximumTextureDimension, max(1, Int(ceil(tileRect.width * scale))))
         let pixelHeight = min(maximumTextureDimension, max(1, Int(ceil(tileRect.height * scale))))
-        let cacheGeneration = tiledLayer.tileCacheGeneration
-        tiledLayer.loadingTiles.insert(tileKey)
-        tiledLayer.loadingTileGenerations[tileKey] = cacheGeneration
+        guard let cacheGeneration =
+                tiledLayer.beginTileRequest(for: tileKey) else {
+            return
+        }
 
         pendingTileDraws.append(PendingTileDraw(
             tiledLayer: tiledLayer,
@@ -18231,10 +19057,10 @@ private final class RetainedEmitterSnapshot {
                 bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
               ) else {
             recordTiledLayerRenderFailure(.drawingContextCreationFailed)
-            if tiledLayer.loadingTileGenerations[tileKey] == cacheGeneration {
-                tiledLayer.loadingTiles.remove(tileKey)
-                tiledLayer.loadingTileGenerations.removeValue(forKey: tileKey)
-            }
+            tiledLayer.cancelTileRequest(
+                for: tileKey,
+                generation: cacheGeneration
+            )
             return
         }
 
@@ -18246,10 +19072,10 @@ private final class RetainedEmitterSnapshot {
             guard let tiledLayer else { return }
             guard let image = await context.makeImageAsync() else {
                 self?.recordTiledLayerRenderFailure(.imageCreationFailed)
-                if tiledLayer.loadingTileGenerations[tileKey] == cacheGeneration {
-                    tiledLayer.loadingTiles.remove(tileKey)
-                    tiledLayer.loadingTileGenerations.removeValue(forKey: tileKey)
-                }
+                tiledLayer.cancelTileRequest(
+                    for: tileKey,
+                    generation: cacheGeneration
+                )
                 return
             }
             if tiledLayer.cacheImage(

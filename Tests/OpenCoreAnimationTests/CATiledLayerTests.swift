@@ -43,11 +43,11 @@ struct CATiledLayerTests {
         let key = CATiledLayer.TileKey(column: 1, row: 2, lodLevel: 0)
         let image = try makeImage()
 
-        layer.loadingTiles.insert(key)
+        #expect(layer.beginTileRequest(for: key) != nil)
         layer.cacheImage(image, for: key, at: 10)
 
         #expect(layer.cachedImage(for: key) === image)
-        #expect(!layer.loadingTiles.contains(key))
+        #expect(!layer.hasLoadingTile(key))
         #expect(layer.tileOpacity(for: key, at: 10) == 0)
         #expect(abs(layer.tileOpacity(for: key, at: 10.125) - 0.5) < 0.001)
         #expect(layer.tileOpacity(for: key, at: 10.25) == 1)
@@ -63,7 +63,7 @@ struct CATiledLayerTests {
         layer.clearTile(at: key)
 
         #expect(layer.cachedImage(for: key) == nil)
-        #expect(layer.tileFadeStartTimes[key] == nil)
+        #expect(layer.tileFadeStartTime(for: key) == nil)
         #expect(layer.tileOpacity(for: key, at: 10) == 1)
     }
 
@@ -71,22 +71,25 @@ struct CATiledLayerTests {
     func staleTileGenerationIsRejected() throws {
         let layer = CATiledLayer()
         let key = CATiledLayer.TileKey(column: 0, row: 0, lodLevel: 0)
-        let staleGeneration = layer.tileCacheGeneration
-        layer.loadingTiles.insert(key)
-        layer.loadingTileGenerations[key] = staleGeneration
+        let staleGeneration = try #require(
+            layer.beginTileRequest(for: key)
+        )
 
         layer.setNeedsDisplay()
 
-        let currentGeneration = layer.tileCacheGeneration
-        layer.loadingTiles.insert(key)
-        layer.loadingTileGenerations[key] = currentGeneration
+        let currentGeneration = try #require(
+            layer.beginTileRequest(for: key)
+        )
         #expect(!layer.cacheImage(
             try makeImage(),
             for: key,
             requestGeneration: staleGeneration,
             at: 10
         ))
-        #expect(layer.loadingTileGenerations[key] == currentGeneration)
+        #expect(
+            layer.loadingGeneration(for: key)
+                == currentGeneration
+        )
         #expect(layer.cachedImage(for: key) == nil)
 
         #expect(layer.cacheImage(
@@ -96,7 +99,7 @@ struct CATiledLayerTests {
             at: 11
         ))
         #expect(layer.cachedImage(for: key) != nil)
-        #expect(!layer.loadingTiles.contains(key))
+        #expect(!layer.hasLoadingTile(key))
     }
 
     @Test("Tile geometry changes clear cache without dirtying copies")
@@ -119,7 +122,34 @@ struct CATiledLayerTests {
         #expect(copy.levelsOfDetail == 3)
         #expect(copy.levelsOfDetailBias == 2)
         #expect(!copy.needsDisplay())
-        #expect(copy.tileCache.isEmpty)
+        #expect(copy.isTileCacheEmpty)
+    }
+
+    @Test("Presentation copies preserve renderer resource identity")
+    func presentationResourceIdentity() throws {
+        let layer = CATiledLayer()
+        layer.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64
+        )
+        let expectedIdentity = layer.resourceIdentity
+        let expectedGeneration = layer.tileCacheGeneration
+
+        let presentation = try #require(
+            layer.presentation()
+        )
+
+        #expect(
+            presentation.resourceIdentity
+                == expectedIdentity
+        )
+        #expect(
+            presentation.tileCacheGeneration
+                == expectedGeneration
+        )
+        #expect(presentation.isTileCacheEmpty)
     }
 
     @Test("Tile storage preserves keys through growth, replacement, and removal")

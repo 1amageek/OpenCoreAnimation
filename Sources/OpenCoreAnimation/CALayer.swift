@@ -379,6 +379,13 @@ open class CALayer: CAMediaTiming, Hashable {
             emitterPresentation.seed = emitterSelf.seed
         }
 
+        if let tiledPresentation = presentation as? CATiledLayer,
+           let tiledSelf = self as? CATiledLayer {
+            tiledPresentation._copyPresentationConfiguration(
+                from: tiledSelf
+            )
+        }
+
         if let replicatorPresentation = presentation as? CAReplicatorLayer,
            let replicatorSelf = self as? CAReplicatorLayer {
             replicatorPresentation.instanceCount = replicatorSelf.instanceCount
@@ -390,13 +397,6 @@ open class CALayer: CAMediaTiming, Hashable {
             replicatorPresentation._instanceGreenOffset = replicatorSelf._instanceGreenOffset
             replicatorPresentation._instanceBlueOffset = replicatorSelf._instanceBlueOffset
             replicatorPresentation._instanceAlphaOffset = replicatorSelf._instanceAlphaOffset
-        }
-
-        if let tiledPresentation = presentation as? CATiledLayer,
-           let tiledSelf = self as? CATiledLayer {
-            tiledPresentation.levelsOfDetail = tiledSelf.levelsOfDetail
-            tiledPresentation.levelsOfDetailBias = tiledSelf.levelsOfDetailBias
-            tiledPresentation.tileSize = tiledSelf.tileSize
         }
 
         if let scrollPresentation = presentation as? CAScrollLayer,

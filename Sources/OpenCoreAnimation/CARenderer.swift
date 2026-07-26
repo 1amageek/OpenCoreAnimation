@@ -23,6 +23,7 @@ public enum CARenderSnapshotFeature: String, Equatable, Sendable {
     case transformDepth
     case replicatorInstances
     case emitter
+    case tiledLayer
 }
 
 /// A layer filter value that could not cross the immutable commit boundary.
@@ -194,6 +195,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     )
     /// An emitter layer could not become immutable simulation input.
     case invalidLayerEmitter(CARenderSnapshotEmitterError)
+    /// A tiled layer could not become immutable renderer input.
+    case invalidLayerTiled(CATiledLayerRenderFailure)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

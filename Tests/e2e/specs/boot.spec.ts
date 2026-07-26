@@ -42,6 +42,7 @@ interface OCA extends Harness {
     getTransactionSchedulingProbeResult: () => string;
     getTransactionCompletionProbeResult: () => string;
     getImmutableSnapshotProbeResult: () => string;
+    getImmutableTileSnapshotProbeResult: () => string;
     getEmitterProbeResult: () => string;
     getReplicatorProbeResult: () => string;
     getCompositionProbeResult: () => string;
@@ -97,6 +98,7 @@ interface OCA extends Harness {
     beginTransactionSchedulingProbe: () => void;
     beginTransactionCompletionProbe: () => void;
     beginImmutableSnapshotProbe: () => void;
+    beginImmutableTileSnapshotProbe: () => void;
     beginEmitterProbe: () => void;
     beginReplicatorProbe: () => void;
     removeTransition: () => void;
@@ -326,6 +328,14 @@ test.describe("OpenCoreAnimation smoke", () => {
             { timeout: 30_000 }
         ).toBe(
             "0,128,0,255;0,0,0,255;255,255,0,255;0,0,0,255;0,0,0,255;255,0,0,255;0,255,0,255;255,0,0,255;0,255,0,255;128,0,0,255;0,64,0,255;0,128,0,255;64,128,0,255;0,64,0,255;0,255,0,255;255,0,255,255;0,255,255,255;255,0,255,255;255,255,0,255;255,255,0,255;0,128,128,255;0,0,255,255;0,255,0,255;0,0,0,255;0,255,255,255;0,255,255,255;255,255,255,255;0,255,0,255;0,0,0,255;255,255,255,255;0,255,0,255,overflowTyped=true,overflowPending=true,maskOverflowTyped=true,maskOverflowPending=true,contentsOverflowTyped=true,contentsOverflowPending=true,shapeOverflowTyped=true,shapeOverflowPending=true,shapeOverflowRecovered=true,textOverflowTyped=true,textOverflowPending=true,textOverflowRecovered=true,transformFailureTyped=true,transformFailurePending=true,transformFailureRecovered=true,replicatorFailureTyped=true,replicatorFailurePending=true,replicatorFailureRecovered=true,replicatorDepthFailureTyped=true,replicatorDepthFailurePending=true,replicatorDepthFailureRecovered=true,snapshotMaskFailureTyped=true,snapshotMaskFailurePending=true,snapshotMaskFailureRecovered=true,snapshotShadowFailureTyped=true,snapshotShadowFailurePending=true,snapshotShadowFailureRecovered=true,snapshotFilterFailureTyped=true,snapshotFilterFailurePending=true,snapshotCompositionFailureTyped=true,snapshotCompositionFailurePending=true,snapshotRasterScale=true,snapshotRasterFailureTyped=true,snapshotRasterFailurePending=true,unsupportedContentsTyped=true,unsupportedContentsPending=true,delegateCaptured=true,snapshotPending=true,snapshotCompleted=true,delegateFailureTyped=true,delegateFailurePending=true"
+        );
+
+        await h.beginImmutableTileSnapshotProbe();
+        await expect.poll(
+            () => h.getImmutableTileSnapshotProbeResult(),
+            { timeout: 10_000 }
+        ).toBe(
+            "committed=255,0,0,255;0,0,0,255;0,0,0,255;0,0,0,255;0,0,0,255,updated=0,0,255,255,pending=true,completed=true,draws=2,failures=0,states=1,queued=0,cached=1,source=0,0,255,255,submissions=2"
         );
 
         await h.exerciseUnsupportedTransitionFilter();

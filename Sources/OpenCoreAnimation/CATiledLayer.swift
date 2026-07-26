@@ -6,26 +6,38 @@
 //
 
 import Foundation
+import Synchronization
 
 /// A layer that provides a way to asynchronously provide tiles of the layer's content,
 /// potentially cached at multiple levels of detail.
 ///
 /// ## Tile Drawing
 ///
-/// To provide tile content, set a delegate that implements `draw(_:in:)`.
-/// The delegate will be called with a CGContext configured for each visible tile.
-/// The context is already translated and scaled appropriately for the tile's position
-/// and the current level of detail.
+/// To provide tile content, set a delegate that implements
+/// `CATiledLayerContentProvider`. OpenCoreAnimation captures a Sendable content
+/// snapshot at transaction commit and invokes that snapshot for every visible
+/// tile. The context is already translated and scaled for the tile position and
+/// current level of detail.
 ///
 /// ## Usage Example
 ///
 /// ```swift
-/// class TileProvider: CALayerDelegate {
-///     func draw(_ layer: CALayer, in ctx: CGContext) {
-///         // Draw content for the current tile
-///         // The context is pre-transformed for the tile's position
-///         ctx.setFillColor(CGColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1))
-///         ctx.fill(layer.bounds)
+/// struct TileContent: CATiledLayerContentSnapshot {
+///     func drawTile(
+///         _ tile: CATiledLayerTileDrawingInfo,
+///         in context: CGContext
+///     ) {
+///         context.setFillColor(
+///             CGColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1)
+///         )
+///         context.fill(tile.tileRect)
+///     }
+/// }
+///
+/// final class TileProvider: CATiledLayerContentProvider {
+///     func makeTileContentSnapshot()
+///         -> any CATiledLayerContentSnapshot {
+///         TileContent()
 ///     }
 /// }
 ///
@@ -34,22 +46,72 @@ import Foundation
 /// tiledLayer.tileSize = CGSize(width: 256, height: 256)
 /// ```
 open class CATiledLayer: CALayer {
+    private static let resourceIdentityStorage =
+        Mutex<UInt64>(0)
+
+    private struct TileState {
+        var cache = CATileKeyMap<CGImage>()
+        var fadeStartTimes = CATileKeyMap<CFTimeInterval>()
+        var loadingTiles = CATileKeySet()
+        var loadingGenerations = CATileKeyMap<UInt64>()
+        var generation: UInt64 = 0
+    }
+
+    private let tileState = Mutex(TileState())
+    internal private(set) var resourceIdentity: UInt64
 
     // MARK: - Initialization
 
     public required init() {
+        resourceIdentity = Self.nextResourceIdentity()
         super.init()
     }
 
     /// Initializes a new tiled layer as a copy of the specified layer.
     public required init(layer: Any) {
+        resourceIdentity = Self.nextResourceIdentity()
         super.init(layer: layer)
         if let tiledLayer = layer as? CATiledLayer {
             self._levelsOfDetail = tiledLayer._levelsOfDetail
             self._levelsOfDetailBias = tiledLayer._levelsOfDetailBias
             self._tileSize = tiledLayer._tileSize
-            // Note: tileCache and loadingTiles are not copied as they are internal state
+            // Compatibility cache and request state belong to the new copy.
         }
+    }
+
+    private static func nextResourceIdentity() -> UInt64 {
+        resourceIdentityStorage.withLock { identity in
+            identity &+= 1
+            if identity == 0 {
+                identity = 1
+            }
+            return identity
+        }
+    }
+
+    internal func adoptPresentationResourceState(
+        from modelLayer: CATiledLayer
+    ) {
+        resourceIdentity = modelLayer.resourceIdentity
+        let generation = modelLayer.tileCacheGeneration
+        tileState.withLock { state in
+            state.generation = generation
+            state.cache.removeAll(keepingCapacity: false)
+            state.fadeStartTimes.removeAll(keepingCapacity: false)
+            state.loadingTiles.removeAll(keepingCapacity: false)
+            state.loadingGenerations.removeAll(
+                keepingCapacity: false
+            )
+        }
+    }
+
+    internal func _copyPresentationConfiguration(
+        from modelLayer: CATiledLayer
+    ) {
+        _levelsOfDetail = modelLayer._levelsOfDetail
+        _levelsOfDetailBias = modelLayer._levelsOfDetailBias
+        _tileSize = modelLayer._tileSize
+        adoptPresentationResourceState(from: modelLayer)
     }
 
     /// Specifies the default value associated with a tiled-layer property.
@@ -133,23 +195,14 @@ open class CATiledLayer: CALayer {
         }
     }
 
-    /// Cache of rendered tile images.
-    ///
-    /// Keys are TileKey structs, values are CGImage representations of tiles.
-    /// The renderer uses this cache to avoid re-rendering tiles unnecessarily.
-    internal var tileCache = CATileKeyMap<CGImage>()
-
-    /// Media times at which cached tiles became available for display.
-    internal var tileFadeStartTimes = CATileKeyMap<CFTimeInterval>()
-
-    /// Set of tiles currently being loaded.
-    internal var loadingTiles = CATileKeySet()
-
-    /// Cache generation associated with each in-flight tile request.
-    internal var loadingTileGenerations = CATileKeyMap<UInt64>()
-
     /// Advances whenever cached content becomes invalid.
-    internal private(set) var tileCacheGeneration: UInt64 = 0
+    internal var tileCacheGeneration: UInt64 {
+        tileState.withLock(\.generation)
+    }
+
+    internal var isTileCacheEmpty: Bool {
+        tileState.withLock(\.cache.isEmpty)
+    }
 
     /// Clears all cached tiles.
     ///
@@ -167,16 +220,63 @@ open class CATiledLayer: CALayer {
         // Advancing the generation prevents a replacement request for this key
         // from aliasing an older request that completes later. Other cached tiles
         // remain valid, while in-flight requests are conservatively restarted.
-        tileCacheGeneration &+= 1
-        loadingTiles.removeAll(keepingCapacity: true)
-        loadingTileGenerations.removeAll(keepingCapacity: true)
-        tileCache.removeValue(forKey: key)
-        tileFadeStartTimes.removeValue(forKey: key)
+        tileState.withLock { state in
+            state.generation &+= 1
+            state.loadingTiles.removeAll(keepingCapacity: true)
+            state.loadingGenerations.removeAll(keepingCapacity: true)
+            state.cache.removeValue(forKey: key)
+            state.fadeStartTimes.removeValue(forKey: key)
+        }
     }
 
     /// Returns the cached image for a tile, or nil if not cached.
     internal func cachedImage(for key: TileKey) -> CGImage? {
-        return tileCache[key]
+        tileState.withLock { $0.cache[key] }
+    }
+
+    internal func tileFadeStartTime(
+        for key: TileKey
+    ) -> CFTimeInterval? {
+        tileState.withLock { $0.fadeStartTimes[key] }
+    }
+
+    internal func hasLoadingTile(_ key: TileKey) -> Bool {
+        tileState.withLock { $0.loadingTiles.contains(key) }
+    }
+
+    internal func loadingGeneration(
+        for key: TileKey
+    ) -> UInt64? {
+        tileState.withLock { $0.loadingGenerations[key] }
+    }
+
+    /// Atomically reserves one tile request in the current cache generation.
+    internal func beginTileRequest(
+        for key: TileKey
+    ) -> UInt64? {
+        tileState.withLock { state in
+            guard !state.loadingTiles.contains(key) else {
+                return nil
+            }
+            let generation = state.generation
+            state.loadingTiles.insert(key)
+            state.loadingGenerations[key] = generation
+            return generation
+        }
+    }
+
+    /// Releases a failed request only if it still owns the recorded generation.
+    internal func cancelTileRequest(
+        for key: TileKey,
+        generation: UInt64
+    ) {
+        tileState.withLock { state in
+            guard state.loadingGenerations[key] == generation else {
+                return
+            }
+            state.loadingTiles.remove(key)
+            state.loadingGenerations.removeValue(forKey: key)
+        }
     }
 
     /// Stores a rendered tile image in the cache.
@@ -187,17 +287,20 @@ open class CATiledLayer: CALayer {
         requestGeneration: UInt64? = nil,
         at mediaTime: CFTimeInterval = CACurrentMediaTime()
     ) -> Bool {
-        if let requestGeneration {
-            guard requestGeneration == tileCacheGeneration,
-                  loadingTileGenerations[key] == requestGeneration else {
-                return false
+        tileState.withLock { state in
+            if let requestGeneration {
+                guard requestGeneration == state.generation,
+                      state.loadingGenerations[key]
+                        == requestGeneration else {
+                    return false
+                }
             }
+            state.cache[key] = image
+            state.fadeStartTimes[key] = mediaTime
+            state.loadingTiles.remove(key)
+            state.loadingGenerations.removeValue(forKey: key)
+            return true
         }
-        tileCache[key] = image
-        tileFadeStartTimes[key] = mediaTime
-        loadingTiles.remove(key)
-        loadingTileGenerations.removeValue(forKey: key)
-        return true
     }
 
     /// Invalidates all cached and in-flight tile content.
@@ -226,16 +329,20 @@ open class CATiledLayer: CALayer {
     }
 
     private func invalidateTileStorage() {
-        tileCacheGeneration &+= 1
-        tileCache.removeAll(keepingCapacity: true)
-        tileFadeStartTimes.removeAll(keepingCapacity: true)
-        loadingTiles.removeAll(keepingCapacity: true)
-        loadingTileGenerations.removeAll(keepingCapacity: true)
+        tileState.withLock { state in
+            state.generation &+= 1
+            state.cache.removeAll(keepingCapacity: true)
+            state.fadeStartTimes.removeAll(keepingCapacity: true)
+            state.loadingTiles.removeAll(keepingCapacity: true)
+            state.loadingGenerations.removeAll(keepingCapacity: true)
+        }
     }
 
     /// Returns the opacity for a newly cached tile at the supplied media time.
     internal func tileOpacity(for key: TileKey, at mediaTime: CFTimeInterval) -> Float {
-        guard let startTime = tileFadeStartTimes[key] else { return 1 }
+        guard let startTime = tileFadeStartTime(for: key) else {
+            return 1
+        }
         let duration = type(of: self).fadeDuration()
         guard duration > 0 else { return 1 }
         return Float(min(max((mediaTime - startTime) / duration, 0), 1))

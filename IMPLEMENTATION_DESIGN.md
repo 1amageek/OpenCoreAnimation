@@ -229,176 +229,70 @@ Sources/OpenCoreAnimation/
 
 ---
 
-## 2. CATiledLayer - タイル描画
+## 2. CATiledLayer - Committed Tile Rendering
 
-### 現状
+### Current contract
 
-- `CATiledLayer.swift`: 3プロパティと`fadeDuration()`のみ（19行）
-- タイル分割・非同期読み込み・LOD管理なし
+Static tiled trees use the immutable committed-snapshot path. A
+`CATiledLayerContentProvider` captures a `CATiledLayerContentSnapshot` at the
+transaction boundary. The renderer never retains the provider or reads the
+model layer while fulfilling requests.
 
-### Apple仕様
-
-```swift
-class CATiledLayer: CALayer {
-    var levelsOfDetail: Int       // 縮小時のLODレベル数（デフォルト1）
-    var levelsOfDetailBias: Int   // 拡大時のLODレベル数（デフォルト0）
-    var tileSize: CGSize          // タイルサイズ（デフォルト256x256）
-
-    class func fadeDuration() -> CFTimeInterval  // フェードイン時間（0.25秒）
-}
+```text
+CATiledLayer + content provider
+    -> CATiledLayerRenderConfiguration
+        -> immutable content snapshot
+            -> renderer-owned generation state
+                -> software CGContext tile
+                    -> value-owned RGBA storage
+                        -> WebGPU texture and quad
 ```
 
-**動作仕様:**
-- `draw(in:)` がバックグラウンドスレッドで呼ばれる
-- CTMからタイルの位置と解像度を判断
-- `setNeedsDisplay(_:)` で特定領域を無効化
+`CATiledLayer` protects its compatibility cache, loading set, fade times, and
+generation with one `Mutex<TileState>` on every target. The committed WebGPU
+path owns a separate state keyed by the layer's stable resource identity.
+Bounds, scale, tile geometry, detail-level changes, and display invalidation
+advance the generation. Asynchronous results are installed only when resource,
+generation, content snapshot, and tile key still match.
 
-### 実装設計
+### Shared-state review matrix
 
-#### 2.1 アーキテクチャ
+| Target/path | Storage type | Isolation | Read entry point | Mutation entry point | Shutdown/owner release |
+|---|---|---|---|---|---|
+| Native compatibility state | `Mutex<TileState>` | `Synchronization.Mutex` | `withLock` helpers | `withLock` helpers | Layer ownership releases the mutex and value-owned images |
+| WASM compatibility state | `Mutex<TileState>` | `Synchronization.Mutex` | The same `withLock` helpers | The same `withLock` helpers | The same layer ownership contract |
+| Embedded source contract | `Mutex<TileState>` | No conditional raw-state replacement | The same `withLock` helpers | The same `withLock` helpers | OpenCoreAnimation does not advertise an Embedded production target; runtime behavior is not claimed |
+| WASM committed renderer state | `CommittedTiledLayerState` dictionary | `CAWebGPURenderer` `@MainActor` isolation | Renderer frame methods | Renderer frame methods and `Task { @MainActor ... }` completion | Successful-frame pruning and renderer shutdown |
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    CATiledLayer                              │
-│  (タイル座標計算 + 描画リクエスト管理)                         │
-├─────────────────────────────────────────────────────────────┤
-│                   TileManager                                │
-│  ┌─────────────────┐  ┌──────────────────┐                  │
-│  │ TileCache       │  │ TileRenderer     │                  │
-│  │ (LRUキャッシュ) │  │ (非同期描画)     │                  │
-│  └─────────────────┘  └──────────────────┘                  │
-├─────────────────────────────────────────────────────────────┤
-│              CAWebGPURenderer拡張                            │
-│  ┌─────────────────┐  ┌──────────────────┐                  │
-│  │ TileTexture     │  │ FadeAnimation    │                  │
-│  │ (GPUテクスチャ) │  │ (フェードイン)   │                  │
-│  └─────────────────┘  └──────────────────┘                  │
-└─────────────────────────────────────────────────────────────┘
-```
+No tile-state declaration, `Sendable` conformance, callback contract, or
+mutation entry point is conditionalized for Embedded Swift. `CAWebGPURenderer`
+is a WASM-only backend; that target difference is isolated at the file
+boundary rather than weakening shared model-state synchronization.
 
-#### 2.2 タイル座標システム
+Portable API difference: Apple's delegate-only drawing contract cannot cross
+an immutable transaction boundary safely. OpenCoreAnimation therefore requires
+a delegate used by a static tiled commit to conform to
+`CATiledLayerContentProvider` and create a `CATiledLayerContentSnapshot`.
+Ordinary `CALayerDelegate` values fail capture with
+`delegateRequiresSendableTileProvider`; they are never retained as an
+apparently immutable renderer resource.
 
-```swift
-/// タイルの識別子
-struct TileKey: Hashable {
-    let x: Int           // タイルX座標
-    let y: Int           // タイルY座標
-    let lod: Int         // LODレベル（0が最高解像度）
-}
+### Failure and retry rules
 
-/// LODレベル計算
-func calculateLOD(scale: CGFloat, levelsOfDetail: Int, levelsOfDetailBias: Int) -> Int {
-    // scale < 1: 縮小 → 正のLODレベル
-    // scale > 1: 拡大 → 負のLODレベル（bias内）
-    let logScale = log2(Double(scale))
-    let lod = -Int(floor(logScale))
-    return max(-levelsOfDetailBias, min(levelsOfDetail - 1, lod))
-}
+- Invalid geometry, scale, detail levels, fade duration, renderer capacity,
+  context creation, content drawing, image creation, conversion, and resource
+  allocation remain typed `CATiledLayerRenderFailure` values.
+- Missing or unsafe content is never replaced with placeholder pixels.
+- Frame encoding checkpoints renderer-owned tile state and pending requests.
+  A rejected frame restores both before retry.
+- Content providers must return an immutable `Sendable` snapshot. Provider
+  mutation after commit cannot alter the captured frame.
+- A successful display invalidation starts a new generation and rejects stale
+  asynchronous completion from the previous generation.
 
-/// 可視タイルの列挙
-func visibleTiles(
-    visibleRect: CGRect,
-    tileSize: CGSize,
-    lod: Int
-) -> [TileKey] {
-    let scaleFactor = pow(2.0, Double(lod))
-    let effectiveTileSize = CGSize(
-        width: tileSize.width * CGFloat(scaleFactor),
-        height: tileSize.height * CGFloat(scaleFactor)
-    )
-
-    let minX = Int(floor(visibleRect.minX / effectiveTileSize.width))
-    let maxX = Int(ceil(visibleRect.maxX / effectiveTileSize.width))
-    let minY = Int(floor(visibleRect.minY / effectiveTileSize.height))
-    let maxY = Int(ceil(visibleRect.maxY / effectiveTileSize.height))
-
-    var tiles: [TileKey] = []
-    for y in minY..<maxY {
-        for x in minX..<maxX {
-            tiles.append(TileKey(x: x, y: y, lod: lod))
-        }
-    }
-    return tiles
-}
-```
-
-#### 2.3 非同期描画（WASM対応）
-
-WASMはシングルスレッドのため、`setTimeout`を使用した協調的マルチタスク:
-
-```swift
-#if arch(wasm32)
-import JavaScriptKit
-
-final class TileRenderer {
-    private var pendingTiles: [TileKey] = []
-    private var rendering: Bool = false
-
-    func requestTile(_ key: TileKey, layer: CATiledLayer) {
-        pendingTiles.append(key)
-        scheduleRender()
-    }
-
-    private func scheduleRender() {
-        guard !rendering, !pendingTiles.isEmpty else { return }
-        rendering = true
-
-        // 次のイベントループで描画
-        let callback = JSClosure { [weak self] _ in
-            self?.renderNextTile()
-            return .undefined
-        }
-        _ = JSObject.global.setTimeout!(callback, 0)
-    }
-
-    private func renderNextTile() {
-        guard let key = pendingTiles.first else {
-            rendering = false
-            return
-        }
-        pendingTiles.removeFirst()
-
-        // CGContextを作成してdraw(in:)を呼び出す
-        let context = createTileContext(for: key)
-        layer.draw(in: context)
-
-        // テクスチャに変換してキャッシュ
-        let texture = createTexture(from: context)
-        tileCache[key] = TileCacheEntry(texture: texture, opacity: 0)
-
-        // 次のタイルをスケジュール
-        scheduleRender()
-    }
-}
-#endif
-```
-
-#### 2.4 フェードインアニメーション
-
-```swift
-struct TileCacheEntry {
-    let texture: GPUTexture
-    var opacity: Float           // 0→1でフェードイン
-    let creationTime: CFTimeInterval
-
-    func currentOpacity(fadeDuration: CFTimeInterval) -> Float {
-        let elapsed = CACurrentMediaTime() - creationTime
-        return Float(min(1.0, elapsed / fadeDuration))
-    }
-}
-```
-
-#### 2.5 実装ファイル構成
-
-```
-Sources/OpenCoreAnimation/
-├── Tiling/
-│   ├── TileManager.swift          # タイル管理
-│   ├── TileCache.swift            # LRUキャッシュ
-│   ├── TileRenderer.swift         # 非同期描画
-│   └── TileCoordinate.swift       # 座標計算
-└── CATiledLayer.swift             # 既存に機能追加
-```
+Animated and transitioning tiled trees still use the explicitly marked live
+path until animation and transition evaluators themselves become immutable
+snapshot resources.
 
 ---
 

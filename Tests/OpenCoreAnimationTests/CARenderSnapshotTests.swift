@@ -1,6 +1,27 @@
 import Testing
 @testable import OpenCoreAnimation
 
+private struct SnapshotTileContent:
+    CATiledLayerContentSnapshot {
+    let value: Int
+
+    func drawTile(
+        _ tile: CATiledLayerTileDrawingInfo,
+        in context: CGContext
+    ) {}
+}
+
+private final class SnapshotTileProvider:
+    CATiledLayerContentProvider {
+    func makeTileContentSnapshot()
+        -> any CATiledLayerContentSnapshot {
+        SnapshotTileContent(value: 42)
+    }
+}
+
+private final class SnapshotNonSendableTileDelegate:
+    CALayerDelegate {}
+
 @MainActor
 @Suite("Immutable render snapshots", .serialized)
 struct CARenderSnapshotTests {
@@ -76,6 +97,67 @@ struct CARenderSnapshotTests {
             rootNode.childIndices.map { snapshot.nodes[$0].identity }
                 == [ObjectIdentifier(back), ObjectIdentifier(front)]
         )
+    }
+
+    @Test("Tiled content becomes immutable committed input")
+    func tiledContentIsCaptured() throws {
+        let layer = CATiledLayer()
+        layer.bounds = CGRect(
+            x: 4,
+            y: 8,
+            width: 128,
+            height: 64
+        )
+        layer.tileSize = CGSize(width: 32, height: 16)
+        layer.levelsOfDetail = 3
+        let provider = SnapshotTileProvider()
+        layer.delegate = provider
+        let expectedGeneration = layer.tileCacheGeneration
+
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 46
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+        let configuration = try #require(values.tiled)
+        let capturedContent = try #require(
+            configuration.capturedContent
+        )
+        let content = try #require(
+            capturedContent.snapshot
+                as? SnapshotTileContent
+        )
+
+        #expect(snapshot.liveTreeRequirement == nil)
+        #expect(
+            configuration.resourceIdentity
+                == layer.resourceIdentity
+        )
+        #expect(
+            configuration.cacheGeneration
+                == expectedGeneration
+        )
+        #expect(configuration.bounds == layer.bounds)
+        #expect(configuration.tileSize == layer.tileSize)
+        #expect(content.value == 42)
+    }
+
+    @Test("Unsafe tile delegates fail committed capture exactly")
+    func unsafeTileDelegateFailsCapture() {
+        let layer = CATiledLayer()
+        let delegate = SnapshotNonSendableTileDelegate()
+        layer.delegate = delegate
+
+        #expect(throws: CARendererError.invalidLayerTiled(
+            .delegateRequiresSendableTileProvider
+        )) {
+            try CARenderSnapshot.capture(
+                layer,
+                frameToken: 47
+            )
+        }
     }
 
     @Test("Base-only subclasses and scroll layers use immutable snapshots")
@@ -2385,6 +2467,48 @@ extension CARenderSnapshotTests {
 
         #expect(renderer.lastRenderError
             == .unsupportedCommittedSnapshotFeature(.emitter))
+        #expect(renderer.lastCommandBuffer == nil)
+    }
+
+    @Test("Metal reports committed tiled content instead of omitting it")
+    func metalRejectsUnsupportedTiledSnapshot() throws {
+        let device = try #require(
+            MTLCreateSystemDefaultDevice()
+        )
+        let descriptor =
+            MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: 16,
+                height: 16,
+                mipmapped: false
+            )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(
+            destination: texture
+        )
+        let root = CATiledLayer()
+        root.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16
+        )
+        root.position = CGPoint(x: 8, y: 8)
+        let provider = SnapshotTileProvider()
+        root.delegate = provider
+
+        renderer.render(layer: root)
+
+        #expect(
+            renderer.lastRenderError
+                == .unsupportedCommittedSnapshotFeature(
+                    .tiledLayer
+                )
+        )
         #expect(renderer.lastCommandBuffer == nil)
     }
 

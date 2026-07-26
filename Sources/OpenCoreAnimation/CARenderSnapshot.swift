@@ -1,7 +1,6 @@
 import Foundation
 
 internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
-    case specializedLayer
     case transition
 }
 
@@ -18,7 +17,8 @@ internal enum CARenderSnapshotLiveTreeRequirement: Equatable, Sendable {
 // tessellated shape geometry, validated text configuration, and emitter cells
 // with their converted image bytes.
 // Production WebGPU still uses explicitly typed live-tree branches for
-// tiled layers, transitions, and animation evaluation.
+// transitions and animation evaluation; animated or transitioning tiled
+// content is evaluated inside those branches.
 // Phase 4 must not be considered complete until those
 // values and resources are owned here, the live-tree commit states are removed,
 // and every WebGPU frame encodes without reading mutable model layers after
@@ -51,6 +51,8 @@ internal struct CARenderSnapshot: Sendable {
             CAReplicatorRenderConfiguration?
         internal let emitter:
             CAEmitterRenderConfiguration?
+        internal let tiled:
+            CATiledLayerRenderConfiguration?
         internal private(set) var replicatorInstanceTransform:
             CATransform3D
         internal private(set) var effectiveReplicatorColor:
@@ -203,13 +205,14 @@ internal struct CARenderSnapshot: Sendable {
         let presentationLayer = layer._renderTimePresentation()
         if liveTreeRequirement == nil {
             liveTreeRequirement = requiredLiveTreeFeature(
-                modelLayer: layer,
                 presentationLayer: presentationLayer
             )
         }
         let values = try presentationValues(
             from: presentationLayer,
-            delegateBackingStore: layer.delegateBackingStore
+            delegateBackingStore: layer.delegateBackingStore,
+            tiledContentDelegate:
+                (layer as? CATiledLayer)?.delegate
         )
         let nodeIndex = nodes.count
         nodes.append(
@@ -416,22 +419,12 @@ internal struct CARenderSnapshot: Sendable {
     }
 
     private static func requiredLiveTreeFeature(
-        modelLayer: CALayer,
         presentationLayer: CALayer
     ) -> CARenderSnapshotLiveTreeRequirement? {
-        if requiresSpecializedCapture(modelLayer) {
-            return .specializedLayer
-        }
         if presentationLayer._transitionRenderState != nil {
             return .transition
         }
         return nil
-    }
-
-    private static func requiresSpecializedCapture(
-        _ layer: CALayer
-    ) -> Bool {
-        layer is CATiledLayer
     }
 
     private static func snapshotReplicatorError(
@@ -502,7 +495,9 @@ internal struct CARenderSnapshot: Sendable {
 
     private static func presentationValues(
         from layer: CALayer,
-        delegateBackingStore: CADelegateBackingStore? = nil
+        delegateBackingStore: CADelegateBackingStore? = nil,
+        tiledContentDelegate:
+            (any CALayerDelegate)? = nil
     ) throws(CARendererError) -> PresentationValues {
         let isTransformLayer = layer is CATransformLayer
         let replicator: CAReplicatorRenderConfiguration?
@@ -533,6 +528,19 @@ internal struct CARenderSnapshot: Sendable {
             }
         } else {
             emitter = nil
+        }
+        let tiled: CATiledLayerRenderConfiguration?
+        if let tiledLayer = layer as? CATiledLayer {
+            do {
+                tiled = try CATiledLayerRenderConfiguration(
+                    layer: tiledLayer,
+                    contentDelegate: tiledContentDelegate
+                )
+            } catch {
+                throw .invalidLayerTiled(error)
+            }
+        } else {
+            tiled = nil
         }
         let isDepthContainer =
             isTransformLayer || replicator?.preservesDepth == true
@@ -766,6 +774,7 @@ internal struct CARenderSnapshot: Sendable {
         return PresentationValues(
             replicator: replicator,
             emitter: emitter,
+            tiled: tiled,
             replicatorInstanceTransform:
                 CATransform3DIdentity,
             effectiveReplicatorColor:
@@ -1210,10 +1219,10 @@ internal enum CACommittedRenderState: Sendable {
     case snapshot(CARenderSnapshot)
     case captureFailure(frameToken: UInt64, error: CARendererError)
     case requiresLiveAnimationEvaluation(frameToken: UInt64)
-    // FIXME(INCOMPLETE_IMPLEMENTATION): Static trees using this feature still
+    // FIXME(INCOMPLETE_IMPLEMENTATION): Trees with active transitions still
     // reach production WebGPU through the live-tree renderer. This branch must
-    // not be treated as snapshot success until the named resource category is
-    // value-owned by CARenderSnapshot and encoded without CALayer reads.
+    // not be treated as snapshot success until transition state is value-owned
+    // by CARenderSnapshot and encoded without CALayer reads.
     case requiresLiveResourceCapture(
         frameToken: UInt64,
         requirement: CARenderSnapshotLiveTreeRequirement

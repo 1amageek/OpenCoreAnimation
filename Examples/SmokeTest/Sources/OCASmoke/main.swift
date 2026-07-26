@@ -11,6 +11,7 @@
 // OCA pipeline.
 
 import Foundation
+import Synchronization
 import WasmTesting
 @_spi(RendererDiagnostics) import OpenCoreAnimation
 import OpenCoreImage
@@ -71,9 +72,100 @@ private enum ImmutableSnapshotProbeState {
     static var result: String = "pending"
 }
 
+@MainActor
+private enum ImmutableTileSnapshotProbeState {
+    static var result: String = "pending"
+}
+
 final class SnapshotBaseProbeLayer: CALayer {}
 
-final class SmokeTileDelegate: CALayerDelegate {
+final class ImmediateFadeTiledLayer: CATiledLayer {
+    override class func fadeDuration() -> CFTimeInterval {
+        0
+    }
+}
+
+final class ImmutableTileProbeCounter: Sendable {
+    private let storage = Mutex(0)
+
+    var value: Int {
+        storage.withLock { $0 }
+    }
+
+    func increment() {
+        storage.withLock { value in
+            value += 1
+        }
+    }
+}
+
+struct ImmutableTileProbeSnapshot:
+    CATiledLayerContentSnapshot {
+    let usesBlue: Bool
+    let counter: ImmutableTileProbeCounter
+
+    func drawTile(
+        _ tile: CATiledLayerTileDrawingInfo,
+        in context: CGContext
+    ) {
+        counter.increment()
+        let color = usesBlue
+            ? CGColor(
+                red: 0,
+                green: 0,
+                blue: 1,
+                alpha: 1
+            )
+            : CGColor(
+                red: 1,
+                green: 0,
+                blue: 0,
+                alpha: 1
+            )
+        context.setFillColor(color)
+        context.fill(tile.layerBounds)
+    }
+}
+
+final class ImmutableTileProbeProvider:
+    CATiledLayerContentProvider {
+    private let blueState = Mutex(false)
+    let counter = ImmutableTileProbeCounter()
+
+    func makeTileContentSnapshot()
+        -> any CATiledLayerContentSnapshot {
+        ImmutableTileProbeSnapshot(
+            usesBlue: blueState.withLock { $0 },
+            counter: counter
+        )
+    }
+
+    func setUsesBlue(_ usesBlue: Bool) {
+        blueState.withLock { state in
+            state = usesBlue
+        }
+    }
+}
+
+struct SmokeTileContentSnapshot: CATiledLayerContentSnapshot {
+    func drawTile(
+        _ tile: CATiledLayerTileDrawingInfo,
+        in context: CGContext
+    ) {
+        tileDrawCount += 1
+        context.setFillColor(
+            CGColor(red: 1, green: 0, blue: 1, alpha: 1)
+        )
+        context.fill(tile.layerBounds)
+    }
+}
+
+final class SmokeTileDelegate: CATiledLayerContentProvider {
+    func makeTileContentSnapshot()
+        -> any CATiledLayerContentSnapshot {
+        SmokeTileContentSnapshot()
+    }
+
     func draw(_ layer: CALayer, in context: CGContext) {
         tileDrawCount += 1
         context.setFillColor(CGColor(red: 1, green: 0, blue: 1, alpha: 1))
@@ -308,6 +400,8 @@ public func setup() {
             transactionCompletionProbeResult = "pending"
             MainActor.assumeIsolated {
                 ImmutableSnapshotProbeState.result = "pending"
+                ImmutableTileSnapshotProbeState.result =
+                    "pending"
             }
             emitterProbeResult = "pending"
             replicatorProbeResult = "pending"
@@ -564,6 +658,15 @@ func installHarness() {
             }
             return .string(result)
         })
+        h.expose(
+            "getImmutableTileSnapshotProbeResult",
+            returning: {
+                let result = MainActor.assumeIsolated {
+                    ImmutableTileSnapshotProbeState.result
+                }
+                return .string(result)
+            }
+        )
         h.expose("getEmitterProbeResult", returning: {
             .string(emitterProbeResult)
         })
@@ -6119,6 +6222,141 @@ func installHarness() {
                     + "completedAfterRender=\(completedAfterRender)"
             }
         })
+        h.expose(
+            "beginImmutableTileSnapshotProbe",
+            action: {
+                Task { @MainActor in
+                    ImmutableTileSnapshotProbeState.result =
+                        "running"
+                    let engine = CAAnimationEngine.shared
+                    let shouldResumeEngine = engine.isRunning
+                    if shouldResumeEngine {
+                        engine.pause()
+                    }
+                    defer {
+                        if shouldResumeEngine {
+                            engine.resume()
+                        }
+                    }
+                    guard let renderer =
+                            engine.rendererBackend
+                                as? CAWebGPURenderer else {
+                        ImmutableTileSnapshotProbeState.result =
+                            "error: renderer unavailable"
+                        return
+                    }
+
+                    let root = CALayer()
+                    let tiled = ImmediateFadeTiledLayer()
+                    let provider =
+                        ImmutableTileProbeProvider()
+                    var firstCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        firstCompletionRan = true
+                    }
+                    root.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 400,
+                        height: 300
+                    )
+                    root.position = CGPoint(x: 200, y: 150)
+                    root.backgroundColor = CGColor(
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    tiled.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    tiled.position = CGPoint(x: 200, y: 150)
+                    tiled.tileSize = CGSize(
+                        width: 40,
+                        height: 40
+                    )
+                    tiled.delegate = provider
+                    root.addSublayer(tiled)
+                    CATransaction.commit()
+
+                    let completionWasPending =
+                        !firstCompletionRan
+                    provider.setUsesBlue(true)
+                    do {
+                        for _ in 0..<2 {
+                            renderer.render(layer: root)
+                            try await browserDelay(
+                                milliseconds: 10
+                            )
+                        }
+                        renderer.render(layer: root)
+                        let committedPixels =
+                            try await renderer.readbackPixels(
+                                at: [
+                                    CGPoint(x: 200, y: 150),
+                                    CGPoint(x: 20, y: 20),
+                                    CGPoint(x: 100, y: 75),
+                                    CGPoint(x: 300, y: 225),
+                                    CGPoint(x: 380, y: 280),
+                                ]
+                            )
+
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        tiled.setNeedsDisplay()
+                        CATransaction.commit()
+                        for _ in 0..<2 {
+                            renderer.render(layer: root)
+                            try await browserDelay(
+                                milliseconds: 10
+                            )
+                        }
+                        renderer.render(layer: root)
+                        let updatedPixels =
+                            try await renderer.readbackPixels(
+                                at: [
+                                    CGPoint(x: 200, y: 150),
+                                ]
+                            )
+                        guard !committedPixels.isEmpty,
+                              let updatedPixel =
+                                updatedPixels.first else {
+                            ImmutableTileSnapshotProbeState
+                                .result =
+                                "error: missing readback pixel"
+                            return
+                        }
+                        let committed = committedPixels.map {
+                            $0.map(String.init)
+                                .joined(separator: ",")
+                        }.joined(separator: ";")
+                        let updated = updatedPixel
+                            .map(String.init)
+                            .joined(separator: ",")
+                        ImmutableTileSnapshotProbeState.result =
+                            "committed=\(committed),"
+                            + "updated=\(updated),"
+                            + "pending=\(completionWasPending),"
+                            + "completed=\(firstCompletionRan),"
+                            + "draws=\(provider.counter.value),"
+                            + "failures=\(renderer.tiledLayerRenderFailureCount),"
+                            + "states=\(renderer.committedTiledLayerStateCount),"
+                            + "queued=\(renderer.pendingCommittedTileDrawCount),"
+                            + "cached=\(renderer.committedTiledLayerCachedTileCount),"
+                            + "source=\(renderer.lastCommittedTileSourcePixel.map(String.init).joined(separator: ",")),"
+                            + "submissions=\(renderer.committedTileSubmissionCount)"
+                    } catch {
+                        ImmutableTileSnapshotProbeState.result =
+                            "error: \(error)"
+                    }
+                }
+            }
+        )
         h.expose("beginImmutableSnapshotProbe", action: {
             Task { @MainActor in
                 ImmutableSnapshotProbeState.result = "running"

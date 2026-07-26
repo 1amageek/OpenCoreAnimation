@@ -870,16 +870,16 @@ renderer-owned particle state without retaining a model layer. Successful
 submission retains only the immutable emitter snapshot while particles require
 clean-tree frames; encoding failure restores the complete particle state and
 keeps the committed transaction pending for retry. The snapshot does not yet
-own non-image contents, tiled specialized-layer resources, or copied animation
-evaluators. A static tree that needs those resources, a remaining specialized
-layer, or transition state publishes
-`requiresLiveResourceCapture` with the exact first requirement instead of
-claiming snapshot success. Backface policy, clipping geometry, and the captured
-transform are value-owned and evaluated by both static snapshot renderers.
+own non-image contents or copied animation evaluators. Static tiled layers
+capture immutable provider content and use renderer-owned generation/cache
+state. A tree with active transition state publishes
+`requiresLiveResourceCapture(.transition)` instead of claiming snapshot success.
+Backface policy, clipping geometry, and the captured transform are value-owned
+and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents,
 content masks, group opacity, rasterization, filters, backdrop composition,
-shadows, gradients, shapes, text, transform depth, replicator instances, and
-emitters with the corresponding
+shadows, gradients, shapes, text, transform depth, replicator instances,
+emitters, and tiled layers with the corresponding
 `unsupportedCommittedSnapshotFeature` value rather than dropping any resource
 and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,
