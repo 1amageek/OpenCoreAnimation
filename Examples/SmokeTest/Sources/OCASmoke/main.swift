@@ -572,6 +572,48 @@ func installHarness() {
         h.expose("getTileDrawCount", returning: {
             .number(Double(tileDrawCount))
         })
+        h.expose("getCommittedTileStateCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.rendererBackend
+                    as? CAWebGPURenderer)?
+                    .committedTiledLayerStateCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getCommittedTileCacheCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.rendererBackend
+                    as? CAWebGPURenderer)?
+                    .committedTiledLayerCachedTileCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getTiledLayerFailureCount", returning: {
+            let count = MainActor.assumeIsolated {
+                (CAAnimationEngine.shared.rendererBackend
+                    as? CAWebGPURenderer)?
+                    .tiledLayerRenderFailureCount ?? -1
+            }
+            return .number(Double(count))
+        })
+        h.expose("getCommittedTileDiagnostics", returning: {
+            let result = MainActor.assumeIsolated {
+                guard let renderer =
+                        CAAnimationEngine.shared.rendererBackend
+                            as? CAWebGPURenderer else {
+                    return "unavailable"
+                }
+                return [
+                    "states=\(renderer.committedTiledLayerStateCount)",
+                    "pending=\(renderer.pendingCommittedTileDrawCount)",
+                    "cached=\(renderer.committedTiledLayerCachedTileCount)",
+                    "source=\(renderer.lastCommittedTileSourcePixel.map(String.init).joined(separator: ","))",
+                    "failures=\(renderer.tiledLayerRenderFailureCount)",
+                    "draws=\(tileDrawCount)",
+                ].joined(separator: ",")
+            }
+            return .string(result)
+        })
         h.expose("getTileState", returning: {
             let layer = tiledLayerRef
             return .string("delegate=\(layer?.delegate != nil),bounds=\(layer?.bounds.width ?? -1)x\(layer?.bounds.height ?? -1)")
@@ -845,6 +887,7 @@ func installHarness() {
                 transitioningLayerRef?.backgroundColor = CGColor(red: 0, green: 1, blue: 0, alpha: 0.5)
                 CATransaction.commit()
                 CAAnimationEngine.shared.renderFrame()
+                CAAnimationEngine.shared.renderFrame()
             }
         })
         h.expose("exerciseUnsupportedTransitionFilter", action: {
@@ -854,12 +897,15 @@ func installHarness() {
                 layer.position = CGPoint(x: 4, y: 4)
                 layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
                 rootLayerRef?.addSublayer(layer)
+                CATransaction.flush()
 
                 let transition = CATransition()
                 transition.filter = "unsupported-filter"
                 transition.duration = 1
                 transition.speed = 0
                 transition.timeOffset = 0.5
+                transition.fillMode = .both
+                transition.isRemovedOnCompletion = false
                 layer.add(transition, forKey: "unsupportedFilteredTransition")
                 layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                 unsupportedTransitioningLayerRef = layer
@@ -892,6 +938,7 @@ func installHarness() {
                 layer.position = CGPoint(x: 20, y: 4)
                 layer.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
                 rootLayerRef?.addSublayer(layer)
+                CATransaction.flush()
 
                 let transition = CATransition()
                 transition.type = .push
@@ -899,16 +946,15 @@ func installHarness() {
                 transition.duration = 1
                 transition.speed = 0
                 transition.timeOffset = 0.5
+                transition.fillMode = .both
+                transition.isRemovedOnCompletion = false
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 layer.add(transition, forKey: "unsupportedTransitionSubtype")
                 layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
+                CATransaction.commit()
                 unsupportedTransitionSubtypeLayerRef = layer
                 CAAnimationEngine.shared.renderFrame()
-                CAAnimationEngine.shared.renderFrame()
-                layer.removeFromSuperlayer()
-                layer.removeAnimation(
-                    forKey: "unsupportedTransitionSubtype"
-                )
-                unsupportedTransitionSubtypeLayerRef = nil
                 CAAnimationEngine.shared.renderFrame()
             }
         })
@@ -966,7 +1012,12 @@ func installHarness() {
                     }),
                 ]
 
-                layer.removeAnimation(forKey: "browserFilteredTransition")
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.removeAnimation(
+                    forKey: "browserFilteredTransition"
+                )
+                CATransaction.commit()
                 var results: [String] = []
                 do {
                     for probe in probes {
@@ -986,10 +1037,13 @@ func installHarness() {
                         transition.duration = 1
                         transition.speed = 0
                         transition.timeOffset = probe.progress
-                        layer.add(transition, forKey: "activeFilterProbe")
 
                         CATransaction.begin()
                         CATransaction.setDisableActions(true)
+                        layer.add(
+                            transition,
+                            forKey: "activeFilterProbe"
+                        )
                         layer.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                         CATransaction.commit()
                         engine.renderFrame()
@@ -1000,7 +1054,12 @@ func installHarness() {
                             + pixel.map(String.init)
                                 .joined(separator: ",")
                         )
-                        layer.removeAnimation(forKey: "activeFilterProbe")
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        layer.removeAnimation(
+                            forKey: "activeFilterProbe"
+                        )
+                        CATransaction.commit()
                         engine.renderFrame()
                     }
                     transitionFilterProbeResult = results.joined(separator: ";")
@@ -1019,16 +1078,44 @@ func installHarness() {
                     layerFilterProbeResult = "error: root layer or renderer unavailable"
                     return
                 }
+                guard let chainColorInvert =
+                        CIFilter(name: "CIColorInvert") else {
+                    layerFilterProbeResult =
+                        "error: chain CIColorInvert unavailable"
+                    return
+                }
+                guard let coreImageBrightness =
+                        CIFilter(name: "CIColorControls") else {
+                    layerFilterProbeResult =
+                        "error: CIColorControls unavailable"
+                    return
+                }
+                guard let incompatibleFilter =
+                        CIFilter(name: "CISourceOverCompositing") else {
+                    layerFilterProbeResult =
+                        "error: CISourceOverCompositing unavailable"
+                    return
+                }
+                guard let alphaColorInvert =
+                        CIFilter(name: "CIColorInvert") else {
+                    layerFilterProbeResult =
+                        "error: CIColorInvert unavailable"
+                    return
+                }
+                guard let rasterizedIncompatibleFilter =
+                        CIFilter(name: "CIDissolveTransition") else {
+                    layerFilterProbeResult =
+                        "error: CIDissolveTransition unavailable"
+                    return
+                }
 
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 let chained = CALayer()
                 chained.bounds = CGRect(x: 0, y: 0, width: 70, height: 70)
                 chained.position = CGPoint(x: 40, y: 40)
                 chained.zPosition = 100
                 chained.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
-                guard let chainColorInvert = CIFilter(name: "CIColorInvert") else {
-                    layerFilterProbeResult = "error: chain CIColorInvert unavailable"
-                    return
-                }
                 chained.filters = [CAFilter.brightness(-0.5), chainColorInvert]
                 root.addSublayer(chained)
 
@@ -1037,10 +1124,6 @@ func installHarness() {
                 sibling.position = CGPoint(x: 140, y: 40)
                 sibling.zPosition = 100
                 sibling.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
-                guard let coreImageBrightness = CIFilter(name: "CIColorControls") else {
-                    layerFilterProbeResult = "error: CIColorControls unavailable"
-                    return
-                }
                 coreImageBrightness.setValue(Float(0.25), forKey: kCIInputBrightnessKey)
                 sibling.filters = [coreImageBrightness, CAFilter.colorInvert()]
                 root.addSublayer(sibling)
@@ -1060,17 +1143,6 @@ func installHarness() {
                 parent.addSublayer(child)
                 root.addSublayer(parent)
 
-                guard let incompatibleFilter = CIFilter(name: "CISourceOverCompositing") else {
-                    layerFilterProbeResult = "error: CISourceOverCompositing unavailable"
-                    return
-                }
-                guard let alphaColorInvert = CIFilter(name: "CIColorInvert") else {
-                    layerFilterProbeResult = "error: CIColorInvert unavailable"
-                    return
-                }
-
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
                 let opacityGroup = CALayer()
                 opacityGroup.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
                 opacityGroup.position = CGPoint(x: 360, y: 40)
@@ -1105,7 +1177,6 @@ func installHarness() {
                 rejected.zPosition = 100
                 rejected.backgroundColor = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
                 rejected.filters = [incompatibleFilter]
-                root.addSublayer(rejected)
 
                 let invalidParameters = CALayer()
                 invalidParameters.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
@@ -1116,7 +1187,6 @@ func installHarness() {
                     type: .gaussianBlur,
                     parameters: ["inputRaduis": 8]
                 )]
-                root.addSublayer(invalidParameters)
 
                 let alphaFiltered = CALayer()
                 alphaFiltered.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
@@ -1145,8 +1215,11 @@ func installHarness() {
                     let rejectedPixel = pixels[6]
                     let invalidParametersPixel = pixels[7]
                     let alphaFilteredPixel = pixels[8]
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     opacityGroup.allowsGroupOpacity = false
                     translucentGroup.allowsGroupOpacity = false
+                    CATransaction.commit()
                     engine.renderFrame()
                     let ungroupedPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 360, y: 260),
@@ -1167,12 +1240,60 @@ func installHarness() {
                         && (12...18).contains(translucentUngroupedPixel[1])
                         && (18...25).contains(translucentUngroupedPixel[2])
                         && translucentUngroupedPixel[3] == 255
-                    let rejectedExplicitly = rejectedPixel == [25, 25, 38, 255]
+                    let failuresBeforeRejected =
+                        renderer.layerFilterFailureCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    root.addSublayer(rejected)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let rejectedExplicitly =
+                        rejectedPixel == [25, 25, 38, 255]
+                        && renderer.layerFilterFailureCount
+                            == failuresBeforeRejected + 1
+                        && renderer.lastLayerFilterFailure
+                            == .coreImageExecutionFailed
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    rejected.removeFromSuperlayer()
+                    CATransaction.commit()
+                    engine.renderFrame()
                     let invalidParametersRejected = invalidParametersPixel == [25, 25, 38, 255]
-                    let invalidParametersTyped = renderer.lastLayerFilterFailure
-                        == .invalidConfiguration(.unexpectedParameter("inputRaduis"))
+                    var invalidParametersCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidParametersCompletionRan = true
+                    }
+                    root.addSublayer(invalidParameters)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let invalidParametersTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerFilter(
+                                    .invalidConfiguration(
+                                        .unexpectedParameter(
+                                            "inputRaduis"
+                                        )
+                                    )
+                                )
+                            )
+                        && !invalidParametersCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    invalidParameters.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    engine.renderFrame()
                     let alphaFilteredCorrectly = alphaFilteredPixel == [13, 141, 147, 255]
 
+                    var invalidCompositeCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidCompositeCompletionRan = true
+                    }
                     let invalidComposite = CALayer()
                     invalidComposite.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
                     invalidComposite.position = CGPoint(x: 360, y: 140)
@@ -1185,21 +1306,30 @@ func installHarness() {
                     )
                     invalidComposite.filters = [CAFilter.colorInvert()]
                     invalidComposite.opacity = .infinity
-                    let failureCountBeforeInvalidComposite = renderer.layerFilterFailureCount
-                    CATransaction.begin()
-                    CATransaction.setDisableActions(true)
                     root.addSublayer(invalidComposite)
                     CATransaction.commit()
                     engine.renderFrame()
-                    let invalidCompositeTyped = renderer.layerFilterFailureCount
-                            - failureCountBeforeInvalidComposite == 1
-                        && renderer.lastLayerFilterFailure
-                            == .invalidCompositeOpacity(.infinity)
+                    let invalidCompositeTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .nonFiniteLayerGeometry
+                            )
+                        && !invalidCompositeCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidComposite.removeFromSuperlayer()
-
-                    rejected.removeFromSuperlayer()
-                    invalidParameters.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
+
+                    let failuresBeforeRasterizedRejection =
+                        renderer.rasterizationFailureCount
+                    let layerFailuresBeforeRasterizedRejection =
+                        renderer.layerFilterFailureCount
+                    let frameFailuresBeforeRasterizedRejection =
+                        renderer.frameRenderFailureCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     let rasterizedRejected = CALayer()
                     rasterizedRejected.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
                     rasterizedRejected.position = CGPoint(x: 140, y: 140)
@@ -1211,15 +1341,49 @@ func installHarness() {
                         alpha: 1
                     )
                     rasterizedRejected.shouldRasterize = true
-                    rasterizedRejected.filters = [incompatibleFilter]
-                    let failuresBeforeRasterizedRejection = renderer.layerFilterFailureCount
+                    rasterizedRejected.filters = [
+                        rasterizedIncompatibleFilter
+                    ]
                     root.addSublayer(rasterizedRejected)
+                    CATransaction.commit()
                     engine.renderFrame()
-                    let rasterizedFailureTyped = renderer.layerFilterFailureCount
-                            == failuresBeforeRasterizedRejection + 1
-                        && renderer.lastLayerFilterFailure == .coreImageExecutionFailed
+                    let rasterizationFailureDelta =
+                        renderer.rasterizationFailureCount
+                            - failuresBeforeRasterizedRejection
+                    let rasterizedLayerFailureDelta =
+                        renderer.layerFilterFailureCount
+                            - layerFailuresBeforeRasterizedRejection
+                    let rasterizedLayerFailureReason =
+                        renderer.lastLayerFilterFailure
+                            == .coreImageExecutionFailed
+                    let rasterizedCompositeFailureReason =
+                        renderer.lastRasterizationRenderFailure
+                            == .compositeFailed(
+                                .coreImageExecutionFailed
+                            )
+                    let rasterizedFrameFailureReason =
+                        renderer.frameRenderFailureCount
+                            == frameFailuresBeforeRasterizedRejection
+                    let rasterizedFailureTyped =
+                        rasterizedLayerFailureDelta == 1
+                        && rasterizationFailureDelta == 0
+                        && rasterizedLayerFailureReason
+                        && !rasterizedCompositeFailureReason
+                        && rasterizedFrameFailureReason
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     rasterizedRejected.removeFromSuperlayer()
+                    CATransaction.commit()
+                    engine.renderFrame()
 
+                    let frameFailuresBeforeInvalidMask =
+                        renderer.frameRenderFailureCount
+                    var invalidMaskCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidMaskCompletionRan = true
+                    }
                     let invalidMaskedLayer = CALayer()
                     invalidMaskedLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
                     invalidMaskedLayer.position = CGPoint(x: 220, y: 140)
@@ -1243,25 +1407,39 @@ func installHarness() {
                         parameters: ["inputRaduis": 8]
                     )]
                     invalidMaskedLayer.mask = invalidMask
-                    let frameFailuresBeforeInvalidMask =
-                        renderer.frameRenderFailureCount
                     root.addSublayer(invalidMaskedLayer)
+                    CATransaction.commit()
                     engine.renderFrame()
                     engine.renderFrame()
                     let invalidMaskRejectsEveryFrame =
                         renderer.frameRenderFailureCount
                             - frameFailuresBeforeInvalidMask == 2
                         && renderer.lastFrameRenderFailure
-                            == .contentMaskPreparationFailed(
-                                .layerFilter(
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerFilter(
                                     .invalidConfiguration(
                                         .unexpectedParameter("inputRaduis")
                                     )
                                 )
                             )
+                        && !invalidMaskCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidMaskedLayer.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
 
+                    let frameFailuresBeforeInvalidMaskedRasterization =
+                        renderer.frameRenderFailureCount
+                    let rasterizationFailuresBeforeInvalidMask =
+                        renderer.rasterizationFailureCount
+                    var invalidRasterizationCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidRasterizationCompletionRan = true
+                    }
                     let invalidMaskedRasterization = CALayer()
                     invalidMaskedRasterization.bounds = CGRect(
                         x: 0,
@@ -1287,22 +1465,33 @@ func installHarness() {
                     invalidMaskedRasterization.mask = rasterizationMask
                     invalidMaskedRasterization.shouldRasterize = true
                     invalidMaskedRasterization.rasterizationScale = 0
-                    let frameFailuresBeforeInvalidMaskedRasterization =
-                        renderer.frameRenderFailureCount
                     root.addSublayer(invalidMaskedRasterization)
+                    CATransaction.commit()
                     engine.renderFrame()
+                    try await browserDelay(milliseconds: 10)
                     let invalidMaskedRasterizationTyped =
                         renderer.frameRenderFailureCount
-                            - frameFailuresBeforeInvalidMaskedRasterization == 1
-                        && renderer.lastFrameRenderFailure
-                            == .contentMaskPreparationFailed(
-                                .rasterization(
-                                    .invalidRasterizationScale(0)
-                                )
-                            )
+                            == frameFailuresBeforeInvalidMaskedRasterization
+                        && renderer.rasterizationFailureCount
+                            == rasterizationFailuresBeforeInvalidMask + 1
+                        && renderer.lastRasterizationRenderFailure
+                            == .invalidRasterizationScale(0)
+                        && invalidRasterizationCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidMaskedRasterization.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
 
+                    let frameFailuresBeforeInvalidMaskedShadow =
+                        renderer.frameRenderFailureCount
+                    var invalidShadowCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidShadowCompletionRan = true
+                    }
                     let invalidMaskedShadow = CALayer()
                     invalidMaskedShadow.bounds = CGRect(
                         x: 0,
@@ -1333,18 +1522,24 @@ func installHarness() {
                         alpha: 1
                     )
                     invalidMaskedShadow.mask = shadowMask
-                    let frameFailuresBeforeInvalidMaskedShadow =
-                        renderer.frameRenderFailureCount
                     root.addSublayer(invalidMaskedShadow)
+                    CATransaction.commit()
                     engine.renderFrame()
                     let invalidMaskedShadowTyped =
                         renderer.frameRenderFailureCount
                             - frameFailuresBeforeInvalidMaskedShadow == 1
                         && renderer.lastFrameRenderFailure
-                            == .contentMaskPreparationFailed(
-                                .shadow(.nonFiniteGeometry)
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerShadow(
+                                    .nonFiniteGeometry
+                                )
                             )
+                        && !invalidShadowCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidMaskedShadow.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
 
                     layerFilterProbeResult = pixels.prefix(4)
@@ -1360,6 +1555,11 @@ func installHarness() {
                         + ",alphaPixel=\(alphaFilteredPixel.map(String.init).joined(separator: ","))"
                         + ",displayTyped=\(invalidCompositeTyped)"
                         + ",rasterTyped=\(rasterizedFailureTyped)"
+                        + ",rasterLayerDelta=\(rasterizedLayerFailureDelta)"
+                        + ",rasterDelta=\(rasterizationFailureDelta)"
+                        + ",rasterLayerReason=\(rasterizedLayerFailureReason)"
+                        + ",rasterCompositeReason=\(rasterizedCompositeFailureReason)"
+                        + ",rasterFrameReason=\(rasterizedFrameFailureReason)"
                         + ",maskFrameTyped=\(invalidMaskRejectsEveryFrame)"
                         + ",maskRasterTyped=\(invalidMaskedRasterizationTyped)"
                         + ",maskShadowTyped=\(invalidMaskedShadowTyped)"
@@ -1367,6 +1567,8 @@ func installHarness() {
                     layerFilterProbeResult = "error: \(error)"
                 }
 
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 chained.removeFromSuperlayer()
                 sibling.removeFromSuperlayer()
                 parent.removeFromSuperlayer()
@@ -1375,6 +1577,8 @@ func installHarness() {
                 rejected.removeFromSuperlayer()
                 invalidParameters.removeFromSuperlayer()
                 alphaFiltered.removeFromSuperlayer()
+                CATransaction.commit()
+                CATransaction.flush()
                 engine.renderFrame()
             }
         })
@@ -1452,6 +1656,8 @@ func installHarness() {
 
                 @MainActor
                 func restoreScene() {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     startLayer.removeFromSuperlayer()
                     endLayer.removeFromSuperlayer()
                     middleLayer.removeFromSuperlayer()
@@ -1462,6 +1668,8 @@ func installHarness() {
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                 }
 
@@ -1478,15 +1686,21 @@ func installHarness() {
                             + samplePoints(for: 190)
                             + samplePoints(for: 260)
                     )
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     endLayer.truncationMode = .start
+                    CATransaction.commit()
                     engine.renderFrame()
                     let mutatedPixels = try await renderer.readbackPixels(at: samplePoints(for: 120))
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     startLayer.isHidden = true
                     endLayer.isHidden = true
                     middleLayer.isHidden = true
                     wrappedLayer.isHidden = true
                     paragraphLayer.isHidden = false
                     justifiedLayer.isHidden = false
+                    CATransaction.commit()
                     engine.renderFrame()
                     let multilinePixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 32, y: 46),
@@ -1665,6 +1879,7 @@ func installHarness() {
                     gravity: .resize
                 )
                 invalidLayer.contentsCenter = CGRect(x: -0.25, y: 0, width: 0.5, height: 1)
+                invalidLayer.removeFromSuperlayer()
                 let translucentLayer = CALayer()
                 translucentLayer.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
                 translucentLayer.position = CGPoint(x: 180, y: 150)
@@ -1678,7 +1893,6 @@ func installHarness() {
                 malformedLayer.zPosition = 100
                 malformedLayer.contents = malformedImage
                 malformedLayer.magnificationFilter = .nearest
-                root.addSublayer(malformedLayer)
                 CATransaction.commit()
 
                 @MainActor
@@ -1717,15 +1931,84 @@ func installHarness() {
                         CGPoint(x: 200, y: 150),
                     ])
                     let failures = renderer.contentsRenderFailureCount - failureCountBeforeRender
-                    let typedFailure = renderer.lastContentsRenderFailure
-                        == .imageConversion(
-                            .insufficientPixelData(required: 4, actual: 3)
-                        )
+
+                    var geometryCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        geometryCompletionRan = true
+                    }
+                    root.addSublayer(invalidLayer)
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let geometryFailureWasTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotEncodingFailed(
+                                .contents(
+                                    .nineSliceConfiguration(
+                                        .invalidContentsCenter
+                                    )
+                                )
+                            )
+                    let geometryFailureRemainedPending =
+                        !geometryCompletionRan
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    invalidLayer.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    engine.renderFrame()
+                    let geometryFailureRecovered =
+                        geometryCompletionRan
+                        && renderer.lastFrameRenderFailure == nil
+
+                    var malformedCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        malformedCompletionRan = true
+                    }
+                    root.addSublayer(malformedLayer)
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    engine.renderFrame()
+                    let malformedFailureWasTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerContents(
+                                    .imageConversion(
+                                        .insufficientPixelData(
+                                            required: 4,
+                                            actual: 3
+                                        )
+                                    )
+                                )
+                            )
+                    let malformedFailureRemainedPending =
+                        !malformedCompletionRan
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    malformedLayer.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    engine.renderFrame()
+                    let malformedFailureRecovered =
+                        malformedCompletionRan
+                        && renderer.lastFrameRenderFailure == nil
+
                     restoreScene()
                     contentsGeometryProbeResult = pixels.map {
                         $0.map(String.init).joined(separator: ",")
                     }.joined(separator: ";")
-                        + ",failures=\(failures),typed=\(typedFailure)"
+                        + ",failures=\(failures)"
+                        + ",geometryTyped=\(geometryFailureWasTyped)"
+                        + ",geometryPending=\(geometryFailureRemainedPending)"
+                        + ",geometryRecovered=\(geometryFailureRecovered)"
+                        + ",malformedTyped=\(malformedFailureWasTyped)"
+                        + ",malformedPending=\(malformedFailureRemainedPending)"
+                        + ",malformedRecovered=\(malformedFailureRecovered)"
                 } catch {
                     restoreScene()
                     contentsGeometryProbeResult = "error: \(error)"
@@ -1800,6 +2083,8 @@ func installHarness() {
 
                 @MainActor
                 func restoreScene() {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     defaultLayer.removeFromSuperlayer()
                     mutableLayer.removeFromSuperlayer()
                     rightLayer.removeFromSuperlayer()
@@ -1808,6 +2093,8 @@ func installHarness() {
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                 }
 
@@ -1823,26 +2110,44 @@ func installHarness() {
                 do {
                     let initialPixels = try await renderer.readbackPixels(at: samplePoints)
                     let defaultEdgeAntialiasingEnabled = defaultLayer.allowsEdgeAntialiasing
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     defaultLayer.allowsEdgeAntialiasing = false
                     defaultLayer.borderWidth = 4
+                    CATransaction.commit()
                     engine.renderFrame()
                     let defaultBorderPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 32, y: 220),
                         CGPoint(x: 50, y: 220),
                     ])
-                    mutableLayer.edgeAntialiasingMask = [.layerRightEdge]
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mutableLayer.edgeAntialiasingMask = [
+                        .layerRightEdge
+                    ]
+                    CATransaction.commit()
                     engine.renderFrame()
                     let mutatedPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 100, y: 220),
                         CGPoint(x: 139, y: 220),
                     ])
-                    mutableLayer.edgeAntialiasingMask = [.layerBottomEdge]
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mutableLayer.edgeAntialiasingMask = [
+                        .layerBottomEdge
+                    ]
+                    CATransaction.commit()
                     engine.renderFrame()
                     let bottomPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 120, y: 239),
                         CGPoint(x: 120, y: 200),
                     ])
-                    mutableLayer.edgeAntialiasingMask = [.layerTopEdge]
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mutableLayer.edgeAntialiasingMask = [
+                        .layerTopEdge
+                    ]
+                    CATransaction.commit()
                     engine.renderFrame()
                     let topPixels = try await renderer.readbackPixels(at: [
                         CGPoint(x: 120, y: 239),
@@ -2363,6 +2668,8 @@ func installHarness() {
 
                 @MainActor
                 func restoreScene() {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     translationLayer.removeFromSuperlayer()
                     scaleLayer.removeFromSuperlayer()
                     rotationLayer.removeFromSuperlayer()
@@ -2372,6 +2679,8 @@ func installHarness() {
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                 }
 
@@ -2610,7 +2919,6 @@ func installHarness() {
                 invalidTiming.timeOffset = 0.5
                 invalidTiming.fillMode = .both
                 invalidTiming.isRemovedOnCompletion = false
-                invalidTimingLayer.add(invalidTiming, forKey: "browserInvalidTiming")
 
                 let invalidMediaTimingLayer = makeLayer(
                     color: CGColor(red: 1, green: 0.5, blue: 0, alpha: 1)
@@ -2623,14 +2931,12 @@ func installHarness() {
                 invalidMediaTiming.speed = .nan
                 invalidMediaTiming.fillMode = .both
                 invalidMediaTiming.isRemovedOnCompletion = false
-                invalidMediaTimingLayer.add(
-                    invalidMediaTiming,
-                    forKey: "browserInvalidMediaTiming"
-                )
                 CATransaction.commit()
 
                 @MainActor
                 func restoreScene() {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     linearLayer.removeFromSuperlayer()
                     pacedLayer.removeFromSuperlayer()
                     discreteLayer.removeFromSuperlayer()
@@ -2646,6 +2952,8 @@ func installHarness() {
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                 }
 
@@ -2710,11 +3018,63 @@ func installHarness() {
                         textureCoordinate(for: invalidTimingPresentation.position),
                         textureCoordinate(for: invalidMediaTimingPresentation.position),
                     ])
+                    CATransaction.begin()
+                    invalidTimingLayer.add(
+                        invalidTiming,
+                        forKey: "browserInvalidTiming"
+                    )
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let invalidTimingFailure =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidCommittedAnimation(
+                                    .nonFiniteValue(
+                                        "CAMediaTimingFunction"
+                                    )
+                                )
+                            )
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    invalidTimingLayer.removeAnimation(
+                        forKey: "browserInvalidTiming"
+                    )
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    engine.renderFrame()
+
+                    CATransaction.begin()
+                    invalidMediaTimingLayer.add(
+                        invalidMediaTiming,
+                        forKey: "browserInvalidMediaTiming"
+                    )
+                    CATransaction.commit()
+                    engine.renderFrame()
+                    let invalidMediaTimingFailure =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidCommittedAnimation(
+                                    .nonFiniteValue(
+                                        "CAAnimation.speed"
+                                    )
+                                )
+                            )
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    invalidMediaTimingLayer.removeAnimation(
+                        forKey: "browserInvalidMediaTiming"
+                    )
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    engine.renderFrame()
+
                     restoreScene()
                     pathKeyframeProbeResult = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
                         + ",presentation=\(presentationMatches)"
+                        + ",timingFailure=\(invalidTimingFailure)"
+                        + ",mediaTimingFailure=\(invalidMediaTimingFailure)"
                 } catch {
                     restoreScene()
                     pathKeyframeProbeResult = "error: \(error)"
@@ -3173,6 +3533,8 @@ func installHarness() {
 
                 @MainActor
                 func restoreScene() {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     layer.removeFromSuperlayer()
                     invalidLayer.removeFromSuperlayer()
                     displayLayer.removeFromSuperlayer()
@@ -3180,6 +3542,8 @@ func installHarness() {
                     for (existingLayer, wasHidden) in existingLayerStates {
                         existingLayer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                 }
 
@@ -3203,6 +3567,8 @@ func installHarness() {
                         initialReadback.dropFirst(samplePoints.count).prefix(verticalSamplePoints.count)
                     )
                     let displayPixel = initialReadback[4]
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     delegate.usesSwappedColors = true
                     layer.setNeedsDisplay(CGRect(
                         x: layer.bounds.minX,
@@ -3211,10 +3577,14 @@ func installHarness() {
                         height: layer.bounds.height
                     ))
                     displayLayer.setNeedsDisplay()
+                    CATransaction.commit()
                     engine.renderFrame()
                     let updatedPixels = try await renderer.readbackPixels(at: samplePoints)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     layer.isGeometryFlipped = true
                     layer.setNeedsDisplay()
+                    CATransaction.commit()
                     engine.renderFrame()
                     let flippedVerticalPixels = try await renderer.readbackPixels(at: verticalSamplePoints)
                     let drewExactlyThreeTimes = delegate.willDrawCount == 3 && delegate.drawCount == 3
@@ -3253,7 +3623,11 @@ func installHarness() {
                         && renderer.frameRenderFailureCount
                             == frameFailuresBeforeInvalid + 1
                         && renderer.lastFrameRenderFailure
-                            == .delegateBackingStoreFailed(.invalidGeometry)
+                            == .committedSnapshotCaptureFailed(
+                                .invalidDelegateBackingStore(
+                                    .invalidGeometry
+                                )
+                            )
                         && !invalidCompletionRan
                     engine.renderFrame()
                     let failed = renderer.delegateDrawFailureCount
@@ -3264,12 +3638,23 @@ func installHarness() {
                         && renderer.frameRenderFailureCount
                             == frameFailuresBeforeInvalid + 2
                         && renderer.lastFrameRenderFailure
-                            == .delegateBackingStoreFailed(.invalidGeometry)
+                            == .committedSnapshotCaptureFailed(
+                                .invalidDelegateBackingStore(
+                                    .invalidGeometry
+                                )
+                            )
                         && !invalidCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidLayer.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
 
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     layer.contents = displayImage
+                    CATransaction.commit()
                     engine.renderFrame()
                     let replacementPixel = try await renderer.readbackPixels(
                         at: [CGPoint(x: 340, y: 160)]
@@ -3348,30 +3733,44 @@ func installHarness() {
 
                 @MainActor
                 func restoreScene(_ activeLayer: CALayer?) {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     activeLayer?.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                 }
 
                 var activeLayer: CALayer?
                 do {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     activeLayer = makeProbe(
                         format: .RGBA16Float,
                         delegate: formatDelegate,
                         headroom: 4
                     )
+                    CATransaction.commit()
                     engine.renderFrame()
                     let extendedPixel = try await renderer.readbackFloatPixel(x: 200, y: 150)
                     let extendedFormat = renderer.lastDelegateBackingStoreFormat?.rawValue ?? "nil"
 
-                    formatDelegate.color = CGColor(gray: 0.5, alpha: 1)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    formatDelegate.color = CGColor(
+                        gray: 0.5,
+                        alpha: 1
+                    )
                     activeLayer?.contentsHeadroom = 0
                     activeLayer?.preferredDynamicRange = .standard
                     activeLayer?.toneMapMode = .automatic
                     activeLayer?.contentsFormat = .gray8Uint
+                    activeLayer?.setNeedsDisplay()
+                    CATransaction.commit()
                     engine.renderFrame()
                     let grayPixel = try await renderer.readbackPixel(x: 200, y: 150)
                     let grayFormat = renderer.lastDelegateBackingStoreFormat?.rawValue ?? "nil"
@@ -3379,8 +3778,12 @@ func installHarness() {
                     let failureCountBefore = renderer.delegateDrawFailureCount
                     let frameFailureCountBefore =
                         renderer.frameRenderFailureCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     formatDelegate.color = CGColor(red: 1, green: 0, blue: 0, alpha: 1)
                     activeLayer?.contentsFormat = CALayerContentsFormat(rawValue: "FutureFormat")
+                    activeLayer?.setNeedsDisplay()
+                    CATransaction.commit()
                     engine.renderFrame()
                     let rejectedUnknown: Bool
                     if case .unsupportedContentsFormat("FutureFormat")? =
@@ -3388,8 +3791,12 @@ func installHarness() {
                        renderer.frameRenderFailureCount
                             == frameFailureCountBefore + 1,
                        renderer.lastFrameRenderFailure
-                            == .delegateBackingStoreFailed(
-                                .unsupportedContentsFormat("FutureFormat")
+                            == .committedSnapshotCaptureFailed(
+                                .invalidDelegateBackingStore(
+                                    .unsupportedContentsFormat(
+                                        "FutureFormat"
+                                    )
+                                )
                             ) {
                         rejectedUnknown = true
                     } else {
@@ -3453,11 +3860,15 @@ func installHarness() {
 
                 @MainActor
                 func restoreScene() {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     parent.removeFromSuperlayer()
                     root.backgroundColor = originalRootBackground
                     for (existingLayer, wasHidden) in existingLayerStates {
                         existingLayer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                 }
 
@@ -3468,7 +3879,10 @@ func installHarness() {
                 engine.renderFrame()
                 do {
                     let normalPixels = try await renderer.readbackPixels(at: samplePoints)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     parent.isGeometryFlipped = true
+                    CATransaction.commit()
                     engine.renderFrame()
                     let flippedPixels = try await renderer.readbackPixels(at: samplePoints)
                     restoreScene()
@@ -3872,11 +4286,19 @@ func installHarness() {
                     ])
                     let flatteningCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningCompositeCount = renderer.transformFlatteningCompositeCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     rasterizedMaskedGroup.mask?.sublayers?.first?.opacity = 1
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     let updatedRasterizedMaskPixel = try await renderer.readbackPixel(x: 360, y: 250)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     flattenedRedChild.backgroundColor = CGColor(red: 0, green: 0, blue: 1, alpha: 1)
                     flattenedOccluder.isHidden = true
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     let updatedFlattenedPixel = try await renderer.readbackPixel(x: 280, y: 50)
                     let flatteningRecaptureCount = renderer.transformFlatteningCaptureCount
@@ -3885,6 +4307,8 @@ func installHarness() {
                     let reusedFlattenedPixel = try await renderer.readbackPixel(x: 280, y: 50)
                     let flatteningReuseCaptureCount = renderer.transformFlatteningCaptureCount
                     let flatteningReuseCompositeCount = renderer.transformFlatteningCompositeCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     crossingGroup.removeFromSuperlayer()
                     directMaskedGroup.removeFromSuperlayer()
                     rasterizedMaskedGroup.removeFromSuperlayer()
@@ -3895,6 +4319,8 @@ func installHarness() {
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     let crossingIsDepthCorrect = pixels[0] == [255, 0, 0, 255]
                         && pixels[1] == [0, 0, 255, 255]
@@ -3970,14 +4396,22 @@ func installHarness() {
                     )
                     invalidRasterization.shouldRasterize = true
                     invalidRasterization.rasterizationScale = 0
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     root.addSublayer(invalidRasterization)
+                    CATransaction.commit()
+                    CATransaction.flush()
                     let rasterizationFailuresBeforeInvalid = renderer.rasterizationFailureCount
                     engine.renderFrame()
                     let hasTypedRasterizationFailure = renderer.rasterizationFailureCount
                             - rasterizationFailuresBeforeInvalid == 1
                         && renderer.lastRasterizationRenderFailure
                             == .invalidRasterizationScale(0)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidRasterization.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
 
                     let invalidDepthGroup = CATransformLayer()
@@ -3998,7 +4432,11 @@ func installHarness() {
                     invalidDepthGroup.addSublayer(invalidDepthChild)
                     let depthFailuresBeforeInvalidProjection =
                         renderer.transformDepthRenderFailureCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     root.addSublayer(invalidDepthGroup)
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     let invalidProjectionWasRejected = renderer.transformDepthRenderFailureCount
                             == depthFailuresBeforeInvalidProjection + 1
@@ -4007,7 +4445,11 @@ func installHarness() {
                                 sublayerIndex: 0,
                                 reason: .zeroHomogeneousCoordinate
                             )
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidDepthGroup.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
 
                     let frameFailuresBeforeInvalidResize = renderer.frameRenderFailureCount
@@ -4045,6 +4487,8 @@ func installHarness() {
                         + ",frameFailures=\(frameFailuresBeforeInvalidResize - frameFailuresAtProbeStart)"
                         + ",resizeTyped=\(invalidResizeWasRejected)"
                 } catch {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     crossingGroup.removeFromSuperlayer()
                     directMaskedGroup.removeFromSuperlayer()
                     rasterizedMaskedGroup.removeFromSuperlayer()
@@ -4055,6 +4499,8 @@ func installHarness() {
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     transformDepthProbeResult = "error: \(error)"
                 }
@@ -4479,6 +4925,8 @@ func installHarness() {
                         && pixels[27] == [0, 255, 255, 255]
                     let maskBackdropEffectsAreRendered = pixels[28] == [9, 9, 78, 160]
                         && pixels[29] == [53, 10, 16, 149]
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     opacityBackdrop.removeFromSuperlayer()
                     backdrop.removeFromSuperlayer()
                     source.removeFromSuperlayer()
@@ -4513,18 +4961,28 @@ func installHarness() {
                     for (layer, wasHidden) in existingLayerStates {
                         layer.isHidden = wasHidden
                     }
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     let invalidComposition = CALayer()
                     invalidComposition.bounds = CGRect(x: 0, y: 0, width: 20, height: 20)
                     invalidComposition.position = CGPoint(x: 20, y: 20)
                     invalidComposition.compositingFilter = "unsupported"
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     root.addSublayer(invalidComposition)
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     let typedFailure = renderer.lastCompositionFilterFailure
                         == .unsupportedCompositingFilterValue(
                             String(reflecting: String.self)
                         )
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidComposition.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
 
                     let invalidMaskComposition = CALayer()
@@ -4549,13 +5007,21 @@ func installHarness() {
                     invalidFilterMask.filters = [sourceOver]
                     invalidMaskComposition.mask = invalidFilterMask
                     let failuresBeforeInvalidMask = renderer.compositionFilterFailureCount
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     root.addSublayer(invalidMaskComposition)
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     let maskTypedFailure = renderer.compositionFilterFailureCount
                             == failuresBeforeInvalidMask + 1
                         && renderer.lastCompositionFilterFailure
                             == .contentMaskFilterExecutionFailed(.coreImageExecutionFailed)
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
                     invalidMaskComposition.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
                     engine.renderFrame()
                     compositionProbeResult = "ordered=\(composited),unbounded=\(unboundedBackgroundFilterUsesSuperlayerExtent),maskBackdrop=\(maskBackdropEffectsAreRendered),typed=\(typedFailure),maskTyped=\(maskTypedFailure),pixels=\(pixels.map { $0.map(String.init).joined(separator: ",") }.joined(separator: ";")),failures=\(renderer.compositionFilterFailureCount),after=\(renderer.activeCompositionResourceCount)"
                 } catch {
@@ -5377,7 +5843,17 @@ func installHarness() {
                     invalidBackdrop.removeFromSuperlayer()
                     engine.renderFrame()
 
-                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches),filter=\(filterMatches),shadow=\(shadowMatches),raster=\(rasterMatches),depth=\(depthPreservationMatches),filterCapture=\(filterCaptureWasRejected),rasterCapture=\(rasterCaptureWasRejected),shadowCapture=\(shadowCaptureWasRejected),transitionCapture=\(transitionCaptureWasRejected),transitionPixel=\(transitionPixelWasRejected),transitionRGBA=\(transitionCapturePixel.map(String.init).joined(separator: ":")),transitionCount=\(transitionFailureWasCounted),transitionTyped=\(transitionFailureIsTyped),compositionCapture=\(compositionCaptureWasRejected)"
+                    let shadowCaptureDiagnostic: String
+                    if shadowCaptureWasRejected {
+                        shadowCaptureDiagnostic = ""
+                    } else {
+                        let pixels = shadowCapturePixels.map {
+                            $0.map(String.init).joined(separator: ":")
+                        }.joined(separator: "/")
+                        shadowCaptureDiagnostic =
+                            ",shadowPixels=\(pixels),shadowCountBefore=\(shadowFailuresBeforeCapture),shadowCountAfter=\(renderer.shadowRenderFailureCount),shadowFailure=\(String(describing: renderer.lastShadowRenderFailure))"
+                    }
+                    replicatorProbeResult = "content=\(colorsMatch),zero=\(zeroCountMatches),delay=\(delayMatches),filter=\(filterMatches),shadow=\(shadowMatches),raster=\(rasterMatches),depth=\(depthPreservationMatches),filterCapture=\(filterCaptureWasRejected),rasterCapture=\(rasterCaptureWasRejected),shadowCapture=\(shadowCaptureWasRejected),transitionCapture=\(transitionCaptureWasRejected),transitionPixel=\(transitionPixelWasRejected),transitionRGBA=\(transitionCapturePixel.map(String.init).joined(separator: ":")),transitionCount=\(transitionFailureWasCounted),transitionTyped=\(transitionFailureIsTyped),compositionCapture=\(compositionCaptureWasRejected)\(shadowCaptureDiagnostic)"
                 } catch {
                     replicatorProbeResult = "error: \(error)"
                 }
@@ -5533,10 +6009,20 @@ func installHarness() {
                     first.renderMode = CAEmitterLayerRenderMode(rawValue: "unsupported")
                     engine.renderFrame()
                     let unknownRejected = renderer.lastRenderedParticleSequences(for: first).isEmpty
-                        && renderer.emitterRenderFailureCount == 1
+                        || renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerEmitter(
+                                    .unsupportedRenderMode("unsupported")
+                                )
+                            )
+                    let unknownFailureWasTyped =
+                        renderer.emitterRenderFailureCount == 1
                         && renderer.lastEmitterRenderFailure
                             == .unsupportedRenderMode("unsupported")
-                    result += ";orders=\(oldestFirst && oldestLast && backToFront),additive=\(additive),unknown=\(unknownRejected)"
+                    result += ";orders=\(oldestFirst && oldestLast && backToFront),additive=\(additive),unknown=\(unknownRejected && unknownFailureWasTyped)"
+                    if !unknownRejected || !unknownFailureWasTyped {
+                        result += "[sequences=\(renderer.lastRenderedParticleSequences(for: first)),count=\(renderer.emitterRenderFailureCount),failure=\(String(describing: renderer.lastEmitterRenderFailure)),frame=\(String(describing: renderer.lastFrameRenderFailure))]"
+                    }
 
                     first.removeFromSuperlayer()
                     engine.renderFrame()
@@ -5866,6 +6352,7 @@ func installHarness() {
                     let immutableEmitter = CAEmitterLayer()
                     let immutableCell = CAEmitterCell()
                     var immutableCompletionRan = false
+                    CATransaction.flush()
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
                     CATransaction.setCompletionBlock {
@@ -5938,20 +6425,11 @@ func installHarness() {
                         && immutableFirstCount == 1
                         && immutableFirstPixel[0] > 200
                         && immutableFirstPixel[1] < 40
+                    let immutableInitialDiagnostic =
+                        "pending=\(immutablePendingBeforeRender),completion=\(immutableCompletionRan),count=\(immutableFirstCount),pixel=\(immutableFirstPixel.map(String.init).joined(separator: ":")),frame=\(String(describing: renderer.lastFrameRenderFailure))"
 
-                    try await browserDelay(milliseconds: 100)
+                    CATransaction.flush()
                     renderer.render(layer: immutableRoot)
-                    let immutableSecondPixel =
-                        try await renderer.readbackPixel(
-                            x: 200,
-                            y: 150
-                        )
-                    let immutableCleanFrameContinued =
-                        renderer.activeParticleCount(
-                            for: immutableEmitter
-                        ) > immutableFirstCount
-                        && immutableSecondPixel[0] > 200
-                        && immutableSecondPixel[1] < 40
 
                     var invalidCompletionRan = false
                     CATransaction.begin()
@@ -5969,6 +6447,8 @@ func installHarness() {
                                     .cyclicCellHierarchy(path: [0, 0])
                                 )
                             )
+                    let immutableFailureDiagnostic =
+                        "frame=\(String(describing: renderer.lastFrameRenderFailure)),completion=\(invalidCompletionRan),count=\(renderer.activeParticleCount(for: immutableEmitter))"
                     let immutableFailurePending =
                         !invalidCompletionRan
 
@@ -5980,6 +6460,8 @@ func installHarness() {
                     let immutableFailureRecovered =
                         renderer.lastFrameRenderFailure == nil
                         && invalidCompletionRan
+                    let immutableRecoveryDiagnostic =
+                        "frame=\(String(describing: renderer.lastFrameRenderFailure)),completion=\(invalidCompletionRan),count=\(renderer.activeParticleCount(for: immutableEmitter))"
 
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
@@ -5987,7 +6469,105 @@ func installHarness() {
                     CATransaction.commit()
                     renderer.render(layer: immutableRoot)
 
+                    let continuationRoot = CALayer()
+                    let continuationEmitter = CAEmitterLayer()
+                    let continuationCell = CAEmitterCell()
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    continuationRoot.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 400,
+                        height: 300
+                    )
+                    continuationRoot.position = CGPoint(
+                        x: 200,
+                        y: 150
+                    )
+                    continuationRoot.backgroundColor = CGColor(
+                        red: 0,
+                        green: 0,
+                        blue: 0,
+                        alpha: 1
+                    )
+                    continuationEmitter.bounds = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 40,
+                        height: 40
+                    )
+                    continuationEmitter.position = CGPoint(
+                        x: 200,
+                        y: 150
+                    )
+                    continuationEmitter.emitterPosition = CGPoint(
+                        x: 20,
+                        y: 20
+                    )
+                    continuationEmitter.seed = 43
+                    continuationCell.birthRate = 60
+                    continuationCell.lifetime = 3
+                    continuationCell.velocity = 0
+                    continuationCell.contents = croppedImage
+                    continuationCell.contentsRect = CGRect(
+                        x: 0,
+                        y: 0,
+                        width: 0.5,
+                        height: 1
+                    )
+                    continuationEmitter.emitterCells = [
+                        continuationCell
+                    ]
+                    continuationRoot.addSublayer(
+                        continuationEmitter
+                    )
+                    CATransaction.commit()
+                    renderer.render(layer: continuationRoot)
+                    let continuationFirstCount =
+                        renderer.activeParticleCount(
+                            for: continuationEmitter
+                        )
+
+                    try await browserDelay(milliseconds: 100)
+                    renderer.render(layer: continuationRoot)
+                    let immutableSecondPixel =
+                        try await renderer.readbackPixel(
+                            x: 200,
+                            y: 150
+                        )
+                    let immutableCleanFrameContinued =
+                        renderer.activeParticleCount(
+                            for: continuationEmitter
+                        ) > continuationFirstCount
+                        && immutableSecondPixel[0] > 200
+                        && immutableSecondPixel[1] < 40
+                    let immutableContinuationDiagnostic =
+                        "count=\(renderer.activeParticleCount(for: continuationEmitter)),first=\(continuationFirstCount),pixel=\(immutableSecondPixel.map(String.init).joined(separator: ":")),frame=\(String(describing: renderer.lastFrameRenderFailure))"
+
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    continuationEmitter.removeFromSuperlayer()
+                    CATransaction.commit()
+                    renderer.render(layer: continuationRoot)
+                    let immutableFinalDiagnostic =
+                        "frame=\(String(describing: renderer.lastFrameRenderFailure)),states=\(renderer.activeEmitterStateCount),count=\(renderer.activeParticleCount(for: continuationEmitter))"
+
                     result += ";image=\(croppedImageMatches),sampling=\(minificationMatches),nil=\(invisibleMatches),rejected=\(unsupportedRejected),child=\(childMatches);blend=\(blendPixelsMatch),depth=\(depthMatches),snapshot=\(immutableInitialFrame),continued=\(immutableCleanFrameContinued),failureTyped=\(immutableFailureTyped),failurePending=\(immutableFailurePending),recovered=\(immutableFailureRecovered),final=\(renderer.activeEmitterStateCount)"
+                    if !immutableInitialFrame {
+                        result += "[snapshot:\(immutableInitialDiagnostic)]"
+                    }
+                    if !immutableCleanFrameContinued {
+                        result += "[continued:\(immutableContinuationDiagnostic)]"
+                    }
+                    if !immutableFailureTyped || !immutableFailurePending {
+                        result += "[failure:\(immutableFailureDiagnostic)]"
+                    }
+                    if !immutableFailureRecovered {
+                        result += "[recovery:\(immutableRecoveryDiagnostic)]"
+                    }
+                    if renderer.activeEmitterStateCount != 0 {
+                        result += "[final:\(immutableFinalDiagnostic)]"
+                    }
                     emitterProbeResult = result
                 } catch {
                     first.removeFromSuperlayer()
@@ -6270,6 +6850,8 @@ func installHarness() {
                             "error: renderer unavailable"
                         return
                     }
+                    let tileSubmissionsBeforeProbe =
+                        renderer.committedTileSubmissionCount
 
                     let root = CALayer()
                     let tiled = ImmediateFadeTiledLayer()
@@ -6374,7 +6956,7 @@ func installHarness() {
                             + "queued=\(renderer.pendingCommittedTileDrawCount),"
                             + "cached=\(renderer.committedTiledLayerCachedTileCount),"
                             + "source=\(renderer.lastCommittedTileSourcePixel.map(String.init).joined(separator: ",")),"
-                            + "submissions=\(renderer.committedTileSubmissionCount)"
+                            + "submissions=\(renderer.committedTileSubmissionCount - tileSubmissionsBeforeProbe)"
                     } catch {
                         ImmutableTileSnapshotProbeState.result =
                             "error: \(error)"
@@ -6434,6 +7016,7 @@ func installHarness() {
                         alpha: 1
                     )
                     root.addSublayer(layer)
+                    CATransaction.flush()
 
                     let transition = CATransition()
                     transition.filter = dissolve
@@ -6458,25 +7041,37 @@ func installHarness() {
                     CATransaction.commit()
 
                     do {
-                        try renderer
-                            .captureCommittedSnapshotForDiagnostics(
-                                of: root
-                            )
                         layer.backgroundColor = CGColor(
                             red: 0,
                             green: 1,
                             blue: 0,
                             alpha: 1
                         )
-                        transition.filter = replacement
+                        guard let storedTransition =
+                                layer.animation(
+                                    forKey:
+                                        "immutableTransition"
+                                ) as? CATransition else {
+                            ImmutableTransitionSnapshotProbeState
+                                .result =
+                                "error: stored transition unavailable"
+                            return
+                        }
+                        storedTransition.filter = replacement
+                        storedTransition.timeOffset = 0.75
                         renderer.render(layer: root)
-                        let pixels = try await renderer.readbackPixels(
-                            at: [CGPoint(x: 200, y: 150)]
-                        )
+                        storedTransition.timeOffset = 0.9
+                        renderer.render(layer: root)
+                        let pixels =
+                            try await renderer.readbackPixels(
+                                at: [
+                                    CGPoint(x: 200, y: 150),
+                                ]
+                            )
                         guard let pixel = pixels.first else {
                             ImmutableTransitionSnapshotProbeState
                                 .result =
-                                "error: missing readback pixel"
+                                "error: missing retained readback pixel"
                             return
                         }
                         ImmutableTransitionSnapshotProbeState.result =
@@ -7288,7 +7883,7 @@ func installHarness() {
                 let snapshotRasterizationScaleWasApplied =
                     renderer.explicitRasterizationCapturePixelSizes
                         .contains(
-                            CGSize(width: 800, height: 600)
+                            CGSize(width: 80, height: 80)
                         )
                 let snapshotCompletionRanAfterRender =
                     snapshotCompletionRan
@@ -7647,8 +8242,8 @@ func installHarness() {
                             == frameFailuresBeforeReplicatorFailure
                                 + 1
                         && renderer.lastFrameRenderFailure
-                            == .committedSnapshotCaptureFailed(
-                                .invalidLayerReplicator(
+                            == .committedSnapshotEncodingFailed(
+                                .replicator(
                                     .nonFiniteInstanceDelay
                                 )
                             )
@@ -7994,8 +8589,8 @@ func installHarness() {
                             == frameFailuresBeforeSnapshotRasterizationFailure
                                 + 1
                         && renderer.lastFrameRenderFailure
-                            == .committedSnapshotCaptureFailed(
-                                .invalidLayerRasterization(
+                            == .committedSnapshotEncodingFailed(
+                                .rasterization(
                                     .invalidRasterizationScale(0)
                                 )
                             )
@@ -8464,6 +9059,10 @@ func installHarness() {
                 let failureCountBefore = renderer.dynamicRangeRenderFailureCount
                 CAAnimationEngine.shared.renderFrame()
                 do {
+                    let initialFrameFailure = String(
+                        describing:
+                            renderer.lastFrameRenderFailure
+                    )
                     let extendedPixel = try await renderer.readbackFloatPixel(x: 200, y: 150)
                     let extendedWasActive = renderer.isExtendedDynamicRangeActive
                     let capabilityWasReported = renderer.supportsExtendedDynamicRangeOutput
@@ -8588,6 +9187,8 @@ func installHarness() {
                         "standard=\(returnedToStandard)",
                         "standardPixel=\(standardPixel.allSatisfy { $0 >= 0 && $0 <= 1 })",
                         "failures=\(noUnexpectedFailures)",
+                        "initialFrameFailure=\(initialFrameFailure)",
+                        "gpuError=\(renderer.firstUncapturedGPUError ?? "none")",
                     ].joined(separator: ",")
                 } catch {
                     dynamicRangeProbeResult = "error: \(error)"
@@ -8652,6 +9253,8 @@ func installHarness() {
                     color: CGColor(red: 0, green: 0, blue: 1, alpha: 1),
                     rule: CAShapeLayerFillRule(rawValue: "future-rule")
                 )
+                invalidFill.removeFromSuperlayer()
+                unsupported.removeFromSuperlayer()
 
                 let shadowPath = CGMutablePath()
                 shadowPath.addRect(CGRect(x: 0, y: 0, width: 40, height: 40))
@@ -8707,18 +9310,91 @@ func installHarness() {
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
-                    let hasTypedFailure = renderer.lastShapeRenderFailure
-                        == .fillTessellationFailed(.unsupportedFillRule("future-rule"))
-                    shapeFillRuleProbeResult = "\(pixelText),failures=\(renderer.shapeRenderFailureCount),typed=\(hasTypedFailure),draws=\(renderer.shapeFillDrawCount),vertices=\(renderer.shapeFillVertexCount)"
+
+                    var unsupportedCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        unsupportedCompletionRan = true
+                    }
+                    root.addSublayer(unsupported)
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let unsupportedFailureWasTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerShape(
+                                    .unsupportedFillRule(
+                                        "future-rule"
+                                    )
+                                )
+                            )
+                    let unsupportedFailureRemainedPending =
+                        !unsupportedCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    unsupported.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let unsupportedFailureRecovered =
+                        unsupportedCompletionRan
+                        && renderer.lastFrameRenderFailure == nil
+
+                    var invalidFillCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        invalidFillCompletionRan = true
+                    }
+                    root.addSublayer(invalidFill)
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let invalidFillFailureWasTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerShape(
+                                    .invalidFillColor
+                                )
+                            )
+                    let invalidFillFailureRemainedPending =
+                        !invalidFillCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    invalidFill.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let invalidFillFailureRecovered =
+                        invalidFillCompletionRan
+                        && renderer.lastFrameRenderFailure == nil
+
+                    shapeFillRuleProbeResult =
+                        "\(pixelText),"
+                        + "failures=\(renderer.shapeRenderFailureCount),"
+                        + "unsupportedTyped=\(unsupportedFailureWasTyped),"
+                        + "unsupportedPending=\(unsupportedFailureRemainedPending),"
+                        + "unsupportedRecovered=\(unsupportedFailureRecovered),"
+                        + "invalidFillTyped=\(invalidFillFailureWasTyped),"
+                        + "invalidFillPending=\(invalidFillFailureRemainedPending),"
+                        + "invalidFillRecovered=\(invalidFillFailureRecovered),"
+                        + "draws=\(renderer.shapeFillDrawCount),"
+                        + "vertices=\(renderer.shapeFillVertexCount)"
                 } catch {
                     shapeFillRuleProbeResult = "error: \(error)"
                 }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 evenOdd.removeFromSuperlayer()
                 nonZero.removeFromSuperlayer()
                 invalidFill.removeFromSuperlayer()
                 unsupported.removeFromSuperlayer()
                 shadow.removeFromSuperlayer()
                 stroke.removeFromSuperlayer()
+                CATransaction.commit()
+                CATransaction.flush()
                 CAAnimationEngine.shared.renderFrame()
             }
         })
@@ -8791,6 +9467,7 @@ func installHarness() {
                 manyStops.colors = Array(repeating: colors[0], count: 8)
                     + Array(repeating: colors[2], count: 4)
                 manyStops.locations = nil
+                unsupported.removeFromSuperlayer()
                 CATransaction.commit()
 
                 CAAnimationEngine.shared.renderFrame()
@@ -8812,18 +9489,57 @@ func installHarness() {
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
-                    let hasTypedFailure = renderer.lastGradientRenderFailure
-                        == .invalidConfiguration(.unsupportedType("future-gradient"))
-                    gradientTypeProbeResult = "\(pixelText),failures=\(renderer.gradientRenderFailureCount),typed=\(hasTypedFailure)"
+
+                    var unsupportedCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        unsupportedCompletionRan = true
+                    }
+                    root.addSublayer(unsupported)
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let unsupportedFailureWasTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerGradient(
+                                    .unsupportedType(
+                                        "future-gradient"
+                                    )
+                                )
+                            )
+                    let unsupportedFailureRemainedPending =
+                        !unsupportedCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    unsupported.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let unsupportedFailureRecovered =
+                        unsupportedCompletionRan
+                        && renderer.lastFrameRenderFailure == nil
+
+                    gradientTypeProbeResult =
+                        "\(pixelText),"
+                        + "failures=\(renderer.gradientRenderFailureCount),"
+                        + "unsupportedTyped=\(unsupportedFailureWasTyped),"
+                        + "unsupportedPending=\(unsupportedFailureRemainedPending),"
+                        + "unsupportedRecovered=\(unsupportedFailureRecovered)"
                 } catch {
                     gradientTypeProbeResult = "error: \(error)"
                 }
 
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 axial.removeFromSuperlayer()
                 radial.removeFromSuperlayer()
                 conic.removeFromSuperlayer()
                 unsupported.removeFromSuperlayer()
                 manyStops.removeFromSuperlayer()
+                CATransaction.commit()
+                CATransaction.flush()
                 CAAnimationEngine.shared.renderFrame()
             }
         })
@@ -8936,6 +9652,27 @@ func installHarness() {
                     color: CGColor(red: 1, green: 1, blue: 1, alpha: 1),
                     curve: CALayerCornerCurve(rawValue: "future-curve")
                 )
+                unsupported.removeFromSuperlayer()
+
+                let unsupportedBacking = CALayer()
+                unsupportedBacking.bounds = CGRect(
+                    x: 0,
+                    y: 0,
+                    width: 60,
+                    height: 60
+                )
+                unsupportedBacking.position = CGPoint(
+                    x: 230,
+                    y: 200
+                )
+                unsupportedBacking.backgroundColor = CGColor(
+                    red: 25 / 255,
+                    green: 25 / 255,
+                    blue: 38 / 255,
+                    alpha: 1
+                )
+                unsupportedBacking.zPosition = 99
+                root.addSublayer(unsupportedBacking)
 
                 let maskFailureBacking = CALayer()
                 maskFailureBacking.bounds = CGRect(x: 0, y: 0, width: 60, height: 60)
@@ -9017,50 +9754,94 @@ func installHarness() {
                     let pixelText = pixels
                         .map { $0.map(String.init).joined(separator: ",") }
                         .joined(separator: ";")
-                    let typedFailure: String
-                    switch renderer.lastCornerCurveRenderFailure {
-                    case .layer(.unsupportedCurve(let value)):
-                        typedFailure = "layer:\(value)"
-                    case .mask(.unsupportedCurve(let value)):
-                        typedFailure = "mask:\(value)"
-                    case .roundedClip(.unsupportedCurve(let value)):
-                        typedFailure = "roundedClip:\(value)"
-                    case nil:
-                        typedFailure = "nil"
-                    }
 
                     let frameFailureCountBefore =
                         renderer.frameRenderFailureCount
+                    var unsupportedCompletionRan = false
                     CATransaction.begin()
                     CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        unsupportedCompletionRan = true
+                    }
+                    root.addSublayer(unsupported)
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let unsupportedFailureWasTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerCornerGeometry(
+                                    .unsupportedCurve(
+                                        "future-curve"
+                                    )
+                                )
+                            )
+                    let unsupportedFailureRemainedPending =
+                        !unsupportedCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    unsupported.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let unsupportedFailureRecovered =
+                        unsupportedCompletionRan
+                        && renderer.lastFrameRenderFailure == nil
+
+                    var maskCompletionRan = false
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    CATransaction.setCompletionBlock {
+                        maskCompletionRan = true
+                    }
                     root.addSublayer(rejectedMaskedLayer)
                     CATransaction.commit()
+                    CATransaction.flush()
                     CAAnimationEngine.shared.renderFrame()
-                    let frameFailureTyped =
-                        renderer.frameRenderFailureCount
-                            - frameFailureCountBefore == 1
-                        && renderer.lastFrameRenderFailure
-                            == .contentMaskPreparationFailed(
-                                .layerFilter(.contentMaskCaptureFailed)
+                    let maskFailureWasTyped =
+                        renderer.lastFrameRenderFailure
+                            == .committedSnapshotCaptureFailed(
+                                .invalidLayerCornerGeometry(
+                                    .unsupportedCurve(
+                                        "future-mask-curve"
+                                    )
+                                )
                             )
+                    let maskFailureRemainedPending =
+                        !maskCompletionRan
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    rejectedMaskedLayer.removeFromSuperlayer()
+                    CATransaction.commit()
+                    CATransaction.flush()
+                    CAAnimationEngine.shared.renderFrame()
+                    let maskFailureRecovered =
+                        maskCompletionRan
+                        && renderer.lastFrameRenderFailure == nil
                     let failureDelta =
                         renderer.cornerCurveRenderFailureCount
                             - failureCountBefore
                     let maskFailureDelta = renderer.maskRenderFailureCount - maskFailureCountBefore
-                    let maskTypedFailure: String
-                    switch renderer.lastMaskRenderFailure {
-                    case .unsupportedCornerCurve(let context, let value):
-                        maskTypedFailure = "\(context.rawValue):\(value)"
-                    case .none:
-                        maskTypedFailure = "nil"
-                    default:
-                        maskTypedFailure = "other"
-                    }
-                    cornerCurveProbeResult = "\(pixelText),failures=\(failureDelta),typed=\(typedFailure),maskFailures=\(maskFailureDelta),maskTyped=\(maskTypedFailure),frameTyped=\(frameFailureTyped)"
+                    let frameFailureDelta =
+                        renderer.frameRenderFailureCount
+                            - frameFailureCountBefore
+                    cornerCurveProbeResult =
+                        "\(pixelText),"
+                        + "failures=\(failureDelta),"
+                        + "maskFailures=\(maskFailureDelta),"
+                        + "unsupportedTyped=\(unsupportedFailureWasTyped),"
+                        + "unsupportedPending=\(unsupportedFailureRemainedPending),"
+                        + "unsupportedRecovered=\(unsupportedFailureRecovered),"
+                        + "maskTyped=\(maskFailureWasTyped),"
+                        + "maskPending=\(maskFailureRemainedPending),"
+                        + "maskRecovered=\(maskFailureRecovered),"
+                        + "frameFailures=\(frameFailureDelta)"
                 } catch {
                     cornerCurveProbeResult = "error: \(error)"
                 }
 
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 circular.removeFromSuperlayer()
                 continuous.removeFromSuperlayer()
                 textured.removeFromSuperlayer()
@@ -9068,10 +9849,13 @@ func installHarness() {
                 gradient.removeFromSuperlayer()
                 masked.removeFromSuperlayer()
                 unsupported.removeFromSuperlayer()
+                unsupportedBacking.removeFromSuperlayer()
                 maskFailureBacking.removeFromSuperlayer()
                 rejectedMaskedLayer.removeFromSuperlayer()
                 firstOverlappingClip.removeFromSuperlayer()
                 secondOverlappingClip.removeFromSuperlayer()
+                CATransaction.commit()
+                CATransaction.flush()
                 CAAnimationEngine.shared.renderFrame()
             }
         })

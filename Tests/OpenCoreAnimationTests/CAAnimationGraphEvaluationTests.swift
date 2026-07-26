@@ -71,7 +71,8 @@ struct CAAnimationGraphEvaluationTests {
 
         #expect(abs(CGFloat(state.progress) - 0.25) < epsilon)
         #expect(state.type == .fade)
-        expectColor(try #require(state.sourceLayer.backgroundColor), [1, 0, 0, 1])
+        let sourceLayer = try #require(state.sourceLayer)
+        expectColor(try #require(sourceLayer.backgroundColor), [1, 0, 0, 1])
         expectColor(try #require(result.backgroundColor), [0, 0, 1, 1])
     }
 

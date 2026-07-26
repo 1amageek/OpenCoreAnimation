@@ -60,6 +60,29 @@ internal struct CAEmitterRenderConfiguration: Equatable, Sendable {
     init(
         layer: CAEmitterLayer
     ) throws(CARenderSnapshotEmitterError) {
+        try self.init(
+            layer: layer,
+            immutableCells: nil,
+            simulationIdentity: layer.simulationIdentity
+        )
+    }
+
+    init(
+        layer: CAEmitterLayer,
+        reusing committed: CAEmitterRenderConfiguration
+    ) throws(CARenderSnapshotEmitterError) {
+        try self.init(
+            layer: layer,
+            immutableCells: committed.emitterCells,
+            simulationIdentity: committed.simulationIdentity
+        )
+    }
+
+    private init(
+        layer: CAEmitterLayer,
+        immutableCells: [CAEmitterCellSnapshot]?,
+        simulationIdentity: UInt64
+    ) throws(CARenderSnapshotEmitterError) {
         switch layer.emitterShape {
         case .point, .line, .rectangle, .cuboid, .circle, .sphere:
             break
@@ -94,10 +117,14 @@ internal struct CAEmitterRenderConfiguration: Equatable, Sendable {
             throw .nonFiniteLayerSimulationValue
         }
 
-        simulationIdentity = layer.simulationIdentity
-        emitterCells = try CAEmitterCellSnapshot.capture(
-            layer.emitterCells ?? []
-        )
+        self.simulationIdentity = simulationIdentity
+        if let immutableCells {
+            emitterCells = immutableCells
+        } else {
+            emitterCells = try CAEmitterCellSnapshot.capture(
+                layer.emitterCells ?? []
+            )
+        }
         emitterPosition = layer.emitterPosition
         emitterZPosition = layer.emitterZPosition
         emitterSize = layer.emitterSize

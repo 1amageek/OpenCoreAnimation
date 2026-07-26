@@ -50,22 +50,38 @@ open class CATransition: CAAnimation {
     /// The layer tree captured when this transition was attached.
     /// The renderer owns no model state; the animation copy carries its source state.
     internal var sourceLayerSnapshot: CALayer?
-    internal let resourceIdentity: UInt64
+    internal var committedSourceSnapshot: CARenderSnapshot?
+    internal var resourceIdentity: UInt64
+    internal var committedFilterSnapshot:
+        CARenderSnapshotTransition.Filter?
+    internal var committedFilterCaptureFailure:
+        CATransitionRenderFailure?
+    internal var usesCommittedFilterSnapshot = false
 
     /// The name of the transition.
-    open var type: CATransitionType = .fade
+    open var type: CATransitionType = .fade {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// An optional subtype that specifies a direction or configuration for the transition.
-    open var subtype: CATransitionSubtype?
+    open var subtype: CATransitionSubtype? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// The amount of progress through to the transition at which to begin and end execution.
-    open var startProgress: Float = 0
+    open var startProgress: Float = 0 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// The amount of progress through the transition at which to end execution.
-    open var endProgress: Float = 1
+    open var endProgress: Float = 1 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// An optional Core Image filter object that provides the transition.
-    open var filter: Any?
+    open var filter: Any? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     public required init() {
         resourceIdentity = Self.nextResourceIdentity()
@@ -82,6 +98,15 @@ open class CATransition: CAAnimation {
             self.endProgress = source.endProgress
             self.filter = source.filter
             self.sourceLayerSnapshot = source.sourceLayerSnapshot
+            self.committedSourceSnapshot =
+                source.committedSourceSnapshot
+            self.committedFilterSnapshot =
+                source.committedFilterSnapshot
+            self.committedFilterCaptureFailure =
+                source.committedFilterCaptureFailure
+            self.usesCommittedFilterSnapshot =
+                source.usesCommittedFilterSnapshot
+            self.resourceIdentity = source.resourceIdentity
         }
     }
 

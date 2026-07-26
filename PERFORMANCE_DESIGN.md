@@ -46,10 +46,10 @@ where the resolution lives:
    `presentation()` / `render()` surface plus a new `internal` introspection
    surface (frame counter, dirty mask). They must not reach into `private`
    storage.
-4. **Native + WASM parity.** Every Phase 1 / 2 / 5 test runs natively
-   (`swift test`) because the dirty-bit and cache logic is platform-agnostic.
-   Phase 3 / 4 tests that touch the WebGPU renderer have a native-only stub
-   `MockCARenderer` so they run under `swift test` too.
+4. **Native + WASM parity.** Every Phase 1 / 2 / 5 test runs natively through
+   timeout-bounded `xcodebuild test` because the dirty-bit and cache logic is
+   platform-agnostic. Phase 3 / 4 tests that touch the WebGPU renderer have a
+   native-only stub `MockCARenderer` so they run through the same command too.
 5. **No brittle frame-time assertions.** Performance gain is measured E2E in
    `megaman` Playwright; correctness tests assert call counts, cache hits, and
    bitfield state — not wall-clock.
@@ -797,7 +797,7 @@ stubs out actual GPU calls and records calls to a counter.
 
 ## 6. Phase 4 — Commit-driven rendering
 
-**Implementation checkpoint (2026-07-26).** R4.5 and the static-submit
+**Implementation checkpoint (2026-07-26).** R4.4, R4.5, and the static-submit
 suppression slice of R4.3 are implemented. A `Sendable`, CALayer-free
 `CARenderSnapshot` now owns the complete presentation input consumed by the
 native Metal backend, and `CAMetalRenderer` encodes exclusively from that
@@ -869,15 +869,18 @@ values. A stable simulation identity lets presentation copies address the same
 renderer-owned particle state without retaining a model layer. Successful
 submission retains only the immutable emitter snapshot while particles require
 clean-tree frames; encoding failure restores the complete particle state and
-keeps the committed transaction pending for retry. The snapshot does not yet
-own copied animation evaluators. Static tiled layers capture immutable provider
+keeps the committed transaction pending for retry. Animated commits own a
+copied layer and animation graph behind one `Mutex<CALayer>`. Frame evaluation
+occurs only under that lock and produces the same value-only snapshot consumed
+by both renderers; callbacks, I/O, and GPU work stay outside the critical
+section. Static tiled layers capture immutable provider
 content and use renderer-owned generation/cache state. When a transition is
 represented in a snapshot, it contains immutable source and target subtrees,
 value-owned filter configuration, composite geometry, and progress; WebGPU
 never rereads the transition's model layer or filter object while encoding that
-snapshot. Active transaction commits still publish
-`requiresLiveAnimationEvaluation` until the copied evaluator produces these
-snapshots in the normal frame path.
+snapshot. Active transaction commits publish
+`animationEvaluator(frameToken:evaluator:)`, which produces these snapshots in
+the normal frame path without rereading the model tree.
 Backface policy, clipping geometry, and the captured transform are value-owned
 and evaluated by both static snapshot renderers.
 The native Metal verification renderer rejects committed image contents,
@@ -888,12 +891,12 @@ emitters, and tiled layers with the corresponding
 and reporting a successful frame.
 Layout reaches a parent-to-child fixed point before static snapshot capture,
 including detached-mask trees and descendants introduced by layout callbacks.
-Animated commits still publish `requiresLiveAnimationEvaluation`. WebGPU rejects
+Animated commits publish an immutable animation evaluator. WebGPU rejects
 typed committed capture failures,
 captures layer and detached-mask revisions after delegate callbacks, clears
 only matching revisions after submission, and acknowledges only the committed
 generation with which the frame began. Every committed state carries that
-generation token. R4.1 and R4.2 remain partial; R4.4, full snapshot-token
+generation token. R4.1 and R4.2 remain partial; full snapshot-token
 decoupling, and active-subtree-only animation evaluation remain open design
 targets below.
 
@@ -902,41 +905,33 @@ targets below.
 ```swift
 internal struct CARenderSnapshot: Sendable {
     struct Node: Sendable {
-        /// Identity, NOT a strong reference. Used as the key into renderer
-        /// caches (texture cache, rasterization cache). The snapshot must
-        /// not retain CALayer because CALayer is a non-Sendable class. (B3)
         let identity: ObjectIdentifier
-
+        let contentRevision: UInt64
+        let hasActiveAnimations: Bool
         let presentationValues: PresentationValues
-        let sortedChildIndices: [Int]
-        let activeAnimations: [SnapshotAnimationRef]   // also Sendable (see below)
-        let backingStoreToken: BackingStoreToken?
+        let childIndices: [Int]
+        let maskIndex: Int?
     }
 
-    /// A snapshot-time copy of just the fields the renderer reads from a
-    /// CAAnimation (start time, evaluator function, key path). Holding a
-    /// CAAnimation directly would re-introduce non-Sendable state (delegate
-    /// closures, mutable timing offsets).
-    struct SnapshotAnimationRef: Sendable {
-        let key: String
-        let beginTime: CFTimeInterval
-        let duration: CFTimeInterval
-        // ... other immutable scalars needed at evaluation time ...
-    }
-
-    let nodes: [Node]                       // depth-first index
+    let nodes: [Node]
     let frameToken: UInt64
     let rootIndex: Int
-    let completionBlocks: [@Sendable () -> Void]   // queued from CATransaction
+}
+
+internal final class CACommittedAnimationEvaluator: Sendable {
+    private let rootLayer: Mutex<CALayer>
+
+    func snapshot(frameToken: UInt64) throws -> CARenderSnapshot
 }
 ```
 
 `PresentationValues` is a `struct` carrying every render-affecting field
-(geometry, appearance, contents handle, etc.). Built once during `commit()`,
-read by the renderer. **The model `CALayer` is never referenced from the
-snapshot** (B3) — the renderer keeps a parallel `[ObjectIdentifier:
-CALayer]` weak map for the rare cache lookup that needs the live object,
-which is also why the rasterization cache (§5.2) keys by `ObjectIdentifier`.
+(geometry, appearance, contents storage, effects, renderer configuration,
+and transition state). Static trees build it once during `commit()`. Animated
+trees copy their complete model and animation graph at that boundary, then
+produce a fresh value-only snapshot for each evaluated frame.
+**The mutable model `CALayer` is never referenced from the snapshot or copied
+evaluator** (B3).
 
 #### Why this pattern (B3 detail)
 
@@ -1010,7 +1005,7 @@ membership.
 
 ### 6.3 Commit-snapshot decoupling from `CADisplayLink` (R4.3)
 
-The current live-tree engine already suppresses a display-link submission when
+The current committed engine suppresses a display-link submission when
 the root's subtree dirty count is zero, no progressing or unprocessed terminal
 animation exists in the layer or mask tree, and the renderer reports no pending
 tile or emitter work. Future and paused animations stay idle after the dirty
@@ -1018,8 +1013,8 @@ frame that captured their committed presentation; the always-running display
 link re-evaluates timing and resumes submission on entry to an active interval.
 An unprocessed terminal interval requests one final frame before completion.
 Manual `renderFrame()` calls remain unconditional. This completes the
-live-tree submission-decision slice, but the renderer still evaluates the
-complete live tree rather than only an active snapshot subtree. The explicit
+submission-decision slice, but the committed evaluator still evaluates its
+complete copied tree rather than only an active snapshot subtree. The explicit
 `CARenderer` uses the same active/terminal distinction and traverses detached
 masks for layout, scheduling, effect discovery, and completion.
 
@@ -1071,8 +1066,11 @@ open func add(_ anim: CAAnimation, forKey key: String?) {
 }
 ```
 
-`CARenderSnapshot.capture` reads `_animations` per layer at capture time.
-Mutations after capture do not affect the in-flight snapshot.
+The outermost transaction copies each animation graph into
+`CACommittedAnimationSnapshot` values. Those values are materialized only
+inside the evaluator-owned tree, and each evaluated frame becomes a
+`CARenderSnapshot`. Mutations after commit affect only a later evaluator
+generation and cannot alter the in-flight snapshot.
 
 ### 6.5 Completion blocks fire post-submit (R4.5)
 
@@ -1089,9 +1087,8 @@ path. A custom `CAAction` that mutates another root while the outer commit is
 being applied registers that root with the coordinator without opening a
 second implicit transaction.
 
-The Metal renderer, WebGPU immutable snapshot path, and WebGPU typed live-tree
-paths release the render-root obligation only after command submission and
-dirty clearing:
+The Metal renderer and WebGPU immutable snapshot path release the render-root
+obligation only after command submission and dirty clearing:
 
 ```swift
 device.queue.submit([encoder.finish()])
@@ -1102,9 +1099,7 @@ rootLayer.completeTransactionsAfterRenderRecursively() // ② then release block
 If a transaction has neither model mutations nor animations, sealing its
 coordinator completes it immediately. If a mutated root has not been submitted,
 the coordinator remains pending on that root. Native static snapshots and
-WebGPU snapshots preserve the same coordinator semantics; animated WebGPU
-submissions remain a typed live-tree path until the copied animation evaluator
-is implemented.
+animated evaluator snapshots preserve the same coordinator semantics.
 
 **Why this order (B6 detail).** A completion block can legally mutate the
 layer graph — the canonical pattern is "fade-out animation finishes →
@@ -1127,27 +1122,25 @@ matches its documented behavior.
 ### 6.6 Planned snapshot migration (R4.1–R4.4)
 
 The production WebGPU renderer consumes transaction-owned immutable value
-snapshots for common static trees, including ordinary `CGImage` contents,
-gradients, shapes, and text configuration. The native Metal backend consumes
-each snapshot feature it supports and reports a typed unsupported-feature
-error for every unimplemented committed resource category. Animated trees
-still require frame-time live-tree evaluation because the copied animation
-evaluator is not yet implemented. As R4.1–R4.4 continue, migration may
-temporarily permit
-`pendingSnapshot == nil` (no commit happened) to render live for existing
-callers (`CADisplayLink.displayLinkDidFire` direct →
-`renderer.render(layer:)`).
+snapshots for static and animated trees, including ordinary `CGImage`
+contents, gradients, shapes, text configuration, effects, transition
+participants, emitter cells, tiled input, and expanded replicator instances.
+The native Metal backend consumes each snapshot feature it supports and reports
+a typed unsupported-feature error for every unimplemented committed resource
+category. Animated trees evaluate only the copied evaluator-owned hierarchy;
+the mutable model tree is not read after commit.
 
 The pending state exists on each render root. WebGPU consumes capture failures,
 generation ownership, and common-solid snapshot render values. Completion
 ordering in §6.5, the live-tree static submission decision in §6.3,
 transaction-owned static snapshots, direct common-solid WebGPU encoding,
 revision-safe dirty clearing on both backends, frame-boundary mutation
-isolation, immutable transition participants, and value-owned transition filter
-configuration are completed Phase 4 building blocks. The final snapshot
-acceptance test must prove that the normal animated commit path, including
-transitions, uses those values and stops reading mutable model state after
-commit.
+isolation, immutable transition participants, value-owned transition filter
+configuration, copied animation graphs, delayed replicator instance
+evaluation, and node-scoped transition failures are completed Phase 4
+building blocks. Native mutation-isolation tests and Chromium GPU readback
+prove that the normal animated commit path, including transitions, uses those
+values and stops reading mutable model state after commit.
 
 ### 6.7 Edge cases checklist
 
@@ -1167,6 +1160,9 @@ commit.
 | Public transaction recursive exclusion | `CATransactionRecursiveLock` with a `Mutex<Void>` gate and `Mutex<State>` owner metadata | Same common declaration and runtime path | Package has no Embedded product; no weaker branch exists | `CATransaction.lock()` / `unlock()` | Static process lifetime; split acquire/release is required by the public API, while owner metadata remains scoped to `withLock` |
 | Transaction stack | Thread-confined `CATransactionStack` retained in the internal pthread TLS slot | Same common declaration and C TLS boundary | Package has no Embedded product; no weaker branch exists | `getCurrentTransactionStack()` creates on the calling thread; all transaction reads and mutations stay on that thread | Idle clearing removes the slot before releasing its retained owner; the pthread destructor releases an uncommitted stack exactly once at thread exit |
 | Transition resource identity | Static `Mutex<UInt64>` counter shared by every `CATransition` initializer | Same common declaration | Package has no Embedded product; no weaker branch exists | `CATransition.nextResourceIdentity()` is the only mutation entry point | Static process lifetime; no callback or I/O occurs under the mutex |
+| Committed animation evaluator tree | `Mutex<CALayer>` owns the copied hierarchy and animation graph | Same common declaration | Package has no Embedded product; no weaker branch exists | `CACommittedAnimationEvaluator.snapshot(frameToken:)` is the only read/mutation entry point | Retained per root while animation work remains; no callback, I/O, `await`, or GPU work occurs under the mutex |
+| Detached mask owner | Weak owner protected by `Mutex<Void>` | Same common declaration | Package has no Embedded product; no weaker branch exists | `maskOwnerForTransaction`, `setMaskOwner`, and `clearMaskOwner` | Weak zeroing belongs to the Swift runtime; all explicit reads and mutations use the common mutex |
+| Attached animation mutation target | Non-Sendable animation owns an exactly-once weak layer/root reference | Same common declaration | Package has no Embedded product; no weaker branch exists | Property observers call `notifyAttachedLayerOfMutation`; attachment is established when the copied animation is added | Weak zeroing belongs to the Swift runtime; the reference never crosses a Sendable boundary |
 | Transition GPU capture and failure history | Renderer state is `MainActor`-isolated | Same `MainActor` renderer declaration and browser execution path | Package has no Embedded product | Frame preparation, encoding, retirement, and diagnostic reads all enter through `CAWebGPURenderer` | Resources are retired at a frame boundary or renderer invalidation; GPU destruction and callbacks occur outside every mutex |
 
 The TLS C boundary stores one opaque pointer and never reads Swift object
@@ -1196,9 +1192,9 @@ is a graphics/WASM package rather than an Embedded product.
 | 4.1 | `commitProducesSnapshot` | After `CATransaction.commit()`, `pendingSnapshot != nil`, frame token incremented | Snapshot capture. |
 | 4.2 | `snapshotIsImmutableAcrossModelMutation` | Mutate model after commit → snapshot.presentationValues unchanged | Defensive copy. |
 | 4.3 | `cleanStaticTreeSkipsSubmit` | A clean display-link tick does not increment `MockRenderer.submitCount`; dirty and renderer-owned work do | R4.3 static decision — implemented. |
-| 4.4 | `liveAnimationForcesEvaluation` | When animation is active, render evaluates only the affected snapshot subtree regardless of token equality | R4.3 snapshot escape hatch — open. |
+| 4.4 | `liveAnimationForcesEvaluation` | When animation is active, render evaluates the committed copied tree without reading the model tree | R4.4 immutable evaluator — implemented; active-subtree-only evaluation remains open. |
 | 4.5 | `nonAnimatedMutationCompletesAfterRendererSubmission` and related completion tests | Blocks remain pending through commit and fire only after renderer submit plus dirty clear; animation and callback-mutation obligations are also verified | R4.5 — implemented. |
-| 4.6 | `addAnimationDirtiesAndIsCapturedNextCommit` | Adding animation mid-commit appears in *next* snapshot, not current | R4.4. |
+| 4.6 | `addAnimationDirtiesAndIsCapturedNextCommit` | Adding or mutating an attached animation republishes a new evaluator and cannot alter the prior committed generation | R4.4 — implemented. |
 
 ---
 

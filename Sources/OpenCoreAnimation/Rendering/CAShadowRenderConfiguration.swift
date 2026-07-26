@@ -7,6 +7,18 @@ internal struct CAShadowRenderConfiguration {
     let radius: Float
     let offset: CGSize
 
+    init(
+        color: SIMD4<Float>,
+        opacity: Float,
+        radius: Float,
+        offset: CGSize
+    ) {
+        self.color = color
+        self.opacity = opacity
+        self.radius = radius
+        self.offset = offset
+    }
+
     init(layer: CALayer) throws(CAShadowRenderFailure) {
         let convertedRadius = Float(layer.shadowRadius)
         let convertedOffsetX = Float(layer.shadowOffset.width)

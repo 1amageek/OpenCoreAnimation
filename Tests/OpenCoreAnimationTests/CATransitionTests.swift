@@ -35,7 +35,8 @@ struct CATransitionTests {
         let state = try #require(presentation._transitionRenderState)
         #expect(assertApproximatelyEqual(CGFloat(state.progress), 0.25, tolerance: epsilon))
         #expect(state.type == .fade)
-        #expect(state.sourceLayer.backgroundColor?.components == [1, 0, 0, 1])
+        let sourceLayer = try #require(state.sourceLayer)
+        #expect(sourceLayer.backgroundColor?.components == [1, 0, 0, 1])
         #expect(presentation.backgroundColor?.components == [0, 0, 1, 1])
         #expect(presentation.opacity == 1)
     }
@@ -184,7 +185,8 @@ struct CATransitionTests {
 
         setStoredAnimationBeginTime(CACurrentMediaTime() - 0.5, on: layer, forKey: "transition")
         let state = try #require(layer.presentation()?._transitionRenderState)
-        #expect(state.sourceLayer.sublayers?.map(\.name) == ["prior"])
+        let sourceLayer = try #require(state.sourceLayer)
+        #expect(sourceLayer.sublayers?.map(\.name) == ["prior"])
         #expect(layer.sublayers?.map(\.name) == ["current"])
     }
 
@@ -204,5 +206,23 @@ struct CATransitionTests {
         let presentation = try #require(layer.presentation())
         let state = try #require(presentation._transitionRenderState)
         #expect(state.filter as? String == "typed-filter-bridge-required")
+    }
+
+    @Test("Committed and public copies preserve transition resource identity")
+    func copiesPreserveResourceIdentity() throws {
+        let transition = CATransition()
+        let expectedIdentity = transition.resourceIdentity
+
+        let publicCopy = transition.copy()
+        let committedSnapshot = try CACommittedAnimationSnapshot.capture(
+            transition,
+            frameToken: 1
+        )
+        let committedCopy = try #require(
+            try committedSnapshot.materialize() as? CATransition
+        )
+
+        #expect(publicCopy.resourceIdentity == expectedIdentity)
+        #expect(committedCopy.resourceIdentity == expectedIdentity)
     }
 }

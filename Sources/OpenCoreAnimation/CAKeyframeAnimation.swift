@@ -11,35 +11,53 @@ import Foundation
 open class CAKeyframeAnimation: CAPropertyAnimation {
 
     /// An array of objects that specify the keyframe values to use for the animation.
-    open var values: [Any]?
+    open var values: [Any]? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// The path for a point-based property to follow.
-    open var path: CGPath?
+    open var path: CGPath? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// An optional array of numbers that define the time at which each keyframe value is applied.
     /// Values should be in the range [0, 1].
-    open var keyTimes: [CGFloat]?
+    open var keyTimes: [CGFloat]? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// An optional array of CAMediaTimingFunction objects.
-    open var timingFunctions: [CAMediaTimingFunction]?
+    open var timingFunctions: [CAMediaTimingFunction]? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Specifies how intermediate keyframe values are calculated by the receiver.
-    open var calculationMode: CAAnimationCalculationMode = .linear
+    open var calculationMode: CAAnimationCalculationMode = .linear {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// An array of numbers that define the tightness of the curve.
     /// Used with cubic and Catmull-Rom calculation modes.
-    open var tensionValues: [CGFloat]?
+    open var tensionValues: [CGFloat]? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// An array of numbers that define the sharpness of timing curve corners.
     /// Used with cubic calculation mode.
-    open var continuityValues: [CGFloat]?
+    open var continuityValues: [CGFloat]? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// An array of numbers that define the position of the curve relative to a control point.
     /// Used with cubic calculation mode.
-    open var biasValues: [CGFloat]?
+    open var biasValues: [CGFloat]? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Determines whether objects animating along the path rotate to match the path tangent.
-    open var rotationMode: CAAnimationRotationMode?
+    open var rotationMode: CAAnimationRotationMode? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     public required init() {
         super.init()

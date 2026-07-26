@@ -45,11 +45,23 @@ public enum CARenderSnapshotShadowError: Error, Equatable, Sendable {
     case nonFiniteGeometry
     case invalidColor
     case pathTessellationFailed
+    case invalidCompositeOpacity(Float)
 }
 
 /// A rasterization value that could not cross the immutable commit boundary.
 public enum CARenderSnapshotRasterizationError: Error, Equatable, Sendable {
     case invalidRasterizationScale(CGFloat)
+}
+
+/// Corner geometry that could not cross the immutable commit boundary.
+public enum CARenderSnapshotCornerGeometryError:
+    Error,
+    Equatable,
+    Sendable
+{
+    case negativeCornerRadius(CGFloat)
+    case unsupportedCurve(String)
+    case invalidResolvedGeometry
 }
 
 /// A gradient value that could not cross the immutable commit boundary.
@@ -169,7 +181,9 @@ public enum CARendererError: Error, Equatable, Sendable {
     /// A layer border width cannot be represented by the renderer.
     case invalidLayerBorderWidth
     /// A layer corner curve or radius cannot be represented by the renderer.
-    case invalidLayerCornerGeometry
+    case invalidLayerCornerGeometry(
+        CARenderSnapshotCornerGeometryError
+    )
     /// Layer image contents could not be captured into immutable renderer storage.
     case invalidLayerContents(CAImageContentsSnapshotError)
     /// Delegate drawing could not produce an immutable bitmap at commit time.
@@ -200,6 +214,8 @@ public enum CARendererError: Error, Equatable, Sendable {
     case invalidLayerTiled(CATiledLayerRenderFailure)
     /// A transition could not become immutable renderer input.
     case invalidLayerTransition(CATransitionRenderFailure)
+    /// An animation graph could not become immutable evaluator input.
+    case invalidCommittedAnimation(CACommittedAnimationCaptureError)
     /// The selected verification backend cannot encode a committed resource.
     case unsupportedCommittedSnapshotFeature(CARenderSnapshotFeature)
     /// A pixel readback coordinate was non-integral or outside the texture.

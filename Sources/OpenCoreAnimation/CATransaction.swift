@@ -118,6 +118,7 @@ private final class CATransactionStack {
     var applyingCompletionCoordinators: [CATransactionCompletionCoordinator] = []
     var isApplyingChange = false
     var rootsMutatedWhileApplyingChanges: [ObjectIdentifier: CALayer] = [:]
+    var mutationRegistrationSuppressionDepth = 0
 
     #if DEBUG
     let lifecycleIdentifier: UInt64
@@ -145,6 +146,7 @@ private final class CATransactionStack {
         return levels.isEmpty &&
             !implicitCommitScheduled &&
             !isApplyingChange &&
+            mutationRegistrationSuppressionDepth == 0 &&
             !hasRetainedBrowserCallbacks
     }
 
@@ -190,6 +192,10 @@ private final class CATransactionStack {
         let roots = rootsMutatedWhileApplyingChanges
         rootsMutatedWhileApplyingChanges.removeAll(keepingCapacity: true)
         return roots
+    }
+
+    var suppressesMutationRegistration: Bool {
+        mutationRegistrationSuppressionDepth > 0
     }
 
     #if arch(wasm32)
@@ -371,6 +377,26 @@ private extension Array where Element == CATransactionCompletionCoordinator {
 
 /// A mechanism for grouping multiple layer-tree operations into atomic updates to the render tree.
 public class CATransaction {
+    /// Runs an internal layer-copy operation without publishing model work.
+    ///
+    /// Presentation and transition snapshots reuse public copy initializers
+    /// to preserve subclass invariants. Setter calls made by those
+    /// initializers belong to the copy operation, not to a model transaction.
+    internal class func withMutationRegistrationSuppressed<Result>(
+        _ body: () throws -> Result
+    ) rethrows -> Result {
+        let existingStack = currentTransactionStackIfPresent()
+        let stack = existingStack ?? getCurrentTransactionStack()
+        stack.mutationRegistrationSuppressionDepth += 1
+        defer {
+            stack.mutationRegistrationSuppressionDepth -= 1
+            if existingStack == nil {
+                releaseTransactionStackIfIdle(stack)
+            }
+        }
+        return try body()
+    }
+
     private static let transactionLock = CATransactionRecursiveLock()
 
     /// Begin a new transaction for the current thread.
@@ -519,13 +545,21 @@ public class CATransaction {
         for root in minimalRenderRoots(for: layers) {
             let frameToken = CALayer.advanceFrameToken()
             root.prepareLayoutForRenderSnapshot()
-            guard !root.hasUnfinishedAnimationsRecursively() else {
-                root.publishCommittedRenderState(
-                    .requiresLiveAnimationEvaluation(frameToken: frameToken)
-                )
-                continue
-            }
             do {
+                if root.hasUnfinishedAnimationsRecursively() {
+                    let evaluator =
+                        try CACommittedAnimationEvaluator(
+                            rootLayer: root,
+                            frameToken: frameToken
+                        )
+                    root.publishCommittedRenderState(
+                        .animationEvaluator(
+                            frameToken: frameToken,
+                            evaluator: evaluator
+                        )
+                    )
+                    continue
+                }
                 let snapshot = try CARenderSnapshot.capture(
                     root,
                     frameToken: frameToken
@@ -648,6 +682,7 @@ public class CATransaction {
         guard !layer._isPresentationLayer else { return }
 
         let stack = getCurrentTransactionStack()
+        guard !stack.suppressesMutationRegistration else { return }
 
         // Create an implicit transaction if none exists
         if stack.levels.isEmpty {
@@ -699,6 +734,7 @@ public class CATransaction {
     internal class func registerMutation(layer: CALayer) {
         guard !layer._isPresentationLayer else { return }
         let stack = getCurrentTransactionStack()
+        guard !stack.suppressesMutationRegistration else { return }
 
         // Changes produced while applying an already-committing action belong
         // to the transaction currently being drained. Associate custom-action
@@ -715,12 +751,12 @@ public class CATransaction {
             return
         }
 
-        // Generic dirty marks supplement an existing transaction. Ordinary
-        // animatable setters call `registerChange`, which owns implicit
-        // transaction creation. A hierarchy/mask/display mutation made with
-        // no transaction has no completion coordinator to track and must not
-        // open an unrelated transaction scope.
-        guard !stack.levels.isEmpty else { return }
+        // Every model-tree mutation must cross the same immutable commit
+        // boundary, including hierarchy, mask, and display-only changes that
+        // do not call `registerChange`.
+        if stack.levels.isEmpty {
+            beginImplicit()
+        }
         stack.mutateLastLevel {
             $0.mutatedLayers[ObjectIdentifier(layer)] = layer
         }
@@ -815,6 +851,20 @@ public class CATransaction {
         while let level = stack.levels.last, level.isImplicitTransaction {
             commit(stack: stack)
         }
+    }
+
+    /// Publishes pending implicit work before a caller-requested manual frame.
+    ///
+    /// Explicit transaction levels remain owned by their caller and are never
+    /// committed by this operation.
+    internal class func commitPendingImplicitTransactions() {
+        guard let stack = currentTransactionStackIfPresent(),
+              stack.levels.last?.isImplicitTransaction == true else {
+            return
+        }
+        cancelImplicitCommitSchedule(stack)
+        commitImplicit(stack: stack)
+        releaseTransactionStackIfIdle(stack)
     }
 
     private class func handleImplicitCommitCallback(

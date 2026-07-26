@@ -48,6 +48,12 @@ public final class CAMetalRenderer: CARendererDelegate {
     /// The latest synchronous renderer failure, cleared after a successful submission.
     public private(set) var lastRenderError: CARendererError?
 
+    private var retainedAnimationEvaluator:
+        CACommittedAnimationEvaluator?
+    private var retainedAnimationFrameToken: UInt64?
+    private var retainedAnimationRootIdentity:
+        ObjectIdentifier?
+
     // MARK: - Initialization
 
     public init() {}
@@ -92,17 +98,29 @@ public final class CAMetalRenderer: CARendererDelegate {
         let committedFrameToken: UInt64?
         switch committedState {
         case .snapshot(let committedSnapshot):
+            retainedAnimationEvaluator = nil
+            retainedAnimationFrameToken = nil
+            retainedAnimationRootIdentity = nil
             snapshot = committedSnapshot
             committedFrameToken = committedSnapshot.frameToken
         case .captureFailure(_, let error):
+            retainedAnimationEvaluator = nil
+            retainedAnimationFrameToken = nil
+            retainedAnimationRootIdentity = nil
             lastRenderError = error
             return
-        case .requiresLiveAnimationEvaluation(let frameToken):
+        case .animationEvaluator(
+            let frameToken,
+            let evaluator
+        ):
+            retainedAnimationEvaluator = evaluator
+            retainedAnimationFrameToken = frameToken
+            retainedAnimationRootIdentity =
+                ObjectIdentifier(rootLayer)
             CALayer.advanceFrameToken()
             do {
-                snapshot = try CARenderSnapshot.capture(
-                    rootLayer,
-                    frameToken: CALayer._currentFrameToken
+                snapshot = try evaluator.snapshot(
+                    frameToken: frameToken
                 )
             } catch {
                 lastRenderError = error
@@ -110,17 +128,37 @@ public final class CAMetalRenderer: CARendererDelegate {
             }
             committedFrameToken = frameToken
         case nil:
-            CALayer.advanceFrameToken()
-            do {
-                snapshot = try CARenderSnapshot.capture(
-                    rootLayer,
-                    frameToken: CALayer._currentFrameToken
-                )
-            } catch {
-                lastRenderError = error
-                return
+            if retainedAnimationRootIdentity
+                    == ObjectIdentifier(rootLayer),
+               let retainedAnimationEvaluator,
+               let retainedAnimationFrameToken {
+                CALayer.advanceFrameToken()
+                do {
+                    snapshot =
+                        try retainedAnimationEvaluator
+                            .snapshot(
+                                frameToken:
+                                    retainedAnimationFrameToken
+                            )
+                } catch {
+                    lastRenderError = error
+                    return
+                }
+                committedFrameToken = nil
+            } else {
+                CALayer.advanceFrameToken()
+                do {
+                    snapshot = try CARenderSnapshot.capture(
+                        rootLayer,
+                        frameToken:
+                            CALayer._currentFrameToken
+                    )
+                } catch {
+                    lastRenderError = error
+                    return
+                }
+                committedFrameToken = nil
             }
-            committedFrameToken = nil
         }
 
         do {

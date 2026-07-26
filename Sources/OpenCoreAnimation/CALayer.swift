@@ -56,6 +56,8 @@ open class CALayer: CAMediaTiming, Hashable {
             // Copy content properties — use backing storage to bypass
             // markDirty during init (we reset dirty state below).
             self._contents = otherLayer._contents
+            self._committedImageContentsStorage =
+                otherLayer._committedImageContentsStorage
             self._contentsRect = otherLayer._contentsRect
             self._contentsCenter = otherLayer._contentsCenter
             self.contentsGravity = otherLayer.contentsGravity
@@ -100,6 +102,16 @@ open class CALayer: CAMediaTiming, Hashable {
             // Copy identification
             self._name = otherLayer._name
             self.style = otherLayer.style
+            self._committedSnapshotIdentity =
+                otherLayer._committedSnapshotIdentity
+            self._committedContentRevision =
+                otherLayer._committedContentRevision
+            self._committedStaticPresentationValues =
+                otherLayer._committedStaticPresentationValues
+            self._committedAnimationAffectsContents =
+                otherLayer._committedAnimationAffectsContents
+            self._suppressesAnimationLifecycle =
+                otherLayer._suppressesAnimationLifecycle
 
             // Note: We intentionally do NOT copy:
             // - delegate (weak reference, not owned)
@@ -125,6 +137,15 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// Set only on a presentation layer while a built-in CATransition is active.
     internal var _transitionRenderState: CATransitionRenderState?
+
+    /// Identity and immutable resource state owned by a committed animation
+    /// evaluator. These values belong to the copied tree, not the live model.
+    internal var _committedSnapshotIdentity: ObjectIdentifier?
+    internal var _committedContentRevision: UInt64?
+    internal var _committedStaticPresentationValues:
+        CARenderSnapshot.PresentationValues?
+    internal var _committedAnimationAffectsContents = false
+    internal var _suppressesAnimationLifecycle = false
 
     /// Returns a copy of the presentation layer object that represents the state of the layer
     /// as it currently appears onscreen.
@@ -210,7 +231,10 @@ open class CALayer: CAMediaTiming, Hashable {
     /// Creates a new presentation layer as a copy of this layer.
     private func createPresentationLayer() -> CALayer {
         let presentationClass = type(of: self)
-        let presentation = presentationClass.init(layer: self)
+        let presentation =
+            CATransaction.withMutationRegistrationSuppressed {
+                presentationClass.init(layer: self)
+            }
         presentation._isPresentation = true
         (presentation as? CAEmitterLayer)?
             .detachEmitterCellOwnershipForPresentation()
@@ -236,7 +260,10 @@ open class CALayer: CAMediaTiming, Hashable {
     internal func presentationAtTimeOffset(_ timeOffset: CFTimeInterval) -> Self {
         // Create a new presentation layer copy
         let presentationClass = type(of: self)
-        let presentation = presentationClass.init(layer: self)
+        let presentation =
+            CATransaction.withMutationRegistrationSuppressed {
+                presentationClass.init(layer: self)
+            }
         presentation._isPresentation = true
         (presentation as? CAEmitterLayer)?
             .detachEmitterCellOwnershipForPresentation()
@@ -294,6 +321,8 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // Copy contents-related properties (critical for texture animation)
         presentation._contents = _contents
+        presentation._committedImageContentsStorage =
+            _committedImageContentsStorage
         presentation._contentsRect = _contentsRect
         presentation._contentsCenter = _contentsCenter
         presentation.contentsGravity = contentsGravity
@@ -479,7 +508,8 @@ open class CALayer: CAMediaTiming, Hashable {
             duration: singleCycleDuration
         )
         guard timing.isValid else { return }
-        if timing.phase != .before {
+        if timing.phase != .before,
+           !_suppressesAnimationLifecycle {
             animation.markStarted()
         }
         guard timing.applies(fillMode: animation.fillMode) else { return }
@@ -534,7 +564,9 @@ open class CALayer: CAMediaTiming, Hashable {
         )
         let timing = CAMediaTimingEvaluator.evaluate(transition, parentTime: time, duration: duration)
         guard timing.isValid else { return }
-        if managesLifecycle, timing.phase != .before {
+        if managesLifecycle,
+           timing.phase != .before,
+           !_suppressesAnimationLifecycle {
             transition.markStarted()
         }
         guard timing.applies(fillMode: transition.fillMode) else { return }
@@ -556,13 +588,24 @@ open class CALayer: CAMediaTiming, Hashable {
         let endProgress = CFTimeInterval(transition.endProgress)
         let rangedProgress = startProgress + adjustedProgress * (endProgress - startProgress)
 
-        guard let sourceLayer = transition.sourceLayerSnapshot else { return }
+        guard transition.sourceLayerSnapshot != nil
+                || transition.committedSourceSnapshot != nil else {
+            return
+        }
         layer._transitionRenderState = CATransitionRenderState(
             resourceIdentity: transition.resourceIdentity,
-            sourceLayer: sourceLayer,
+            sourceLayer: transition.sourceLayerSnapshot,
+            committedSourceSnapshot:
+                transition.committedSourceSnapshot,
             type: transition.type,
             subtype: transition.subtype,
             filter: transition.filter,
+            committedFilterSnapshot:
+                transition.committedFilterSnapshot,
+            committedFilterCaptureFailure:
+                transition.committedFilterCaptureFailure,
+            usesCommittedFilterSnapshot:
+                transition.usesCommittedFilterSnapshot,
             progress: max(0, min(1, rangedProgress))
         )
     }
@@ -581,7 +624,9 @@ open class CALayer: CAMediaTiming, Hashable {
         )
         let timing = CAMediaTimingEvaluator.evaluate(group, parentTime: time, duration: groupBaseDuration)
         guard timing.isValid else { return }
-        if managesLifecycle, timing.phase != .before {
+        if managesLifecycle,
+           timing.phase != .before,
+           !_suppressesAnimationLifecycle {
             group.markStarted()
         }
         guard timing.applies(fillMode: group.fillMode) else { return }
@@ -838,9 +883,37 @@ open class CALayer: CAMediaTiming, Hashable {
         to layer: CALayer,
         progress: CFTimeInterval
     ) {
-        let fromValue = animation.fromValue ?? _contents
-        let toValue = animation.toValue ?? _contents
-        layer._contents = progress < 0.5 ? fromValue : toValue
+        let modelValue = committedContentsAnimationValue()
+        let fromValue = animation.fromValue ?? modelValue
+        let toValue = animation.toValue ?? modelValue
+        assignContentsAnimationValue(
+            progress < 0.5 ? fromValue : toValue,
+            to: layer
+        )
+    }
+
+    private func committedContentsAnimationValue() -> Any? {
+        if let storage = _committedImageContentsStorage {
+            return CACommittedImageAnimationValue(
+                storage: storage
+            )
+        }
+        return _contents
+    }
+
+    private func assignContentsAnimationValue(
+        _ value: Any?,
+        to layer: CALayer
+    ) {
+        if let committed =
+                value as? CACommittedImageAnimationValue {
+            layer._committedImageContentsStorage =
+                committed.storage
+            layer._contents = nil
+        } else {
+            layer._committedImageContentsStorage = nil
+            layer._contents = value
+        }
     }
 
     private func booleanAnimationValue(for keyPath: String) -> Bool? {
@@ -2846,7 +2919,7 @@ open class CALayer: CAMediaTiming, Hashable {
 
         switch keyPath {
         case "contents":
-            layer._contents = value
+            assignContentsAnimationValue(value, to: layer)
         case "opacity":
             if let v = value as? Float { layer._opacity = v }
         case "position":
@@ -3161,7 +3234,10 @@ open class CALayer: CAMediaTiming, Hashable {
         isLastSegment: Bool
     ) {
         if keyPath == "contents" {
-            layer._contents = t < 0.5 ? p1 : p2
+            assignContentsAnimationValue(
+                t < 0.5 ? p1 : p2,
+                to: layer
+            )
             return
         }
         if let valueFunction {
@@ -3542,12 +3618,16 @@ open class CALayer: CAMediaTiming, Hashable {
 
     /// An object that provides the contents of the layer. Animatable.
     private var _contents: Any?
+    /// Renderer-ready image storage owned by a committed animation evaluator.
+    internal var _committedImageContentsStorage:
+        CGImageTextureStorage?
     internal var _contentsAssignmentGeneration: UInt64 = 0
     open var contents: Any? {
         get { _contents }
         set {
             let oldValue = _contents
             _contents = newValue
+            _committedImageContentsStorage = nil
             _contentsAssignmentGeneration &+= 1
             delegateBackingStore = nil
             markDirty(.contents)
@@ -3659,7 +3739,39 @@ open class CALayer: CAMediaTiming, Hashable {
     open var mask: CALayer? {
         didSet {
             guard oldValue !== mask else { return }
+            if !_isPresentation {
+                oldValue?.clearMaskOwner(ifOwnedBy: self)
+                if let mask {
+                    if let previousOwner =
+                            mask.maskOwnerForTransaction,
+                       previousOwner !== self {
+                        previousOwner.mask = nil
+                    }
+                    mask.setMaskOwner(self)
+                }
+            }
             markDirty(.mask)
+        }
+    }
+
+    private let maskOwnerLock = Mutex<Void>(())
+    nonisolated(unsafe) private weak var maskOwner: CALayer?
+
+    private var maskOwnerForTransaction: CALayer? {
+        maskOwnerLock.withLock { _ in maskOwner }
+    }
+
+    private func setMaskOwner(_ owner: CALayer) {
+        maskOwnerLock.withLock { _ in
+            maskOwner = owner
+        }
+    }
+
+    private func clearMaskOwner(ifOwnedBy owner: CALayer) {
+        maskOwnerLock.withLock { _ in
+            if maskOwner === owner {
+                maskOwner = nil
+            }
         }
     }
 
@@ -4864,13 +4976,22 @@ open class CALayer: CAMediaTiming, Hashable {
     /// thread-local while the animation engine consumes frames on MainActor.
     private let committedRenderState = Mutex<CACommittedRenderState?>(nil)
 
-    /// The ordinary superlayer root used to associate a committed mutation
-    /// with a renderer. Detached mask roots remain independent and are drained
-    /// by the renderer's recursive mask traversal.
+    /// The render root used to associate a committed mutation with a renderer.
+    /// A detached mask root crosses its weak mask-owner edge before continuing
+    /// through the owner's ordinary superlayer hierarchy.
     internal var transactionRenderRoot: CALayer {
         var root = self
-        while let parent = root._superlayer {
-            root = parent
+        var visited: Set<ObjectIdentifier> = []
+        while visited.insert(ObjectIdentifier(root)).inserted {
+            if let parent = root._superlayer {
+                root = parent
+                continue
+            }
+            if let maskOwner = root.maskOwnerForTransaction {
+                root = maskOwner
+                continue
+            }
+            break
         }
         return root
     }
@@ -5216,6 +5337,10 @@ open class CALayer: CAMediaTiming, Hashable {
 
     private var _animationKeyCounter: Int = 0
 
+    internal var hasActiveAnimationsForCommittedSnapshot: Bool {
+        _animations.values.contains { !$0.isFinished }
+    }
+
     /// Add the specified animation object to the layer's render tree.
     ///
     /// If an animation with the same key already exists, it is replaced.
@@ -5239,6 +5364,7 @@ open class CALayer: CAMediaTiming, Hashable {
             if !existingAnimation.isFinished {
                 existingAnimation.markFinished(completed: false)
             }
+            existingAnimation.detachFromLayer()
         }
 
         // Copy per Apple's contract: "the animation is copied".
@@ -5257,8 +5383,8 @@ open class CALayer: CAMediaTiming, Hashable {
         // Set up animation internal state on the copy.
         copied.isFinished = false
         copied.hasStarted = false
-        copied.attachedLayer = self
         copied.animationKey = animKey
+        copied.attach(to: self, forKey: animKey)
 
         _animations[animKey] = copied
         CATransaction.registerAnimation(copied)
@@ -5266,17 +5392,405 @@ open class CALayer: CAMediaTiming, Hashable {
 
     }
 
+    /// Creates a hierarchy and animation graph owned exclusively by a
+    /// committed evaluator. Model-layer identities and immutable renderer
+    /// resources are retained by value so later live-tree mutation cannot
+    /// alter a frame generated from this copy.
+    internal func makeCommittedAnimationEvaluatorCopy(
+        frameToken: UInt64
+    ) throws(CARendererError) -> sending CALayer {
+        let staticSnapshot = try CARenderSnapshot.capture(
+            self,
+            frameToken: frameToken,
+            evaluatesAnimations: false
+        )
+        var valuesByIdentity: [
+            ObjectIdentifier:
+                CARenderSnapshot.PresentationValues
+        ] = [:]
+        var revisionsByIdentity:
+            [ObjectIdentifier: UInt64] = [:]
+        for node in staticSnapshot.nodes {
+            if valuesByIdentity[node.identity] == nil {
+                valuesByIdentity[node.identity] =
+                    node.presentationValues
+                revisionsByIdentity[node.identity] =
+                    node.contentRevision
+            }
+        }
+        return try makeCommittedAnimationEvaluatorCopy(
+            valuesByIdentity: valuesByIdentity,
+            revisionsByIdentity: revisionsByIdentity,
+            frameToken: frameToken
+        )
+    }
+
+    private func makeCommittedAnimationEvaluatorCopy(
+        valuesByIdentity: [
+            ObjectIdentifier:
+                CARenderSnapshot.PresentationValues
+        ],
+        revisionsByIdentity: [ObjectIdentifier: UInt64],
+        frameToken: UInt64
+    ) throws(CARendererError) -> sending CALayer {
+        let identity = ObjectIdentifier(self)
+        guard let staticValues = valuesByIdentity[
+            identity
+        ], let contentRevision = revisionsByIdentity[
+            identity
+        ] else {
+            throw .renderingFailed(
+                "Committed animation evaluator lost its static layer mapping"
+            )
+        }
+
+        let copy = type(of: self).init()
+        // Evaluator construction is an immutable commit-internal copy
+        // operation. Public setters are reused to preserve subclass
+        // invariants, but the copy must not register itself as new live model
+        // work while the originating transaction is being published.
+        copy._isPresentation = true
+        let modelValues: CACommittedLayerModelValues
+        do {
+            modelValues = try CACommittedLayerModelValues(
+                layer: self,
+                presentation: staticValues
+            )
+        } catch {
+            throw .invalidCommittedAnimation(error)
+        }
+        try Self.copyCommittedEvaluatorModelValues(
+            modelValues,
+            to: copy
+        )
+        copy._committedSnapshotIdentity = identity
+        copy._committedContentRevision = contentRevision
+        copy._committedStaticPresentationValues =
+            staticValues
+        copy._suppressesAnimationLifecycle = true
+        copy._animationKeyCounter = _animationKeyCounter
+
+        let animationSnapshots =
+            try Self.captureCommittedAnimationSnapshots(
+                _animations,
+                frameToken: frameToken
+            )
+        copy._committedAnimationAffectsContents =
+            animationSnapshots.values.contains {
+                $0.affectsContents
+            }
+        copy._animations =
+            try Self.materializeCommittedAnimationSnapshots(
+                animationSnapshots
+            )
+
+        if let mask {
+            copy.mask =
+                try mask.makeCommittedAnimationEvaluatorCopy(
+                    frameToken: frameToken
+                )
+        }
+        if let sublayers = _sublayers {
+            var copiedSublayers: [CALayer] = []
+            copiedSublayers.reserveCapacity(sublayers.count)
+            for sublayer in sublayers {
+                copiedSublayers.append(
+                    try sublayer.makeCommittedAnimationEvaluatorCopy(
+                    valuesByIdentity: valuesByIdentity,
+                    revisionsByIdentity:
+                        revisionsByIdentity,
+                    frameToken: frameToken
+                )
+                )
+            }
+            for sublayer in copiedSublayers {
+                sublayer._superlayer = copy
+            }
+            copy._sublayers = consume copiedSublayers
+        }
+        copy._dirtyMask = []
+        copy._subtreeDirtyCount = 0
+        copy._presentationCacheToken = 0
+        copy._presentationCacheIsValid = false
+        copy._isPresentation = false
+        return consume copy
+    }
+
+    private static func captureCommittedAnimationSnapshots(
+        _ animations: [String: CAAnimation],
+        frameToken: UInt64
+    ) throws(CARendererError)
+        -> sending [String: CACommittedAnimationSnapshot]
+    {
+        var snapshots:
+            [String: CACommittedAnimationSnapshot] = [:]
+        snapshots.reserveCapacity(animations.count)
+        for (key, animation) in animations {
+            do {
+                snapshots[key] = try .capture(
+                    animation,
+                    frameToken: frameToken
+                )
+            } catch {
+                throw .invalidCommittedAnimation(error)
+            }
+        }
+        return snapshots
+    }
+
+    private static func materializeCommittedAnimationSnapshots(
+        _ snapshots:
+            [String: CACommittedAnimationSnapshot]
+    ) throws(CARendererError)
+        -> sending [String: CAAnimation]
+    {
+        var animations: [String: CAAnimation] = [:]
+        animations.reserveCapacity(snapshots.count)
+        for (key, snapshot) in snapshots {
+            let animation: CAAnimation
+            do {
+                animation = try snapshot.materialize()
+            } catch {
+                throw .invalidCommittedAnimation(error)
+            }
+            animation.animationKey = key
+            animations[key] = consume animation
+        }
+        return consume animations
+    }
+
+    private static func copyCommittedEvaluatorModelValues(
+        _ modelValues: CACommittedLayerModelValues,
+        to copy: CALayer
+    ) throws(CARendererError) {
+        let values = modelValues.presentation
+        copy._bounds = values.bounds
+        copy._position = CGPoint(
+            x: CGFloat(values.position.x),
+            y: CGFloat(values.position.y)
+        )
+        copy._anchorPoint = modelValues.anchorPoint
+        copy._zPosition = CGFloat(values.position.z)
+        copy._anchorPointZ = modelValues.anchorPointZ
+        copy._transform = values.transform
+        copy._sublayerTransform = values.sublayerTransform
+        copy._contentsScale = values.contentsScale
+        copy._contentsRect = modelValues.contentsRect
+        copy._contentsCenter = modelValues.contentsCenter
+        copy.contentsGravity = modelValues.contentsGravity
+        copy.contentsFormat = modelValues.contentsFormat
+        copy.toneMapMode = values.toneMapMode
+        copy.preferredDynamicRange =
+            values.preferredDynamicRange
+        copy.contentsHeadroom =
+            CGFloat(values.contentsHeadroom)
+        copy._opacity = values.opacity
+        copy._isHidden = values.isHidden
+        copy._masksToBounds = values.masksToBounds
+        copy._isDoubleSided = values.isDoubleSided
+        copy._cornerRadius = CGFloat(values.cornerRadius)
+        copy.maskedCorners = modelValues.maskedCorners
+        copy.cornerCurve = modelValues.cornerCurve
+        copy._borderWidth = CGFloat(values.borderWidth)
+        copy._borderColor = values.borderColor.map {
+            CGColor(
+                red: CGFloat($0.x),
+                green: CGFloat($0.y),
+                blue: CGFloat($0.z),
+                alpha: CGFloat($0.w)
+            )
+        }
+        copy._backgroundColor = values.backgroundColor.map {
+            CGColor(
+                red: CGFloat($0.x),
+                green: CGFloat($0.y),
+                blue: CGFloat($0.z),
+                alpha: CGFloat($0.w)
+            )
+        }
+        copy._shadowOpacity = modelValues.shadowOpacity
+        copy._shadowRadius = modelValues.shadowRadius
+        copy._shadowOffset = modelValues.shadowOffset
+        copy._shadowColor = modelValues.shadowColor
+        copy._shadowPath = modelValues.shadowPath
+        copy._isOpaque = values.isOpaque
+        copy.isGeometryFlipped = values.isGeometryFlipped
+        copy._shouldRasterize = values.shouldRasterize
+        copy._rasterizationScale =
+            values.rasterizationScale
+        copy.allowsEdgeAntialiasing =
+            modelValues.allowsEdgeAntialiasing
+        copy.allowsGroupOpacity = values.allowsGroupOpacity
+        copy.edgeAntialiasingMask = CAEdgeAntialiasingMask(
+            rawValue: UInt32(values.edgeAntialiasingMask)
+        )
+        copy.minificationFilter =
+            modelValues.minificationFilter
+        copy.minificationFilterBias =
+            modelValues.minificationFilterBias
+        copy.magnificationFilter =
+            modelValues.magnificationFilter
+        copy.autoresizingMask = modelValues.autoresizingMask
+        copy.needsDisplayOnBoundsChange =
+            modelValues.needsDisplayOnBoundsChange
+        copy.beginTime = modelValues.timing.beginTime
+        copy.timeOffset = modelValues.timing.timeOffset
+        copy.repeatCount = modelValues.timing.repeatCount
+        copy.repeatDuration =
+            modelValues.timing.repeatDuration
+        copy.duration = modelValues.timing.duration
+        copy.speed = modelValues.timing.speed
+        copy.autoreverses = modelValues.timing.autoreverses
+        copy.fillMode = modelValues.timing.fillMode
+        copy._name = modelValues.name
+        if let imageContents = values.imageContents {
+            copy._committedImageContentsStorage =
+                imageContents.storage
+        }
+
+        if let configuration = values.gradient,
+           let destination = copy as? CAGradientLayer {
+            destination._colors =
+                configuration.colorComponents.map {
+                    CGColor(
+                        red: CGFloat($0.x),
+                        green: CGFloat($0.y),
+                        blue: CGFloat($0.z),
+                        alpha: CGFloat($0.w)
+                    )
+                }
+            destination._locations =
+                configuration.locations.map { CGFloat($0) }
+            destination._startPoint = CGPoint(
+                x: CGFloat(configuration.startPoint.x),
+                y: CGFloat(configuration.startPoint.y)
+            )
+            destination._endPoint = CGPoint(
+                x: CGFloat(configuration.endPoint.x),
+                y: CGFloat(configuration.endPoint.y)
+            )
+            switch configuration.renderMode {
+            case 2:
+                destination.type = .axial
+            case 3:
+                destination.type = .radial
+            default:
+                destination.type = .conic
+            }
+        }
+        if let shape = modelValues.shape,
+           let destination = copy as? CAShapeLayer {
+            destination._path = shape.path
+            destination._fillColor = shape.fillColor
+            destination.fillRule = shape.fillRule
+            destination.lineCap = shape.lineCap
+            destination.lineDashPattern =
+                shape.lineDashPattern
+            destination._lineDashPhase =
+                shape.lineDashPhase
+            destination.lineJoin = shape.lineJoin
+            destination._lineWidth = shape.lineWidth
+            destination._miterLimit = shape.miterLimit
+            destination._strokeColor = shape.strokeColor
+            destination._strokeStart = shape.strokeStart
+            destination._strokeEnd = shape.strokeEnd
+        }
+        if let configuration = values.text?.configuration,
+           let destination = copy as? CATextLayer {
+            destination._string = configuration.text
+            destination._font = configuration.fontFamily
+            destination._fontSize = configuration.fontSize
+            destination._foregroundColor = CGColor(
+                red: CGFloat(configuration.foregroundRGBA.x),
+                green: CGFloat(configuration.foregroundRGBA.y),
+                blue: CGFloat(configuration.foregroundRGBA.z),
+                alpha: CGFloat(configuration.foregroundRGBA.w)
+            )
+            destination._isWrapped = configuration.isWrapped
+            destination._truncationMode =
+                configuration.truncationMode
+            destination._alignmentMode =
+                configuration.alignmentMode
+        }
+        if let replicator = modelValues.replicator,
+           let destination = copy as? CAReplicatorLayer {
+            destination.instanceCount =
+                replicator.instanceCount
+            destination.preservesDepth =
+                replicator.preservesDepth
+            destination._instanceDelay =
+                replicator.instanceDelay
+            destination._instanceTransform =
+                replicator.instanceTransform
+            destination._instanceColor =
+                replicator.instanceColor
+            destination._instanceRedOffset =
+                replicator.instanceRedOffset
+            destination._instanceGreenOffset =
+                replicator.instanceGreenOffset
+            destination._instanceBlueOffset =
+                replicator.instanceBlueOffset
+            destination._instanceAlphaOffset =
+                replicator.instanceAlphaOffset
+        }
+        if let configuration = values.emitter,
+           let destination = copy as? CAEmitterLayer {
+            destination._emitterPosition =
+                configuration.emitterPosition
+            destination._emitterZPosition =
+                configuration.emitterZPosition
+            destination._emitterSize =
+                configuration.emitterSize
+            destination._emitterDepth =
+                configuration.emitterDepth
+            destination.emitterShape =
+                configuration.emitterShape
+            destination.emitterMode =
+                configuration.emitterMode
+            destination.renderMode =
+                configuration.renderMode
+            destination.preservesDepth =
+                configuration.preservesDepth
+            destination._birthRate = configuration.birthRate
+            destination._lifetime = configuration.lifetime
+            destination._velocity = configuration.velocity
+            destination._scale = configuration.scale
+            destination._spin = configuration.spin
+            destination.seed = configuration.seed
+        }
+    }
+
+    private static func animationGraphAffectsContents(
+        _ animation: CAAnimation
+    ) -> Bool {
+        if let property =
+                animation as? CAPropertyAnimation,
+           property.keyPath == "contents" {
+            return true
+        }
+        if let group = animation as? CAAnimationGroup {
+            return group.animations?.contains {
+                animationGraphAffectsContents($0)
+            } == true
+        }
+        return false
+    }
+
     /// Captures the renderable model tree without animations or ownership links.
     private func makeTransitionSnapshot() -> CALayer {
-        let snapshot = type(of: self).init(layer: self)
-        if let mask {
-            snapshot.mask = mask.makeTransitionSnapshot()
+        CATransaction.withMutationRegistrationSuppressed {
+            let snapshot = type(of: self).init(layer: self)
+            if let mask {
+                snapshot.mask = mask.makeTransitionSnapshot()
+            }
+            for sublayer in _sublayers ?? [] {
+                snapshot.addSublayer(
+                    sublayer.makeTransitionSnapshot()
+                )
+            }
+            snapshot.recursivelyClearDirtyAfterCommit()
+            return snapshot
         }
-        for sublayer in _sublayers ?? [] {
-            snapshot.addSublayer(sublayer.makeTransitionSnapshot())
-        }
-        snapshot.recursivelyClearDirtyAfterCommit()
-        return snapshot
     }
 
     /// Resolves inherited durations throughout an animation group.
@@ -5303,6 +5817,14 @@ open class CALayer: CAMediaTiming, Hashable {
         return _animations[key]
     }
 
+    internal func attachedAnimationDidMutate(
+        _ animation: CAAnimation,
+        forKey key: String
+    ) {
+        guard _animations[key] === animation else { return }
+        markDirty(.animations)
+    }
+
     /// Remove all animations attached to the layer.
     open func removeAllAnimations() {
         // Notify delegates that animations were stopped
@@ -5310,6 +5832,7 @@ open class CALayer: CAMediaTiming, Hashable {
             if !animation.isFinished {
                 animation.markFinished(completed: false)
             }
+            animation.detachFromLayer()
         }
         _animations.removeAll()
         markDirty(.animations)
@@ -5322,6 +5845,7 @@ open class CALayer: CAMediaTiming, Hashable {
             if !animation.isFinished {
                 animation.markFinished(completed: false)
             }
+            animation.detachFromLayer()
         }
         _animations.removeValue(forKey: key)
         markDirty(.animations)
@@ -5373,9 +5897,11 @@ open class CALayer: CAMediaTiming, Hashable {
                 }
                 continue
             }
+            if timing.phase != .before {
+                animation.markStarted()
+            }
             if timing.phase == .after {
                 // Animation has completed
-                animation.markStarted()
                 animation.markFinished(completed: true)
 
                 if animation.isRemovedOnCompletion {
@@ -5386,7 +5912,8 @@ open class CALayer: CAMediaTiming, Hashable {
 
         // Remove completed animations
         for key in keysToRemove {
-            _animations.removeValue(forKey: key)
+            _animations.removeValue(forKey: key)?
+                .detachFromLayer()
         }
         if !keysToRemove.isEmpty {
             markDirty(.animations)

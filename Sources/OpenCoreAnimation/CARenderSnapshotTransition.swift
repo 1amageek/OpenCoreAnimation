@@ -66,19 +66,35 @@ internal struct CARenderSnapshotTransition: Equatable, Sendable {
     internal let subtype: CATransitionSubtype?
     internal let filter: Filter?
     internal let progress: CFTimeInterval
+    internal let preparationFailure: CATransitionRenderFailure?
 
     internal static func capture(
         _ state: CATransitionRenderState,
         sourceRootIndex: Int
-    ) throws(CATransitionRenderFailure) -> Self {
-        guard state.progress.isFinite else {
-            throw .invalidProgress(state.progress)
-        }
-        let filter = try Filter.capture(state.filter)
-        if filter == nil {
-            try validateBuiltIn(
-                type: state.type,
-                subtype: state.subtype
+    ) -> Self {
+        var filter: Filter?
+        var preparationFailure: CATransitionRenderFailure?
+        do {
+            guard state.progress.isFinite else {
+                throw CATransitionRenderFailure.invalidProgress(
+                    state.progress
+                )
+            }
+            filter = try state.resolvedFilterSnapshot()
+            if filter == nil {
+                try validateBuiltIn(
+                    type: state.type,
+                    subtype: state.subtype
+                )
+            }
+            preparationFailure = nil
+        } catch let failure as CATransitionRenderFailure {
+            filter = nil
+            preparationFailure = failure
+        } catch {
+            filter = nil
+            preparationFailure = .filterDispatchFailed(
+                String(describing: error)
             )
         }
         return Self(
@@ -87,7 +103,8 @@ internal struct CARenderSnapshotTransition: Equatable, Sendable {
             type: state.type,
             subtype: state.subtype,
             filter: filter,
-            progress: state.progress
+            progress: state.progress,
+            preparationFailure: preparationFailure
         )
     }
 

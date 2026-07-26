@@ -22,6 +22,7 @@ open class CASpringAnimation: CABasicAnimation {
         set {
             guard newValue > 0 else { return }
             _mass = newValue
+            notifyAttachedLayerOfMutation()
         }
     }
 
@@ -33,6 +34,7 @@ open class CASpringAnimation: CABasicAnimation {
         set {
             guard newValue > 0 else { return }
             _stiffness = newValue
+            notifyAttachedLayerOfMutation()
         }
     }
 
@@ -44,11 +46,14 @@ open class CASpringAnimation: CABasicAnimation {
         set {
             guard newValue >= 0 else { return }
             _damping = newValue
+            notifyAttachedLayerOfMutation()
         }
     }
 
     /// The initial velocity of the object attached to the spring.
-    open var initialVelocity: CGFloat = 0
+    open var initialVelocity: CGFloat = 0 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Controls whether damping ratios greater than one use an overdamped response.
     ///
@@ -56,7 +61,9 @@ open class CASpringAnimation: CABasicAnimation {
     /// critically damped spring. The physical coefficient remains available through
     /// `damping`, matching QuartzCore's separation between stored parameters and the
     /// response policy.
-    open var allowsOverdamping: Bool = false
+    open var allowsOverdamping: Bool = false {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// The duration of one cycle of the corresponding undamped oscillator.
     open var perceptualDuration: CFTimeInterval {

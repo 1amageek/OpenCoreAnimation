@@ -174,6 +174,40 @@ struct CompletionBehavior {
         #expect(completionCount == 1)
     }
 
+    @Test("A pending failed root does not absorb a later transaction")
+    func pendingRootDoesNotAbsorbLaterTransaction() {
+        CATransaction.flush()
+        let failedRoot = CALayer()
+        var failedCompletionCount = 0
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            failedCompletionCount += 1
+        }
+        failedRoot.opacity = 0.5
+        CATransaction.commit()
+
+        #expect(failedRoot.pendingCommittedRenderState != nil)
+        #expect(failedCompletionCount == 0)
+
+        let succeedingRoot = CALayer()
+        var succeedingCompletionCount = 0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            succeedingCompletionCount += 1
+        }
+        succeedingRoot.opacity = 0.25
+        CATransaction.commit()
+
+        #expect(succeedingRoot.pendingCommittedRenderState != nil)
+        submitCommittedFrame(succeedingRoot)
+        #expect(succeedingCompletionCount == 1)
+        #expect(failedCompletionCount == 0)
+        #expect(failedRoot.pendingCommittedRenderState != nil)
+    }
+
     @Test("Completion mutations remain dirty for the following commit")
     func completionMutationSurvivesCommittedDirtyClear() {
         CATransaction.flush()

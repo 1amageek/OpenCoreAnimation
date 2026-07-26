@@ -4,6 +4,32 @@
 /// CAAnimation provides basic support for the CAMediaTiming and CAAction protocols.
 /// You do not create instances of CAAnimation; create instances of one of the concrete subclasses
 /// such as CABasicAnimation or CAKeyframeAnimation.
+internal final class CAAnimationLayerReference {
+    // Swift's weak-reference runtime owns atomic zeroing. Both references are
+    // assigned exactly once, and CAAnimation itself is not Sendable.
+    nonisolated(unsafe) weak var layer: CALayer?
+    nonisolated(unsafe) weak var rootAnimation: CAAnimation?
+    let key: String
+
+    init(
+        layer: CALayer,
+        rootAnimation: CAAnimation,
+        key: String
+    ) {
+        self.layer = layer
+        self.rootAnimation = rootAnimation
+        self.key = key
+    }
+
+    func notifyMutation() {
+        guard let layer, let rootAnimation else { return }
+        layer.attachedAnimationDidMutate(
+            rootAnimation,
+            forKey: key
+        )
+    }
+}
+
 open class CAAnimation: CAMediaTiming, CAAction {
 
     // MARK: - Initialization
@@ -50,42 +76,64 @@ open class CAAnimation: CAMediaTiming, CAAction {
     // MARK: - CAMediaTiming
 
     /// Specifies the begin time of the receiver in relation to its parent object, if applicable.
-    open var beginTime: CFTimeInterval = 0
+    open var beginTime: CFTimeInterval = 0 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Specifies an additional time offset in active local time.
-    open var timeOffset: CFTimeInterval = 0
+    open var timeOffset: CFTimeInterval = 0 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Determines the number of times the animation will repeat.
-    open var repeatCount: Float = 0
+    open var repeatCount: Float = 0 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Determines how many seconds the animation will repeat for.
-    open var repeatDuration: CFTimeInterval = 0
+    open var repeatDuration: CFTimeInterval = 0 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Specifies the basic duration of the animation, in seconds.
-    open var duration: CFTimeInterval = 0
+    open var duration: CFTimeInterval = 0 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Specifies how time is mapped to receiver's time space from the parent time space.
-    open var speed: Float = 1
+    open var speed: Float = 1 {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Determines if the receiver plays in the reverse upon completion.
-    open var autoreverses: Bool = false
+    open var autoreverses: Bool = false {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// Determines if the receiver's presentation is frozen or removed once its active duration has completed.
-    open var fillMode: CAMediaTimingFillMode = .removed
+    open var fillMode: CAMediaTimingFillMode = .removed {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     // MARK: - Animation Properties
 
     /// The timing function defining the pacing of the animation.
-    open var timingFunction: CAMediaTimingFunction?
+    open var timingFunction: CAMediaTimingFunction? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// A hint describing the range of frame rates preferred while this animation is active.
-    open var preferredFrameRateRange: CAFrameRateRange = .default
+    open var preferredFrameRateRange: CAFrameRateRange = .default {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// The animation's delegate object.
     open weak var delegate: (any CAAnimationDelegate)?
 
     /// Determines if the animation is removed from the target layer's animations upon completion.
-    open var isRemovedOnCompletion: Bool = true
+    open var isRemovedOnCompletion: Bool = true {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     // MARK: - Internal State
 
@@ -95,11 +143,48 @@ open class CAAnimation: CAMediaTiming, CAAction {
     /// Whether the animation has entered its active interval.
     internal var hasStarted: Bool = false
 
-    /// The layer this animation is attached to (weak reference).
-    internal weak var attachedLayer: CALayer?
+    /// The root animation's weak model-layer attachment.
+    internal var attachedLayer: CALayer? {
+        attachmentReference?.layer
+    }
 
     /// The key used when this animation was added to the layer.
     internal var animationKey: String?
+
+    internal var attachmentReference:
+        CAAnimationLayerReference?
+
+    internal func attach(
+        to layer: CALayer,
+        forKey key: String
+    ) {
+        let reference = CAAnimationLayerReference(
+            layer: layer,
+            rootAnimation: self,
+            key: key
+        )
+        attach(using: reference)
+    }
+
+    internal func attach(
+        using reference: CAAnimationLayerReference
+    ) {
+        attachmentReference = reference
+        attachmentDidChange(reference)
+    }
+
+    internal func detachFromLayer() {
+        attachmentReference = nil
+        attachmentDidChange(nil)
+    }
+
+    internal func attachmentDidChange(
+        _ reference: CAAnimationLayerReference?
+    ) {}
+
+    internal func notifyAttachedLayerOfMutation() {
+        attachmentReference?.notifyMutation()
+    }
 
     /// Transaction completion blocks waiting for this animation.
     private var completionCoordinators: [CATransactionCompletionCoordinator] = []

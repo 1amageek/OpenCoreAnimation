@@ -34,6 +34,8 @@ public enum CATransitionRenderFailure: Error, Equatable, Sendable {
     case unsupportedFilter(String)
     case unsupportedTransitionType(String)
     case unsupportedTransitionSubtype(String)
+    case missingSourceState
+    case nestedSourceTransition
     case invalidParticipantBounds(CATransitionParticipantRole, CGRect)
     case invalidParticipantContentsScale(CATransitionParticipantRole, CGFloat)
     case invalidParticipantPixelSize(CATransitionParticipantRole, CGSize)

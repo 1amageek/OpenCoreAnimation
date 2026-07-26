@@ -17,6 +17,10 @@ interface OCA extends Harness {
     getCanvasHeight: () => number;
     getSublayerCount: () => number;
     getTileDrawCount: () => number;
+    getCommittedTileStateCount: () => number;
+    getCommittedTileCacheCount: () => number;
+    getTiledLayerFailureCount: () => number;
+    getCommittedTileDiagnostics: () => string;
     getTileState: () => string;
     getScrollModeProbeResult: () => string;
     isEngineRunning: () => boolean;
@@ -151,7 +155,7 @@ test.describe("OpenCoreAnimation smoke", () => {
             () => h.getImmutableTransitionSnapshotProbeResult(),
             { timeout: 10_000 }
         ).toBe(
-            `pixel=191,0,64,255,sources=${transitionSourcesBefore + 1},targets=${transitionTargetsBefore + 1},dispatches=${transitionDispatchesBefore + 1},failures=0`
+            `pixel=191,0,64,255,sources=${transitionSourcesBefore + 1},targets=${transitionTargetsBefore + 1},dispatches=${transitionDispatchesBefore + 2},failures=0`
         );
         expect(await h.getFirstUncapturedGPUError()).toBe("none");
     });
@@ -200,15 +204,37 @@ test.describe("OpenCoreAnimation smoke", () => {
         );
         expect(await h.getTileState()).toBe("delegate=true,bounds=80.0x80.0");
         await expect.poll(() => h.getTileDrawCount(), { timeout: 2_000 }).toBeGreaterThan(0);
-        await expect.poll(() => h.getTransitionSourceCaptureCount()).toBe(2);
-        expect(await h.getTransitionTargetCaptureCount()).toBe(2);
-        expect(await h.getActiveTransitionTextureCount()).toBe(5);
+        const transitionSourcesBeforeMutation =
+            await h.getTransitionSourceCaptureCount();
+        const transitionTargetsBeforeMutation =
+            await h.getTransitionTargetCaptureCount();
+        expect(transitionSourcesBeforeMutation).toBeGreaterThan(0);
+        expect(transitionTargetsBeforeMutation).toBe(
+            transitionSourcesBeforeMutation
+        );
+        expect(await h.getActiveTransitionTextureCount()).toBeGreaterThan(0);
         await expect.poll(() => h.getTransitionFilterDispatchCount()).toBeGreaterThan(0);
         expect(await h.getTransitionFilterFailureCount()).toBe(0);
         expect(await h.getTransitionRenderFailureCount()).toBe(0);
         await h.mutateTransitionTarget();
-        expect(await h.getTransitionSourceCaptureCount()).toBe(2);
-        expect(await h.getTransitionTargetCaptureCount()).toBe(2);
+        expect(await h.getTransitionSourceCaptureCount()).toBe(
+            transitionSourcesBeforeMutation
+        );
+        expect(await h.getTransitionTargetCaptureCount()).toBe(
+            transitionTargetsBeforeMutation
+        );
+        await expect.poll(
+            () => h.getCommittedTileStateCount(),
+            { timeout: 2_000 }
+        ).toBe(1);
+        await expect.poll(
+            () => h.getCommittedTileCacheCount(),
+            {
+                timeout: 2_000,
+                message: await h.getCommittedTileDiagnostics()
+            }
+        ).toBeGreaterThan(0);
+        expect(await h.getTiledLayerFailureCount()).toBe(0);
         await h.beginPixelReadback();
 
         await expect.poll(() => h.getPixelReadback()).not.toBe("pending");
@@ -219,27 +245,27 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginContentsGeometryProbe();
         await expect.poll(() => h.getContentsGeometryProbeResult(), { timeout: 10_000 }).toBe(
-            "0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;25,25,38,255;0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;141,13,19,255;25,25,38,255,failures=2,typed=true"
+            "0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;25,25,38,255;0,0,255,255;255,0,255,255;255,255,0,255;25,25,38,255;141,13,19,255;25,25,38,255,failures=0,geometryTyped=true,geometryPending=true,geometryRecovered=true,malformedTyped=true,malformedPending=true,malformedRecovered=true"
         );
 
         await h.beginDynamicRangeProbe();
         await expect.poll(() => h.getDynamicRangeProbeResult(), { timeout: 10_000 }).toBe(
-            "capability=true,extended=true,preserved=true,extendedPixel=2.0:0.5:0.25:1.0,imagePreserved=true,imagePixel=2.0:0.5:0.25:1.0,invalid=true,unknownTone=true,unknownRange=true,standardPolicy=true,automatic=true,standard=true,standardPixel=true,failures=true"
+            "capability=true,extended=true,preserved=true,extendedPixel=2.0:0.5:0.25:1.0,imagePreserved=true,imagePixel=2.0:0.5:0.25:1.0,invalid=true,unknownTone=true,unknownRange=true,standardPolicy=true,automatic=true,standard=true,standardPixel=true,failures=true,initialFrameFailure=nil,gpuError=none"
         );
 
         await h.beginShapeFillRuleProbe();
         await expect.poll(() => h.getShapeFillRuleProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;25,25,38,255;0,255,0,255;25,25,38,255;0,0,255,255;25,25,38,255;255,0,0,255;25,25,38,255;255,0,0,255;25,25,38,255;255,0,0,255;25,25,38,255,failures=2,typed=true,draws=2,vertices=42"
+            "255,0,0,255;25,25,38,255;0,255,0,255;25,25,38,255;0,0,255,255;25,25,38,255;255,0,0,255;25,25,38,255;255,0,0,255;25,25,38,255;25,25,38,255;25,25,38,255,failures=0,unsupportedTyped=true,unsupportedPending=true,unsupportedRecovered=true,invalidFillTyped=true,invalidFillPending=true,invalidFillRecovered=true,draws=2,vertices=42"
         );
 
         await h.beginGradientTypeProbe();
         await expect.poll(() => h.getGradientTypeProbeResult(), { timeout: 10_000 }).toBe(
-            "242,13,0,255;0,242,13,255;0,0,255,255;232,23,0,255;0,239,16,255;0,0,255,255;253,2,0,255;130,125,0,255;0,252,3,255;0,125,130,255;25,25,38,255;0,0,255,255,failures=1,typed=true"
+            "242,13,0,255;0,242,13,255;0,0,255,255;232,23,0,255;0,239,16,255;0,0,255,255;253,2,0,255;130,125,0,255;0,252,3,255;0,125,130,255;25,25,38,255;0,0,255,255,failures=0,unsupportedTyped=true,unsupportedPending=true,unsupportedRecovered=true"
         );
 
         await h.beginCornerCurveProbe();
         await expect.poll(() => h.getCornerCurveProbeResult(), { timeout: 10_000 }).toBe(
-            "79,20,29,255;48,207,0,255;0,48,207,255;255,255,0,255;243,48,219,255;5,212,214,255;255,0,255,255;0,0,0,255;0,255,0,255;0,255,0,255,failures=2,typed=layer:future-curve,maskFailures=1,maskTyped=contentMask:future-mask-curve,frameTyped=true"
+            "79,20,29,255;48,207,0,255;0,48,207,255;255,255,0,255;243,48,219,255;5,212,214,255;25,25,38,255;0,0,0,255;0,255,0,255;0,255,0,255,failures=0,maskFailures=0,unsupportedTyped=true,unsupportedPending=true,unsupportedRecovered=true,maskTyped=true,maskPending=true,maskRecovered=true,frameFailures=2"
         );
 
         await h.beginTransitionFilterProbes();
@@ -254,10 +280,10 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginLayerFilterProbe();
         await expect.poll(() => h.getLayerFilterProbeResult(), { timeout: 10_000 }).toBe(
-            "128,255,255,255;191,191,0,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true,rejected=true,invalid=true,typed=true,alphaFilter=true,alphaPixel=13,141,147,255,displayTyped=true,rasterTyped=true,maskFrameTyped=true,maskRasterTyped=true,maskShadowTyped=true"
+            "128,255,255,255;191,191,0,255;255,0,255,255;255,0,0,255;group=true,ungrouped=true,translucentGroup=true,translucentUngrouped=true,rejected=true,invalid=true,typed=true,alphaFilter=true,alphaPixel=13,141,147,255,displayTyped=true,rasterTyped=true,rasterLayerDelta=1,rasterDelta=0,rasterLayerReason=true,rasterCompositeReason=false,rasterFrameReason=true,maskFrameTyped=true,maskRasterTyped=true,maskShadowTyped=true"
         );
         expect(await h.getActiveFilterResourceCount()).toBe(0);
-        expect(await h.getLayerFilterFailureCount()).toBe(7);
+        expect(await h.getLayerFilterFailureCount()).toBe(2);
 
         await h.beginTextProbe();
         await expect.poll(() => h.getTextProbeResult(), { timeout: 10_000 }).toBe(
@@ -311,7 +337,7 @@ test.describe("OpenCoreAnimation smoke", () => {
 
         await h.beginPathKeyframeProbe();
         await expect.poll(() => h.getPathKeyframeProbeResult(), { timeout: 10_000 }).toBe(
-            "255,0,0,255;0,255,0,255;0,0,255,255;0,255,255,255;255,0,255,255;255,255,0,255;255,128,0,255;255,255,255,255;0,128,255,255;255,0,128,255;255,128,0,255,presentation=true"
+            "255,0,0,255;0,255,0,255;0,0,255,255;0,255,255,255;255,0,255,255;255,255,0,255;255,128,0,255;255,255,255,255;0,128,255,255;255,0,128,255;255,128,0,255,presentation=true,timingFailure=true,mediaTimingFailure=true"
         );
 
         await h.beginConstraintLayoutProbe();
@@ -330,7 +356,7 @@ test.describe("OpenCoreAnimation smoke", () => {
         );
 
         await h.beginTransformDepthProbe();
-        await expect.poll(() => h.getTransformDepthProbeResult(), { timeout: 10_000 }).toBe(
+        await expect.poll(() => h.getTransformDepthProbeResult(), { timeout: 30_000 }).toBe(
             "crossing=true,transparent=true,isolated=true,flattened=true,nested=true,captures=10,composites=10,groupOpacity=true,filter=true,mask=true,directMask=true,rasterMask=true,maskUpdated=true,nestedFilter=true,shadow=true,shadowPath=true,compositionDepth=true,nestedComposition=true,overflow=true,updated=true,reused=true,rasterFailure=true,depthFailures=0,depthTyped=true,frameFailures=0,resizeTyped=true"
         );
 

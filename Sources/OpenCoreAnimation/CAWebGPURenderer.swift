@@ -343,6 +343,7 @@ private final class FilterLayerResources {
     let resultView: GPUTextureView
     let compositeUniformBuffer: GPUBuffer
     private(set) var operationUniformBuffers: [GPUBuffer] = []
+    private var preservedTexture: GPUTexture?
 
     init(device: GPUDevice, width: Int, height: Int, format: GPUTextureFormat) {
         self.width = width
@@ -384,10 +385,25 @@ private final class FilterLayerResources {
         return nil
     }
 
+    func preserve(_ texture: GPUTexture) {
+        precondition(
+            texture === sourceTexture
+                || texture === intermediateTexture
+                || texture === resultTexture
+        )
+        preservedTexture = texture
+    }
+
     func destroy() {
-        sourceTexture.destroy()
-        intermediateTexture.destroy()
-        resultTexture.destroy()
+        if sourceTexture !== preservedTexture {
+            sourceTexture.destroy()
+        }
+        if intermediateTexture !== preservedTexture {
+            intermediateTexture.destroy()
+        }
+        if resultTexture !== preservedTexture {
+            resultTexture.destroy()
+        }
         compositeUniformBuffer.destroy()
         for buffer in operationUniformBuffers {
             buffer.destroy()
@@ -411,15 +427,28 @@ private enum SnapshotCompositeKind: Equatable {
 }
 
 private struct SnapshotCompositedNode {
-    let resources: FilterLayerResources
+    let resources: FilterLayerResources?
     let outputTexture: GPUTexture
     let outputView: GPUTextureView
     let kind: SnapshotCompositeKind
+    let captureBounds: CGRect?
+    let rasterizationPurpose: RasterizationCachePurpose?
 }
 
 private struct SnapshotCompositeTarget {
     let nodeIndex: Int
     let parentMatrix: Matrix4x4
+    let rasterizationPurpose: RasterizationCachePurpose?
+
+    init(
+        nodeIndex: Int,
+        parentMatrix: Matrix4x4,
+        rasterizationPurpose: RasterizationCachePurpose? = nil
+    ) {
+        self.nodeIndex = nodeIndex
+        self.parentMatrix = parentMatrix
+        self.rasterizationPurpose = rasterizationPurpose
+    }
 }
 
 private struct SnapshotBackdropCompositionTarget {
@@ -442,7 +471,9 @@ private struct SnapshotBackdropCompositionRoot {
 
 private struct SnapshotPreparedComposition {
     let resources: CompositionLayerResources
+    let outputTexture: GPUTexture
     let outputView: GPUTextureView
+    let samplingModelMatrix: Matrix4x4
 }
 
 private struct SnapshotPreparedShadow {
@@ -796,6 +827,47 @@ private final class RetainedDynamicSnapshot {
     ) {
         self.rootLayer = rootLayer
         self.snapshot = snapshot
+    }
+}
+
+private final class RetainedCommittedAnimationEvaluator {
+    weak var rootLayer: CALayer?
+    let evaluator: CACommittedAnimationEvaluator
+    let frameToken: UInt64
+
+    init(
+        rootLayer: CALayer,
+        evaluator: CACommittedAnimationEvaluator,
+        frameToken: UInt64
+    ) {
+        self.rootLayer = rootLayer
+        self.evaluator = evaluator
+        self.frameToken = frameToken
+    }
+}
+
+private final class CommittedAnimationEvaluationFailure {
+    weak var rootLayer: CALayer?
+    let frameToken: UInt64
+    let transitionFailureDescription: String?
+    let shadowFailureDescription: String?
+    let emitterFailureDescription: String?
+
+    init(
+        rootLayer: CALayer,
+        frameToken: UInt64,
+        transitionFailureDescription: String?,
+        shadowFailureDescription: String?,
+        emitterFailureDescription: String?
+    ) {
+        self.rootLayer = rootLayer
+        self.frameToken = frameToken
+        self.transitionFailureDescription =
+            transitionFailureDescription
+        self.shadowFailureDescription =
+            shadowFailureDescription
+        self.emitterFailureDescription =
+            emitterFailureDescription
     }
 }
 
@@ -1897,6 +1969,11 @@ private final class RetainedDynamicSnapshot {
     /// Requested layer-filter paths whose configuration is currently not executable.
     private var failedLayerFilterKeys = LayerRenderKeySet()
 
+    /// The exact committed node whose filter path raised the current
+    /// frame-level encoding failure.
+    private var pendingCommittedFilterFailureKey:
+        LayerRenderKey?
+
     /// Exact failures retained by render key so an owning content-mask target
     /// can reject the frame instead of accepting a transparent failed subtree.
     private var layerFilterFailuresByKey =
@@ -1980,15 +2057,17 @@ private final class RetainedDynamicSnapshot {
     private var transitionPreparationFailures:
         [UInt64: CATransitionRenderFailure] = [:]
 
-    /// Capture-only depth textures retained until their command buffer has been submitted.
+    /// Capture-only resources retained until the submitted queue work finishes.
     private var transientCaptureDepthTextures: [GPUTexture] = []
 
-    /// Raw captures and filter ping-pong resources retained until their command buffer
-    /// has been submitted. The final filtered texture is owned by rasterizationCache.
+    /// Raw captures and filter ping-pong resources retained until submitted
+    /// queue work finishes. Cached live-tree textures belong to rasterizationCache.
     private var transientRasterizationTextures: [GPUTexture] = []
     private var transientRasterizationFilterResources: [FilterLayerResources] = []
     private var transientRasterizationShadowResources: [ShadowLayerResources] = []
     private var transientSnapshotCompositionResources: [CompositionLayerResources] = []
+    private var pendingCommittedRasterizationCacheKeys:
+        [RasterizationCacheKey] = []
 
     /// Per-frame scratch storage: layers whose subtree has been captured
     /// (or had a fresh cache hit) this frame, mapped to the texture used
@@ -2006,11 +2085,19 @@ private final class RetainedDynamicSnapshot {
 
     /// Value-owned subtree composites prepared for the current snapshot.
     private var snapshotCompositedNodes: [SnapshotCompositedNode?] = []
+    private var failedSnapshotRasterizationNodeIndices: Set<Int> = []
+    private var failedSnapshotFilterNodeFailures:
+        [Int: CALayerFilterRenderFailure] = [:]
+    private var failedSnapshotCompositionNodeIndices: Set<Int> = []
+    private var currentSnapshotCompositeTargetNodeIndex: Int?
     private var snapshotCompositeCaptureRootNodeIndex: Int?
+    private var snapshotCompositeCaptureBounds: CGRect?
     private var snapshotCompositeCaptureSuppressesOpacity = false
     private var snapshotPreparedShadows: [SnapshotPreparedShadow?] = []
     private var snapshotSuppressesShadows = false
     private var snapshotShadowCaptureRootNodeIndex: Int?
+    private var failedSnapshotShadowCaptureReplicatorNodeIndices:
+        Set<Int> = []
     private var snapshotPreparedCompositions: [SnapshotPreparedComposition?] = []
     private var snapshotCompositionCaptureStopNodeIndex: Int?
     private var snapshotCompositionCaptureDidReachStop = false
@@ -2178,6 +2265,16 @@ private final class RetainedDynamicSnapshot {
     /// clean-tree frames after the originating transaction was acknowledged.
     private var retainedDynamicSnapshots:
         [ObjectIdentifier: RetainedDynamicSnapshot] = [:]
+    private var retainedAnimationEvaluators:
+        [
+            ObjectIdentifier:
+                RetainedCommittedAnimationEvaluator
+        ] = [:]
+    private var committedAnimationEvaluationFailures:
+        [
+            ObjectIdentifier:
+                CommittedAnimationEvaluationFailure
+        ] = [:]
 
     /// Tile state is renderer-owned because a committed snapshot must never
     /// read or mutate the model layer while asynchronous requests complete.
@@ -4576,11 +4673,12 @@ private final class RetainedDynamicSnapshot {
             case .filter(let failure):
                 recordLayerFilterFailure(
                     failure,
-                    for: LayerRenderKey(
-                        layer: snapshot.nodes[
-                            snapshot.rootIndex
-                        ].identity
-                    )
+                    for: pendingCommittedFilterFailureKey
+                        ?? LayerRenderKey(
+                            layer: snapshot.nodes[
+                                snapshot.rootIndex
+                            ].identity
+                        )
                 )
             case .backdropComposition(let failure):
                 lastCompositionFilterFailure = failure
@@ -4658,6 +4756,7 @@ private final class RetainedDynamicSnapshot {
             minDepth: 0,
             maxDepth: 1
         )
+        isRenderingMainPass = true
         do {
             try renderSnapshotNode(
                 at: snapshot.rootIndex,
@@ -4697,9 +4796,12 @@ private final class RetainedDynamicSnapshot {
             case .filter(let failure):
                 recordLayerFilterFailure(
                     failure,
-                    for: LayerRenderKey(
-                        layer: snapshot.nodes[snapshot.rootIndex].identity
-                    )
+                    for: pendingCommittedFilterFailureKey
+                        ?? LayerRenderKey(
+                            layer: snapshot.nodes[
+                                snapshot.rootIndex
+                            ].identity
+                        )
                 )
             case .backdropComposition(let failure):
                 lastCompositionFilterFailure = failure
@@ -4753,6 +4855,12 @@ private final class RetainedDynamicSnapshot {
             )
         }
         device.queue.submit([encoder.finish()])
+        pendingCommittedRasterizationCacheKeys.removeAll(
+            keepingCapacity: true
+        )
+        releaseTransientResourcesAfterSubmittedWork(
+            on: device.queue
+        )
         lastRenderedTexture = currentTexture
         retireInactiveTransitionCaptures()
         let transitionPreparationFailed =
@@ -4888,6 +4996,7 @@ private final class RetainedDynamicSnapshot {
             || values.emitter?.preservesDepth == false
             || !values.filters.isEmpty
             || values.compositingFilter != nil
+            || values.compositingFilterCaptureFailure != nil
             || !values.backgroundFilters.isEmpty
         if requiresOffscreenRoot {
             return GPUColor(r: 0, g: 0, b: 0, a: 0)
@@ -4901,6 +5010,52 @@ private final class RetainedDynamicSnapshot {
             )
         }
         return GPUColor(r: 0, g: 0, b: 0, a: 1)
+    }
+
+    private func releaseTransientResourcesAfterSubmittedWork(
+        on queue: GPUQueue
+    ) {
+        let captureDepthTextures =
+            transientCaptureDepthTextures
+        transientCaptureDepthTextures = []
+        let rasterizationTextures =
+            transientRasterizationTextures
+        transientRasterizationTextures = []
+        let rasterizationFilterResources =
+            transientRasterizationFilterResources
+        transientRasterizationFilterResources = []
+        let rasterizationShadowResources =
+            transientRasterizationShadowResources
+        transientRasterizationShadowResources = []
+        let snapshotCompositionResources =
+            transientSnapshotCompositionResources
+        transientSnapshotCompositionResources = []
+        guard !captureDepthTextures.isEmpty
+                || !rasterizationTextures.isEmpty
+                || !rasterizationFilterResources.isEmpty
+                || !rasterizationShadowResources.isEmpty
+                || !snapshotCompositionResources.isEmpty else {
+            return
+        }
+
+        Task { @MainActor in
+            await queue.onSubmittedWorkDone()
+            for texture in captureDepthTextures {
+                texture.destroy()
+            }
+            for texture in rasterizationTextures {
+                texture.destroy()
+            }
+            for resources in rasterizationFilterResources {
+                resources.destroy()
+            }
+            for resources in rasterizationShadowResources {
+                resources.destroy()
+            }
+            for resources in snapshotCompositionResources {
+                resources.destroy()
+            }
+        }
     }
 
     private func resetFrameStateForCommittedSnapshot() {
@@ -4924,6 +5079,7 @@ private final class RetainedDynamicSnapshot {
         renderTargetSizeOverride = nil
         activeTransitionResourceIDs.removeAll(keepingCapacity: true)
         failedTransitionResourceIDs.removeAll(keepingCapacity: true)
+        pendingCommittedFilterFailureKey = nil
         for capture in retiredTransitionCaptures {
             capture.filterExecution?.invalidate()
             capture.source.texture.destroy()
@@ -4940,26 +5096,6 @@ private final class RetainedDynamicSnapshot {
         retiredTransitionFilterExecutions.removeAll(
             keepingCapacity: true
         )
-        for texture in transientCaptureDepthTextures {
-            texture.destroy()
-        }
-        transientCaptureDepthTextures.removeAll(keepingCapacity: true)
-        for texture in transientRasterizationTextures {
-            texture.destroy()
-        }
-        transientRasterizationTextures.removeAll(keepingCapacity: true)
-        for resources in transientRasterizationFilterResources {
-            resources.destroy()
-        }
-        transientRasterizationFilterResources.removeAll(keepingCapacity: true)
-        for resources in transientRasterizationShadowResources {
-            resources.destroy()
-        }
-        transientRasterizationShadowResources.removeAll(keepingCapacity: true)
-        for resources in transientSnapshotCompositionResources {
-            resources.destroy()
-        }
-        transientSnapshotCompositionResources.removeAll(keepingCapacity: true)
         currentRootLayer = nil
         filterPrerenderRootLayer = nil
         contentMaskCaptureSuppressedRootLayer = nil
@@ -4999,17 +5135,31 @@ private final class RetainedDynamicSnapshot {
         explicitRasterizationCaptureCount = 0
         explicitRasterizationCapturePixelSizes.removeAll(keepingCapacity: true)
         transformFlatteningCompositeCount = 0
-        isRenderingMainPass = true
+        isRenderingMainPass = false
         prerasterizedTextures.removeAll(keepingCapacity: true)
         failedRasterizationRenderKeys.removeAll(keepingCapacity: true)
         pendingContentMaskFrameFailure = nil
         rasterizePrerenderRootLayer = nil
         snapshotCompositedNodes.removeAll(keepingCapacity: true)
+        failedSnapshotRasterizationNodeIndices.removeAll(
+            keepingCapacity: true
+        )
+        failedSnapshotFilterNodeFailures.removeAll(
+            keepingCapacity: true
+        )
+        failedSnapshotCompositionNodeIndices.removeAll(
+            keepingCapacity: true
+        )
+        currentSnapshotCompositeTargetNodeIndex = nil
         snapshotCompositeCaptureRootNodeIndex = nil
+        snapshotCompositeCaptureBounds = nil
         snapshotCompositeCaptureSuppressesOpacity = false
         snapshotPreparedShadows.removeAll(keepingCapacity: true)
         snapshotSuppressesShadows = false
         snapshotShadowCaptureRootNodeIndex = nil
+        failedSnapshotShadowCaptureReplicatorNodeIndices.removeAll(
+            keepingCapacity: true
+        )
         snapshotPreparedCompositions.removeAll(keepingCapacity: true)
         snapshotCompositionCaptureStopNodeIndex = nil
         snapshotCompositionCaptureDidReachStop = false
@@ -5022,32 +5172,49 @@ private final class RetainedDynamicSnapshot {
     }
 
     private func discardFailedCommittedSnapshotResources() {
+        for key in pendingCommittedRasterizationCacheKeys {
+            rasterizationCache?.remove(key)
+        }
+        pendingCommittedRasterizationCacheKeys.removeAll(
+            keepingCapacity: true
+        )
         for texture in transientCaptureDepthTextures {
             texture.destroy()
         }
-        transientCaptureDepthTextures.removeAll(keepingCapacity: true)
+        transientCaptureDepthTextures = []
         for texture in transientRasterizationTextures {
             texture.destroy()
         }
-        transientRasterizationTextures.removeAll(keepingCapacity: true)
+        transientRasterizationTextures = []
         for resources in transientRasterizationFilterResources {
             resources.destroy()
         }
-        transientRasterizationFilterResources.removeAll(keepingCapacity: true)
+        transientRasterizationFilterResources = []
         for resources in transientRasterizationShadowResources {
             resources.destroy()
         }
-        transientRasterizationShadowResources.removeAll(keepingCapacity: true)
+        transientRasterizationShadowResources = []
         for resources in transientSnapshotCompositionResources {
             resources.destroy()
         }
-        transientSnapshotCompositionResources.removeAll(keepingCapacity: true)
+        transientSnapshotCompositionResources = []
         for execution in activeCompositionExecutions {
             execution.invalidate()
         }
         activeCompositionExecutions.removeAll(keepingCapacity: true)
         snapshotCompositedNodes.removeAll(keepingCapacity: true)
+        failedSnapshotRasterizationNodeIndices.removeAll(
+            keepingCapacity: true
+        )
+        failedSnapshotFilterNodeFailures.removeAll(
+            keepingCapacity: true
+        )
+        failedSnapshotCompositionNodeIndices.removeAll(
+            keepingCapacity: true
+        )
+        currentSnapshotCompositeTargetNodeIndex = nil
         snapshotCompositeCaptureRootNodeIndex = nil
+        snapshotCompositeCaptureBounds = nil
         snapshotCompositeCaptureSuppressesOpacity = false
         snapshotPreparedShadows.removeAll(keepingCapacity: true)
         snapshotSuppressesShadows = false
@@ -5113,9 +5280,21 @@ private final class RetainedDynamicSnapshot {
         retainedDynamicSnapshots = retainedDynamicSnapshots.filter {
             $0.value.rootLayer != nil
         }
+        retainedAnimationEvaluators =
+            retainedAnimationEvaluators.filter {
+                $0.value.rootLayer != nil
+            }
+        committedAnimationEvaluationFailures =
+            committedAnimationEvaluationFailures.filter {
+                $0.value.rootLayer != nil
+            }
         let rootIdentity = ObjectIdentifier(rootLayer)
         let pendingCommittedState =
             rootLayer.pendingCommittedRenderState
+        let retainedAnimationEvaluator =
+            pendingCommittedState == nil
+                ? retainedAnimationEvaluators[rootIdentity]
+                : nil
         let retainedEntry =
             pendingCommittedState == nil
                 ? retainedDynamicSnapshots[rootIdentity]
@@ -5132,39 +5311,117 @@ private final class RetainedDynamicSnapshot {
                 forKey: rootIdentity
             )
         }
-        let committedState: CACommittedRenderState? =
-            usesRetainedDynamicSnapshot
-                ? retainedSnapshot.map(
-                    CACommittedRenderState.snapshot
+        let committedState:
+            CACommittedRenderState?
+        if let retainedAnimationEvaluator,
+           retainedAnimationEvaluator.rootLayer === rootLayer {
+            CALayer.advanceFrameToken()
+            do {
+                committedState = .snapshot(
+                    try retainedAnimationEvaluator
+                        .evaluator.snapshot(
+                            frameToken:
+                                retainedAnimationEvaluator
+                                    .frameToken
+                        )
                 )
-                : pendingCommittedState
+            } catch {
+                recordCommittedAnimationEvaluationFailure(
+                    error,
+                    frameToken:
+                        retainedAnimationEvaluator.frameToken,
+                    rootLayer: rootLayer
+                )
+                return
+            }
+        } else if case .animationEvaluator(
+            let frameToken,
+            let evaluator
+        ) = pendingCommittedState {
+            retainedAnimationEvaluators[rootIdentity] =
+                RetainedCommittedAnimationEvaluator(
+                    rootLayer: rootLayer,
+                    evaluator: evaluator,
+                    frameToken: frameToken
+                )
+            CALayer.advanceFrameToken()
+            do {
+                committedState = .snapshot(
+                    try evaluator.snapshot(
+                        frameToken: frameToken
+                    )
+                )
+            } catch {
+                recordCommittedAnimationEvaluationFailure(
+                    error,
+                    frameToken: frameToken,
+                    rootLayer: rootLayer
+                )
+                return
+            }
+        } else {
+            committedState =
+                usesRetainedDynamicSnapshot
+                    ? retainedSnapshot.map(
+                        CACommittedRenderState.snapshot
+                    )
+                    : pendingCommittedState
+        }
+        if case .snapshot = committedState {
+            committedAnimationEvaluationFailures.removeValue(
+                forKey: rootIdentity
+            )
+        }
         switch pendingCommittedState {
         case .captureFailure,
-             .requiresLiveAnimationEvaluation:
+             .snapshot:
+            retainedAnimationEvaluators.removeValue(
+                forKey: rootIdentity
+            )
             retainedDynamicSnapshots.removeValue(
                 forKey: rootIdentity
             )
-        case .snapshot, nil:
+            if case .snapshot = pendingCommittedState {
+                committedAnimationEvaluationFailures
+                    .removeValue(forKey: rootIdentity)
+            }
+        case .animationEvaluator:
+            retainedDynamicSnapshots.removeValue(
+                forKey: rootIdentity
+            )
+        case nil:
             break
         }
         let committedFrameToken: UInt64?
         switch committedState {
-        case .captureFailure(_, let error):
+        case .captureFailure(
+            let frameToken,
+            let error
+        ):
             synchronizeDelegateBackingStoreDiagnostics(in: rootLayer)
             if case .invalidDelegateBackingStore(let backingStoreError) = error {
                 delegateDrawFailureCount += 1
                 lastDelegateBackingStoreError = backingStoreError
                 lastDelegateBackingStoreFormat = nil
             }
-            recordFrameRenderFailure(
-                .committedSnapshotCaptureFailed(error)
+            recordCommittedAnimationEvaluationFailure(
+                error,
+                frameToken: frameToken,
+                rootLayer: rootLayer
             )
             return
         case .snapshot(let snapshot):
             synchronizeDelegateBackingStoreDiagnostics(in: snapshot)
             committedFrameToken = snapshot.frameToken
-        case .requiresLiveAnimationEvaluation(let frameToken):
-            committedFrameToken = frameToken
+        case .animationEvaluator:
+            recordFrameRenderFailure(
+                .committedSnapshotCaptureFailed(
+                    .renderingFailed(
+                        "Animation evaluator was not resolved to a snapshot"
+                    )
+                )
+            )
+            return
         case nil:
             committedFrameToken = nil
         }
@@ -5205,17 +5462,32 @@ private final class RetainedDynamicSnapshot {
         }
         processPendingCommittedTileDraws()
         if case .snapshot(let snapshot) = committedState {
+            let usesAnimationEvaluator =
+                retainedAnimationEvaluator != nil
+                || {
+                    if case .animationEvaluator =
+                        pendingCommittedState {
+                        return true
+                    }
+                    return false
+                }()
             renderCommittedSnapshot(
                 snapshot,
                 rootLayer: rootLayer,
                 acknowledgesCommit:
-                    !usesRetainedDynamicSnapshot,
+                    !usesRetainedDynamicSnapshot
+                    && retainedAnimationEvaluator == nil,
                 device: device,
                 context: context,
                 pipeline: pipeline,
                 depthTextureView: depthTextureView,
                 renderTarget: renderTarget
             )
+            if usesAnimationEvaluator {
+                retainedDynamicSnapshots.removeValue(
+                    forKey: rootIdentity
+                )
+            }
             return
         }
         guard let layerFilterProcessor else {
@@ -5271,26 +5543,6 @@ private final class RetainedDynamicSnapshot {
         retiredTransitionFilterExecutions.removeAll(
             keepingCapacity: true
         )
-        for texture in transientCaptureDepthTextures {
-            texture.destroy()
-        }
-        transientCaptureDepthTextures.removeAll(keepingCapacity: true)
-        for texture in transientRasterizationTextures {
-            texture.destroy()
-        }
-        transientRasterizationTextures.removeAll(keepingCapacity: true)
-        for resources in transientRasterizationFilterResources {
-            resources.destroy()
-        }
-        transientRasterizationFilterResources.removeAll(keepingCapacity: true)
-        for resources in transientRasterizationShadowResources {
-            resources.destroy()
-        }
-        transientRasterizationShadowResources.removeAll(keepingCapacity: true)
-        for resources in transientSnapshotCompositionResources {
-            resources.destroy()
-        }
-        transientSnapshotCompositionResources.removeAll(keepingCapacity: true)
         snapshotPreparedCompositions.removeAll(keepingCapacity: true)
         snapshotCompositionCaptureStopNodeIndex = nil
         snapshotCompositionCaptureDidReachStop = false
@@ -5299,6 +5551,7 @@ private final class RetainedDynamicSnapshot {
         )
         snapshotCompositedNodes.removeAll(keepingCapacity: true)
         snapshotCompositeCaptureRootNodeIndex = nil
+        snapshotCompositeCaptureBounds = nil
         snapshotCompositeCaptureSuppressesOpacity = false
         snapshotPreparedShadows.removeAll(keepingCapacity: true)
         snapshotSuppressesShadows = false
@@ -5598,6 +5851,9 @@ private final class RetainedDynamicSnapshot {
 
         // Submit command buffer
         device.queue.submit([encoder.finish()])
+        releaseTransientResourcesAfterSubmittedWork(
+            on: device.queue
+        )
         lastRenderedTexture = currentTexture
         let transitionPreparationFailed =
             !failedTransitionResourceIDs.isEmpty
@@ -6159,6 +6415,12 @@ private final class RetainedDynamicSnapshot {
         emitterLayerStates.removeAll(keepingCapacity: false)
         activeEmitterLayerIDs.removeAll(keepingCapacity: false)
         retainedDynamicSnapshots.removeAll(keepingCapacity: false)
+        retainedAnimationEvaluators.removeAll(
+            keepingCapacity: false
+        )
+        committedAnimationEvaluationFailures.removeAll(
+            keepingCapacity: false
+        )
         emitterSpawnFailureCount = 0
         lastEmitterSpawnFailure = nil
         emitterRenderFailureCount = 0
@@ -6477,6 +6739,12 @@ private final class RetainedDynamicSnapshot {
                     snapshotShadowCaptureRootNodeIndex = nil
                     snapshotSuppressesShadows = previousSuppressesShadows
                     capturePass.end()
+                    if case .replicator(let failure) = error {
+                        lastShadowRenderFailure =
+                            .subtreeReplicatorFailed(failure)
+                        shadowRenderFailureCount += 1
+                        continue
+                    }
                     throw error
                 }
                 snapshotShadowCaptureRootNodeIndex = nil
@@ -6602,6 +6870,216 @@ private final class RetainedDynamicSnapshot {
         }
     }
 
+    private func snapshotRasterizationCaptureBounds(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot
+    ) -> CGRect {
+        let node = snapshot.nodes[nodeIndex]
+        let values = node.presentationValues
+        guard !values.isHidden, values.opacity > 0 else {
+            return .null
+        }
+
+        var subtreeBounds = CGRect(
+            origin: .zero,
+            size: values.bounds.size
+        )
+        if !values.masksToBounds {
+            let childParentMatrix = values.sublayerMatrix(
+                modelMatrix: .identity
+            )
+            for childIndex in node.childIndices {
+                let childBounds =
+                    snapshotRasterizationCaptureBounds(
+                        at: childIndex,
+                        in: snapshot
+                    )
+                if childBounds.isNull {
+                    continue
+                }
+                let childValues =
+                    snapshot.nodes[childIndex]
+                        .presentationValues
+                guard let projected =
+                        projectedRasterizationBounds(
+                            childBounds,
+                            matrix: childValues.modelMatrix(
+                                parentMatrix:
+                                    childParentMatrix
+                            )
+                        ) else {
+                    return .infinite
+                }
+                subtreeBounds = subtreeBounds.union(projected)
+            }
+        }
+
+        guard let shadow = values.shadow else {
+            return subtreeBounds
+        }
+        let shadowSourceBounds: CGRect
+        if let vertices = shadow.pathVertices,
+           let first = vertices.first {
+            var minimum = first
+            var maximum = first
+            for vertex in vertices.dropFirst() {
+                minimum = SIMD2(
+                    Swift.min(minimum.x, vertex.x),
+                    Swift.min(minimum.y, vertex.y)
+                )
+                maximum = SIMD2(
+                    Swift.max(maximum.x, vertex.x),
+                    Swift.max(maximum.y, vertex.y)
+                )
+            }
+            shadowSourceBounds = CGRect(
+                x: CGFloat(minimum.x),
+                y: CGFloat(minimum.y),
+                width: CGFloat(maximum.x - minimum.x),
+                height: CGFloat(maximum.y - minimum.y)
+            )
+        } else {
+            shadowSourceBounds = subtreeBounds
+        }
+        let blurPadding = CGFloat(
+            Swift.max(0, shadow.radius * 2)
+        )
+        let shadowBounds = shadowSourceBounds
+            .offsetBy(
+                dx: CGFloat(shadow.offset.x),
+                dy: CGFloat(shadow.offset.y)
+            )
+            .insetBy(
+                dx: -blurPadding,
+                dy: -blurPadding
+            )
+        return subtreeBounds.union(shadowBounds)
+    }
+
+    private func snapshotRasterizationContentHash(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot,
+        captureBounds: CGRect,
+        purpose: RasterizationCachePurpose
+    ) -> Int {
+        var hasher = Hasher()
+        hasher.combine(purpose)
+        hasher.combine(captureBounds.origin.x)
+        hasher.combine(captureBounds.origin.y)
+        hasher.combine(captureBounds.size.width)
+        hasher.combine(captureBounds.size.height)
+
+        func combineSubtree(at index: Int) {
+            let node = snapshot.nodes[index]
+            hasher.combine(node.identity)
+            hasher.combine(node.contentRevision)
+            hasher.combine(node.childIndices.count)
+            for childIndex in node.childIndices {
+                combineSubtree(at: childIndex)
+            }
+            if let maskIndex = node.maskIndex {
+                hasher.combine(true)
+                combineSubtree(at: maskIndex)
+            } else {
+                hasher.combine(false)
+            }
+        }
+
+        combineSubtree(at: nodeIndex)
+        return hasher.finalize()
+    }
+
+    private func snapshotSubtreeRequiresFreshRasterization(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot
+    ) -> Bool {
+        let node = snapshot.nodes[nodeIndex]
+        let values = node.presentationValues
+        if node.hasActiveAnimations
+            || values.emitter != nil
+            || values.tiled != nil
+            || values.transition != nil
+            || values.compositingFilter != nil
+            || values.compositingFilterCaptureFailure != nil
+            || !values.backgroundFilters.isEmpty
+            || !CATransform3DIsIdentity(
+                values.replicatorInstanceTransform
+            )
+            || values.effectiveReplicatorColor
+                != SIMD4<Float>(repeating: 1)
+            || values.effectiveReplicatorTimeOffset != 0 {
+            return true
+        }
+        if node.childIndices.contains(where: {
+            snapshotSubtreeRequiresFreshRasterization(
+                at: $0,
+                in: snapshot
+            )
+        }) {
+            return true
+        }
+        if let maskIndex = node.maskIndex,
+           snapshotSubtreeRequiresFreshRasterization(
+               at: maskIndex,
+               in: snapshot
+           ) {
+            return true
+        }
+        return false
+    }
+
+    private func snapshotSubtreeContainsUnpreparedComposition(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot
+    ) -> Bool {
+        let node = snapshot.nodes[nodeIndex]
+        let values = node.presentationValues
+        let hasComposition =
+            values.compositingFilter != nil
+            || values.compositingFilterCaptureFailure != nil
+            || !values.backgroundFilters.isEmpty
+        if hasComposition {
+            guard snapshotPreparedCompositions.indices.contains(
+                nodeIndex
+            ), snapshotPreparedCompositions[nodeIndex] != nil else {
+                return true
+            }
+        }
+        if node.childIndices.contains(where: {
+            snapshotSubtreeContainsUnpreparedComposition(
+                at: $0,
+                in: snapshot
+            )
+        }) {
+            return true
+        }
+        if let maskIndex = node.maskIndex,
+           snapshotSubtreeContainsUnpreparedComposition(
+               at: maskIndex,
+               in: snapshot
+           ) {
+            return true
+        }
+        return false
+    }
+
+    private func snapshotDescendantsContainBackdropComposition(
+        at nodeIndex: Int,
+        in snapshot: CARenderSnapshot
+    ) -> Bool {
+        snapshot.nodes[nodeIndex].childIndices.contains { childIndex in
+            let child = snapshot.nodes[childIndex]
+            let values = child.presentationValues
+            return values.compositingFilter != nil
+                || values.compositingFilterCaptureFailure != nil
+                || !values.backgroundFilters.isEmpty
+                || snapshotDescendantsContainBackdropComposition(
+                    at: childIndex,
+                    in: snapshot
+                )
+        }
+    }
+
     private func prerenderSnapshotComposites(
         in snapshot: CARenderSnapshot,
         projectionMatrix: Matrix4x4,
@@ -6611,6 +7089,89 @@ private final class RetainedDynamicSnapshot {
         bindGroup: GPUBindGroup,
         pipeline: GPURenderPipeline
     ) throws(CACommittedSnapshotEncodingFailure) {
+        // Offscreen composites provide the content silhouette from which a
+        // shadow is prepared. The shadow itself remains a separate main-pass
+        // draw; baking it into the content texture would apply content masks
+        // to the offset shadow a second time.
+        let previousSuppressesShadows = snapshotSuppressesShadows
+        snapshotSuppressesShadows = true
+        defer {
+            snapshotSuppressesShadows =
+                previousSuppressesShadows
+        }
+        while true {
+            do {
+                try prerenderSnapshotCompositesPass(
+                    in: snapshot,
+                    projectionMatrix: projectionMatrix,
+                    depthTextureView: depthTextureView,
+                    encoder: encoder,
+                    device: device,
+                    bindGroup: bindGroup,
+                    pipeline: pipeline
+                )
+                currentSnapshotCompositeTargetNodeIndex = nil
+                return
+            } catch {
+                guard let nodeIndex =
+                        currentSnapshotCompositeTargetNodeIndex else {
+                    throw error
+                }
+                let values =
+                    snapshot.nodes[nodeIndex]
+                        .presentationValues
+                switch error {
+                case .filter(let failure):
+                    failedSnapshotFilterNodeFailures[nodeIndex] =
+                        failure
+                    recordLayerFilterFailure(
+                        failure,
+                        for: LayerRenderKey(
+                            layer:
+                                snapshot.nodes[nodeIndex]
+                                    .identity
+                        )
+                    )
+                case .replicator(let failure)
+                    where !values.filters.isEmpty:
+                    let contextualFailure =
+                        CALayerFilterRenderFailure
+                            .subtreeReplicatorFailed(failure)
+                    failedSnapshotFilterNodeFailures[nodeIndex] =
+                        contextualFailure
+                    recordLayerFilterFailure(
+                        contextualFailure,
+                        for: LayerRenderKey(
+                            layer:
+                                snapshot.nodes[nodeIndex]
+                                    .identity
+                        )
+                    )
+                case .replicator(let failure)
+                    where values.shouldRasterize:
+                    failedSnapshotRasterizationNodeIndices
+                        .insert(nodeIndex)
+                    recordRasterizationFailure(
+                        .subtreeReplicatorFailed(failure)
+                    )
+                default:
+                    throw error
+                }
+                currentSnapshotCompositeTargetNodeIndex = nil
+            }
+        }
+    }
+
+    private func prerenderSnapshotCompositesPass(
+        in snapshot: CARenderSnapshot,
+        projectionMatrix: Matrix4x4,
+        depthTextureView: GPUTextureView,
+        encoder: GPUCommandEncoder,
+        device: GPUDevice,
+        bindGroup: GPUBindGroup,
+        pipeline: GPURenderPipeline
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        currentSnapshotCompositeTargetNodeIndex = nil
         snapshotCompositedNodes = Array(
             repeating: nil,
             count: snapshot.nodes.count
@@ -6619,50 +7180,106 @@ private final class RetainedDynamicSnapshot {
 
         func collect(
             nodeIndex: Int,
-            parentMatrix: Matrix4x4
+            parentMatrix: Matrix4x4,
+            parentIsTransformLayer: Bool,
+            isInsideFlattenedSubtree: Bool,
+            isMaskTreeRoot: Bool = false
         ) {
             let node = snapshot.nodes[nodeIndex]
             let values = node.presentationValues
             guard !values.isHidden, values.opacity > 0 else {
                 return
             }
+            if failedSnapshotFilterNodeFailures[nodeIndex] != nil {
+                return
+            }
             let modelMatrix = values.modelMatrix(
                 parentMatrix: parentMatrix
             )
-            let sublayerMatrix = values.sublayerMatrix(
-                modelMatrix: modelMatrix
-            )
-            for childIndex in node.childIndices {
-                collect(
-                    nodeIndex: childIndex,
-                    parentMatrix: sublayerMatrix
-                )
-            }
-            if let maskIndex = node.maskIndex {
-                collect(
-                    nodeIndex: maskIndex,
-                    parentMatrix: modelMatrix
-                )
-            }
+            let isTransformLayer =
+                values.isTransformLayer
+                || values.replicator?.preservesDepth == true
             let requiresGroupOpacity =
                 values.allowsGroupOpacity
                 && values.opacity < 1
-                && !node.childIndices.isEmpty
+            let requiresTransformFlattening =
+                parentIsTransformLayer
+                && !isTransformLayer
+                && (
+                    values.emitter?.preservesDepth == false
+                    || !node.childIndices.isEmpty
+                    || !values.filters.isEmpty
+                    || requiresGroupOpacity
+                    || node.maskIndex != nil
+                    || values.masksToBounds
+                    || values.shadow != nil
+                )
+            let requiresEffectFlattening =
+                isInsideFlattenedSubtree
+                && !isMaskTreeRoot
+                && !isTransformLayer
+                && !values.shouldRasterize
+                && !requiresTransformFlattening
+                && (
+                    !values.filters.isEmpty
+                    || requiresGroupOpacity
+                    || values.shadow != nil
+                )
+            let descendantsAreInsideFlattenedSubtree =
+                isInsideFlattenedSubtree
+                || isMaskTreeRoot
+                || values.shouldRasterize
+                || requiresTransformFlattening
+            let sublayerMatrix = values.sublayerMatrix(
+                modelMatrix: modelMatrix
+            )
+            if let maskIndex = node.maskIndex {
+                collect(
+                    nodeIndex: maskIndex,
+                    parentMatrix: modelMatrix,
+                    parentIsTransformLayer: false,
+                    isInsideFlattenedSubtree: true,
+                    isMaskTreeRoot: true
+                )
+            }
+            for childIndex in node.childIndices {
+                collect(
+                    nodeIndex: childIndex,
+                    parentMatrix: sublayerMatrix,
+                    parentIsTransformLayer: isTransformLayer,
+                    isInsideFlattenedSubtree:
+                        descendantsAreInsideFlattenedSubtree
+                )
+            }
             let requiresBackdropComposition =
                 values.compositingFilter != nil
+                || values.compositingFilterCaptureFailure != nil
                 || !values.backgroundFilters.isEmpty
             let requiresEmitterFlattening =
                 values.emitter?.preservesDepth == false
+            let rasterizationPurpose:
+                RasterizationCachePurpose?
+            if requiresTransformFlattening {
+                rasterizationPurpose = .transformFlattening
+            } else if !isTransformLayer && values.shouldRasterize {
+                rasterizationPurpose = .explicit
+            } else if requiresEffectFlattening {
+                rasterizationPurpose = .effectFlattening
+            } else {
+                rasterizationPurpose = nil
+            }
             if node.maskIndex != nil
                 || requiresGroupOpacity
-                || values.shouldRasterize
+                || rasterizationPurpose != nil
                 || !values.filters.isEmpty
                 || requiresBackdropComposition
                 || requiresEmitterFlattening {
                 targets.append(
                     SnapshotCompositeTarget(
                         nodeIndex: nodeIndex,
-                        parentMatrix: parentMatrix
+                        parentMatrix: parentMatrix,
+                        rasterizationPurpose:
+                            rasterizationPurpose
                     )
                 )
             }
@@ -6670,23 +7287,60 @@ private final class RetainedDynamicSnapshot {
 
         collect(
             nodeIndex: snapshot.rootIndex,
-            parentMatrix: projectionMatrix
+            parentMatrix: projectionMatrix,
+            parentIsTransformLayer: false,
+            isInsideFlattenedSubtree: false
         )
         guard !targets.isEmpty else { return }
 
         for target in targets {
+            currentSnapshotCompositeTargetNodeIndex =
+                target.nodeIndex
             let node = snapshot.nodes[target.nodeIndex]
             let values = node.presentationValues
+            let requiresGroupOpacity =
+                values.allowsGroupOpacity
+                && values.opacity < 1
+            let requiresCompositionSource =
+                values.compositingFilter != nil
+                || values.compositingFilterCaptureFailure != nil
+                || !values.backgroundFilters.isEmpty
+            let compositionOwnsAncestorMask =
+                node.maskIndex != nil
+                && values.filters.isEmpty
+                && !requiresGroupOpacity
+                && !requiresCompositionSource
+                && snapshotDescendantsContainBackdropComposition(
+                    at: target.nodeIndex,
+                    in: snapshot
+                )
+            if compositionOwnsAncestorMask {
+                // Descendant composition targets already apply this ancestor
+                // mask through their immutable content-mask target list.
+                // Capturing the ancestor would multiply partial alpha twice.
+                continue
+            }
+            if target.rasterizationPurpose != nil,
+               snapshotSubtreeContainsUnpreparedComposition(
+                   at: target.nodeIndex,
+                   in: snapshot
+               ) {
+                continue
+            }
             let captureConfiguration:
                 CARasterizationCaptureConfiguration?
-            if values.shouldRasterize {
+            let captureBounds: CGRect?
+            if target.rasterizationPurpose != nil {
+                let resolvedCaptureBounds =
+                    snapshotRasterizationCaptureBounds(
+                        at: target.nodeIndex,
+                        in: snapshot
+                    )
                 do {
                     captureConfiguration =
                         try CARasterizationCaptureConfiguration(
-                            captureBounds: CGRect(
-                                origin: .zero,
-                                size: size
-                            ),
+                            captureBounds:
+                                resolvedCaptureBounds,
                             rasterizationScale:
                                 values.rasterizationScale,
                             maximumTextureDimension: Int(
@@ -6694,10 +7348,19 @@ private final class RetainedDynamicSnapshot {
                             )
                         )
                 } catch {
+                    if target.nodeIndex != snapshot.rootIndex {
+                        failedSnapshotRasterizationNodeIndices.insert(
+                            target.nodeIndex
+                        )
+                        recordRasterizationFailure(error)
+                        continue
+                    }
                     throw .rasterization(error)
                 }
+                captureBounds = resolvedCaptureBounds
             } else {
                 captureConfiguration = nil
+                captureBounds = nil
             }
             let captureWidth =
                 captureConfiguration?.pixelWidth
@@ -6705,6 +7368,57 @@ private final class RetainedDynamicSnapshot {
             let captureHeight =
                 captureConfiguration?.pixelHeight
                     ?? Int(currentRenderTargetSize.height)
+            let rasterizationCacheKey =
+                target.rasterizationPurpose.map {
+                    RasterizationCacheKey(
+                        LayerRenderKey(layer: node.identity),
+                        purpose: $0
+                    )
+                }
+            let rasterizationContentHash: Int?
+            if let captureBounds,
+               let purpose = target.rasterizationPurpose {
+                rasterizationContentHash =
+                    snapshotRasterizationContentHash(
+                        at: target.nodeIndex,
+                        in: snapshot,
+                        captureBounds: captureBounds,
+                        purpose: purpose
+                    )
+            } else {
+                rasterizationContentHash = nil
+            }
+            let requiresFreshRasterization =
+                target.rasterizationPurpose != nil
+                && snapshotSubtreeRequiresFreshRasterization(
+                    at: target.nodeIndex,
+                    in: snapshot
+                )
+            if !requiresFreshRasterization,
+               let cache = rasterizationCache,
+               let cacheKey = rasterizationCacheKey,
+               let contentHash = rasterizationContentHash,
+               let entry = cache.lookup(
+                   cacheKey,
+                   atFrame: CALayer._currentFrameToken
+               ),
+               entry.pixelSize == CGSize(
+                   width: captureWidth,
+                   height: captureHeight
+               ),
+               entry.contentBoundsHash == contentHash {
+                snapshotCompositedNodes[target.nodeIndex] =
+                    SnapshotCompositedNode(
+                        resources: nil,
+                        outputTexture: entry.texture,
+                        outputView: entry.texture.createView(),
+                        kind: .rasterization,
+                        captureBounds: captureBounds,
+                        rasterizationPurpose:
+                            target.rasterizationPurpose
+                    )
+                continue
+            }
             let resources = FilterLayerResources(
                 device: device,
                 width: captureWidth,
@@ -6728,13 +7442,19 @@ private final class RetainedDynamicSnapshot {
                     captureDepthTexture
                 )
                 captureDepthView = captureDepthTexture.createView()
-                explicitRasterizationCaptureCount += 1
-                explicitRasterizationCapturePixelSizes.append(
-                    CGSize(
-                        width: captureWidth,
-                        height: captureHeight
+                if target.rasterizationPurpose
+                    == .transformFlattening {
+                    transformFlatteningCaptureCount += 1
+                } else if target.rasterizationPurpose
+                    == .explicit {
+                    explicitRasterizationCaptureCount += 1
+                    explicitRasterizationCapturePixelSizes.append(
+                        CGSize(
+                            width: captureWidth,
+                            height: captureHeight
+                        )
                     )
-                )
+                }
             } else {
                 captureDepthView = depthTextureView
             }
@@ -6776,32 +7496,57 @@ private final class RetainedDynamicSnapshot {
                 maxDepth: 1
             )
             snapshotCompositeCaptureRootNodeIndex = target.nodeIndex
+            snapshotCompositeCaptureBounds = captureBounds
             snapshotCompositeCaptureSuppressesOpacity = true
             let previousRenderTargetSize = renderTargetSizeOverride
             renderTargetSizeOverride = CGSize(
                 width: captureWidth,
                 height: captureHeight
             )
+            let captureParentMatrix: Matrix4x4
+            if let captureConfiguration {
+                captureParentMatrix = Matrix4x4.orthographic(
+                    left: captureConfiguration.projectionLeft,
+                    right: captureConfiguration.projectionRight,
+                    bottom: captureConfiguration.projectionBottom,
+                    top: captureConfiguration.projectionTop,
+                    near: -1000,
+                    far: 1000
+                )
+            } else {
+                captureParentMatrix = target.parentMatrix
+            }
+            let previousSuppressesShadows =
+                snapshotSuppressesShadows
+            if captureConfiguration != nil {
+                snapshotSuppressesShadows = true
+            }
             do {
                 try renderSnapshotNode(
                     at: target.nodeIndex,
                     in: snapshot,
                     renderPass: contentPass,
-                    parentMatrix: target.parentMatrix,
+                    parentMatrix: captureParentMatrix,
                     isRoot: false,
                     device: device,
                     bindGroup: bindGroup
                 )
             } catch {
                 snapshotCompositeCaptureRootNodeIndex = nil
+                snapshotCompositeCaptureBounds = nil
                 snapshotCompositeCaptureSuppressesOpacity = false
                 renderTargetSizeOverride = previousRenderTargetSize
+                snapshotSuppressesShadows =
+                    previousSuppressesShadows
                 contentPass.end()
                 throw error
             }
             snapshotCompositeCaptureRootNodeIndex = nil
+            snapshotCompositeCaptureBounds = nil
             snapshotCompositeCaptureSuppressesOpacity = false
             renderTargetSizeOverride = previousRenderTargetSize
+            snapshotSuppressesShadows =
+                previousSuppressesShadows
             contentPass.end()
 
             var currentTexture = resources.sourceTexture
@@ -6813,6 +7558,8 @@ private final class RetainedDynamicSnapshot {
                         from: values.filters
                     )
                 } catch {
+                    pendingCommittedFilterFailureKey =
+                        LayerRenderKey(layer: node.identity)
                     throw .filter(error)
                 }
                 let filtered: (
@@ -6831,6 +7578,8 @@ private final class RetainedDynamicSnapshot {
                         encoder: encoder
                     )
                 } catch {
+                    pendingCommittedFilterFailureKey =
+                        LayerRenderKey(layer: node.identity)
                     throw .filter(error)
                 }
                 let premultipliedTexture =
@@ -6849,14 +7598,16 @@ private final class RetainedDynamicSnapshot {
                     ),
                     encoder: encoder
                 ) else {
+                    pendingCommittedFilterFailureKey =
+                        LayerRenderKey(layer: node.identity)
                     throw .filter(.alphaConversionFailed)
                 }
                 currentTexture = premultipliedTexture
                 currentView = premultipliedView
             }
 
-            let outputTexture: GPUTexture
-            let outputView: GPUTextureView
+            var outputTexture: GPUTexture
+            var outputView: GPUTextureView
             if let maskIndex = node.maskIndex {
                 guard let compositionMaskApplyPipeline else {
                     throw .contentMask(.contentMaskUnavailable)
@@ -6897,9 +7648,12 @@ private final class RetainedDynamicSnapshot {
                 minDepth: 0,
                 maxDepth: 1
                 )
-                let targetModelMatrix = values.modelMatrix(
-                    parentMatrix: target.parentMatrix
-                )
+                let maskParentMatrix =
+                    captureConfiguration == nil
+                        ? values.modelMatrix(
+                            parentMatrix: target.parentMatrix
+                        )
+                        : captureParentMatrix
                 let previousMaskRenderTargetSize =
                     renderTargetSizeOverride
                 renderTargetSizeOverride = CGSize(
@@ -6911,7 +7665,7 @@ private final class RetainedDynamicSnapshot {
                         at: maskIndex,
                         in: snapshot,
                         renderPass: maskPass,
-                        parentMatrix: targetModelMatrix,
+                        parentMatrix: maskParentMatrix,
                         isRoot: false,
                         device: device,
                         bindGroup: bindGroup
@@ -6947,12 +7701,67 @@ private final class RetainedDynamicSnapshot {
                 outputTexture = currentTexture
                 outputView = currentView
             }
+            if captureConfiguration != nil,
+               let shadow = values.shadow {
+                let configuration =
+                    CAShadowRenderConfiguration(
+                        color: shadow.color,
+                        opacity: shadow.opacity,
+                        radius: shadow.radius,
+                        offset: CGSize(
+                            width: CGFloat(shadow.offset.x),
+                            height: CGFloat(shadow.offset.y)
+                        )
+                    )
+                switch executeSnapshotRasterizedShadow(
+                    configuration: configuration,
+                    pathVertices: shadow.pathVertices,
+                    contentTexture: outputTexture,
+                    captureBounds: captureBounds ?? .null,
+                    width: captureWidth,
+                    height: captureHeight,
+                    encoder: encoder
+                ) {
+                case .success(let texture):
+                    outputTexture = texture
+                    outputView = outputTexture.createView()
+                case .failure(let failure):
+                    throw .shadow(failure)
+                }
+            }
+            if !requiresFreshRasterization,
+               let cache = rasterizationCache,
+               let cacheKey = rasterizationCacheKey,
+               let contentHash = rasterizationContentHash {
+                if resources.view(for: outputTexture) != nil {
+                    resources.preserve(outputTexture)
+                }
+                cache.insert(
+                    cacheKey,
+                    texture: outputTexture,
+                    pixelSize: CGSize(
+                        width: captureWidth,
+                        height: captureHeight
+                    ),
+                    contentBoundsHash: contentHash,
+                    atFrame: CALayer._currentFrameToken
+                )
+                pendingCommittedRasterizationCacheKeys.append(
+                    cacheKey
+                )
+            } else if resources.view(for: outputTexture) == nil {
+                transientRasterizationTextures.append(
+                    outputTexture
+                )
+            }
             snapshotCompositedNodes[target.nodeIndex] =
                 SnapshotCompositedNode(
                     resources: resources,
                     outputTexture: outputTexture,
                     outputView: outputView,
-                    kind: node.maskIndex != nil
+                    kind: captureBounds != nil
+                        ? .rasterization
+                        : node.maskIndex != nil
                         ? .contentMask
                         : !values.filters.isEmpty
                             ? .filter
@@ -6960,7 +7769,10 @@ private final class RetainedDynamicSnapshot {
                                 ? .rasterization
                                 : values.emitter?.preservesDepth == false
                                     ? .rasterization
-                                    : .groupOpacity
+                                    : .groupOpacity,
+                    captureBounds: captureBounds,
+                    rasterizationPurpose:
+                        target.rasterizationPurpose
                 )
         }
     }
@@ -7008,6 +7820,11 @@ private final class RetainedDynamicSnapshot {
             var previousDepth = processingTargets.first?.depth
 
             for target in processingTargets {
+                if failedSnapshotCompositionNodeIndices.contains(
+                    target.nodeIndex
+                ) {
+                    continue
+                }
                 if let previousDepth, target.depth < previousDepth {
                     try prerenderSnapshotComposites(
                         in: snapshot,
@@ -7020,16 +7837,37 @@ private final class RetainedDynamicSnapshot {
                     )
                 }
                 previousDepth = target.depth
-                try prerenderSnapshotBackdropComposition(
-                    target,
-                    root: root,
-                    in: snapshot,
-                    depthTextureView: depthTextureView,
-                    encoder: encoder,
-                    device: device,
-                    bindGroup: bindGroup,
-                    pipeline: pipeline
-                )
+                do {
+                    try prerenderSnapshotBackdropComposition(
+                        target,
+                        root: root,
+                        in: snapshot,
+                        depthTextureView: depthTextureView,
+                        encoder: encoder,
+                        device: device,
+                        bindGroup: bindGroup,
+                        pipeline: pipeline
+                    )
+                } catch {
+                    if case .replicator(let failure) = error {
+                        failedSnapshotCompositionNodeIndices
+                            .insert(target.nodeIndex)
+                        lastCompositionFilterFailure =
+                            .backdropReplicatorFailed(failure)
+                        compositionFilterFailureCount += 1
+                        continue
+                    }
+                    guard case .backdropComposition(
+                        let failure
+                    ) = error else {
+                        throw error
+                    }
+                    failedSnapshotCompositionNodeIndices.insert(
+                        target.nodeIndex
+                    )
+                    lastCompositionFilterFailure = failure
+                    compositionFilterFailureCount += 1
+                }
             }
 
             if previousDepth != nil {
@@ -7114,10 +7952,21 @@ private final class RetainedDynamicSnapshot {
         let node = snapshot.nodes[nodeIndex]
         let values = node.presentationValues
         guard !values.isHidden, values.opacity > 0 else { return }
+        if failedSnapshotRasterizationNodeIndices.contains(
+            nodeIndex
+        ) {
+            return
+        }
+        if failedSnapshotCompositionNodeIndices.contains(
+            nodeIndex
+        ) {
+            return
+        }
 
         let modelMatrix = values.modelMatrix(parentMatrix: parentMatrix)
         let hasComposition =
             values.compositingFilter != nil
+            || values.compositingFilterCaptureFailure != nil
             || !values.backgroundFilters.isEmpty
         let createsBackdropScope =
             hasComposition
@@ -7205,6 +8054,10 @@ private final class RetainedDynamicSnapshot {
         pipeline: GPURenderPipeline
     ) throws(CACommittedSnapshotEncodingFailure) {
         let values = snapshot.nodes[target.nodeIndex].presentationValues
+        if let failure =
+                values.compositingFilterCaptureFailure {
+            throw .backdropComposition(failure)
+        }
         guard snapshotCompositedNodes.indices.contains(target.nodeIndex),
               let source = snapshotCompositedNodes[target.nodeIndex] else {
             throw .backdropComposition(.sourceCaptureUnavailable)
@@ -7340,7 +8193,10 @@ private final class RetainedDynamicSnapshot {
                 in: snapshot,
                 renderPass: backdropPass,
                 parentMatrix: captureRoot.parentMatrix,
-                isRoot: false,
+                isRoot:
+                    target.scope == nil
+                    && captureRoot.nodeIndex
+                        == snapshot.rootIndex,
                 device: device,
                 bindGroup: bindGroup
             )
@@ -7549,7 +8405,14 @@ private final class RetainedDynamicSnapshot {
             snapshotPreparedCompositions[target.nodeIndex] =
                 SnapshotPreparedComposition(
                     resources: resources,
-                    outputView: resources.resultPremultipliedView
+                    outputTexture:
+                        resources.resultPremultipliedTexture,
+                    outputView:
+                        resources.resultPremultipliedView,
+                    samplingModelMatrix:
+                        values.modelMatrix(
+                            parentMatrix: target.parentMatrix
+                        )
                 )
         } catch let failure as CACompositionFilterRenderFailure {
             throw .backdropComposition(failure)
@@ -7816,6 +8679,12 @@ private final class RetainedDynamicSnapshot {
         bindGroup: GPUBindGroup,
         pipeline: GPURenderPipeline
     ) throws(CACompositionFilterRenderFailure) {
+        if let failure =
+                failedSnapshotFilterNodeFailures[
+                    target.nodeIndex
+                ] {
+            throw .contentMaskFilterExecutionFailed(failure)
+        }
         let renderPass = encoder.beginRenderPass(
             descriptor: GPURenderPassDescriptor(
                 colorAttachments: [
@@ -7899,7 +8768,10 @@ private final class RetainedDynamicSnapshot {
         snapshotCompositionCapturePassThroughNodeIndices =
             savedPassThrough
         renderPass.end()
-        if renderFailure != nil {
+        if let renderFailure {
+            if case .filter(let failure) = renderFailure {
+                throw .contentMaskFilterExecutionFailed(failure)
+            }
             throw .clipMaskFailed
         }
     }
@@ -7916,6 +8788,29 @@ private final class RetainedDynamicSnapshot {
         let node = snapshot.nodes[nodeIndex]
         let values = node.presentationValues
         guard !values.isHidden, values.opacity > 0 else { return }
+        if let replicatorFailure =
+                values.replicatorCaptureFailure {
+            if snapshotShadowCaptureRootNodeIndex != nil {
+                failedSnapshotShadowCaptureReplicatorNodeIndices
+                    .insert(nodeIndex)
+            } else if
+                failedSnapshotShadowCaptureReplicatorNodeIndices
+                    .contains(nodeIndex) {
+                return
+            }
+            throw .replicator(replicatorFailure)
+        }
+        if failedSnapshotRasterizationNodeIndices.contains(
+            nodeIndex
+        ) {
+            return
+        }
+        if failedSnapshotFilterNodeFailures[nodeIndex] != nil
+            || failedSnapshotCompositionNodeIndices.contains(
+                nodeIndex
+            ) {
+            return
+        }
         replicatorColorStack.append(
             values.effectiveReplicatorColor
         )
@@ -7960,11 +8855,21 @@ private final class RetainedDynamicSnapshot {
            ),
            snapshotPreparedCompositions.indices.contains(nodeIndex),
            let composition = snapshotPreparedCompositions[nodeIndex] {
+            try renderSnapshotPreparedShadowBeforeComposite(
+                at: nodeIndex,
+                values: values,
+                device: device,
+                renderPass: renderPass
+            )
             do {
                 try renderSnapshotPreparedComposition(
                     composition,
+                    values: values,
                     device: device,
-                    renderPass: renderPass
+                    renderPass: renderPass,
+                    modelMatrix: values.modelMatrix(
+                        parentMatrix: parentMatrix
+                    )
                 )
             } catch {
                 throw .backdropComposition(error)
@@ -7978,39 +8883,79 @@ private final class RetainedDynamicSnapshot {
            ),
            snapshotCompositedNodes.indices.contains(nodeIndex),
            let compositedNode = snapshotCompositedNodes[nodeIndex] {
-            do {
-                try renderPremultipliedFullScreenTexture(
-                    compositedNode.outputView,
-                    uniformBuffer:
-                        compositedNode.resources.compositeUniformBuffer,
-                    configuration:
-                        CALayerFilterCompositeConfiguration(
-                            opacity: currentEffectiveOpacity
-                                * (
-                                    snapshotShadowCaptureRootNodeIndex
-                                        == nodeIndex
-                                    || snapshotTransitionCaptureRootNodeIndex
-                                        == nodeIndex
-                                        ? 1
-                                        : values.opacity
-                                ),
-                            colorMultiplier: SIMD4<Float>(repeating: 1)
-                        ),
-                    device: device,
-                    renderPass: renderPass
-                )
-            } catch {
-                switch compositedNode.kind {
-                case .contentMask:
-                    throw .contentMask(error)
-                case .groupOpacity:
-                    throw .groupOpacity(error)
-                case .rasterization:
-                    throw .rasterization(
-                        .compositeFailed(error)
+            try renderSnapshotPreparedShadowBeforeComposite(
+                at: nodeIndex,
+                values: values,
+                device: device,
+                renderPass: renderPass
+            )
+            if let captureBounds =
+                    compositedNode.captureBounds {
+                if isRenderingMainPass,
+                   compositedNode.rasterizationPurpose
+                    == .transformFlattening {
+                    transformFlatteningCompositeCount += 1
+                }
+                do {
+                    try renderSnapshotRasterizedComposite(
+                        texture: compositedNode.outputTexture,
+                        captureBounds: captureBounds,
+                        opacity:
+                            currentEffectiveOpacity
+                            * values.opacity,
+                        device: device,
+                        renderPass: renderPass,
+                        modelMatrix: values.modelMatrix(
+                            parentMatrix: parentMatrix
+                        )
                     )
-                case .filter:
-                    throw .filter(error)
+                } catch {
+                    throw .rasterization(error)
+                }
+            } else {
+                guard let resources =
+                        compositedNode.resources else {
+                    throw .rasterization(
+                        .compositeResourcesUnavailable
+                    )
+                }
+                do {
+                    try renderPremultipliedFullScreenTexture(
+                        compositedNode.outputView,
+                        uniformBuffer:
+                            resources.compositeUniformBuffer,
+                        configuration:
+                            CALayerFilterCompositeConfiguration(
+                                opacity: currentEffectiveOpacity
+                                    * (
+                                        snapshotShadowCaptureRootNodeIndex
+                                            == nodeIndex
+                                        || snapshotTransitionCaptureRootNodeIndex
+                                            == nodeIndex
+                                            ? 1
+                                            : values.opacity
+                                    ),
+                                colorMultiplier:
+                                    SIMD4<Float>(repeating: 1)
+                            ),
+                        device: device,
+                        renderPass: renderPass
+                    )
+                } catch {
+                    switch compositedNode.kind {
+                    case .contentMask:
+                        throw .contentMask(error)
+                    case .groupOpacity:
+                        throw .groupOpacity(error)
+                    case .rasterization:
+                        throw .rasterization(
+                            .compositeFailed(error)
+                        )
+                    case .filter:
+                        pendingCommittedFilterFailureKey =
+                            LayerRenderKey(layer: node.identity)
+                        throw .filter(error)
+                    }
                 }
             }
             return
@@ -8031,7 +8976,12 @@ private final class RetainedDynamicSnapshot {
         defer { _ = opacityStack.popLast() }
 
         let modelMatrix: Matrix4x4
-        if snapshotTransitionCaptureRootNodeIndex == nodeIndex {
+        if snapshotTransitionCaptureRootNodeIndex == nodeIndex
+            || (
+                snapshotCompositeCaptureRootNodeIndex
+                    == nodeIndex
+                && snapshotCompositeCaptureBounds != nil
+            ) {
             modelMatrix = parentMatrix
         } else {
             modelMatrix = values.modelMatrix(
@@ -8044,6 +8994,7 @@ private final class RetainedDynamicSnapshot {
                 in: snapshot,
                 renderPass: renderPass,
                 modelMatrix: modelMatrix,
+                rejectsCompleteFrameOnFailure: isRoot,
                 device: device,
                 bindGroup: bindGroup
             )
@@ -8055,6 +9006,7 @@ private final class RetainedDynamicSnapshot {
                 in: snapshot,
                 renderPass: renderPass,
                 modelMatrix: modelMatrix,
+                rejectsCompleteFrameOnFailure: isRoot,
                 device: device,
                 bindGroup: bindGroup
             )
@@ -8251,6 +9203,29 @@ private final class RetainedDynamicSnapshot {
                 bindGroup: bindGroup
             )
         }
+    }
+
+    private func renderSnapshotPreparedShadowBeforeComposite(
+        at nodeIndex: Int,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder
+    ) throws(CACommittedSnapshotEncodingFailure) {
+        guard !snapshotSuppressesShadows,
+              snapshotPreparedShadows.indices.contains(nodeIndex),
+              let preparedShadow =
+                snapshotPreparedShadows[nodeIndex] else {
+            return
+        }
+        opacityStack.append(
+            currentEffectiveOpacity * values.opacity
+        )
+        defer { _ = opacityStack.popLast() }
+        try renderSnapshotShadow(
+            preparedShadow,
+            device: device,
+            renderPass: renderPass
+        )
     }
 
     private func renderSnapshotShape(
@@ -8455,9 +9430,22 @@ private final class RetainedDynamicSnapshot {
 
     private func renderSnapshotPreparedComposition(
         _ composition: SnapshotPreparedComposition,
+        values: CARenderSnapshot.PresentationValues,
         device: GPUDevice,
-        renderPass: GPURenderPassEncoder
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
     ) throws(CACompositionFilterRenderFailure) {
+        if transformDepthNesting > 0
+            || snapshotCompositeCaptureBounds != nil {
+            try renderSnapshotPreparedCompositionPlane(
+                composition,
+                values: values,
+                device: device,
+                renderPass: renderPass,
+                modelMatrix: modelMatrix
+            )
+            return
+        }
         guard let filterReplacementPipeline,
               let blurSampler else {
             throw .displayResourcesUnavailable
@@ -8499,6 +9487,137 @@ private final class RetainedDynamicSnapshot {
         )
         renderPass.setPipeline(filterReplacementPipeline)
         renderPass.setBindGroup(0, bindGroup: bindGroup)
+        renderPass.draw(vertexCount: 6)
+    }
+
+    private func renderSnapshotPreparedCompositionPlane(
+        _ composition: SnapshotPreparedComposition,
+        values: CARenderSnapshot.PresentationValues,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CACompositionFilterRenderFailure) {
+        let configuration =
+            try CACompositionPlaneRenderConfiguration(
+                bounds: values.bounds,
+                viewportSize: size
+            )
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(
+                configuration.size.x,
+                0,
+                0,
+                0
+            ),
+            SIMD4<Float>(
+                0,
+                configuration.size.y,
+                0,
+                0
+            ),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        let finalMatrix = modelMatrix * scaleMatrix
+        try configuration.validateDisplayTransform(
+            columns: finalMatrix.columns
+        )
+
+        let selectedPipeline: GPURenderPipeline?
+        if transformDepthNesting > 0 {
+            selectedPipeline = maskNestingDepth > 0
+                ? transformedCompositionStencilPipeline
+                : transformedCompositionPipeline
+        } else {
+            selectedPipeline = maskNestingDepth > 0
+                ? capturedCompositionStencilPipeline
+                : capturedCompositionPipeline
+        }
+        guard let selectedPipeline,
+              let blurSampler,
+              let vertexBuffer else {
+            throw .displayResourcesUnavailable
+        }
+
+        let planeVertices: [CACompositionPlaneVertex]
+        if snapshotCompositeCaptureBounds != nil {
+            planeVertices = try configuration.capturedVertices(
+                samplingColumns:
+                    composition.samplingModelMatrix.columns
+            )
+        } else {
+            planeVertices = configuration.standardVertices()
+        }
+        var vertices = planeVertices.map {
+            CARendererVertex(
+                position: $0.position,
+                texCoord: $0.texCoord,
+                color: $0.color
+            )
+        }
+        guard let allocation =
+                allocateVertices(count: vertices.count) else {
+            throw .displayVertexCapacityExceeded
+        }
+
+        var uniforms = TexturedUniforms(
+            mvpMatrix: finalMatrix,
+            layerSize: configuration.viewportSize
+        )
+        let compositionBindGroup = device.createBindGroup(
+            descriptor: GPUBindGroupDescriptor(
+                layout: selectedPipeline.getBindGroupLayout(
+                    index: 0
+                ),
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .buffer(
+                            composition.resources
+                                .transformedDisplayUniformBuffer,
+                            offset: 0,
+                            size: UInt64(
+                                MemoryLayout<
+                                    TexturedUniforms
+                                >.stride
+                            )
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .textureView(
+                            composition.outputView
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 2,
+                        resource: .sampler(blurSampler)
+                    ),
+                ]
+            )
+        )
+        device.queue.writeBuffer(
+            composition.resources
+                .transformedDisplayUniformBuffer,
+            bufferOffset: 0,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: allocation.vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: compositionBindGroup
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: allocation.vertexOffset
+        )
         renderPass.draw(vertexCount: 6)
     }
 
@@ -9660,8 +10779,10 @@ private final class RetainedDynamicSnapshot {
             stage = .transformDepth
             reason = String(describing: failure)
         case .replicator(let failure):
-            stage = .replicator
-            reason = String(describing: failure)
+            return .participantReplicatorFailed(
+                role,
+                failure
+            )
         case .emitter(let failure):
             stage = .emitter
             reason = String(describing: failure)
@@ -9690,6 +10811,139 @@ private final class RetainedDynamicSnapshot {
             transitionRenderFailureCount += 1
         }
         lastTransitionRenderFailure = failure
+    }
+
+    private func recordCommittedAnimationEvaluationFailure(
+        _ error: CARendererError,
+        frameToken: UInt64,
+        rootLayer: CALayer
+    ) {
+        let rootIdentity = ObjectIdentifier(rootLayer)
+        let previous =
+            committedAnimationEvaluationFailures[
+                rootIdentity
+            ]
+        let transitionFailure =
+            committedTransitionFailure(in: error)
+        let transitionFailureDescription =
+            transitionFailure.map(String.init(describing:))
+        let shadowFailure = committedShadowFailure(in: error)
+        let shadowFailureDescription =
+            shadowFailure.map(String.init(describing:))
+        let emitterFailure = committedEmitterFailure(in: error)
+        let emitterFailureDescription =
+            emitterFailure.map(String.init(describing:))
+        let record = CommittedAnimationEvaluationFailure(
+            rootLayer: rootLayer,
+            frameToken: frameToken,
+            transitionFailureDescription:
+                transitionFailureDescription,
+            shadowFailureDescription:
+                shadowFailureDescription,
+            emitterFailureDescription:
+                emitterFailureDescription
+        )
+        if (
+            previous?.frameToken != frameToken
+                || previous?
+                    .transitionFailureDescription
+                    != transitionFailureDescription
+        ),
+           let transitionFailure {
+            recordTransitionFailure(
+                transitionFailure,
+                category: transitionFailureCategory(
+                    for: transitionFailure
+                )
+            )
+        }
+        if (
+            previous?.frameToken != frameToken
+                || previous?
+                    .shadowFailureDescription
+                    != shadowFailureDescription
+        ),
+           let shadowFailure {
+            lastShadowRenderFailure = shadowFailure
+            shadowRenderFailureCount += 1
+        }
+        if (
+            previous?.frameToken != frameToken
+                || previous?
+                    .emitterFailureDescription
+                    != emitterFailureDescription
+        ),
+           let emitterFailure {
+            switch emitterFailure {
+            case .unsupportedRenderMode:
+                recordEmitterRenderFailure(emitterFailure)
+            default:
+                recordEmitterSpawnFailure(emitterFailure)
+            }
+        }
+        committedAnimationEvaluationFailures[
+            rootIdentity
+        ] = record
+        if transitionFailure != nil {
+            frameRenderFailureCount += 1
+        } else {
+            recordFrameRenderFailure(
+                .committedSnapshotCaptureFailed(error)
+            )
+        }
+    }
+
+    private func committedTransitionFailure(
+        in error: CARendererError
+    ) -> CATransitionRenderFailure? {
+        switch error {
+        case .invalidLayerTransition(let failure):
+            return failure
+        case .invalidCommittedAnimation(let failure):
+            return committedTransitionFailure(in: failure)
+        default:
+            return nil
+        }
+    }
+
+    private func committedTransitionFailure(
+        in error: CACommittedAnimationCaptureError
+    ) -> CATransitionRenderFailure? {
+        switch error {
+        case .invalidTransitionFilter(let failure):
+            return failure
+        case .invalidTransitionSource(let failure):
+            return committedTransitionFailure(in: failure)
+        default:
+            return nil
+        }
+    }
+
+    private func committedShadowFailure(
+        in error: CARendererError
+    ) -> CAShadowRenderFailure? {
+        guard case .invalidLayerShadow(let failure) = error else {
+            return nil
+        }
+        switch failure {
+        case .nonFiniteGeometry:
+            return .nonFiniteGeometry
+        case .invalidColor:
+            return .invalidColor
+        case .pathTessellationFailed:
+            return .shadowPathTessellationFailed
+        case .invalidCompositeOpacity(let opacity):
+            return .invalidCompositeOpacity(opacity)
+        }
+    }
+
+    private func committedEmitterFailure(
+        in error: CARendererError
+    ) -> CAEmitterFailure? {
+        guard case .invalidLayerEmitter(let failure) = error else {
+            return nil
+        }
+        return emitterFailure(from: failure)
     }
 
     private func recordTransitionPreparationFailure(
@@ -9736,6 +10990,17 @@ private final class RetainedDynamicSnapshot {
 
             let resourceIdentity = transition.resourceIdentity
             activeTransitionResourceIDs.insert(resourceIdentity)
+            if let failure = transition.preparationFailure {
+                failedTransitionResourceIDs.insert(
+                    resourceIdentity
+                )
+                retireTransitionCapture(for: resourceIdentity)
+                recordTransitionPreparationFailure(
+                    failure,
+                    resourceIdentity: resourceIdentity
+                )
+                return
+            }
             guard !failedTransitionResourceIDs.contains(
                 resourceIdentity
             ) else {
@@ -9927,6 +11192,8 @@ private final class RetainedDynamicSnapshot {
         let savedSuppressesShadows = snapshotSuppressesShadows
         let savedShadowCaptureRoot =
             snapshotShadowCaptureRootNodeIndex
+        let savedShadowCaptureReplicatorFailures =
+            failedSnapshotShadowCaptureReplicatorNodeIndices
         let savedPreparedCompositions =
             snapshotPreparedCompositions
         let savedCompositionStop =
@@ -9964,6 +11231,8 @@ private final class RetainedDynamicSnapshot {
                 savedSuppressesShadows
             snapshotShadowCaptureRootNodeIndex =
                 savedShadowCaptureRoot
+            failedSnapshotShadowCaptureReplicatorNodeIndices =
+                savedShadowCaptureReplicatorFailures
             snapshotPreparedCompositions =
                 savedPreparedCompositions
             snapshotCompositionCaptureStopNodeIndex =
@@ -9992,6 +11261,9 @@ private final class RetainedDynamicSnapshot {
 
         snapshotTransitionCaptureRootNodeIndex = nodeIndex
         snapshotTransitionSuppressedNodeIndex = nodeIndex
+        failedSnapshotShadowCaptureReplicatorNodeIndices.removeAll(
+            keepingCapacity: true
+        )
         renderTargetSizeOverride = pixelSize
         isRenderingMainPass = false
         opacityStack.removeAll(keepingCapacity: true)
@@ -10153,9 +11425,7 @@ private final class RetainedDynamicSnapshot {
                 }
                 do {
                     let filterConfiguration =
-                        try CARenderSnapshotTransition.Filter.capture(
-                            state.filter
-                        )
+                        try state.resolvedFilterSnapshot()
                     if filterConfiguration == nil {
                         try CARenderSnapshotTransition.validateBuiltIn(
                             type: state.type,
@@ -10163,9 +11433,13 @@ private final class RetainedDynamicSnapshot {
                         )
                     }
                     if transitionCaptures[resourceIdentity] == nil {
+                        guard let sourceLayer = state.sourceLayer else {
+                            throw CATransitionRenderFailure
+                                .missingSourceState
+                        }
                         transitionCaptures[resourceIdentity] =
                             try createTransitionCapture(
-                                sourceLayer: state.sourceLayer,
+                                sourceLayer: sourceLayer,
                                 targetLayer: layer,
                                 filterConfiguration:
                                     filterConfiguration,
@@ -16648,6 +17922,42 @@ private final class RetainedDynamicSnapshot {
         height: Int,
         encoder: GPUCommandEncoder
     ) throws(CAShadowRenderFailure) -> GPUTexture {
+        let configuration = try CAShadowRenderConfiguration(layer: layer)
+        let pathVertices: [SIMD2<Float>]?
+        if let shadowPath = layer.shadowPath {
+            do {
+                pathVertices = try ShapeFillTessellator.triangles(
+                    for: shadowPath,
+                    rule: .nonZero
+                ).map {
+                    SIMD2(Float($0.x), Float($0.y))
+                }
+            } catch {
+                throw .shadowPathTessellationFailed
+            }
+        } else {
+            pathVertices = nil
+        }
+        return try executeRasterizedShadow(
+            configuration: configuration,
+            pathVertices: pathVertices,
+            contentTexture: contentTexture,
+            captureBounds: captureBounds,
+            width: width,
+            height: height,
+            encoder: encoder
+        )
+    }
+
+    private func executeRasterizedShadow(
+        configuration: CAShadowRenderConfiguration,
+        pathVertices: [SIMD2<Float>]?,
+        contentTexture: GPUTexture,
+        captureBounds: CGRect,
+        width: Int,
+        height: Int,
+        encoder: GPUCommandEncoder
+    ) throws(CAShadowRenderFailure) -> GPUTexture {
         guard let device,
               let bindGroupLayout,
               let dummyGradientStopBuffer,
@@ -16659,8 +17969,6 @@ private final class RetainedDynamicSnapshot {
               let blurSampler else {
             throw .rasterizedShadowResourcesUnavailable
         }
-        let configuration = try CAShadowRenderConfiguration(layer: layer)
-
         let resources = ShadowLayerResources(
             device: device,
             width: width,
@@ -16670,7 +17978,7 @@ private final class RetainedDynamicSnapshot {
         transientRasterizationShadowResources.append(resources)
 
         let horizontalInputView: GPUTextureView
-        if let shadowPath = layer.shadowPath {
+        if let pathVertices {
             var maskUniforms = CARendererUniforms(
                 mvpMatrix: Matrix4x4.orthographic(
                     left: Float(captureBounds.minX),
@@ -16710,20 +18018,13 @@ private final class RetainedDynamicSnapshot {
                 ]
             ))
             let white = SIMD4<Float>(repeating: 1)
-            var vertices: [CARendererVertex]
-            do {
-                vertices = try ShapeFillTessellator.triangles(
-                    for: shadowPath,
-                    rule: .nonZero
-                ).map { point in
+            var vertices: [CARendererVertex] =
+                pathVertices.map { point in
                     CARendererVertex(
-                        position: SIMD2(Float(point.x), Float(point.y)),
+                        position: point,
                         texCoord: .zero,
                         color: white
                     )
-                }
-            } catch {
-                throw .shadowPathTessellationFailed
             }
             let vertexBuffer = resources.ensureMaskVertexCapacity(vertices.count, device: device)
             if !vertices.isEmpty {
@@ -16872,6 +18173,32 @@ private final class RetainedDynamicSnapshot {
         return finalTexture
     }
 
+    private func executeSnapshotRasterizedShadow(
+        configuration: CAShadowRenderConfiguration,
+        pathVertices: [SIMD2<Float>]?,
+        contentTexture: GPUTexture,
+        captureBounds: CGRect,
+        width: Int,
+        height: Int,
+        encoder: GPUCommandEncoder
+    ) -> Result<GPUTexture, CAShadowRenderFailure> {
+        do {
+            return .success(
+                try executeRasterizedShadow(
+                    configuration: configuration,
+                    pathVertices: pathVertices,
+                    contentTexture: contentTexture,
+                    captureBounds: captureBounds,
+                    width: width,
+                    height: height,
+                    encoder: encoder
+                )
+            )
+        } catch {
+            return .failure(error)
+        }
+    }
+
     /// Hash of the inputs that determine the captured pixels. Used by
     /// `RasterizationDecisions.canReuseRasterizedTexture` to detect
     /// content invalidation independent of the dirty-bit pathway.
@@ -16944,6 +18271,154 @@ private final class RetainedDynamicSnapshot {
         for sublayer in layer.sublayers ?? [] {
             combineDetachedContentRevision(of: sublayer, into: &hasher, visited: &visited)
         }
+    }
+
+    private func renderSnapshotRasterizedComposite(
+        texture: GPUTexture,
+        captureBounds: CGRect,
+        opacity: Float,
+        device: GPUDevice,
+        renderPass: GPURenderPassEncoder,
+        modelMatrix: Matrix4x4
+    ) throws(CARasterizationRenderFailure) {
+        guard let texturedBindGroupLayout,
+              let textureSampler,
+              let vertexBuffer,
+              let uniformBuffer,
+              let basePipeline = pipeline else {
+            throw .compositeResourcesUnavailable
+        }
+        guard let selectedPipeline =
+                selectPremultipliedTexturedPipeline() else {
+            throw .compositePipelineUnavailable
+        }
+
+        let captureMinX = Float(captureBounds.minX)
+        let captureMinY = Float(captureBounds.minY)
+        let captureWidth = Float(captureBounds.width)
+        let captureHeight = Float(captureBounds.height)
+        guard captureMinX.isFinite,
+              captureMinY.isFinite,
+              captureWidth.isFinite,
+              captureHeight.isFinite,
+              captureWidth > 0,
+              captureHeight > 0 else {
+            throw .invalidCompositeBounds(captureBounds)
+        }
+
+        let white = currentReplicatorColor
+        var vertices: [CARendererVertex] = [
+            CARendererVertex(
+                position: SIMD2(0, 0),
+                texCoord: SIMD2(0, 1),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 1),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 0),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 0),
+                texCoord: SIMD2(1, 1),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(1, 1),
+                texCoord: SIMD2(1, 0),
+                color: white
+            ),
+            CARendererVertex(
+                position: SIMD2(0, 1),
+                texCoord: SIMD2(0, 0),
+                color: white
+            ),
+        ]
+        guard let allocation =
+                allocateVertices(count: vertices.count) else {
+            throw .compositeVertexCapacityExceeded
+        }
+        let (vertexOffset, layerIndex) = allocation
+        let originMatrix = Matrix4x4(
+            translation: SIMD3(
+                captureMinX,
+                captureMinY,
+                0
+            )
+        )
+        let scaleMatrix = Matrix4x4(columns: (
+            SIMD4<Float>(captureWidth, 0, 0, 0),
+            SIMD4<Float>(0, captureHeight, 0, 0),
+            SIMD4<Float>(0, 0, 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+        var uniforms = TexturedUniforms(
+            mvpMatrix:
+                modelMatrix * originMatrix * scaleMatrix,
+            opacity: opacity,
+            cornerRadius: 0,
+            layerSize: SIMD2(captureWidth, captureHeight),
+            cornerRadii: .zero
+        )
+        let uniformOffset =
+            UInt64(layerIndex) * Self.alignedUniformSize
+        device.queue.writeBuffer(
+            uniformBuffer,
+            bufferOffset: uniformOffset,
+            data: createFloat32Array(from: &uniforms)
+        )
+        device.queue.writeBuffer(
+            vertexBuffer,
+            bufferOffset: vertexOffset,
+            data: createFloat32Array(from: &vertices)
+        )
+        let textureView = texture.createView()
+        let texturedBindGroup = device.createBindGroup(
+            descriptor: GPUBindGroupDescriptor(
+                layout: texturedBindGroupLayout,
+                entries: [
+                    GPUBindGroupEntry(
+                        binding: 0,
+                        resource: .bufferBinding(
+                            GPUBufferBinding(
+                                buffer: uniformBuffer,
+                                size: UInt64(
+                                    MemoryLayout<
+                                        TexturedUniforms
+                                    >.stride
+                                )
+                            )
+                        )
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 1,
+                        resource: .sampler(textureSampler)
+                    ),
+                    GPUBindGroupEntry(
+                        binding: 2,
+                        resource: .textureView(textureView)
+                    ),
+                ]
+            )
+        )
+        renderPass.setPipeline(selectedPipeline)
+        renderPass.setBindGroup(
+            0,
+            bindGroup: texturedBindGroup,
+            dynamicOffsets: [UInt32(uniformOffset)]
+        )
+        renderPass.setVertexBuffer(
+            0,
+            buffer: vertexBuffer,
+            offset: vertexOffset
+        )
+        renderPass.draw(vertexCount: 6)
+        renderPass.setPipeline(basePipeline)
     }
 
     /// Composites a captured rasterization texture as a quad placed at
@@ -17738,6 +19213,7 @@ private final class RetainedDynamicSnapshot {
         in snapshot: CARenderSnapshot,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4,
+        rejectsCompleteFrameOnFailure: Bool,
         device: GPUDevice,
         bindGroup: GPUBindGroup
     ) throws(CACommittedSnapshotEncodingFailure) {
@@ -17754,7 +19230,11 @@ private final class RetainedDynamicSnapshot {
                     parentMatrix: sublayerMatrix
                 )
         } catch {
-            throw .transformDepth(error)
+            if rejectsCompleteFrameOnFailure {
+                throw .transformDepth(error)
+            }
+            recordTransformDepthRenderFailure(error)
+            return
         }
 
         let configuration: CADepthGroupRenderConfiguration
@@ -17763,15 +19243,25 @@ private final class RetainedDynamicSnapshot {
                 currentNestingDepth: transformDepthNesting
             )
         } catch {
-            throw .transformDepth(
-                .depthGroupStateFailure(error)
-            )
+            let failure =
+                CATransformDepthRenderFailure
+                    .depthGroupStateFailure(error)
+            if rejectsCompleteFrameOnFailure {
+                throw .transformDepth(failure)
+            }
+            recordTransformDepthRenderFailure(failure)
+            return
         }
         if configuration.requiresDepthClear {
             guard let depthClearPipeline else {
-                throw .transformDepth(
-                    .depthClearPipelineUnavailable
-                )
+                let failure =
+                    CATransformDepthRenderFailure
+                        .depthClearPipelineUnavailable
+                if rejectsCompleteFrameOnFailure {
+                    throw .transformDepth(failure)
+                }
+                recordTransformDepthRenderFailure(failure)
+                return
             }
             renderPass.setPipeline(depthClearPipeline)
             renderPass.draw(vertexCount: 3)
@@ -17845,6 +19335,7 @@ private final class RetainedDynamicSnapshot {
         in snapshot: CARenderSnapshot,
         renderPass: GPURenderPassEncoder,
         modelMatrix: Matrix4x4,
+        rejectsCompleteFrameOnFailure: Bool,
         device: GPUDevice,
         bindGroup: GPUBindGroup
     ) throws(CACommittedSnapshotEncodingFailure) {
@@ -17861,7 +19352,11 @@ private final class RetainedDynamicSnapshot {
                     parentMatrix: sublayerMatrix
                 )
         } catch {
-            throw .replicator(error)
+            if rejectsCompleteFrameOnFailure {
+                throw .replicator(error)
+            }
+            recordCommittedReplicatorRenderFailure(error)
+            return
         }
 
         let configuration: CADepthGroupRenderConfiguration
@@ -17870,15 +19365,25 @@ private final class RetainedDynamicSnapshot {
                 currentNestingDepth: transformDepthNesting
             )
         } catch {
-            throw .replicator(
-                .depthGroupStateFailure(error)
-            )
+            let failure =
+                CAReplicatorRenderFailure
+                    .depthGroupStateFailure(error)
+            if rejectsCompleteFrameOnFailure {
+                throw .replicator(failure)
+            }
+            recordCommittedReplicatorRenderFailure(failure)
+            return
         }
         if configuration.requiresDepthClear {
             guard let depthClearPipeline else {
-                throw .replicator(
-                    .depthResourcesUnavailable
-                )
+                let failure =
+                    CAReplicatorRenderFailure
+                        .depthResourcesUnavailable
+                if rejectsCompleteFrameOnFailure {
+                    throw .replicator(failure)
+                }
+                recordCommittedReplicatorRenderFailure(failure)
+                return
             }
             renderPass.setPipeline(depthClearPipeline)
             renderPass.draw(vertexCount: 3)
@@ -19480,11 +20985,11 @@ private final class RetainedDynamicSnapshot {
         lastTiledLayerRenderFailure = failure
     }
 
-    // FIXME(INCOMPLETE_IMPLEMENTATION): Animated tiled trees still reach this
-    // live model-layer path. Production static and transition commits use
-    // `renderCommittedTiledLayer`; completion requires the copied animation
-    // evaluator to use the same renderer-owned generation/cache contract before
-    // this model-reading path can be removed.
+    /// Renders the compatibility path used when a caller submits an
+    /// uncommitted live tree directly. Transaction snapshots and copied
+    /// animation evaluators render tiled content through
+    /// `renderCommittedTiledLayer`, which owns their generation and cache
+    /// state independently of the model tree.
     private func renderTiledLayer(
         _ tiledLayer: CATiledLayer,
         presentation: CATiledLayer,

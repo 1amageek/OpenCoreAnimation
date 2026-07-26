@@ -9,6 +9,15 @@ public class CAMediaTimingFunction: Hashable {
     /// The control points of the cubic Bézier curve.
     private let controlPoints: [Float]
 
+    internal var committedControlPoints: SIMD4<Float> {
+        SIMD4(
+            controlPoints[0],
+            controlPoints[1],
+            controlPoints[2],
+            controlPoints[3]
+        )
+    }
+
     // MARK: - Initialization
 
     /// Creates and returns a new instance of CAMediaTimingFunction configured with the predefined

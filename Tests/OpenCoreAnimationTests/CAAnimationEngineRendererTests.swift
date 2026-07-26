@@ -7,6 +7,32 @@ import Metal
 @MainActor
 @Suite("CAAnimationEngine native renderer")
 struct CAAnimationEngineRendererTests {
+    @Test("renderFrame publishes pending implicit work before submission")
+    func renderFrameCommitsPendingImplicitTransaction() {
+        CATransaction.flush()
+        let engine = CAAnimationEngine()
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        root.position = CGPoint(x: 8, y: 8)
+        engine.rootLayer = root
+        var completionRan = false
+
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            completionRan = true
+        }
+        root.backgroundColor = CGColor(
+            red: 0,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+
+        engine.renderFrame()
+
+        #expect(completionRan)
+    }
+
     @Test("renderFrame submits the root layer to a real offscreen Metal target")
     func renderFrameSubmitsMetalPixels() throws {
         let engine = CAAnimationEngine()

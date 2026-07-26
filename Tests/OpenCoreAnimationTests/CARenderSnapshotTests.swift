@@ -1,5 +1,5 @@
 import Testing
-@testable import OpenCoreAnimation
+@_spi(RendererDiagnostics) @testable import OpenCoreAnimation
 
 private struct SnapshotTileContent:
     CATiledLayerContentSnapshot {
@@ -25,6 +25,31 @@ private final class SnapshotNonSendableTileDelegate:
 @MainActor
 @Suite("Immutable render snapshots", .serialized)
 struct CARenderSnapshotTests {
+    @Test("Hierarchy-only mutations publish through implicit transactions")
+    func hierarchyMutationPublishesImplicitSnapshot() {
+        CATransaction.flush()
+        let root = CALayer()
+        let child = CALayer()
+
+        root.addSublayer(child)
+        #expect(root.pendingCommittedRenderState == nil)
+
+        CATransaction.deliverScheduledImplicitCommitForTesting()
+
+        guard case .snapshot(let snapshot) =
+                root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected hierarchy mutation to publish an implicit snapshot"
+            )
+            return
+        }
+        #expect(
+            snapshot.nodes.contains {
+                $0.identity == ObjectIdentifier(child)
+            }
+        )
+    }
+
     @Test("Outermost transaction publishes an immutable root snapshot")
     func commitPublishesSnapshot() throws {
         CATransaction.flush()
@@ -43,6 +68,81 @@ struct CARenderSnapshotTests {
         #expect(snapshot.rootBounds == root.bounds)
         #expect(snapshot.nodes[snapshot.rootIndex].presentationValues.backgroundColor
             == SIMD4<Float>(0, 1, 0, 1))
+    }
+
+    @Test("Committed emitter cells remain independent of later model mutation")
+    func committedEmitterCellsRemainImmutable() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        let emitter = CAEmitterLayer()
+        let cell = CAEmitterCell()
+        var completionRan = false
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        CATransaction.setCompletionBlock {
+            completionRan = true
+        }
+        root.bounds = CGRect(x: 0, y: 0, width: 64, height: 64)
+        emitter.bounds = CGRect(x: 0, y: 0, width: 16, height: 16)
+        cell.birthRate = 60
+        cell.lifetime = 3
+        emitter.emitterCells = [cell]
+        root.addSublayer(emitter)
+        CATransaction.commit()
+
+        cell.birthRate = 0
+
+        guard case .snapshot(let snapshot) =
+                root.pendingCommittedRenderState else {
+            Issue.record("Expected a committed emitter snapshot")
+            CATransaction.flush()
+            return
+        }
+        let emitterNode = try #require(
+            snapshot.nodes.first {
+                $0.identity == ObjectIdentifier(emitter)
+            }
+        )
+        let configuration = try #require(
+            emitterNode.presentationValues.emitter
+        )
+        #expect(configuration.emitterCells.count == 1)
+        #expect(configuration.emitterCells[0].birthRate == 60)
+        #expect(cell.birthRate == 0)
+        #expect(!completionRan)
+
+        CATransaction.flush()
+    }
+
+    @Test("Detached mask descendant mutations publish the owning root")
+    func detachedMaskMutationPublishesOwningRoot() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        let maskRoot = CALayer()
+        let maskChild = CALayer()
+        maskRoot.addSublayer(maskChild)
+        root.mask = maskRoot
+        CATransaction.flush()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        maskChild.opacity = 0.25
+        CATransaction.commit()
+
+        guard case .snapshot(let snapshot) =
+                root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected the mask owner to publish a snapshot"
+            )
+            return
+        }
+        let maskChildIdentity = ObjectIdentifier(maskChild)
+        let capturedMaskChild = snapshot.nodes.first {
+            $0.identity == maskChildIdentity
+        }
+        #expect(capturedMaskChild?.presentationValues.opacity == 0.25)
+        #expect(maskRoot.pendingCommittedRenderState == nil)
     }
 
     @Test("Common solid state and z-ordered hierarchy are value-owned")
@@ -95,6 +195,46 @@ struct CARenderSnapshotTests {
             rootNode.childIndices.map { snapshot.nodes[$0].identity }
                 == [ObjectIdentifier(back), ObjectIdentifier(front)]
         )
+    }
+
+    @Test("Committed evaluator preserves scalar transform keyframes")
+    func committedEvaluatorPreservesScalarTransformKeyframes() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        let translated = CALayer()
+        translated.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 20
+        )
+        translated.position = CGPoint(x: 60, y: 60)
+        root.addSublayer(translated)
+
+        let animation = CAKeyframeAnimation(
+            keyPath: "transform.translation.x"
+        )
+        animation.values = [CGFloat(0), CGFloat(40)]
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        animation.fillMode = .both
+        animation.isRemovedOnCompletion = false
+        translated.add(animation, forKey: "translation")
+
+        let evaluator = try CACommittedAnimationEvaluator(
+            rootLayer: root,
+            frameToken: 71
+        )
+        let snapshot = try evaluator.snapshot(frameToken: 72)
+        let translatedIndex = try #require(
+            snapshot.nodes[snapshot.rootIndex].childIndices.first
+        )
+        let transform = snapshot.nodes[translatedIndex]
+            .presentationValues.transform
+
+        #expect(abs(transform.m41 - 20) < 0.001)
+        CATransaction.flush()
     }
 
     @Test("Transition source and configuration become immutable snapshot values")
@@ -191,8 +331,8 @@ struct CARenderSnapshotTests {
         )
     }
 
-    @Test("Invalid built-in transition is a typed capture failure")
-    func invalidTransitionFailsCapture() throws {
+    @Test("Invalid built-in transition is isolated in its snapshot node")
+    func invalidTransitionIsIsolated() throws {
         let source = CALayer()
         let target = CALayer()
         target.recursivelyClearDirtyAfterCommit()
@@ -206,18 +346,20 @@ struct CARenderSnapshotTests {
             progress: 0.5
         )
 
-        #expect(throws: CARendererError.invalidLayerTransition(
-            .unsupportedTransitionType("unsupported")
-        )) {
-            _ = try CARenderSnapshot.capture(
-                target,
-                frameToken: 48
-            )
-        }
+        let snapshot = try CARenderSnapshot.capture(
+            target,
+            frameToken: 48
+        )
+        #expect(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.transition?
+                .preparationFailure
+                == .unsupportedTransitionType("unsupported")
+        )
     }
 
-    @Test("Nonportable transition filter is a typed capture failure")
-    func nonportableTransitionFilterFailsCapture() throws {
+    @Test("Nonportable transition filter is isolated in its snapshot node")
+    func nonportableTransitionFilterIsIsolated() throws {
         let source = CALayer()
         let target = CALayer()
         target.recursivelyClearDirtyAfterCommit()
@@ -231,14 +373,73 @@ struct CARenderSnapshotTests {
             progress: 0.5
         )
 
-        #expect(throws: CARendererError.invalidLayerTransition(
-            .unsupportedFilterValue("Swift.String")
-        )) {
-            _ = try CARenderSnapshot.capture(
-                target,
-                frameToken: 49
-            )
+        let snapshot = try CARenderSnapshot.capture(
+            target,
+            frameToken: 49
+        )
+        #expect(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.transition?
+                .preparationFailure
+                == .unsupportedFilterValue("Swift.String")
+        )
+    }
+
+    @Test("Invalid committed transitions do not block sibling evaluation")
+    func invalidCommittedTransitionsDoNotBlockSiblings() throws {
+        let root = CALayer()
+        let filteredLayer = CALayer()
+        let typedLayer = CALayer()
+        root.addSublayer(filteredLayer)
+        root.addSublayer(typedLayer)
+
+        let filteredTransition = CATransition()
+        filteredTransition.filter = "not-a-filter"
+        filteredTransition.duration = 1
+        filteredTransition.speed = 0
+        filteredTransition.timeOffset = 0.5
+        filteredTransition.fillMode = .both
+        filteredTransition.isRemovedOnCompletion = false
+        filteredLayer.add(
+            filteredTransition,
+            forKey: "invalid-filter"
+        )
+
+        let typedTransition = CATransition()
+        typedTransition.type =
+            CATransitionType(rawValue: "unsupported")
+        typedTransition.duration = 1
+        typedTransition.speed = 0
+        typedTransition.timeOffset = 0.5
+        typedTransition.fillMode = .both
+        typedTransition.isRemovedOnCompletion = false
+        typedLayer.add(
+            typedTransition,
+            forKey: "invalid-type"
+        )
+
+        let evaluator = try CACommittedAnimationEvaluator(
+            rootLayer: root,
+            frameToken: 50
+        )
+        let snapshot = try evaluator.snapshot(
+            frameToken: 50
+        )
+        let failures = snapshot.nodes.compactMap {
+            $0.presentationValues.transition?
+                .preparationFailure
         }
+
+        #expect(
+            failures.contains(
+                .unsupportedFilterValue("Swift.String")
+            )
+        )
+        #expect(
+            failures.contains(
+                .unsupportedTransitionType("unsupported")
+            )
+        )
     }
 
     @Test("Filter vector arrays become finite immutable values")
@@ -727,6 +928,59 @@ struct CARenderSnapshotTests {
         )
     }
 
+    @Test("Replicator delay evaluates each immutable animation instance")
+    func replicatorDelayEvaluatesEachInstance() throws {
+        CATransaction.flush()
+        let replicator = CAReplicatorLayer()
+        replicator.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100
+        )
+        replicator.instanceCount = 2
+        replicator.instanceDelay = 0.5
+        let child = CALayer()
+        child.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10
+        )
+        child.opacity = 1
+        replicator.addSublayer(child)
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.duration = 2
+        animation.beginTime = child.convertTime(
+            CACurrentMediaTime(),
+            from: nil
+        ) - 1
+        animation.fillMode = .both
+        animation.isRemovedOnCompletion = false
+        child.add(animation, forKey: "opacity")
+
+        let snapshot = try CARenderSnapshot.capture(
+            replicator,
+            frameToken: CALayer.advanceFrameToken()
+        )
+        let rootNode = snapshot.nodes[
+            snapshot.rootIndex
+        ]
+        #expect(rootNode.childIndices.count == 2)
+        let firstOpacity = snapshot.nodes[
+            rootNode.childIndices[0]
+        ].presentationValues.opacity
+        let secondOpacity = snapshot.nodes[
+            rootNode.childIndices[1]
+        ].presentationValues.opacity
+        #expect(firstOpacity > secondOpacity + 0.2)
+
+        child.removeAllAnimations()
+        CATransaction.flush()
+    }
+
     @Test("Emitter cells and image bytes become immutable snapshot values")
     func emitterValuesUseSnapshots() throws {
         let image = try makeImage(
@@ -836,13 +1090,21 @@ struct CARenderSnapshotTests {
         }
     }
 
-    @Test("Invalid replicator input fails immutable capture exactly")
-    func invalidReplicatorCaptureFails() {
+    @Test("Invalid replicator input remains a deferred typed value")
+    func invalidReplicatorCaptureIsDeferred() throws {
         let replicator = CAReplicatorLayer()
         replicator.instanceCount =
             CAReplicatorRenderConfiguration
                 .maximumInstanceCount + 1
-        #expect(throws: CARendererError.invalidLayerReplicator(
+        var snapshot = try CARenderSnapshot.capture(
+            replicator,
+            frameToken: 49
+        )
+        #expect(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues
+                .replicatorCaptureFailure
+            ==
             .instanceCountExceedsRendererCapacity(
                 actual:
                     CAReplicatorRenderConfiguration
@@ -851,23 +1113,20 @@ struct CARenderSnapshotTests {
                     CAReplicatorRenderConfiguration
                         .maximumInstanceCount
             )
-        )) {
-            try CARenderSnapshot.capture(
-                replicator,
-                frameToken: 49
-            )
-        }
+        )
 
         replicator.instanceCount = 2
         replicator.instanceDelay = .nan
-        #expect(throws: CARendererError.invalidLayerReplicator(
-            .nonFiniteInstanceDelay
-        )) {
-            try CARenderSnapshot.capture(
-                replicator,
-                frameToken: 50
-            )
-        }
+        snapshot = try CARenderSnapshot.capture(
+            replicator,
+            frameToken: 50
+        )
+        #expect(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues
+                .replicatorCaptureFailure
+            == .nonFiniteInstanceDelay
+        )
     }
 
     @Test("Gradient stops and geometry become immutable snapshot values")
@@ -1231,20 +1490,22 @@ struct CARenderSnapshotTests {
         #expect(values.rasterizationScale == 2.5)
     }
 
-    @Test("Invalid active rasterization scale fails snapshot capture")
-    func invalidRasterizationScaleFailsCapture() {
+    @Test("Invalid rasterization scale remains renderer-visible")
+    func invalidRasterizationScaleIsCapturedForRendererValidation() throws {
         let layer = CALayer()
         layer.shouldRasterize = true
         layer.rasterizationScale = 0
 
-        #expect(throws: CARendererError.invalidLayerRasterization(
-            .invalidRasterizationScale(0)
-        )) {
-            _ = try CARenderSnapshot.capture(
-                layer,
-                frameToken: 46
-            )
-        }
+        let snapshot = try CARenderSnapshot.capture(
+            layer,
+            frameToken: 46
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+
+        #expect(values.shouldRasterize)
+        #expect(values.rasterizationScale == 0)
     }
 
     @Test("Layer and mask filters become value-owned snapshot plans")
@@ -1332,7 +1593,7 @@ struct CARenderSnapshotTests {
     }
 
     @Test("Invalid backdrop plans retain their owning property")
-    func invalidBackdropCaptureIsTyped() {
+    func invalidBackdropCaptureIsTyped() throws {
         let backgroundLayer = CALayer()
         backgroundLayer.backgroundFilters = [
             CAFilter(
@@ -1353,14 +1614,20 @@ struct CARenderSnapshotTests {
 
         let compositionLayer = CALayer()
         compositionLayer.compositingFilter = "invalid"
-        #expect(throws: CARendererError.invalidLayerCompositingFilter(
-            .unsupportedFilterValue("Swift.String")
-        )) {
-            try CARenderSnapshot.capture(
-                compositionLayer,
-                frameToken: 48
-            )
-        }
+        let compositionSnapshot = try CARenderSnapshot.capture(
+            compositionLayer,
+            frameToken: 48
+        )
+        let compositionValues = compositionSnapshot.nodes[
+            compositionSnapshot.rootIndex
+        ].presentationValues
+        #expect(compositionValues.compositingFilter == nil)
+        #expect(
+            compositionValues.compositingFilterCaptureFailure
+                == .unsupportedCompositingFilterValue(
+                    "Swift.String"
+                )
+        )
     }
 
     @Test("Group opacity becomes value-owned snapshot state")
@@ -1453,6 +1720,19 @@ struct CARenderSnapshotTests {
             .nonFiniteGeometry
         )) {
             try CARenderSnapshot.capture(layer, frameToken: 50)
+        }
+    }
+
+    @Test("Invalid shadow composite opacity is typed at commit capture")
+    func invalidShadowCompositeOpacityIsTyped() {
+        let layer = CALayer()
+        layer.shadowOpacity = 1
+        layer.opacity = .infinity
+
+        #expect(throws: CARendererError.invalidLayerShadow(
+            .invalidCompositeOpacity(.infinity)
+        )) {
+            try CARenderSnapshot.capture(layer, frameToken: 51)
         }
     }
 
@@ -1909,12 +2189,696 @@ struct CARenderSnapshotTests {
         #expect(contents.storage.data == Data([255, 255, 0, 255]))
     }
 
-    @Test("Animated commits request explicit live evaluation until evaluators are immutable")
-    func animatedCommitPublishesExplicitEvaluationState() {
+    @Test("Animated commits publish a model-independent evaluator")
+    func animatedCommitPublishesIndependentEvaluator() throws {
         CATransaction.flush()
         let root = CALayer()
         let animation = CABasicAnimation(keyPath: "opacity")
         animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.25
+        CATransaction.flush()
+
+        CATransaction.begin()
+        root.add(animation, forKey: "opacity")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected an immutable animation evaluator")
+            return
+        }
+        let committed = try evaluator.snapshot(frameToken: 80)
+        let committedValues = committed.nodes[
+            committed.rootIndex
+        ].presentationValues
+        #expect(abs(committedValues.opacity - 0.25) < 0.0001)
+
+        root.opacity = 0.9
+        let stored = try #require(
+            root.animation(forKey: "opacity")
+                as? CABasicAnimation
+        )
+        stored.fromValue = Float(1)
+        stored.toValue = Float(0)
+        stored.timeOffset = 0.75
+
+        let afterMutation = try evaluator.snapshot(
+            frameToken: 81
+        )
+        let afterMutationValues = afterMutation.nodes[
+            afterMutation.rootIndex
+        ].presentationValues
+        #expect(
+            afterMutationValues.opacity
+                == committedValues.opacity
+        )
+        #expect(
+            afterMutation.nodes[afterMutation.rootIndex].identity
+                == ObjectIdentifier(root)
+        )
+        root.removeAllAnimations()
+    }
+
+    @Test("Committed evaluator retains an initially hidden animated shadow")
+    func animatedShadowRetainsHiddenModelValues() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+        root.shadowColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        root.shadowOpacity = 0
+        root.shadowRadius = 4
+        root.shadowOffset = CGSize(width: 8, height: 2)
+        CATransaction.flush()
+
+        let animation = CABasicAnimation(keyPath: "shadowOpacity")
+        animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        animation.fillMode = .both
+        animation.isRemovedOnCompletion = false
+
+        CATransaction.begin()
+        root.add(animation, forKey: "shadowOpacity")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected a committed shadow evaluator")
+            return
+        }
+        let snapshot = try evaluator.snapshot(frameToken: 82)
+        let shadow = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.shadow
+        )
+
+        #expect(abs(shadow.opacity - 0.5) < 0.0001)
+        #expect(shadow.color == SIMD4<Float>(0, 0, 1, 1))
+        #expect(shadow.radius == 4)
+        #expect(shadow.offset == SIMD2<Float>(8, 2))
+        root.removeAllAnimations()
+    }
+
+    @Test("Committed evaluator preserves invalid replicator model values")
+    func committedEvaluatorPreservesInvalidReplicatorValues() throws {
+        CATransaction.flush()
+        let replicator = CAReplicatorLayer()
+        replicator.instanceCount = 2
+        replicator.instanceDelay = .nan
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.5
+        animation.fillMode = .both
+        animation.isRemovedOnCompletion = false
+        CATransaction.flush()
+
+        CATransaction.begin()
+        replicator.add(animation, forKey: "opacity")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            let frameToken,
+            let evaluator
+        ) = replicator.pendingCommittedRenderState else {
+            Issue.record("Expected a committed replicator evaluator")
+            return
+        }
+        let snapshot = try evaluator.snapshot(
+            frameToken: frameToken
+        )
+        let values = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues
+
+        #expect(
+            values.replicatorCaptureFailure
+                == .nonFiniteInstanceDelay
+        )
+        #expect(values.replicator == nil)
+        replicator.removeAllAnimations()
+        CATransaction.flush()
+    }
+
+    @Test("Mutating a stored animation republishes the committed evaluator")
+    func storedAnimationMutationRepublishesEvaluator() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        let child = CALayer()
+        child.position = CGPoint(x: 20, y: 25)
+        root.addSublayer(child)
+        CATransaction.flush()
+
+        let animation = CABasicAnimation(keyPath: "position")
+        animation.fromValue = CGPoint(x: 20, y: 25)
+        animation.toValue = CGPoint(x: 60, y: 25)
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0
+        animation.fillMode = .both
+        animation.isRemovedOnCompletion = false
+
+        CATransaction.begin()
+        child.add(animation, forKey: "position")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            let firstToken,
+            let firstEvaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected the first committed evaluator")
+            return
+        }
+        let firstSnapshot = try firstEvaluator.snapshot(
+            frameToken: firstToken
+        )
+        let firstNode = try #require(
+            firstSnapshot.nodes.first {
+                $0.identity == ObjectIdentifier(child)
+            }
+        )
+        #expect(firstNode.presentationValues.position.x == 20)
+
+        let stored = try #require(
+            child.animation(forKey: "position")
+        )
+        stored.timeOffset = 1
+        CATransaction.commitPendingImplicitTransactions()
+
+        guard case .animationEvaluator(
+            let secondToken,
+            let secondEvaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected the updated committed evaluator")
+            return
+        }
+        #expect(secondToken != firstToken)
+        let secondSnapshot = try secondEvaluator.snapshot(
+            frameToken: secondToken
+        )
+        let secondNode = try #require(
+            secondSnapshot.nodes.first {
+                $0.identity == ObjectIdentifier(child)
+            }
+        )
+        #expect(secondNode.presentationValues.position.x == 60)
+        child.removeAllAnimations()
+    }
+
+    @Test("Removing a detached mask animation republishes static mask state")
+    func detachedMaskAnimationRemovalRepublishesState() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        let animatedSibling = CALayer()
+        let keeper = CABasicAnimation(keyPath: "opacity")
+        keeper.fromValue = Float(1)
+        keeper.toValue = Float(1)
+        keeper.duration = 1
+        keeper.speed = 0
+        keeper.fillMode = .both
+        keeper.isRemovedOnCompletion = false
+        animatedSibling.add(keeper, forKey: "keeper")
+
+        let masked = CALayer()
+        let maskRoot = CALayer()
+        let maskChild = CALayer()
+        maskChild.backgroundColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 1,
+            alpha: 1
+        )
+        let transition = CATransition()
+        transition.duration = 1
+        transition.speed = 0
+        transition.timeOffset = 0.5
+        transition.fillMode = .both
+        transition.isRemovedOnCompletion = false
+        maskChild.add(transition, forKey: "fade")
+        maskChild.backgroundColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 0,
+            alpha: 0
+        )
+        maskRoot.addSublayer(maskChild)
+        masked.mask = maskRoot
+        root.addSublayer(animatedSibling)
+        root.addSublayer(masked)
+        CATransaction.flush()
+
+        guard case .animationEvaluator(
+            let firstToken,
+            let firstEvaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected the first mask evaluator")
+            return
+        }
+        let firstSnapshot = try firstEvaluator.snapshot(
+            frameToken: firstToken
+        )
+        let firstMaskChild = try #require(
+            firstSnapshot.nodes.first {
+                $0.identity == ObjectIdentifier(maskChild)
+            }
+        )
+        #expect(firstMaskChild.presentationValues.transition != nil)
+
+        maskChild.removeAnimation(forKey: "fade")
+        maskChild.backgroundColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 1,
+            alpha: 1
+        )
+        CATransaction.commitPendingImplicitTransactions()
+
+        guard case .animationEvaluator(
+            let secondToken,
+            let secondEvaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected the updated mask evaluator")
+            return
+        }
+        #expect(secondToken != firstToken)
+        let secondSnapshot = try secondEvaluator.snapshot(
+            frameToken: secondToken
+        )
+        let secondMaskChild = try #require(
+            secondSnapshot.nodes.first {
+                $0.identity == ObjectIdentifier(maskChild)
+            }
+        )
+        #expect(secondMaskChild.presentationValues.transition == nil)
+        #expect(
+            secondMaskChild.presentationValues.backgroundColor
+                == SIMD4<Float>(1, 1, 1, 1)
+        )
+        animatedSibling.removeAllAnimations()
+    }
+
+    @Test("Animated tiled commits retain the committed cache contract")
+    func animatedTiledCommitRetainsCommittedConfiguration() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        let tiled = CATiledLayer()
+        let provider = SnapshotTileProvider()
+        tiled.bounds = CGRect(x: 0, y: 0, width: 32, height: 32)
+        tiled.tileSize = CGSize(width: 16, height: 16)
+        tiled.delegate = provider
+        root.addSublayer(tiled)
+        CATransaction.flush()
+
+        let animation = CABasicAnimation(keyPath: "position.x")
+        animation.fromValue = CGFloat(0)
+        animation.toValue = CGFloat(0)
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.25
+
+        CATransaction.begin()
+        tiled.add(animation, forKey: "position.x")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected an immutable animation evaluator")
+            return
+        }
+
+        let first = try evaluator.snapshot(frameToken: 82)
+        let second = try evaluator.snapshot(frameToken: 83)
+        let firstChildIndex = try #require(
+            first.nodes[first.rootIndex].childIndices.first
+        )
+        let secondChildIndex = try #require(
+            second.nodes[second.rootIndex].childIndices.first
+        )
+        let firstConfiguration = try #require(
+            first.nodes[firstChildIndex].presentationValues.tiled
+        )
+        let secondConfiguration = try #require(
+            second.nodes[secondChildIndex].presentationValues.tiled
+        )
+
+        #expect(
+            firstConfiguration.resourceIdentity
+                == tiled.resourceIdentity
+        )
+        #expect(
+            secondConfiguration.resourceIdentity
+                == firstConfiguration.resourceIdentity
+        )
+        #expect(
+            secondConfiguration.cacheGeneration
+                == firstConfiguration.cacheGeneration
+        )
+        #expect(
+            secondConfiguration.capturedContent?.identity
+                == firstConfiguration.capturedContent?.identity
+        )
+        tiled.removeAllAnimations()
+    }
+
+    @Test("Committed contents animation owns its model and endpoint pixels")
+    func committedContentsAnimationOwnsPixels() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+        root.contents = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 0, 0, 255]
+        )
+        let animation = CABasicAnimation(keyPath: "contents")
+        animation.toValue = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [0, 0, 255, 255]
+        )
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.25
+        CATransaction.flush()
+
+        CATransaction.begin()
+        root.add(animation, forKey: "contents")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected a committed animation evaluator, got \(String(describing: root.pendingCommittedRenderState))"
+            )
+            return
+        }
+        root.contents = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [0, 255, 0, 255]
+        )
+        let stored = try #require(
+            root.animation(forKey: "contents")
+                as? CABasicAnimation
+        )
+        stored.toValue = root.contents
+        stored.timeOffset = 0.75
+
+        let snapshot = try evaluator.snapshot(frameToken: 82)
+        let image = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+        #expect(image.storage.data == Data([255, 0, 0, 255]))
+        root.removeAllAnimations()
+    }
+
+    @Test("Committed keyframe contents own every endpoint image")
+    func committedKeyframeContentsOwnPixels() throws {
+        CATransaction.flush()
+        let red = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [255, 0, 0, 255]
+        )
+        let blue = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [0, 0, 255, 255]
+        )
+        let green = try makeImage(
+            width: 1,
+            height: 1,
+            pixels: [0, 255, 0, 255]
+        )
+        let root = CALayer()
+        root.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1
+        )
+        root.contents = green
+        let animation = CAKeyframeAnimation(
+            keyPath: "contents"
+        )
+        animation.values = [red, blue]
+        animation.calculationMode = .discrete
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.25
+        CATransaction.flush()
+
+        CATransaction.begin()
+        root.add(animation, forKey: "contents")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected a committed animation evaluator"
+            )
+            return
+        }
+        let stored = try #require(
+            root.animation(forKey: "contents")
+                as? CAKeyframeAnimation
+        )
+        stored.values = [green, green]
+        stored.timeOffset = 0.75
+        root.contents = green
+
+        let snapshot = try evaluator.snapshot(
+            frameToken: 83
+        )
+        let image = try #require(
+            snapshot.nodes[snapshot.rootIndex]
+                .presentationValues.imageContents
+        )
+        #expect(
+            image.storage.data
+                == Data([255, 0, 0, 255])
+        )
+        root.removeAllAnimations()
+    }
+
+    @Test("Committed nested groups own their child graphs")
+    func committedNestedGroupsOwnChildren() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        root.position = .zero
+        let child = CABasicAnimation(
+            keyPath: "position"
+        )
+        child.fromValue = CGPoint.zero
+        child.toValue = CGPoint(x: 100, y: 40)
+        child.duration = 1
+        let inner = CAAnimationGroup()
+        inner.animations = [child]
+        inner.duration = 1
+        let outer = CAAnimationGroup()
+        outer.animations = [inner]
+        outer.duration = 1
+        outer.speed = 0
+        outer.timeOffset = 0.25
+        CATransaction.flush()
+
+        CATransaction.begin()
+        root.add(outer, forKey: "nested")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected a committed animation evaluator"
+            )
+            return
+        }
+        let storedOuter = try #require(
+            root.animation(forKey: "nested")
+                as? CAAnimationGroup
+        )
+        let storedInner = try #require(
+            storedOuter.animations?.first
+                as? CAAnimationGroup
+        )
+        let storedChild = try #require(
+            storedInner.animations?.first
+                as? CABasicAnimation
+        )
+        storedChild.toValue = CGPoint(x: 400, y: 400)
+        storedOuter.timeOffset = 0.75
+        root.position = CGPoint(x: 900, y: 900)
+
+        let snapshot = try evaluator.snapshot(
+            frameToken: 84
+        )
+        let position = snapshot.nodes[
+            snapshot.rootIndex
+        ].presentationValues.position
+        #expect(abs(position.x - 25) < 0.0001)
+        #expect(abs(position.y - 10) < 0.0001)
+        root.removeAllAnimations()
+    }
+
+    @Test("Committed evaluator serializes concurrent frame capture")
+    func committedEvaluatorSerializesCapture() async throws {
+        CATransaction.flush()
+        let root = CALayer()
+        root.opacity = 1
+        let animation = CABasicAnimation(
+            keyPath: "opacity"
+        )
+        animation.fromValue = Float(0)
+        animation.toValue = Float(1)
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.375
+        CATransaction.flush()
+
+        CATransaction.begin()
+        root.add(animation, forKey: "opacity")
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected a committed animation evaluator"
+            )
+            return
+        }
+        let opacities = try await withThrowingTaskGroup(
+            of: Float.self,
+            returning: [Float].self
+        ) { group in
+            for token in UInt64(100)..<UInt64(116) {
+                group.addTask {
+                    let snapshot = try evaluator.snapshot(
+                        frameToken: token
+                    )
+                    return snapshot.nodes[
+                        snapshot.rootIndex
+                    ].presentationValues.opacity
+                }
+            }
+            var values: [Float] = []
+            for try await value in group {
+                values.append(value)
+            }
+            return values
+        }
+        #expect(opacities.count == 16)
+        #expect(
+            opacities.allSatisfy {
+                abs($0 - 0.375) < 0.0001
+            }
+        )
+        root.removeAllAnimations()
+    }
+
+    @Test("Committed transition owns source, target, and timing")
+    func committedTransitionOwnsParticipants() throws {
+        CATransaction.flush()
+        let root = CALayer()
+        root.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
+        root.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        let transition = CATransition()
+        transition.duration = 1
+        transition.speed = 0
+        transition.timeOffset = 0.25
+        CATransaction.flush()
+
+        CATransaction.begin()
+        root.add(transition, forKey: "transition")
+        root.backgroundColor = CGColor(
+            red: 0,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        CATransaction.commit()
+
+        guard case .animationEvaluator(
+            _,
+            let evaluator
+        ) = root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected a committed animation evaluator, got \(String(describing: root.pendingCommittedRenderState))"
+            )
+            return
+        }
+        root.backgroundColor = CGColor(
+            red: 0,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+        let stored = try #require(
+            root.animation(forKey: "transition")
+                as? CATransition
+        )
+        stored.timeOffset = 0.75
+
+        let snapshot = try evaluator.snapshot(frameToken: 83)
+        let target = snapshot.nodes[snapshot.rootIndex]
+        let capturedTransition = try #require(
+            target.presentationValues.transition
+        )
+        let source = snapshot.nodes[
+            capturedTransition.sourceRootIndex
+        ]
+        #expect(
+            source.presentationValues.backgroundColor
+                == SIMD4<Float>(1, 0, 0, 1)
+        )
+        #expect(
+            target.presentationValues.backgroundColor
+                == SIMD4<Float>(0, 0, 1, 1)
+        )
+        #expect(
+            abs(capturedTransition.progress - 0.25)
+                < 0.0001
+        )
+        root.removeAllAnimations()
+    }
+
+    @Test("Unsupported animation endpoints publish a typed failure")
+    func unsupportedAnimationEndpointFailsCommit() {
+        CATransaction.flush()
+        let root = CALayer()
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = "unsupported"
         animation.toValue = Float(1)
         animation.duration = 1
 
@@ -1922,10 +2886,53 @@ struct CARenderSnapshotTests {
         root.add(animation, forKey: "opacity")
         CATransaction.commit()
 
-        guard case .requiresLiveAnimationEvaluation = root.pendingCommittedRenderState else {
-            Issue.record("Expected an explicit live-animation evaluation state")
+        guard case .captureFailure(
+            _,
+            let error
+        ) = root.pendingCommittedRenderState else {
+            Issue.record("Expected a typed committed capture failure")
             return
         }
+        #expect(
+            error == .invalidCommittedAnimation(
+                .unsupportedValueType("Swift.String")
+            )
+        )
+        root.removeAllAnimations()
+    }
+
+    @Test("Non-finite animation endpoints publish a typed failure")
+    func nonFiniteAnimationEndpointFailsCommit() {
+        CATransaction.flush()
+        let root = CALayer()
+        let animation = CABasicAnimation(
+            keyPath: "position"
+        )
+        animation.fromValue = CGPoint(
+            x: CGFloat.infinity,
+            y: 0
+        )
+        animation.toValue = CGPoint(x: 1, y: 1)
+        animation.duration = 1
+
+        CATransaction.begin()
+        root.add(animation, forKey: "position")
+        CATransaction.commit()
+
+        guard case .captureFailure(
+            _,
+            let error
+        ) = root.pendingCommittedRenderState else {
+            Issue.record(
+                "Expected a typed committed capture failure"
+            )
+            return
+        }
+        #expect(
+            error == .invalidCommittedAnimation(
+                .nonFiniteValue("CGPoint")
+            )
+        )
         root.removeAllAnimations()
     }
 
@@ -2058,6 +3065,28 @@ struct CARenderSnapshotTests {
 
         #expect(throws: CARendererError.nonFiniteLayerGeometry) {
             try CARenderSnapshot.capture(root, frameToken: 44)
+        }
+    }
+
+    @Test("Invalid corner geometry preserves its exact capture reason")
+    func invalidCornerGeometryPreservesReason() {
+        let root = CALayer()
+        root.cornerRadius = -1
+
+        #expect(throws: CARendererError.invalidLayerCornerGeometry(
+            .negativeCornerRadius(-1)
+        )) {
+            try CARenderSnapshot.capture(root, frameToken: 45)
+        }
+
+        root.cornerRadius = 1
+        root.cornerCurve = CALayerCornerCurve(
+            rawValue: "future-curve"
+        )
+        #expect(throws: CARendererError.invalidLayerCornerGeometry(
+            .unsupportedCurve("future-curve")
+        )) {
+            try CARenderSnapshot.capture(root, frameToken: 46)
         }
     }
 
@@ -2691,6 +3720,115 @@ extension CARenderSnapshotTests {
         CATransaction.flush()
     }
 
+    @Test("Metal retains the committed evaluator after acknowledging its transaction")
+    func metalRetainsCommittedAnimationEvaluator() throws {
+        CATransaction.flush()
+        let device = try #require(
+            MTLCreateSystemDefaultDevice()
+        )
+        let descriptor =
+            MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: 16,
+                height: 16,
+                mipmapped: false
+            )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .shared
+        let texture = try #require(
+            device.makeTexture(descriptor: descriptor)
+        )
+        let renderer = try CAMetalRenderer(
+            destination: texture
+        )
+        let root = CALayer()
+        root.bounds = CGRect(
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16
+        )
+        root.position = CGPoint(x: 8, y: 8)
+        root.backgroundColor = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        let animation = CABasicAnimation(
+            keyPath: "backgroundColor"
+        )
+        animation.fromValue = CGColor(
+            red: 1,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+        animation.toValue = CGColor(
+            red: 0,
+            green: 0,
+            blue: 1,
+            alpha: 1
+        )
+        animation.duration = 1
+        animation.speed = 0
+        animation.timeOffset = 0.25
+        CATransaction.flush()
+
+        CATransaction.begin()
+        root.add(
+            animation,
+            forKey: "backgroundColor"
+        )
+        CATransaction.commit()
+
+        root.backgroundColor = CGColor(
+            red: 0,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+        let stored = try #require(
+            root.animation(forKey: "backgroundColor")
+                as? CABasicAnimation
+        )
+        stored.toValue = root.backgroundColor
+        stored.timeOffset = 0.75
+
+        renderer.render(layer: root)
+        let firstCommandBuffer = try #require(
+            renderer.lastCommandBuffer
+        )
+        firstCommandBuffer.waitUntilCompleted()
+        #expect(firstCommandBuffer.status == .completed)
+        #expect(root.pendingCommittedRenderState == nil)
+        let firstPixel = readPixel(
+            texture,
+            x: 8,
+            y: 8
+        )
+        #expect(firstPixel == [64, 0, 191, 255])
+
+        root.backgroundColor = CGColor(
+            red: 1,
+            green: 1,
+            blue: 0,
+            alpha: 1
+        )
+        renderer.render(layer: root)
+        let secondCommandBuffer = try #require(
+            renderer.lastCommandBuffer
+        )
+        secondCommandBuffer.waitUntilCompleted()
+        #expect(secondCommandBuffer.status == .completed)
+        #expect(
+            readPixel(texture, x: 8, y: 8)
+                == firstPixel
+        )
+        CATransaction.flush()
+        root.removeAllAnimations()
+    }
+
     @Test("Metal encoding reads the captured frame instead of the mutated model")
     func metalEncodingUsesCapturedValues() throws {
         let device = try #require(MTLCreateSystemDefaultDevice())
@@ -2729,6 +3867,26 @@ extension CARenderSnapshotTests {
             )
         }
         #expect(pixel == [0, 255, 0, 255])
+    }
+
+    private func readPixel(
+        _ texture: any MTLTexture,
+        x: Int,
+        y: Int
+    ) -> [UInt8] {
+        var pixel = [UInt8](repeating: 0, count: 4)
+        pixel.withUnsafeMutableBytes { bytes in
+            guard let destination = bytes.baseAddress else {
+                return
+            }
+            texture.getBytes(
+                destination,
+                bytesPerRow: 4,
+                from: MTLRegionMake2D(x, y, 1, 1),
+                mipmapLevel: 0
+            )
+        }
+        return pixel
     }
 }
 #endif

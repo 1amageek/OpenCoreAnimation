@@ -6,19 +6,6 @@ import Foundation
 /// The snapshot intentionally stores layer identity without retaining a
 /// `CALayer`. This prevents mutations made after capture from changing the
 /// frame that is already being encoded.
-// FIXME(INCOMPLETE_IMPLEMENTATION): The immutable snapshot contains every value
-// consumed by CAMetalRenderer and by CAWebGPURenderer's static snapshot path,
-// including nested rectangular and rounded clipping, ordinary CGImage
-// contents, layer filter and backdrop-composition plans, gradient inputs,
-// tessellated shape geometry, validated text configuration, and emitter cells
-// with their converted image bytes.
-// Production WebGPU still uses an explicitly typed live-tree branch for
-// animation evaluation.
-// Phase 4 must not be considered complete until those
-// values and resources are owned here, the animation live-tree commit state is
-// removed,
-// and every WebGPU frame encodes without reading mutable model layers after
-// capture.
 internal struct CARenderSnapshot: Sendable {
     internal struct PresentationValues: Sendable, Equatable {
         internal struct Shadow: Sendable, Equatable {
@@ -45,6 +32,8 @@ internal struct CARenderSnapshot: Sendable {
 
         internal let replicator:
             CAReplicatorRenderConfiguration?
+        internal let replicatorCaptureFailure:
+            CAReplicatorRenderFailure?
         internal let emitter:
             CAEmitterRenderConfiguration?
         internal let tiled:
@@ -89,6 +78,8 @@ internal struct CARenderSnapshot: Sendable {
         internal let filters: [CARenderSnapshotFilterStage]
         internal let compositingFilter:
             CARenderSnapshotCompositingFilter?
+        internal let compositingFilterCaptureFailure:
+            CACompositionFilterRenderFailure?
         internal let backgroundFilters: [CARenderSnapshotFilterStage]
         internal let gradient: GradientRenderConfiguration?
         internal let shape: Shape?
@@ -134,6 +125,7 @@ internal struct CARenderSnapshot: Sendable {
     internal struct Node: Sendable, Equatable {
         internal let identity: ObjectIdentifier
         internal let contentRevision: UInt64
+        internal let hasActiveAnimations: Bool
         internal let presentationValues: PresentationValues
         internal let childIndices: [Int]
         internal let maskIndex: Int?
@@ -162,14 +154,16 @@ internal struct CARenderSnapshot: Sendable {
 
     internal static func capture(
         _ rootLayer: CALayer,
-        frameToken: UInt64
+        frameToken: UInt64,
+        evaluatesAnimations: Bool = true
     ) throws(CARendererError) -> CARenderSnapshot {
         var nodes: [Node] = []
         var visited: Set<ObjectIdentifier> = []
         let rootIndex = try captureNode(
             rootLayer,
             nodes: &nodes,
-            visited: &visited
+            visited: &visited,
+            evaluatesAnimations: evaluatesAnimations
         )
         var capturedContentRevisions: [ObjectIdentifier: UInt64] = [:]
         capturedContentRevisions.reserveCapacity(nodes.count)
@@ -180,8 +174,10 @@ internal struct CARenderSnapshot: Sendable {
             nodes: nodes,
             rootIndex: rootIndex,
             frameToken: frameToken,
-            rootBounds: rootLayer.bounds,
-            rootContentsScale: rootLayer.contentsScale,
+            rootBounds:
+                nodes[rootIndex].presentationValues.bounds,
+            rootContentsScale:
+                nodes[rootIndex].presentationValues.contentsScale,
             capturedContentRevisions: capturedContentRevisions
         )
     }
@@ -189,17 +185,23 @@ internal struct CARenderSnapshot: Sendable {
     private static func captureNode(
         _ layer: CALayer,
         nodes: inout [Node],
-        visited: inout Set<ObjectIdentifier>
+        visited: inout Set<ObjectIdentifier>,
+        evaluatesAnimations: Bool,
+        replicatorTimeOffset: CFTimeInterval = 0
     ) throws(CARendererError) -> Int {
-        let identity = ObjectIdentifier(layer)
-        guard visited.insert(identity).inserted else {
+        let traversalIdentity = ObjectIdentifier(layer)
+        guard visited.insert(traversalIdentity).inserted else {
             throw .cyclicLayerHierarchy
         }
+        let identity =
+            layer._committedSnapshotIdentity
+            ?? traversalIdentity
 
         let isDepthContainer =
             layer is CATransformLayer
             || (layer as? CAReplicatorLayer)?.preservesDepth == true
-        if !isDepthContainer {
+        if !isDepthContainer,
+           layer._committedStaticPresentationValues == nil {
             do {
                 try layer.prepareDelegateBackingStore(
                     maximumPixelDimension: Int.max
@@ -208,24 +210,49 @@ internal struct CARenderSnapshot: Sendable {
                 throw .invalidDelegateBackingStore(error)
             }
         }
-        let contentRevision = layer._contentRevision
-        let presentationLayer = layer._renderTimePresentation()
-        let transition: CARenderSnapshotTransition?
-        if let transitionState =
-                presentationLayer._transitionRenderState {
-            let sourceRootIndex = try captureNode(
-                transitionState.sourceLayer,
-                nodes: &nodes,
-                visited: &visited
-            )
-            do {
-                transition = try CARenderSnapshotTransition.capture(
-                    transitionState,
-                    sourceRootIndex: sourceRootIndex
+        let contentRevision =
+            layer._committedContentRevision
+            ?? layer._contentRevision
+        let presentationLayer: CALayer
+        if evaluatesAnimations {
+            presentationLayer = replicatorTimeOffset == 0
+                ? layer._renderTimePresentation()
+                : layer.presentationAtTimeOffset(
+                    replicatorTimeOffset
                 )
-            } catch {
-                throw .invalidLayerTransition(error)
+        } else {
+            presentationLayer = layer
+        }
+        let transition: CARenderSnapshotTransition?
+        if evaluatesAnimations,
+           let transitionState =
+                presentationLayer._transitionRenderState {
+            let sourceRootIndex: Int
+            if let committedSourceSnapshot =
+                    transitionState.committedSourceSnapshot {
+                sourceRootIndex = try append(
+                    committedSourceSnapshot,
+                    to: &nodes
+                )
+            } else if let sourceLayer =
+                        transitionState.sourceLayer {
+                sourceRootIndex = try captureNode(
+                    sourceLayer,
+                    nodes: &nodes,
+                    visited: &visited,
+                    evaluatesAnimations: true,
+                    replicatorTimeOffset:
+                        replicatorTimeOffset
+                )
+            } else {
+                throw .invalidLayerTransition(
+                    .missingSourceState
+                )
             }
+            transition = CARenderSnapshotTransition.capture(
+                transitionState,
+                sourceRootIndex: sourceRootIndex
+            )
         } else {
             transition = nil
         }
@@ -233,14 +260,22 @@ internal struct CARenderSnapshot: Sendable {
             from: presentationLayer,
             delegateBackingStore: layer.delegateBackingStore,
             tiledContentDelegate:
-                (layer as? CATiledLayer)?.delegate,
-            transition: transition
+                layer._committedStaticPresentationValues == nil
+                    ? (layer as? CATiledLayer)?.delegate
+                    : nil,
+            transition: transition,
+            staticValues:
+                layer._committedStaticPresentationValues,
+            animationAffectsContents:
+                layer._committedAnimationAffectsContents
         )
         let nodeIndex = nodes.count
         nodes.append(
             Node(
                 identity: identity,
                 contentRevision: contentRevision,
+                hasActiveAnimations:
+                    layer.hasActiveAnimationsForCommittedSnapshot,
                 presentationValues: values,
                 childIndices: [],
                 maskIndex: nil,
@@ -249,30 +284,68 @@ internal struct CARenderSnapshot: Sendable {
         )
 
         var childIndices: [Int] = []
-        let orderedChildren = isDepthContainer
-            ? layer.sublayers ?? []
-            : layer.sortedSublayers()
+        let orderedChildren: [CALayer]
+        if isDepthContainer {
+            orderedChildren = layer.sublayers ?? []
+        } else if evaluatesAnimations,
+                  replicatorTimeOffset != 0 {
+            orderedChildren = (layer.sublayers ?? [])
+                .enumerated()
+                .sorted { lhs, rhs in
+                    let lhsZ = lhs.element
+                        .presentationAtTimeOffset(
+                            replicatorTimeOffset
+                        ).zPosition
+                    let rhsZ = rhs.element
+                        .presentationAtTimeOffset(
+                            replicatorTimeOffset
+                        ).zPosition
+                    return lhsZ == rhsZ
+                        ? lhs.offset < rhs.offset
+                        : lhsZ < rhsZ
+                }
+                .map(\.element)
+        } else {
+            orderedChildren = layer.sortedSublayers()
+        }
         childIndices.reserveCapacity(orderedChildren.count)
         for child in orderedChildren {
             childIndices.append(
                 try captureNode(
                     child,
                     nodes: &nodes,
-                    visited: &visited
+                    visited: &visited,
+                    evaluatesAnimations: evaluatesAnimations,
+                    replicatorTimeOffset:
+                        replicatorTimeOffset
                 )
             )
         }
         if let replicator = values.replicator {
-            do {
-                childIndices = try expandedReplicatorChildren(
-                    sourceChildIndices: childIndices,
-                    configuration: replicator,
-                    nodes: &nodes
-                )
-            } catch {
-                throw .invalidLayerReplicator(
-                    snapshotReplicatorError(from: error)
-                )
+            if evaluatesAnimations,
+               replicator.instanceCount > 1,
+               replicator.instanceDelay != 0 {
+                childIndices =
+                    try expandedAnimatedReplicatorChildren(
+                        sourceChildIndices: childIndices,
+                        sourceChildren: orderedChildren,
+                        inheritedTimeOffset:
+                            replicatorTimeOffset,
+                        configuration: replicator,
+                        nodes: &nodes
+                    )
+            } else {
+                do {
+                    childIndices = try expandedReplicatorChildren(
+                        sourceChildIndices: childIndices,
+                        configuration: replicator,
+                        nodes: &nodes
+                    )
+                } catch {
+                    throw .invalidLayerReplicator(
+                        snapshotReplicatorError(from: error)
+                    )
+                }
             }
         }
         let maskIndex: Int?
@@ -280,7 +353,10 @@ internal struct CARenderSnapshot: Sendable {
             maskIndex = try captureNode(
                 mask,
                 nodes: &nodes,
-                visited: &visited
+                visited: &visited,
+                evaluatesAnimations: evaluatesAnimations,
+                replicatorTimeOffset:
+                    replicatorTimeOffset
             )
         } else {
             maskIndex = nil
@@ -289,6 +365,8 @@ internal struct CARenderSnapshot: Sendable {
         nodes[nodeIndex] = Node(
             identity: identity,
             contentRevision: contentRevision,
+            hasActiveAnimations:
+                layer.hasActiveAnimationsForCommittedSnapshot,
             presentationValues: values,
             childIndices: childIndices,
             maskIndex: maskIndex,
@@ -298,6 +376,38 @@ internal struct CARenderSnapshot: Sendable {
                     : orderedChildren.count
         )
         return nodeIndex
+    }
+
+    private static func append(
+        _ snapshot: CARenderSnapshot,
+        to nodes: inout [Node]
+    ) throws(CARendererError) -> Int {
+        let baseIndex = nodes.count
+        nodes.reserveCapacity(nodes.count + snapshot.nodes.count)
+        for node in snapshot.nodes {
+            guard node.presentationValues.transition == nil else {
+                throw .invalidLayerTransition(
+                    .nestedSourceTransition
+                )
+            }
+            nodes.append(
+                Node(
+                    identity: node.identity,
+                    contentRevision: node.contentRevision,
+                    hasActiveAnimations: node.hasActiveAnimations,
+                    presentationValues: node.presentationValues,
+                    childIndices: node.childIndices.map {
+                        baseIndex + $0
+                    },
+                    maskIndex: node.maskIndex.map {
+                        baseIndex + $0
+                    },
+                    replicatorSourceChildCount:
+                        node.replicatorSourceChildCount
+                )
+            )
+        }
+        return baseIndex + snapshot.rootIndex
     }
 
     private static func expandedReplicatorChildren(
@@ -356,6 +466,108 @@ internal struct CARenderSnapshot: Sendable {
         return expandedChildIndices
     }
 
+    private static func expandedAnimatedReplicatorChildren(
+        sourceChildIndices: [Int],
+        sourceChildren: [CALayer],
+        inheritedTimeOffset: CFTimeInterval,
+        configuration: CAReplicatorRenderConfiguration,
+        nodes: inout [Node]
+    ) throws(CARendererError) -> [Int] {
+        guard configuration.instanceCount > 0,
+              !sourceChildIndices.isEmpty else {
+            return []
+        }
+
+        var cumulativeTransform = CATransform3DIdentity
+        var expandedChildIndices: [Int] = []
+        expandedChildIndices.reserveCapacity(
+            sourceChildIndices.count
+                * configuration.instanceCount
+        )
+        for instanceIndex in 0..<configuration.instanceCount {
+            let color: SIMD4<Float>
+            let instanceTimeOffset: CFTimeInterval
+            do {
+                color = try configuration.color(
+                    at: instanceIndex
+                )
+                instanceTimeOffset =
+                    try configuration.timeOffset(
+                        at: instanceIndex
+                    )
+            } catch {
+                throw .invalidLayerReplicator(
+                    snapshotReplicatorError(from: error)
+                )
+            }
+            let instanceChildIndices: [Int]
+            if instanceIndex == 0 {
+                instanceChildIndices = sourceChildIndices
+            } else {
+                let evaluationTimeOffset =
+                    inheritedTimeOffset
+                    + instanceTimeOffset
+                guard evaluationTimeOffset.isFinite else {
+                    throw .invalidLayerReplicator(
+                        .instanceTimeOffsetOverflow(
+                            instanceIndex: instanceIndex
+                        )
+                    )
+                }
+                var instanceVisited: Set<ObjectIdentifier> = []
+                var capturedChildren: [Int] = []
+                capturedChildren.reserveCapacity(
+                    sourceChildren.count
+                )
+                for child in sourceChildren {
+                    capturedChildren.append(
+                        try captureNode(
+                            child,
+                            nodes: &nodes,
+                            visited: &instanceVisited,
+                            evaluatesAnimations: true,
+                            replicatorTimeOffset:
+                                evaluationTimeOffset
+                        )
+                    )
+                }
+                instanceChildIndices = capturedChildren
+            }
+            for childIndex in instanceChildIndices {
+                do {
+                    try applyReplicatorInstance(
+                        to: childIndex,
+                        rootTransform: cumulativeTransform,
+                        color: color,
+                        timeOffset: instanceTimeOffset,
+                        instanceIndex: instanceIndex,
+                        nodes: &nodes
+                    )
+                } catch {
+                    throw .invalidLayerReplicator(
+                        snapshotReplicatorError(from: error)
+                    )
+                }
+                expandedChildIndices.append(childIndex)
+            }
+            if instanceIndex + 1 < configuration.instanceCount {
+                do {
+                    cumulativeTransform =
+                        try configuration.nextTransform(
+                            after: cumulativeTransform,
+                            nextInstanceIndex:
+                                instanceIndex + 1
+                        )
+                } catch {
+                    throw .invalidLayerReplicator(
+                        snapshotReplicatorError(from: error)
+                    )
+                }
+            }
+        }
+        return expandedChildIndices
+    }
+
     private static func cloneSubtree(
         at sourceIndex: Int,
         nodes: inout [Node]
@@ -366,6 +578,7 @@ internal struct CARenderSnapshot: Sendable {
             Node(
                 identity: source.identity,
                 contentRevision: source.contentRevision,
+                hasActiveAnimations: source.hasActiveAnimations,
                 presentationValues: source.presentationValues,
                 childIndices: [],
                 maskIndex: nil,
@@ -382,6 +595,7 @@ internal struct CARenderSnapshot: Sendable {
         nodes[cloneIndex] = Node(
             identity: source.identity,
             contentRevision: source.contentRevision,
+            hasActiveAnimations: source.hasActiveAnimations,
             presentationValues: source.presentationValues,
             childIndices: childIndices,
             maskIndex: maskIndex,
@@ -410,6 +624,7 @@ internal struct CARenderSnapshot: Sendable {
         nodes[nodeIndex] = Node(
             identity: source.identity,
             contentRevision: source.contentRevision,
+            hasActiveAnimations: source.hasActiveAnimations,
             presentationValues: values,
             childIndices: source.childIndices,
             maskIndex: source.maskIndex,
@@ -509,10 +724,14 @@ internal struct CARenderSnapshot: Sendable {
         delegateBackingStore: CADelegateBackingStore? = nil,
         tiledContentDelegate:
             (any CALayerDelegate)? = nil,
-        transition: CARenderSnapshotTransition? = nil
+        transition: CARenderSnapshotTransition? = nil,
+        staticValues: PresentationValues? = nil,
+        animationAffectsContents: Bool = false
     ) throws(CARendererError) -> PresentationValues {
         let isTransformLayer = layer is CATransformLayer
         let replicator: CAReplicatorRenderConfiguration?
+        let replicatorCaptureFailure:
+            CAReplicatorRenderFailure?
         if let replicatorLayer = layer as? CAReplicatorLayer {
             do {
                 replicator = try CAReplicatorRenderConfiguration(
@@ -521,20 +740,29 @@ internal struct CARenderSnapshot: Sendable {
                         CAReplicatorRenderConfiguration
                             .maximumInstanceCount
                 )
+                replicatorCaptureFailure = nil
             } catch {
-                throw .invalidLayerReplicator(
-                    snapshotReplicatorError(from: error)
-                )
+                replicator = nil
+                replicatorCaptureFailure = error
             }
         } else {
             replicator = nil
+            replicatorCaptureFailure = nil
         }
         let emitter: CAEmitterRenderConfiguration?
         if let emitterLayer = layer as? CAEmitterLayer {
             do {
-                emitter = try CAEmitterRenderConfiguration(
-                    layer: emitterLayer
-                )
+                if let staticEmitter = staticValues?.emitter {
+                    emitter =
+                        try CAEmitterRenderConfiguration(
+                            layer: emitterLayer,
+                            reusing: staticEmitter
+                        )
+                } else {
+                    emitter = try CAEmitterRenderConfiguration(
+                        layer: emitterLayer
+                    )
+                }
             } catch {
                 throw .invalidLayerEmitter(error)
             }
@@ -542,7 +770,9 @@ internal struct CARenderSnapshot: Sendable {
             emitter = nil
         }
         let tiled: CATiledLayerRenderConfiguration?
-        if let tiledLayer = layer as? CATiledLayer {
+        if let staticTiled = staticValues?.tiled {
+            tiled = staticTiled
+        } else if let tiledLayer = layer as? CATiledLayer {
             do {
                 tiled = try CATiledLayerRenderConfiguration(
                     layer: tiledLayer,
@@ -566,9 +796,18 @@ internal struct CARenderSnapshot: Sendable {
               layer.anchorPoint.x.isFinite,
               layer.anchorPoint.y.isFinite,
               layer.anchorPointZ.isFinite,
-              layer.opacity.isFinite,
               isFinite(layer.transform),
               isFinite(layer.sublayerTransform) else {
+            throw .nonFiniteLayerGeometry
+        }
+        guard layer.opacity.isFinite else {
+            if !isDepthContainer,
+               layer.shadowOpacity > 0,
+               layer.shadowColor != nil {
+                throw .invalidLayerShadow(
+                    .invalidCompositeOpacity(layer.opacity)
+                )
+            }
             throw .nonFiniteLayerGeometry
         }
         if !isDepthContainer {
@@ -578,15 +817,9 @@ internal struct CARenderSnapshot: Sendable {
                 throw .nonFiniteLayerGeometry
             }
             guard layer.cornerRadius >= 0 else {
-                throw .invalidLayerCornerGeometry
-            }
-        }
-        if !isDepthContainer, layer.shouldRasterize {
-            guard layer.rasterizationScale.isFinite,
-                  layer.rasterizationScale > 0 else {
-                throw .invalidLayerRasterization(
-                    .invalidRasterizationScale(
-                        layer.rasterizationScale
+                throw .invalidLayerCornerGeometry(
+                    .negativeCornerRadius(
+                        layer.cornerRadius
                     )
                 )
             }
@@ -604,7 +837,12 @@ internal struct CARenderSnapshot: Sendable {
                     ).exponent
                 )
             } catch {
-                throw .invalidLayerCornerGeometry
+                switch error {
+                case .unsupportedCurve(let value):
+                    throw .invalidLayerCornerGeometry(
+                        .unsupportedCurve(value)
+                    )
+                }
             }
         }
         let cornerRadii = isDepthContainer
@@ -616,7 +854,9 @@ internal struct CARenderSnapshot: Sendable {
               cornerRadii.y.isFinite,
               cornerRadii.z.isFinite,
               cornerRadii.w.isFinite else {
-            throw .invalidLayerCornerGeometry
+            throw .invalidLayerCornerGeometry(
+                .invalidResolvedGeometry
+            )
         }
         let borderWidth = isDepthContainer
             ? 0
@@ -661,7 +901,10 @@ internal struct CARenderSnapshot: Sendable {
             throw .nonFiniteLayerGeometry
         }
         let imageContents: CAImageContentsSnapshot?
-        if isDepthContainer
+        if let staticValues,
+           !animationAffectsContents {
+            imageContents = staticValues.imageContents
+        } else if isDepthContainer
             || layer is CAShapeLayer
             || layer is CATextLayer {
             imageContents = nil
@@ -677,10 +920,21 @@ internal struct CARenderSnapshot: Sendable {
         }
         let filters: [CARenderSnapshotFilterStage]
         let compositingFilter: CARenderSnapshotCompositingFilter?
+        let compositingFilterCaptureFailure:
+            CACompositionFilterRenderFailure?
         let backgroundFilters: [CARenderSnapshotFilterStage]
-        if isDepthContainer {
+        if let staticValues {
+            filters = staticValues.filters
+            compositingFilter =
+                staticValues.compositingFilter
+            compositingFilterCaptureFailure =
+                staticValues.compositingFilterCaptureFailure
+            backgroundFilters =
+                staticValues.backgroundFilters
+        } else if isDepthContainer {
             filters = []
             compositingFilter = nil
+            compositingFilterCaptureFailure = nil
             backgroundFilters = []
         } else {
             do {
@@ -695,6 +949,11 @@ internal struct CARenderSnapshot: Sendable {
                     try CARenderSnapshotCompositingFilter.capture(
                         layer.compositingFilter
                     )
+                compositingFilterCaptureFailure = nil
+            } catch .unsupportedFilterValue(let typeName) {
+                compositingFilter = nil
+                compositingFilterCaptureFailure =
+                    .unsupportedCompositingFilterValue(typeName)
             } catch {
                 throw .invalidLayerCompositingFilter(error)
             }
@@ -785,6 +1044,8 @@ internal struct CARenderSnapshot: Sendable {
         let text = try captureText(from: layer)
         return PresentationValues(
             replicator: replicator,
+            replicatorCaptureFailure:
+                replicatorCaptureFailure,
             emitter: emitter,
             tiled: tiled,
             transition: transition,
@@ -847,6 +1108,8 @@ internal struct CARenderSnapshot: Sendable {
             imageContents: imageContents,
             filters: filters,
             compositingFilter: compositingFilter,
+            compositingFilterCaptureFailure:
+                compositingFilterCaptureFailure,
             backgroundFilters: backgroundFilters,
             gradient: gradient,
             shape: shape,
@@ -1057,16 +1320,36 @@ internal struct CARenderSnapshot: Sendable {
         from layer: CALayer,
         delegateBackingStore: CADelegateBackingStore?
     ) throws(CAImageContentsSnapshotError) -> CAImageContentsSnapshot? {
-        let image: CGImage
-        if let delegateImage = delegateBackingStore?.image {
-            image = delegateImage
+        let storage: CGImageTextureStorage
+        let origin: CAImageContentsSnapshot.Origin
+        if let delegateBackingStore {
+            let delegateImage = delegateBackingStore.image
+            do {
+                storage = try CGImageTextureStorageConverter
+                    .convert(delegateImage)
+            } catch {
+                throw .imageConversion(error)
+            }
+            origin = .delegateBackingStore(
+                delegateBackingStore.format.contentsFormat
+            )
+        } else if let committedStorage =
+                    layer._committedImageContentsStorage {
+            storage = committedStorage
+            origin = .layerContents
         } else if let contents = layer.contents {
             guard let contentsImage = contents as? CGImage else {
                 throw .unsupportedContentsType(
                     String(reflecting: type(of: contents))
                 )
             }
-            image = contentsImage
+            do {
+                storage = try CGImageTextureStorageConverter
+                    .convert(contentsImage)
+            } catch {
+                throw .imageConversion(error)
+            }
+            origin = .layerContents
         } else {
             return nil
         }
@@ -1084,17 +1367,9 @@ internal struct CARenderSnapshot: Sendable {
                 layer.minificationFilterBias
             )
         }
-        let storage: CGImageTextureStorage
-        do {
-            storage = try CGImageTextureStorageConverter.convert(image)
-        } catch {
-            throw .imageConversion(error)
-        }
         return CAImageContentsSnapshot(
             storage: storage,
-            origin: delegateBackingStore.map {
-                .delegateBackingStore($0.format.contentsFormat)
-            } ?? .layerContents,
+            origin: origin,
             contentsRect: layer.contentsRect,
             contentsCenter: layer.contentsCenter,
             contentsScale: layer.contentsScale,
@@ -1232,14 +1507,17 @@ internal struct CARenderRevisionSnapshot: Sendable {
 internal enum CACommittedRenderState: Sendable {
     case snapshot(CARenderSnapshot)
     case captureFailure(frameToken: UInt64, error: CARendererError)
-    case requiresLiveAnimationEvaluation(frameToken: UInt64)
+    case animationEvaluator(
+        frameToken: UInt64,
+        evaluator: CACommittedAnimationEvaluator
+    )
 
     internal var frameToken: UInt64 {
         switch self {
         case .snapshot(let snapshot):
             snapshot.frameToken
         case .captureFailure(let frameToken, _),
-             .requiresLiveAnimationEvaluation(let frameToken):
+             .animationEvaluator(let frameToken, _):
             frameToken
         }
     }

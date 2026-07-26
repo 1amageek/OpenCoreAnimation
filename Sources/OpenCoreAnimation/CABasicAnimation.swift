@@ -3,13 +3,19 @@
 open class CABasicAnimation: CAPropertyAnimation {
 
     /// The value at the start of the animation.
-    open var fromValue: Any?
+    open var fromValue: Any? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// The value at the end of the animation.
-    open var toValue: Any?
+    open var toValue: Any? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     /// The value at which the animation will interpolate between.
-    open var byValue: Any?
+    open var byValue: Any? {
+        didSet { notifyAttachedLayerOfMutation() }
+    }
 
     public required init() {
         super.init()

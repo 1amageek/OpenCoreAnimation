@@ -458,6 +458,7 @@ import JavaScriptKit
     /// Use this method when you need to render without the animation loop running,
     /// for example, after making changes that should be immediately visible.
     public func renderFrame() {
+        CATransaction.commitPendingImplicitTransactions()
         if let rootLayer = rootLayer, let delegate = rendererDelegate {
             layoutRecursively(rootLayer)
             delegate.render(layer: rootLayer)

@@ -8,7 +8,13 @@
 open class CAAnimationGroup: CAAnimation {
 
     /// An array of CAAnimation objects to be evaluated concurrently.
-    open var animations: [CAAnimation]?
+    open var animations: [CAAnimation]? {
+        didSet {
+            oldValue?.forEach { $0.detachFromLayer() }
+            attachmentDidChange(attachmentReference)
+            notifyAttachedLayerOfMutation()
+        }
+    }
 
     public required init() {
         super.init()
@@ -20,6 +26,18 @@ open class CAAnimationGroup: CAAnimation {
             // Deep-copy nested animations so mutation of originals does not
             // propagate into the grouped copy.
             self.animations = source.animations?.map { $0.copy() }
+        }
+    }
+
+    internal override func attachmentDidChange(
+        _ reference: CAAnimationLayerReference?
+    ) {
+        for animation in animations ?? [] {
+            if let reference {
+                animation.attach(using: reference)
+            } else {
+                animation.detachFromLayer()
+            }
         }
     }
 
