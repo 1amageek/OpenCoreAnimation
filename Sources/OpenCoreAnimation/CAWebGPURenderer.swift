@@ -2302,7 +2302,7 @@ private final class CommittedAnimationEvaluationFailure {
         }
 
         // Request adapter
-        guard let adapter = await gpu.requestAdapter() else {
+        guard let adapter = try await gpu.requestAdapter() else {
             throw CARendererError.deviceNotAvailable
         }
 
@@ -5039,7 +5039,13 @@ private final class CommittedAnimationEvaluationFailure {
         }
 
         Task { @MainActor in
-            await queue.onSubmittedWorkDone()
+            do {
+                try await queue.onSubmittedWorkDone()
+            } catch {
+                if firstUncapturedGPUError == nil {
+                    firstUncapturedGPUError = "GPU queue completion failed: \(error)"
+                }
+            }
             for texture in captureDepthTextures {
                 texture.destroy()
             }
